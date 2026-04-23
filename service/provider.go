@@ -68,16 +68,30 @@ func (s *providerService) ListProviders(userID string) ([]*Provider, error) {
 }
 
 func (s *providerService) UpdateProvider(p *Provider) error {
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, enabled=? WHERE id=? AND user_id=?`,
 		p.Name, p.BaseURL, p.APIKey, string(p.Protocol), boolToInt(p.Enabled), p.ID, p.UserID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *providerService) DeleteProvider(id int64, userID string) error {
-	_, err := s.db.Exec(`DELETE FROM providers WHERE id=? AND user_id=?`, id, userID)
-	return err
+	res, err := s.db.Exec(`DELETE FROM providers WHERE id=? AND user_id=?`, id, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *providerService) UpsertPolicy(p *PrivacyPolicy) error {

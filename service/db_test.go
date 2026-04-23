@@ -84,6 +84,7 @@ func TestForeignKeyConstraint(t *testing.T) {
 func TestPrivacyPolicyCRUD(t *testing.T) {
 	db, err := NewDB(t.TempDir() + "/test.db")
 	require.NoError(t, err)
+	defer db.Close()
 	svc := &providerService{db: db}
 
 	policy := &PrivacyPolicy{UserID: "5", AllowRemote: true, DefaultBackend: "local", EscalationPrompt: true}
