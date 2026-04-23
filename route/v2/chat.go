@@ -4,6 +4,7 @@ package v2
 import (
 	"bufio"
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,7 +75,10 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 
 func (h *ChatHandler) forwardToCloud(c echo.Context, userID string, body io.Reader, stream bool) error {
 	providers, err := h.svc.Providers().ListProviders(userID)
-	if err != nil || len(providers) == 0 {
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list providers")
+	}
+	if len(providers) == 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, "no cloud provider configured")
 	}
 
@@ -128,11 +132,17 @@ func (h *ChatHandler) Messages(c echo.Context) error {
 
 	// /messages always routes to Anthropic provider — does not participate in default_backend switching
 	policy, err := h.svc.Providers().GetPolicy(userID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to load privacy policy")
+	}
 	if err == nil && !policy.AllowRemote {
 		return echo.NewHTTPError(http.StatusForbidden, "remote access not allowed by privacy policy")
 	}
 
-	providers, _ := h.svc.Providers().ListProviders(userID)
+	providers, err := h.svc.Providers().ListProviders(userID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list providers")
+	}
 	var provider *service.Provider
 	for _, p := range providers {
 		if p.Enabled && p.Protocol == service.ProtocolAnthropic {
