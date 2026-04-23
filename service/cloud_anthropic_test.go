@@ -138,6 +138,24 @@ func TestAnthropicAdapter_ChatCompletions_ConvertsSystemMessage(t *testing.T) {
 	require.Len(t, anthropicReq.Messages, 1) // system extracted
 }
 
+func TestAnthropicAdapter_ChatCompletions_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	adapter := NewAnthropicAdapter(server.URL, "key")
+	_, err := adapter.ChatCompletions(strings.NewReader("not-json"))
+	require.Error(t, err)
+}
+
+func TestAnthropicAdapter_ChatCompletions_ConnectionRefused(t *testing.T) {
+	adapter := NewAnthropicAdapter("http://127.0.0.1:1", "key")
+	body := `{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}`
+	_, err := adapter.ChatCompletions(strings.NewReader(body))
+	require.Error(t, err)
+}
+
 func TestAnthropicAdapter_Messages_PassesThrough(t *testing.T) {
 	var receivedBody string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

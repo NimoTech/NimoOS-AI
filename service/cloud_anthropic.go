@@ -75,6 +75,7 @@ type anthropicChunkData struct {
 
 // convertToAnthropic converts an OpenAI chat request to Anthropic format.
 // It extracts the system message from the messages array into the top-level System field.
+// If multiple system messages are present, only the last one is used.
 func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
 	maxTokens := req.MaxTokens
 	if maxTokens == 0 {
@@ -149,7 +150,7 @@ func NewAnthropicAdapter(baseURL, apiKey string) *AnthropicAdapter {
 	return &AnthropicAdapter{
 		baseURL: baseURL,
 		apiKey:  apiKey,
-		client:  &http.Client{},
+		client:  &http.Client{}, // no timeout: streaming responses can be long
 	}
 }
 
@@ -160,8 +161,8 @@ func (a *AnthropicAdapter) setHeaders(req *http.Request) {
 }
 
 // ChatCompletions accepts an OpenAI-format request, converts it to Anthropic format,
-// and returns the raw Anthropic response. The caller receives the Anthropic-format response
-// and must handle further conversion if needed for the /chat/completions endpoint.
+// and returns the raw upstream *http.Response. Caller owns resp.Body and is responsible
+// for SSE parsing and protocol conversion for the /chat/completions endpoint.
 func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
