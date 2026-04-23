@@ -31,6 +31,9 @@ func main() {
 	fmt.Println("git commit:", commit)
 	fmt.Println("build date:", date)
 
-	config.Init(*configFlag, _confSample)
+	if err := config.Init(*configFlag, _confSample); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize config: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Println("NimoOS-AI starting... (stub)")
 }

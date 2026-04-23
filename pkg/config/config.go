@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/viper"
@@ -15,18 +16,22 @@ type Config struct {
 	LogPath       string
 }
 
-func Init(configFile, confSample string) {
+func Init(configFile, confSample string) error {
 	if configFile == "" {
 		configFile = "/etc/nimoos/ai.conf"
 	}
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		_ = os.WriteFile(configFile, []byte(confSample), 0644)
+		if err := os.WriteFile(configFile, []byte(confSample), 0644); err != nil {
+			return fmt.Errorf("failed to write default config: %w", err)
+		}
 	}
 
 	v := viper.New()
 	v.SetConfigFile(configFile)
 	v.SetConfigType("ini")
-	_ = v.ReadInConfig()
+	if err := v.ReadInConfig(); err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
 
 	Cfg = &Config{
 		RuntimePath:   v.GetString("common.RuntimePath"),
@@ -44,4 +49,8 @@ func Init(configFile, confSample string) {
 	if Cfg.MasterKeyPath == "" {
 		Cfg.MasterKeyPath = "/etc/nimoos/ai_master.key"
 	}
+	if Cfg.LogPath == "" {
+		Cfg.LogPath = "/var/log/nimoos"
+	}
+	return nil
 }
