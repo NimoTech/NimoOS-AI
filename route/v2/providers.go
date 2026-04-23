@@ -62,9 +62,13 @@ func (h *ProvidersHandler) Create(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	encKey, err := h.svc.MasterKey().Encrypt(req.APIKey)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt api key")
+	encKey := ""
+	if req.APIKey != "" {
+		var err error
+		encKey, err = h.svc.MasterKey().Encrypt(req.APIKey)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt api key")
+		}
 	}
 	p := &service.Provider{
 		UserID: userID, Name: req.Name, BaseURL: req.BaseURL,
