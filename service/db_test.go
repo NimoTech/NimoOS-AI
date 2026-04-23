@@ -80,3 +80,49 @@ func TestForeignKeyConstraint(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO chat_messages (session_id, role, content) VALUES (9999, 'user', 'hi')`)
 	require.Error(t, err, "foreign key constraint should be enforced")
 }
+
+func TestPrivacyPolicyCRUD(t *testing.T) {
+	db, err := NewDB(t.TempDir() + "/test.db")
+	require.NoError(t, err)
+	svc := &providerService{db: db}
+
+	policy := &PrivacyPolicy{UserID: "5", AllowRemote: true, DefaultBackend: "local", EscalationPrompt: true}
+	err = svc.UpsertPolicy(policy)
+	require.NoError(t, err)
+
+	got, err := svc.GetPolicy("5")
+	require.NoError(t, err)
+	require.True(t, got.AllowRemote)
+
+	policy.AllowRemote = false
+	err = svc.UpsertPolicy(policy)
+	require.NoError(t, err)
+
+	got2, err := svc.GetPolicy("5")
+	require.NoError(t, err)
+	require.False(t, got2.AllowRemote)
+}
+
+func TestProviderListAndDelete(t *testing.T) {
+	db, err := NewDB(t.TempDir() + "/test.db")
+	require.NoError(t, err)
+	svc := &providerService{db: db}
+
+	err = svc.CreateProvider(&Provider{UserID: "10", Name: "A", BaseURL: "https://a.com", Protocol: ProtocolOpenAI})
+	require.NoError(t, err)
+	err = svc.CreateProvider(&Provider{UserID: "10", Name: "B", BaseURL: "https://b.com", Protocol: ProtocolOpenAI})
+	require.NoError(t, err)
+	err = svc.CreateProvider(&Provider{UserID: "99", Name: "C", BaseURL: "https://c.com", Protocol: ProtocolOpenAI})
+	require.NoError(t, err)
+
+	list, err := svc.ListProviders("10")
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+
+	err = svc.DeleteProvider(list[0].ID, "10")
+	require.NoError(t, err)
+
+	list2, err := svc.ListProviders("10")
+	require.NoError(t, err)
+	require.Len(t, list2, 1)
+}
