@@ -81,6 +81,8 @@ func main() {
 	urlFilePath := filepath.Join(config.Cfg.RuntimePath, common.URLFileName)
 	if err := file.CreateFileAndWriteContent(urlFilePath, "http://"+listener.Addr().String()); err != nil {
 		logger.Error("failed to write URL file", zap.Error(err))
+		// URL file failure is non-fatal: Gateway registration below sends the address directly.
+		// Other consumers that read the URL file may fail to discover this service.
 	}
 
 	// Register routes at Gateway

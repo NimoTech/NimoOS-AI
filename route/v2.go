@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/NimoTech/NimoOS-AI/common"
 	v2 "github.com/NimoTech/NimoOS-AI/route/v2"
@@ -21,10 +22,9 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.OPTIONS},
-		AllowHeaders:     []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud"},
-		AllowCredentials: true,
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.OPTIONS},
+		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud"},
 	}))
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
@@ -43,7 +43,8 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 		},
 		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
 			func(c echo.Context) ([]string, error) {
-				return []string{c.Request().Header.Get(echo.HeaderAuthorization)}, nil
+				auth := c.Request().Header.Get(echo.HeaderAuthorization)
+				return []string{strings.TrimPrefix(auth, "Bearer ")}, nil
 			},
 		},
 	}))
