@@ -7,12 +7,14 @@ import (
 )
 
 func newTestRouter(t *testing.T, policy PrivacyPolicy) *Router {
-	db, _ := NewDB(t.TempDir() + "/test.db")
+	db, err := NewDB(t.TempDir() + "/test.db")
+	require.NoError(t, err)
 	svc := &providerService{db: db}
-	db.Exec(
+	_, err = db.Exec(
 		`INSERT INTO privacy_policies (user_id, allow_remote, default_backend, escalation_prompt) VALUES (?,?,?,?)`,
 		policy.UserID, boolToInt(policy.AllowRemote), policy.DefaultBackend, boolToInt(policy.EscalationPrompt),
 	)
+	require.NoError(t, err)
 	return &Router{providers: svc, db: db}
 }
 
@@ -44,9 +46,11 @@ func TestRouter_ForceCloudHeader_BlockedWhenNotAllowed(t *testing.T) {
 }
 
 func TestRouter_DefaultsToLocalForNewUser(t *testing.T) {
-	db, _ := NewDB(t.TempDir() + "/test.db")
+	db, err := NewDB(t.TempDir() + "/test.db")
+	require.NoError(t, err)
 	r := &Router{providers: &providerService{db: db}, db: db}
 	decision, err := r.Decide("999", false) // no policy record exists
 	require.NoError(t, err)
 	require.Equal(t, BackendLocal, decision.Backend)
+	require.False(t, decision.ForceLocal) // AllowRemote=true by default, so not force-local
 }
