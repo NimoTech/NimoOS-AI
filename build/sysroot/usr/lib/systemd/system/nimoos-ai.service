@@ -1,0 +1,13 @@
+[Unit]
+After=nimoos-gateway.service nimoos-message-bus.service
+Description=NimoOS AI Service
+
+[Service]
+ExecStartPre=/usr/bin/nimoos-ai -v
+ExecStart=/usr/bin/nimoos-ai -c /etc/nimoos/ai.conf
+PIDFile=/var/run/nimoos/ai.pid
+Restart=always
+Type=notify
+
+[Install]
+WantedBy=multi-user.target
