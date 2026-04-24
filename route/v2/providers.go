@@ -17,21 +17,23 @@ func NewProvidersHandler(svc service.Services) *ProvidersHandler {
 }
 
 type providerRequest struct {
-	Name     string           `json:"name"`
-	BaseURL  string           `json:"base_url"`
-	APIKey   string           `json:"api_key"` // plaintext; handler encrypts before storing
-	Protocol service.Protocol `json:"protocol"`
-	Enabled  bool             `json:"enabled"`
+	Name         string           `json:"name"`
+	BaseURL      string           `json:"base_url"`
+	APIKey       string           `json:"api_key"` // plaintext; handler encrypts before storing
+	Protocol     service.Protocol `json:"protocol"`
+	Enabled      bool             `json:"enabled"`
+	DefaultModel string           `json:"default_model"`
 }
 
 // safeProvider is the response shape — never exposes the encrypted api_key.
 type safeProvider struct {
-	ID       int64            `json:"id"`
-	Name     string           `json:"name"`
-	BaseURL  string           `json:"base_url"`
-	Protocol service.Protocol `json:"protocol"`
-	Enabled  bool             `json:"enabled"`
-	HasKey   bool             `json:"has_key"`
+	ID           int64            `json:"id"`
+	Name         string           `json:"name"`
+	BaseURL      string           `json:"base_url"`
+	Protocol     service.Protocol `json:"protocol"`
+	Enabled      bool             `json:"enabled"`
+	HasKey       bool             `json:"has_key"`
+	DefaultModel string           `json:"default_model"`
 }
 
 func (h *ProvidersHandler) List(c echo.Context) error {
@@ -48,6 +50,7 @@ func (h *ProvidersHandler) List(c echo.Context) error {
 		result[i] = safeProvider{
 			ID: p.ID, Name: p.Name, BaseURL: p.BaseURL,
 			Protocol: p.Protocol, Enabled: p.Enabled, HasKey: p.APIKey != "",
+			DefaultModel: p.DefaultModel,
 		}
 	}
 	return c.JSON(http.StatusOK, result)
@@ -73,6 +76,7 @@ func (h *ProvidersHandler) Create(c echo.Context) error {
 	p := &service.Provider{
 		UserID: userID, Name: req.Name, BaseURL: req.BaseURL,
 		APIKey: encKey, Protocol: req.Protocol, Enabled: req.Enabled,
+		DefaultModel: req.DefaultModel,
 	}
 	if err := h.svc.Providers().CreateProvider(p); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -103,6 +107,7 @@ func (h *ProvidersHandler) Update(c echo.Context) error {
 	p := &service.Provider{
 		ID: id, UserID: userID, Name: req.Name, BaseURL: req.BaseURL,
 		APIKey: encKey, Protocol: req.Protocol, Enabled: req.Enabled,
+		DefaultModel: req.DefaultModel,
 	}
 	if err := h.svc.Providers().UpdateProvider(p); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

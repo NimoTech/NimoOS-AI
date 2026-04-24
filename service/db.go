@@ -17,23 +17,24 @@ const (
 
 // Provider stores per-user cloud provider config
 type Provider struct {
-	ID        int64
-	UserID    string   // string form of JWT integer user ID
-	Name      string
-	BaseURL   string
-	APIKey    string   // AES-GCM encrypted, base64-encoded
-	Protocol  Protocol
-	Enabled   bool
-	CreatedAt time.Time
+	ID           int64
+	UserID       string   // string form of JWT integer user ID
+	Name         string
+	BaseURL      string
+	APIKey       string   // AES-GCM encrypted, base64-encoded
+	Protocol     Protocol
+	Enabled      bool
+	DefaultModel string
+	CreatedAt    time.Time
 }
 
 // PrivacyPolicy stores per-user privacy settings
 type PrivacyPolicy struct {
-	ID               int64
-	UserID           string
-	AllowRemote      bool   // false = lock to local only
-	DefaultBackend   string // "local" | "cloud"
-	EscalationPrompt bool   // show confirmation before escalating to cloud
+	ID               int64  `json:"id"`
+	UserID           string `json:"user_id"`
+	AllowRemote      bool   `json:"allow_remote"`   // false = lock to local only
+	DefaultBackend   string `json:"default_backend"` // "local" | "cloud"
+	EscalationPrompt bool   `json:"escalation_prompt"` // show confirmation before escalating to cloud
 }
 
 // ChatSession represents a conversation
@@ -85,14 +86,15 @@ const (
 func migrate(db *sql.DB) error {
 	_, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS providers (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		user_id    TEXT NOT NULL,
-		name       TEXT NOT NULL,
-		base_url   TEXT NOT NULL,
-		api_key    TEXT NOT NULL DEFAULT '',
-		protocol   TEXT NOT NULL DEFAULT 'openai',
-		enabled    INTEGER NOT NULL DEFAULT 1,
-		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id       TEXT NOT NULL,
+		name          TEXT NOT NULL,
+		base_url      TEXT NOT NULL,
+		api_key       TEXT NOT NULL DEFAULT '',
+		protocol      TEXT NOT NULL DEFAULT 'openai',
+		enabled       INTEGER NOT NULL DEFAULT 1,
+		default_model TEXT NOT NULL DEFAULT '',
+		created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_providers_user_id ON providers(user_id);
 
@@ -133,5 +135,10 @@ func migrate(db *sql.DB) error {
 		last_used_at  TEXT NOT NULL DEFAULT ''
 	);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Idempotent column additions for existing databases
+	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN default_model TEXT NOT NULL DEFAULT ''`)
+	return nil
 }
