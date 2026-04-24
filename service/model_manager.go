@@ -251,6 +251,10 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 		progress <- PullProgress{Status: "creating model"}
 	}
 
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close GGUF file: %w", err)
+	}
+
 	modelName := strings.TrimSuffix(filename, ".gguf")
 	modelfilePath := filepath.Join(modelDir, modelName+".Modelfile")
 	modelfileContent := fmt.Sprintf("FROM %s\n", ggufPath)
