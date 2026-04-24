@@ -80,3 +80,34 @@ func TestModelManager_PullModel_SendsCorrectRequest(t *testing.T) {
 	require.Equal(t, int64(100), frames[1].Completed)
 	require.Equal(t, "success", frames[2].Status)
 }
+
+func TestModelManager_SearchHuggingFace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Contains(t, r.URL.Path, "/api/models")
+		w.Write([]byte(`[{"id":"TheBloke/Llama-3-8B-GGUF","modelId":"TheBloke/Llama-3-8B-GGUF","tags":["gguf"]}]`))
+	}))
+	defer server.Close()
+
+	mm := &ModelManager{ollamaBaseURL: "http://unused", client: &http.Client{}, hfBaseURL: server.URL}
+	results, err := mm.SearchHuggingFace("llama 8b")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "TheBloke/Llama-3-8B-GGUF", results[0].ID)
+}
+
+func TestModelManager_ListGGUFFiles(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"siblings":[
+			{"rfilename":"Llama-3-8B.Q4_K_M.gguf"},
+			{"rfilename":"Llama-3-8B.Q8_0.gguf"},
+			{"rfilename":"README.md"}
+		]}`))
+	}))
+	defer server.Close()
+
+	mm := &ModelManager{ollamaBaseURL: "http://unused", client: &http.Client{}, hfBaseURL: server.URL}
+	files, err := mm.ListGGUFFiles("TheBloke/Llama-3-8B-GGUF")
+	require.NoError(t, err)
+	require.Len(t, files, 2)
+	require.Equal(t, "Llama-3-8B.Q4_K_M.gguf", files[0])
+}

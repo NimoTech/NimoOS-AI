@@ -8,8 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
+
+const defaultHFBaseURL = "https://huggingface.co"
 
 type PullProgress struct {
 	Status    string `json:"status"`
@@ -30,6 +36,7 @@ type ollamaTagsResponse struct {
 
 type ModelManager struct {
 	ollamaBaseURL string
+	hfBaseURL     string
 	db            *sql.DB
 	client        *http.Client // no timeout: model downloads can be very long
 }
@@ -37,6 +44,7 @@ type ModelManager struct {
 func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
 	return &ModelManager{
 		ollamaBaseURL: ollamaBaseURL,
+		hfBaseURL:     defaultHFBaseURL,
 		db:            db,
 		client:        &http.Client{},
 	}
@@ -126,4 +134,159 @@ func (m *ModelManager) DeleteModel(name string) error {
 		_, _ = m.db.Exec(`DELETE FROM models WHERE name=?`, name)
 	}
 	return nil
+}
+
+type HFSearchResult struct {
+	ID      string   `json:"id"`
+	ModelID string   `json:"modelId"`
+	Tags    []string `json:"tags"`
+}
+
+func (m *ModelManager) SearchHuggingFace(query string) ([]HFSearchResult, error) {
+	u := fmt.Sprintf("%s/api/models?search=%s&filter=gguf&limit=20",
+		m.hfBaseURL, url.QueryEscape(query))
+	resp, err := m.client.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("HuggingFace search failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var results []HFSearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, fmt.Errorf("decode HF search response: %w", err)
+	}
+	return results, nil
+}
+
+func (m *ModelManager) ListGGUFFiles(repoID string) ([]string, error) {
+	u := fmt.Sprintf("%s/api/models/%s", m.hfBaseURL, repoID)
+	resp, err := m.client.Get(u)
+	if err != nil {
+		return nil, fmt.Errorf("HF repo query failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var meta struct {
+		Siblings []struct {
+			RFilename string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, fmt.Errorf("decode HF repo response: %w", err)
+	}
+
+	var files []string
+	for _, s := range meta.Siblings {
+		if strings.HasSuffix(s.RFilename, ".gguf") {
+			files = append(files, s.RFilename)
+		}
+	}
+	return files, nil
+}
+
+func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, progress chan<- PullProgress) error {
+	downloadURL := fmt.Sprintf("%s/%s/resolve/main/%s", m.hfBaseURL, repoID, filename)
+	resp, err := m.client.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("GGUF download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GGUF download returned %d", resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(modelDir, 0755); err != nil {
+		return fmt.Errorf("failed to create model dir: %w", err)
+	}
+
+	ggufPath := filepath.Join(modelDir, filename)
+	f, err := os.Create(ggufPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer f.Close()
+
+	total := resp.ContentLength
+	var downloaded int64
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, err := f.Write(buf[:n]); err != nil {
+				return fmt.Errorf("write GGUF: %w", err)
+			}
+			downloaded += int64(n)
+			if progress != nil {
+				progress <- PullProgress{Status: "downloading", Completed: downloaded, Total: total}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read GGUF: %w", readErr)
+		}
+	}
+
+	if progress != nil {
+		progress <- PullProgress{Status: "creating model"}
+	}
+
+	modelName := strings.TrimSuffix(filename, ".gguf")
+	modelfilePath := filepath.Join(modelDir, modelName+".Modelfile")
+	modelfileContent := fmt.Sprintf("FROM %s\n", ggufPath)
+	if err := os.WriteFile(modelfilePath, []byte(modelfileContent), 0644); err != nil {
+		return fmt.Errorf("write Modelfile: %w", err)
+	}
+	defer os.Remove(modelfilePath)
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"name":      modelName,
+		"modelfile": modelfileContent,
+		"stream":    false,
+	})
+	createResp, err := m.client.Post(m.ollamaBaseURL+"/api/create", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("ollama create failed: %w", err)
+	}
+	defer createResp.Body.Close()
+
+	if createResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(createResp.Body)
+		return fmt.Errorf("ollama create returned %d: %s", createResp.StatusCode, body)
+	}
+
+	if progress != nil {
+		progress <- PullProgress{Status: "success"}
+	}
+
+	if m.db != nil {
+		now := time.Now().UTC().Format(time.RFC3339)
+		quantization := extractQuantization(filename)
+		fi, _ := os.Stat(ggufPath)
+		sizeBytes := int64(0)
+		if fi != nil {
+			sizeBytes = fi.Size()
+		}
+		_, _ = m.db.Exec(
+			`INSERT INTO models (name, source, size_bytes, quantization, downloaded_at, last_used_at)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(name) DO UPDATE SET
+			   size_bytes=excluded.size_bytes,
+			   quantization=excluded.quantization,
+			   downloaded_at=excluded.downloaded_at`,
+			modelName, ModelSourceHuggingFace, sizeBytes, quantization, now, now,
+		)
+	}
+	return nil
+}
+
+func extractQuantization(filename string) string {
+	base := strings.TrimSuffix(filename, ".gguf")
+	parts := strings.Split(base, ".")
+	if len(parts) >= 2 {
+		return parts[len(parts)-1]
+	}
+	return ""
 }
