@@ -17,6 +17,7 @@ type Services interface {
 	LocalAdapter() *LocalAdapter
 	Router() *Router
 	Providers() *providerService
+	ModelManager() *ModelManager
 }
 
 type services struct {
@@ -26,6 +27,7 @@ type services struct {
 	localAdapter  *LocalAdapter
 	router        *Router
 	providers     *providerService
+	modelManager  *ModelManager
 }
 
 func (s *services) DB() *sql.DB                  { return s.db }
@@ -34,6 +36,7 @@ func (s *services) OllamaChecker() *OllamaChecker { return s.ollamaChecker }
 func (s *services) LocalAdapter() *LocalAdapter   { return s.localAdapter }
 func (s *services) Router() *Router               { return s.router }
 func (s *services) Providers() *providerService   { return s.providers }
+func (s *services) ModelManager() *ModelManager   { return s.modelManager }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -52,6 +55,7 @@ func NewService(cfg *config.Config) Services {
 	checker := NewOllamaChecker(common.OllamaBaseURL)
 	local := NewLocalAdapter(common.OllamaBaseURL)
 	router := &Router{providers: providerSvc, db: db}
+	modelMgr := NewModelManager(common.OllamaBaseURL, db)
 
 	return &services{
 		db:            db,
@@ -60,5 +64,6 @@ func NewService(cfg *config.Config) Services {
 		localAdapter:  local,
 		router:        router,
 		providers:     providerSvc,
+		modelManager:  modelMgr,
 	}
 }
