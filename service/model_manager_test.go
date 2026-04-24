@@ -2,9 +2,12 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -84,6 +87,8 @@ func TestModelManager_PullModel_SendsCorrectRequest(t *testing.T) {
 func TestModelManager_SearchHuggingFace(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Contains(t, r.URL.Path, "/api/models")
+		require.Contains(t, r.URL.RawQuery, "search=llama")
+		require.Contains(t, r.URL.RawQuery, "filter=gguf")
 		w.Write([]byte(`[{"id":"TheBloke/Llama-3-8B-GGUF","modelId":"TheBloke/Llama-3-8B-GGUF","tags":["gguf"]}]`))
 	}))
 	defer server.Close()
@@ -110,4 +115,38 @@ func TestModelManager_ListGGUFFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, files, 2)
 	require.Equal(t, "Llama-3-8B.Q4_K_M.gguf", files[0])
+}
+
+func TestModelManager_ImportFromHuggingFace_OllamaCreateFails_CleansUpGGUF(t *testing.T) {
+	// Serve the GGUF download
+	ggufContent := []byte("fake gguf content")
+	hfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(ggufContent)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(ggufContent)
+	}))
+	defer hfServer.Close()
+
+	// Ollama create returns error
+	ollamaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"model create failed"}`))
+	}))
+	defer ollamaServer.Close()
+
+	modelDir := t.TempDir()
+	mm := &ModelManager{
+		ollamaBaseURL: ollamaServer.URL,
+		hfBaseURL:     hfServer.URL,
+		client:        &http.Client{},
+	}
+
+	err := mm.ImportFromHuggingFace("TheBloke/Test", "Test.Q4_K_M.gguf", modelDir, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "500")
+
+	// GGUF file should be cleaned up
+	ggufPath := filepath.Join(modelDir, "Test.Q4_K_M.gguf")
+	_, statErr := os.Stat(ggufPath)
+	require.True(t, os.IsNotExist(statErr), "GGUF file should be removed on failure")
 }

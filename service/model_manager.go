@@ -151,6 +151,11 @@ func (m *ModelManager) SearchHuggingFace(query string) ([]HFSearchResult, error)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HuggingFace search returned %d: %s", resp.StatusCode, body)
+	}
+
 	var results []HFSearchResult
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return nil, fmt.Errorf("decode HF search response: %w", err)
@@ -165,6 +170,11 @@ func (m *ModelManager) ListGGUFFiles(repoID string) ([]string, error) {
 		return nil, fmt.Errorf("HF repo query failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HuggingFace list files returned %d: %s", resp.StatusCode, body)
+	}
 
 	var meta struct {
 		Siblings []struct {
@@ -206,6 +216,14 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer f.Close()
+
+	// Cleanup GGUF file if the function returns with an error
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			os.Remove(ggufPath)
+		}
+	}()
 
 	total := resp.ContentLength
 	var downloaded int64
@@ -279,6 +297,7 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 			modelName, ModelSourceHuggingFace, sizeBytes, quantization, now, now,
 		)
 	}
+	succeeded = true
 	return nil
 }
 
