@@ -46,6 +46,7 @@ func (h *ChatHandler) ChatCompletions(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "failed to read request body")
 	}
 
+	body = stripProviderPrefix(body)
 	stream := isStreamRequest(body)
 
 	switch decision.Backend {
@@ -166,6 +167,38 @@ func (h *ChatHandler) Messages(c echo.Context) error {
 	}
 	defer resp.Body.Close()
 	return proxyResponse(c, resp)
+}
+
+// stripProviderPrefix removes the "{providerID}:" prefix from the model field.
+// The frontend encodes the provider ID into the model string (e.g. "6:deepseek-chat")
+// so the backend can resolve the provider, but cloud APIs only accept the bare model name.
+func stripProviderPrefix(body []byte) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	modelRaw, ok := req["model"]
+	if !ok {
+		return body
+	}
+	var model string
+	if err := json.Unmarshal(modelRaw, &model); err != nil {
+		return body
+	}
+	if idx := strings.Index(model, ":"); idx >= 0 {
+		model = model[idx+1:]
+		encoded, err := json.Marshal(model)
+		if err != nil {
+			return body
+		}
+		req["model"] = encoded
+		out, err := json.Marshal(req)
+		if err != nil {
+			return body
+		}
+		return out
+	}
+	return body
 }
 
 // isStreamRequest parses the body bytes to check if stream:true was requested.

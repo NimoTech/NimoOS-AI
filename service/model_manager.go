@@ -53,7 +53,7 @@ func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
 func (m *ModelManager) ListModels() ([]*Model, error) {
 	resp, err := m.client.Get(m.ollamaBaseURL + "/api/tags")
 	if err != nil {
-		return nil, fmt.Errorf("ollama unreachable: %w", err)
+		return m.listCachedModels()
 	}
 	defer resp.Body.Close()
 
@@ -70,6 +70,24 @@ func (m *ModelManager) ListModels() ([]*Model, error) {
 			SizeBytes:    t.Size,
 			Quantization: t.Details.QuantizationLevel,
 		})
+	}
+	return models, nil
+}
+
+func (m *ModelManager) listCachedModels() ([]*Model, error) {
+	if m.db == nil {
+		return []*Model{}, nil
+	}
+	rows, err := m.db.Query(`SELECT id, name, source, size_bytes, quantization, downloaded_at, last_used_at FROM models`)
+	if err != nil {
+		return []*Model{}, nil
+	}
+	defer rows.Close()
+	var models []*Model
+	for rows.Next() {
+		var mod Model
+		rows.Scan(&mod.ID, &mod.Name, &mod.Source, &mod.SizeBytes, &mod.Quantization, &mod.DownloadedAt, &mod.LastUsedAt)
+		models = append(models, &mod)
 	}
 	return models, nil
 }

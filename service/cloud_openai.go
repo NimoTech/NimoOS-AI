@@ -21,14 +21,15 @@ func NewOpenAIAdapter(baseURL, apiKey string) *OpenAIAdapter {
 	}
 }
 
-// ChatCompletions forwards the request to baseURL/v1/chat/completions with Bearer auth.
+// ChatCompletions forwards the request to baseURL/chat/completions with Bearer auth.
+// baseURL is expected to already include the version prefix (e.g. https://api.openai.com/v1).
 // The request body is passed unchanged. Returns raw *http.Response; caller owns resp.Body.
 func (a *OpenAIAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/v1/chat/completions", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}

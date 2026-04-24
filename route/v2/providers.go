@@ -17,12 +17,12 @@ func NewProvidersHandler(svc service.Services) *ProvidersHandler {
 }
 
 type providerRequest struct {
-	Name         string           `json:"name"`
-	BaseURL      string           `json:"base_url"`
-	APIKey       string           `json:"api_key"` // plaintext; handler encrypts before storing
-	Protocol     service.Protocol `json:"protocol"`
-	Enabled      bool             `json:"enabled"`
-	DefaultModel string           `json:"default_model"`
+	Name         *string           `json:"name"`
+	BaseURL      *string           `json:"base_url"`
+	APIKey       *string           `json:"api_key"` // plaintext; handler encrypts before storing
+	Protocol     *service.Protocol `json:"protocol"`
+	Enabled      *bool             `json:"enabled"`
+	DefaultModel *string           `json:"default_model"`
 }
 
 // safeProvider is the response shape — never exposes the encrypted api_key.
@@ -66,18 +66,33 @@ func (h *ProvidersHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	encKey := ""
-	if req.APIKey != "" {
+	if req.APIKey != nil && *req.APIKey != "" {
 		var err error
-		encKey, err = h.svc.MasterKey().Encrypt(req.APIKey)
+		encKey, err = h.svc.MasterKey().Encrypt(*req.APIKey)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt api key")
 		}
 	}
-	p := &service.Provider{
-		UserID: userID, Name: req.Name, BaseURL: req.BaseURL,
-		APIKey: encKey, Protocol: req.Protocol, Enabled: req.Enabled,
-		DefaultModel: req.DefaultModel,
+	if req.Protocol != nil && *req.Protocol != service.ProtocolOpenAI && *req.Protocol != service.ProtocolAnthropic {
+		return echo.NewHTTPError(http.StatusBadRequest, "protocol must be 'openai' or 'anthropic'")
 	}
+	p := &service.Provider{UserID: userID, Protocol: service.ProtocolOpenAI}
+	if req.Name != nil {
+		p.Name = *req.Name
+	}
+	if req.BaseURL != nil {
+		p.BaseURL = *req.BaseURL
+	}
+	if req.Protocol != nil {
+		p.Protocol = *req.Protocol
+	}
+	if req.Enabled != nil {
+		p.Enabled = *req.Enabled
+	}
+	if req.DefaultModel != nil {
+		p.DefaultModel = *req.DefaultModel
+	}
+	p.APIKey = encKey
 	if err := h.svc.Providers().CreateProvider(p); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -97,19 +112,44 @@ func (h *ProvidersHandler) Update(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	encKey := ""
-	if req.APIKey != "" {
-		encKey, err = h.svc.MasterKey().Encrypt(req.APIKey)
+
+	// Fetch existing record so unspecified fields are preserved.
+	existing, err := h.svc.Providers().GetProvider(id, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return echo.NewHTTPError(http.StatusNotFound, "provider not found")
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	// Merge: only overwrite fields that were explicitly provided.
+	if req.Name != nil {
+		existing.Name = *req.Name
+	}
+	if req.BaseURL != nil {
+		existing.BaseURL = *req.BaseURL
+	}
+	if req.Protocol != nil {
+		if *req.Protocol != service.ProtocolOpenAI && *req.Protocol != service.ProtocolAnthropic {
+			return echo.NewHTTPError(http.StatusBadRequest, "protocol must be 'openai' or 'anthropic'")
+		}
+		existing.Protocol = *req.Protocol
+	}
+	if req.Enabled != nil {
+		existing.Enabled = *req.Enabled
+	}
+	if req.DefaultModel != nil {
+		existing.DefaultModel = *req.DefaultModel
+	}
+	if req.APIKey != nil && *req.APIKey != "" {
+		encKey, err := h.svc.MasterKey().Encrypt(*req.APIKey)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to encrypt api key")
 		}
+		existing.APIKey = encKey
 	}
-	p := &service.Provider{
-		ID: id, UserID: userID, Name: req.Name, BaseURL: req.BaseURL,
-		APIKey: encKey, Protocol: req.Protocol, Enabled: req.Enabled,
-		DefaultModel: req.DefaultModel,
-	}
-	if err := h.svc.Providers().UpdateProvider(p); err != nil {
+
+	if err := h.svc.Providers().UpdateProvider(existing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return echo.NewHTTPError(http.StatusNotFound, "provider not found")
 		}
