@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/NimoTech/NimoOS-AI/common"
+	"github.com/NimoTech/NimoOS-AI/pkg/config"
 	v2 "github.com/NimoTech/NimoOS-AI/route/v2"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/NimoTech/NimoOS-Common/external"
@@ -19,6 +20,7 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 	chat := v2.NewChatHandler(svc)
 	providers := v2.NewProvidersHandler(svc)
 	policy := v2.NewPolicyHandler(svc)
+	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -64,6 +66,14 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 	// Privacy policy
 	g.GET("/policy", policy.Get)
 	g.PUT("/policy", policy.Update)
+
+	// Model management
+	g.GET("/models", models.List)
+	g.POST("/models/pull", models.Pull)
+	g.GET("/models/hf/search", models.SearchHF)
+	g.GET("/models/hf/files", models.ListHFFiles)
+	g.POST("/models/hf/import", models.ImportHF)
+	g.DELETE("/models/:name", models.Delete)
 
 	return e
 }
