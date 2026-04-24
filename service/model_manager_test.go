@@ -68,5 +68,15 @@ func TestModelManager_PullModel_SendsCorrectRequest(t *testing.T) {
 	require.NoError(t, json.Unmarshal(gotBody, &req))
 	require.Equal(t, "llama3:8b", req.Name)
 	require.True(t, req.Stream)
+
+	// Drain and verify progress frames
 	close(progress)
+	var frames []PullProgress
+	for p := range progress {
+		frames = append(frames, p)
+	}
+	require.Len(t, frames, 3)
+	require.Equal(t, "pulling manifest", frames[0].Status)
+	require.Equal(t, int64(100), frames[1].Completed)
+	require.Equal(t, "success", frames[2].Status)
 }

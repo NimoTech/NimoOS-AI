@@ -74,6 +74,11 @@ func (m *ModelManager) PullModel(name string, progress chan<- PullProgress) erro
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("pull request rejected (%d): %s", resp.StatusCode, body)
+	}
+
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		var p PullProgress
