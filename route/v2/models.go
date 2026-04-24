@@ -1,16 +1,20 @@
 package v2
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
 
-type ModelsHandler struct{ svc service.Services }
+type ModelsHandler struct {
+	svc      service.Services
+	modelDir string
+}
 
-func NewModelsHandler(svc service.Services) *ModelsHandler {
-	return &ModelsHandler{svc: svc}
+func NewModelsHandler(svc service.Services, modelDir string) *ModelsHandler {
+	return &ModelsHandler{svc: svc, modelDir: modelDir}
 }
 
 func (h *ModelsHandler) List(c echo.Context) error {
@@ -36,8 +40,11 @@ func (h *ModelsHandler) Pull(c echo.Context) error {
 	}
 	go func() {
 		progress := make(chan service.PullProgress, 20)
-		defer close(progress)
-		_ = h.svc.ModelManager().PullModel(req.Name, progress)
+		go func() { for range progress {} }() // drain progress
+		if err := h.svc.ModelManager().PullModel(req.Name, progress); err != nil {
+			log.Printf("PullModel %q: %v", req.Name, err)
+		}
+		close(progress)
 	}()
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "pulling", "name": req.Name})
 }
@@ -83,11 +90,13 @@ func (h *ModelsHandler) ImportHF(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.Repo == "" || req.Filename == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "repo and filename are required")
 	}
-	modelDir := "/var/lib/nimoos/ai/models"
 	go func() {
 		progress := make(chan service.PullProgress, 50)
-		defer close(progress)
-		_ = h.svc.ModelManager().ImportFromHuggingFace(req.Repo, req.Filename, modelDir, progress)
+		go func() { for range progress {} }() // drain progress
+		if err := h.svc.ModelManager().ImportFromHuggingFace(req.Repo, req.Filename, h.modelDir, progress); err != nil {
+			log.Printf("ImportFromHuggingFace %q/%q: %v", req.Repo, req.Filename, err)
+		}
+		close(progress)
 	}()
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "importing", "filename": req.Filename})
 }
