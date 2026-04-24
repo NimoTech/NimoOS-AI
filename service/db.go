@@ -67,7 +67,6 @@ func NewDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// Model stores metadata for a locally installed model
 type Model struct {
 	ID           int64  `json:"id"`
 	Name         string `json:"name"`

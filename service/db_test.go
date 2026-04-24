@@ -12,7 +12,7 @@ func TestDBInit_CreatesAllTables(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	tables := []string{"providers", "privacy_policies", "chat_sessions", "chat_messages"}
+	tables := []string{"providers", "privacy_policies", "chat_sessions", "chat_messages", "models"}
 	for _, table := range tables {
 		var name string
 		row := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table)
