@@ -67,6 +67,22 @@ func NewDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// Model stores metadata for a locally installed model
+type Model struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Source       string `json:"source"`
+	SizeBytes    int64  `json:"size_bytes"`
+	Quantization string `json:"quantization"`
+	DownloadedAt string `json:"downloaded_at"`
+	LastUsedAt   string `json:"last_used_at"`
+}
+
+const (
+	ModelSourceOllama      = "ollama"
+	ModelSourceHuggingFace = "huggingface"
+)
+
 func migrate(db *sql.DB) error {
 	_, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS providers (
@@ -107,6 +123,16 @@ func migrate(db *sql.DB) error {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_messages_session_id ON chat_messages(session_id);
+
+	CREATE TABLE IF NOT EXISTS models (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		name         TEXT NOT NULL UNIQUE,
+		source       TEXT NOT NULL DEFAULT 'ollama',
+		size_bytes   INTEGER NOT NULL DEFAULT 0,
+		quantization TEXT NOT NULL DEFAULT '',
+		downloaded_at TEXT NOT NULL DEFAULT '',
+		last_used_at  TEXT NOT NULL DEFAULT ''
+	);
 	`)
 	return err
 }

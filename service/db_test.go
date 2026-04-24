@@ -127,3 +127,22 @@ func TestProviderListAndDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, list2, 1)
 }
+
+func TestModelTable_CreateAndQuery(t *testing.T) {
+	db, err := NewDB(t.TempDir() + "/test.db")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO models (name, source, size_bytes, quantization, downloaded_at, last_used_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		"llama3:8b", "ollama", int64(4*1024*1024*1024), "Q4_K_M",
+		"2026-04-24T00:00:00Z", "2026-04-24T00:00:00Z")
+	require.NoError(t, err)
+
+	var name, source, quantization string
+	var sizeBytes int64
+	row := db.QueryRow(`SELECT name, source, size_bytes, quantization FROM models WHERE name=?`, "llama3:8b")
+	require.NoError(t, row.Scan(&name, &source, &sizeBytes, &quantization))
+	require.Equal(t, "ollama", source)
+	require.Equal(t, int64(4*1024*1024*1024), sizeBytes)
+}
