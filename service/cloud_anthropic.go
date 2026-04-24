@@ -25,8 +25,9 @@ type OpenAIChatRequest struct {
 
 // OpenAIDelta is the delta object in an OpenAI streaming chunk.
 type OpenAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // OpenAIChoice is a choice in an OpenAI response or streaming chunk.
@@ -111,17 +112,27 @@ func ConvertAnthropicChunkToOpenAI(data []byte, model string) (OpenAIStreamChunk
 
 	switch event.Type {
 	case "content_block_delta":
-		if event.Delta.Type != "text_delta" {
-			return OpenAIStreamChunk{}, false
+		switch event.Delta.Type {
+		case "text_delta":
+			return OpenAIStreamChunk{
+				Object: "chat.completion.chunk",
+				Model:  model,
+				Choices: []OpenAIChoice{{
+					Index: event.Index,
+					Delta: OpenAIDelta{Content: event.Delta.Text},
+				}},
+			}, true
+		case "thinking_delta":
+			return OpenAIStreamChunk{
+				Object: "chat.completion.chunk",
+				Model:  model,
+				Choices: []OpenAIChoice{{
+					Index: event.Index,
+					Delta: OpenAIDelta{ReasoningContent: event.Delta.Text},
+				}},
+			}, true
 		}
-		return OpenAIStreamChunk{
-			Object: "chat.completion.chunk",
-			Model:  model,
-			Choices: []OpenAIChoice{{
-				Index: event.Index,
-				Delta: OpenAIDelta{Content: event.Delta.Text},
-			}},
-		}, true
+		return OpenAIStreamChunk{}, false
 
 	case "message_stop":
 		reason := "stop"
@@ -179,7 +190,7 @@ func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, erro
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/messages", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +200,13 @@ func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, erro
 
 // Messages transparently proxies an Anthropic-format request, only adding auth headers.
 // Used by the /v1/ai/messages endpoint which accepts native Anthropic format.
+// baseURL is expected to already include the version prefix (e.g. https://api.anthropic.com/v1).
 func (a *AnthropicAdapter) Messages(body io.Reader) (*http.Response, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, a.baseURL+"/messages", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}

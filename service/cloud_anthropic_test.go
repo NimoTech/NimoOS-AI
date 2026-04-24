@@ -90,6 +90,15 @@ func TestConvertAnthropicChunkToOpenAI_IgnoresNonTextDelta(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestConvertAnthropicChunkToOpenAI_ThinkingDelta(t *testing.T) {
+	data := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"let me think"}}`
+	chunk, ok := ConvertAnthropicChunkToOpenAI([]byte(data), "claude-3-7-sonnet-20250219")
+	require.True(t, ok)
+	require.Equal(t, "let me think", chunk.Choices[0].Delta.ReasoningContent)
+	require.Equal(t, "", chunk.Choices[0].Delta.Content)
+	require.Equal(t, 0, chunk.Choices[0].Index)
+}
+
 // ── AnthropicAdapter tests ─────────────────────────────────────
 
 func TestAnthropicAdapter_ChatCompletions_SetsHeaders(t *testing.T) {
