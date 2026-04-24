@@ -53,6 +53,12 @@ type AnthropicMessage struct {
 	Content string `json:"content"`
 }
 
+// AnthropicThinking configures extended thinking for Anthropic requests.
+type AnthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
 // AnthropicRequest is the Anthropic /v1/messages request body.
 type AnthropicRequest struct {
 	Model     string             `json:"model"`
@@ -60,6 +66,7 @@ type AnthropicRequest struct {
 	System    string             `json:"system,omitempty"`
 	MaxTokens int                `json:"max_tokens"`
 	Stream    bool               `json:"stream"`
+	Thinking  *AnthropicThinking `json:"thinking,omitempty"`
 }
 
 // anthropicChunkData is the data field of an Anthropic SSE event.
@@ -78,9 +85,12 @@ type anthropicChunkData struct {
 // It extracts the system message from the messages array into the top-level System field.
 // If multiple system messages are present, only the last one is used.
 func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
+	const thinkingBudget = 8000
+	const thinkingMinTokens = 16000
+
 	maxTokens := req.MaxTokens
 	if maxTokens == 0 {
-		maxTokens = 4096
+		maxTokens = thinkingMinTokens
 	}
 
 	var system string
@@ -93,13 +103,18 @@ func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
 		}
 	}
 
-	return AnthropicRequest{
+	ar := AnthropicRequest{
 		Model:     req.Model,
 		Messages:  messages,
 		System:    system,
 		MaxTokens: maxTokens,
 		Stream:    req.Stream,
 	}
+
+	if maxTokens >= thinkingMinTokens {
+		ar.Thinking = &AnthropicThinking{Type: "enabled", BudgetTokens: thinkingBudget}
+	}
+	return ar
 }
 
 // ConvertAnthropicChunkToOpenAI converts an Anthropic SSE data payload to an OpenAI StreamChunk.

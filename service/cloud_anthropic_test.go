@@ -25,7 +25,9 @@ func TestConvertToAnthropic_BasicMessage(t *testing.T) {
 	require.Len(t, got.Messages, 1)
 	require.Equal(t, "user", got.Messages[0].Role)
 	require.Equal(t, "", got.System)
-	require.Equal(t, 4096, got.MaxTokens) // default
+	require.Equal(t, 16000, got.MaxTokens) // default with thinking enabled
+	require.NotNil(t, got.Thinking)
+	require.Equal(t, "enabled", got.Thinking.Type)
 }
 
 func TestConvertToAnthropic_ExtractsSystemPrompt(t *testing.T) {
@@ -88,6 +90,29 @@ func TestConvertAnthropicChunkToOpenAI_IgnoresNonTextDelta(t *testing.T) {
 	data := `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`
 	_, ok := ConvertAnthropicChunkToOpenAI([]byte(data), "model")
 	require.False(t, ok)
+}
+
+func TestConvertToAnthropic_EnablesThinkingForLargeContext(t *testing.T) {
+	req := OpenAIChatRequest{
+		Model:    "claude-3-7-sonnet-20250219",
+		Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
+	}
+	got := convertToAnthropic(req)
+	require.NotNil(t, got.Thinking)
+	require.Equal(t, "enabled", got.Thinking.Type)
+	require.Equal(t, 8000, got.Thinking.BudgetTokens)
+	require.Equal(t, 16000, got.MaxTokens)
+}
+
+func TestConvertToAnthropic_NoThinkingForSmallMaxTokens(t *testing.T) {
+	req := OpenAIChatRequest{
+		Model:     "claude-3-7-sonnet-20250219",
+		Messages:  []OpenAIMessage{{Role: "user", Content: "hi"}},
+		MaxTokens: 512,
+	}
+	got := convertToAnthropic(req)
+	require.Nil(t, got.Thinking)
+	require.Equal(t, 512, got.MaxTokens)
 }
 
 func TestConvertAnthropicChunkToOpenAI_ThinkingDelta(t *testing.T) {
