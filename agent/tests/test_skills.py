@@ -41,3 +41,37 @@ async def test_stop_app_emits_confirmation_event(setup_ctx):
     event = queue.get_nowait()
     assert event["type"] == "confirmation_required"
     assert event["action"] == "stop_app"
+
+import skills.storage as st
+import skills.healthcheck as hc
+import skills.message_bus as mb
+
+@pytest.mark.asyncio
+async def test_list_storage_calls_cli():
+    with patch("skills.storage.run_cli", new_callable=AsyncMock, return_value="disk info") as mock:
+        result = await st.list_storage.on_invoke_tool(MagicMock(), "")
+        mock.assert_called_once()
+        assert "disk info" in result
+
+@pytest.mark.asyncio
+async def test_check_services_calls_cli():
+    with patch("skills.healthcheck.run_cli", new_callable=AsyncMock, return_value="all OK") as mock:
+        result = await hc.check_services.on_invoke_tool(MagicMock(), "")
+        mock.assert_called_once()
+        assert "all OK" in result
+
+@pytest.mark.asyncio
+async def test_trigger_action_emits_confirm(setup_ctx):
+    queue, mgr = setup_ctx
+    mb.SESSION_ID_VAR.set("test-session")
+    mb.EVENT_QUEUE_VAR.set(queue)
+    mb.CONFIRM_MGR_VAR.set(mgr)
+    async def auto_cancel():
+        await asyncio.sleep(0.05)
+        mgr.resolve("test-session", confirmed=False)
+    asyncio.create_task(auto_cancel())
+    with patch("skills.message_bus.run_cli", new_callable=AsyncMock):
+        result = await mb.trigger_action.on_invoke_tool(MagicMock(), '{"action_type": "backup.start", "data": "{}"}')
+    assert "cancelled" in result.lower()
+    event = queue.get_nowait()
+    assert event["type"] == "confirmation_required"
