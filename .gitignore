@@ -1,4 +1,9 @@
 .worktrees/
 *.db
+*.db-shm
+*.db-wal
 *.key
 nimoos-ai
+__pycache__/
+*.pyc
+agent/venv/
