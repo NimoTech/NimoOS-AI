@@ -16,6 +16,7 @@ type Config struct {
 	LogPath       string
 	AgentURL      string
 	AgentTimeout  int
+	OllamaURL     string
 }
 
 func Init(configFile, confSample string) error {
@@ -42,6 +43,7 @@ func Init(configFile, confSample string) error {
 		LogPath:       v.GetString("common.LogPath"),
 		AgentURL:      v.GetString("agent.AgentURL"),
 		AgentTimeout:  v.GetInt("agent.AgentTimeout"),
+		OllamaURL:     v.GetString("agent.OllamaURL"),
 	}
 
 	if Cfg.RuntimePath == "" {
@@ -61,6 +63,9 @@ func Init(configFile, confSample string) error {
 	}
 	if Cfg.AgentTimeout == 0 {
 		Cfg.AgentTimeout = 60
+	}
+	if Cfg.OllamaURL == "" {
+		Cfg.OllamaURL = "http://127.0.0.1:11434"
 	}
 	return nil
 }

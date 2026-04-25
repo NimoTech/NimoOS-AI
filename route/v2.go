@@ -16,7 +16,7 @@ import (
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 )
 
-func InitV2Router(svc service.Services, runtimePath string, agentURL string) http.Handler {
+func InitV2Router(svc service.Services, runtimePath string, agentURL string, ollamaURL string) http.Handler {
 	chat := v2.NewChatHandler(svc)
 	providers := v2.NewProvidersHandler(svc)
 	policy := v2.NewPolicyHandler(svc)
@@ -24,6 +24,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string) htt
 	sessions := v2.NewSessionsHandler(svc)
 	agent := v2.NewAgentHandler(svc, agentURL, 60)
 	agent.StartHealthMonitor()
+	services := v2.NewServicesStatusHandler(agent, ollamaURL)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -85,6 +86,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string) htt
 	g.GET("/sessions/:id/messages", sessions.ListMessages)
 	g.POST("/sessions/:id/messages", sessions.AppendMessages)
 	g.PATCH("/sessions/:id/title", sessions.UpdateTitle)
+
+	// Services status (ollama + agent)
+	g.GET("/services/status", services.Status)
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)

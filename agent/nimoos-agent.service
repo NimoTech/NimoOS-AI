@@ -4,11 +4,14 @@ After=network.target nimoos-ai.service
 
 [Service]
 Type=simple
-User=nimoos
-WorkingDirectory=/opt/nimoos/agent
-ExecStart=/opt/nimoos/agent/venv/bin/python main.py
+User=root
+WorkingDirectory=/usr/share/nimoos/agent
+ExecStart=/var/lib/nimoos/ai/agent/venv/bin/python main.py
+Environment=AGENT_DB_PATH=/var/lib/nimoos/ai/agent/agent.db
 Restart=always
 RestartSec=3
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
