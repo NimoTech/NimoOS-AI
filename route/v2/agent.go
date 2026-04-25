@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -120,6 +121,5 @@ func (h *AgentHandler) resolveProvider(userID string) (key, provURL string, ok b
 }
 
 func isRunEndpoint(r *http.Request) bool {
-	path := r.URL.Path
-	return r.Method == http.MethodPost && len(path) >= 3 && path[len(path)-3:] == "run"
+	return r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/run")
 }

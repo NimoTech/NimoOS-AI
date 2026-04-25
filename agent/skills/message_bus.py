@@ -31,6 +31,11 @@ async def trigger_action(action_type: str, data: str = "{}") -> str:
     except ValueError as e:
         return f"Error: {e}"
 
+    try:
+        json.loads(data)
+    except json.JSONDecodeError as e:
+        return f"Error: data is not valid JSON: {e}"
+
     session_id = SESSION_ID_VAR.get()
     queue = EVENT_QUEUE_VAR.get()
     mgr = CONFIRM_MGR_VAR.get()
