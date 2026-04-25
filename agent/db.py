@@ -40,6 +40,7 @@ def init_db(path: str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.commit()
     return conn
 
