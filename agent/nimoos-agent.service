@@ -1,0 +1,14 @@
+[Unit]
+Description=NimoOS Agent Service
+After=network.target nimoos-ai.service
+
+[Service]
+Type=simple
+User=nimoos
+WorkingDirectory=/opt/nimoos/agent
+ExecStart=/opt/nimoos/agent/venv/bin/python main.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
