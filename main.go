@@ -99,7 +99,7 @@ func main() {
 		}
 	}
 
-	handler := route.InitV2Router(svc, config.Cfg.RuntimePath)
+	handler := route.InitV2Router(svc, config.Cfg.RuntimePath, config.Cfg.AgentURL)
 
 	// Notify systemd
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {

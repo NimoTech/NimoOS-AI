@@ -16,18 +16,20 @@ import (
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 )
 
-func InitV2Router(svc service.Services, runtimePath string) http.Handler {
+func InitV2Router(svc service.Services, runtimePath string, agentURL string) http.Handler {
 	chat := v2.NewChatHandler(svc)
 	providers := v2.NewProvidersHandler(svc)
 	policy := v2.NewPolicyHandler(svc)
 	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
 	sessions := v2.NewSessionsHandler(svc)
+	agent := v2.NewAgentHandler(svc, agentURL, 60)
+	agent.StartHealthMonitor()
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.OPTIONS},
-		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud"},
+		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud", "X-User-Id", "X-Agent-Provider-Key", "X-Agent-Provider-Url"},
 	}))
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
@@ -83,6 +85,12 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 	g.GET("/sessions/:id/messages", sessions.ListMessages)
 	g.POST("/sessions/:id/messages", sessions.AppendMessages)
 	g.PATCH("/sessions/:id/title", sessions.UpdateTitle)
+
+	// Agent proxy
+	g.GET("/agent/health", agent.Health)
+	g.Any("/agent/*", func(c echo.Context) error {
+		return agent.Proxy(c)
+	})
 
 	return e
 }
