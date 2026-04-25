@@ -42,7 +42,7 @@ def _run_sync(cmd: list[str]) -> str:
 
 
 async def run_cli(cmd: list[str]) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(_run_sync, cmd))
 
 
