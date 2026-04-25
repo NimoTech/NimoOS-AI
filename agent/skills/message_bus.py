@@ -2,7 +2,7 @@ import json
 import os
 from contextvars import ContextVar
 from agents import function_tool
-from nimoos_cli import run_cli, validate_query
+from nimoos_cli import run_cli, validate_action_type
 
 CLI_BIN = os.environ.get("NIMOOS_CLI_PATH", "nimoos-cli")
 
@@ -27,7 +27,7 @@ async def list_action_types() -> str:
 async def trigger_action(action_type: str, data: str = "{}") -> str:
     """Trigger a MessageBus action. action_type: the action type name. data: JSON payload string."""
     try:
-        validate_query(action_type)
+        validate_action_type(action_type)
     except ValueError as e:
         return f"Error: {e}"
 
@@ -35,7 +35,7 @@ async def trigger_action(action_type: str, data: str = "{}") -> str:
     queue = EVENT_QUEUE_VAR.get()
     mgr = CONFIRM_MGR_VAR.get()
     description = f"Trigger MessageBus action '{action_type}' with data: {data}"
-    command = f"nimoos-cli message-bus trigger action --type {action_type}"
+    command = f"nimoos-cli message-bus trigger action --type {action_type} --data {data}"
 
     await queue.put({
         "type": "confirmation_required",

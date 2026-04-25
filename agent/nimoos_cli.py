@@ -25,6 +25,12 @@ def validate_query(value: str) -> str:
     return value
 
 
+def validate_action_type(value: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_\-\.]*", value):
+        raise ValueError(f"Invalid action type format: {value!r}")
+    return value
+
+
 def _run_sync(cmd: list[str]) -> str:
     try:
         result = subprocess.run(
