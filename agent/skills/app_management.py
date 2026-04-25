@@ -77,13 +77,15 @@ async def _write_op(action: str, description: str, command_preview: str, cli_cmd
 async def install_app(yaml_content: str) -> str:
     """Install an application from a YAML definition. yaml_content: the app YAML."""
     session_id = _session_id()
+    description = "Install a new application from YAML definition. Confirm to proceed."
+    command = "nimoos-cli app-management install <yaml>"
     await _queue().put({
         "type": "confirmation_required",
         "action": "install_app",
-        "description": "Install a new application from YAML definition. Confirm to proceed.",
-        "command": "nimoos-cli app-management install <yaml>",
+        "description": description,
+        "command": command,
     })
-    confirmed = await _mgr().wait(session_id, "install_app", "Install application?", "nimoos-cli app-management install")
+    confirmed = await _mgr().wait(session_id, "install_app", description, command)
     if not confirmed:
         return "Operation cancelled by user."
     return await run_cli_with_yaml([CLI_BIN, "app-management", "install"], yaml_content)
