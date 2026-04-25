@@ -5,3 +5,7 @@ LogPath = /var/log/nimoos
 
 [ai]
 MasterKeyPath = /etc/nimoos/ai_master.key
+
+[agent]
+AgentURL = http://127.0.0.1:8282
+AgentTimeout = 60

@@ -14,6 +14,8 @@ type Config struct {
 	DataPath      string
 	MasterKeyPath string
 	LogPath       string
+	AgentURL      string
+	AgentTimeout  int
 }
 
 func Init(configFile, confSample string) error {
@@ -38,6 +40,8 @@ func Init(configFile, confSample string) error {
 		DataPath:      v.GetString("common.DataPath"),
 		MasterKeyPath: v.GetString("ai.MasterKeyPath"),
 		LogPath:       v.GetString("common.LogPath"),
+		AgentURL:      v.GetString("agent.AgentURL"),
+		AgentTimeout:  v.GetInt("agent.AgentTimeout"),
 	}
 
 	if Cfg.RuntimePath == "" {
@@ -51,6 +55,12 @@ func Init(configFile, confSample string) error {
 	}
 	if Cfg.LogPath == "" {
 		Cfg.LogPath = "/var/log/nimoos"
+	}
+	if Cfg.AgentURL == "" {
+		Cfg.AgentURL = "http://127.0.0.1:8282"
+	}
+	if Cfg.AgentTimeout == 0 {
+		Cfg.AgentTimeout = 60
 	}
 	return nil
 }
