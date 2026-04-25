@@ -119,6 +119,7 @@ async def run_session(
                     event = await asyncio.wait_for(queue.get(), timeout=120)
                 except asyncio.TimeoutError:
                     yield 'data: {"type": "error", "content": "timeout"}\n\n'
+                    yield 'data: {"type": "done"}\n\n'
                     break
                 yield f"data: {json.dumps(event)}\n\n"
                 if event.get("type") == "done":
