@@ -25,11 +25,13 @@ class ConfirmManager:
         try:
             await asyncio.wait_for(event.wait(), timeout=self._timeout)
         except asyncio.TimeoutError:
-            self._cleanup(session_id)
             return False
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._cleanup(session_id)
 
         confirmed = self._results.pop(session_id, False)
-        self._cleanup(session_id)
         return confirmed
 
     def resolve(self, session_id: str, confirmed: bool) -> None:
