@@ -39,20 +39,20 @@ type PrivacyPolicy struct {
 
 // ChatSession represents a conversation
 type ChatSession struct {
-	ID        int64
-	UserID    string
-	Title     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID        int64     `json:"id"`
+	UserID    string    `json:"user_id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ChatMessage stores a single message in OpenAI format
 type ChatMessage struct {
-	ID        int64
-	SessionID int64
-	Role      string // "system"|"user"|"assistant"
-	Content   string // plain text or JSON for multimodal (future)
-	CreatedAt time.Time
+	ID        int64     `json:"id"`
+	SessionID int64     `json:"session_id"`
+	Role      string    `json:"role"` // "system"|"user"|"assistant"
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // NewDB opens (or creates) the SQLite database and runs migrations

@@ -21,6 +21,7 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 	providers := v2.NewProvidersHandler(svc)
 	policy := v2.NewPolicyHandler(svc)
 	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
+	sessions := v2.NewSessionsHandler(svc)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -74,6 +75,14 @@ func InitV2Router(svc service.Services, runtimePath string) http.Handler {
 	g.GET("/models/hf/files", models.ListHFFiles)
 	g.POST("/models/hf/import", models.ImportHF)
 	g.DELETE("/models/:name", models.Delete)
+
+	// Chat session persistence
+	g.GET("/sessions", sessions.List)
+	g.POST("/sessions", sessions.Create)
+	g.DELETE("/sessions/:id", sessions.Delete)
+	g.GET("/sessions/:id/messages", sessions.ListMessages)
+	g.POST("/sessions/:id/messages", sessions.AppendMessages)
+	g.PATCH("/sessions/:id/title", sessions.UpdateTitle)
 
 	return e
 }
