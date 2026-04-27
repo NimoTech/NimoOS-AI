@@ -100,3 +100,143 @@ def test_clean_llm_title_strips_cjk_quote_pairs():
     assert clean_llm_title("『Project』") == "Project"
     # Test curly/smart quotes (U+201C and U+201D)
     assert clean_llm_title("“Smart quotes”") == "Smart quotes"
+
+
+from unittest.mock import patch, AsyncMock
+
+REGEN_HEADERS = {
+    "X-User-Id": "1",
+    "X-Agent-Provider-Key": "fake-key",
+    "X-Agent-Provider-Url": "http://fake/v1",
+}
+
+async def _seed_history(client, sid, history_json):
+    """Insert a history row directly into the test DB via the same connection."""
+    import main as _main
+    import json, time, uuid
+    _main._conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), sid, "history", json.dumps(history_json), int(time.time())),
+    )
+    _main._conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_empty_model_returns_fallback(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "Hello there friend"}])
+    resp = await client.post(
+        f"/agent/sessions/{sid}/regenerate-title",
+        headers=REGEN_HEADERS,
+        json={"model": ""},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fallback"] is True
+    assert body["title"] == "Hello there frie"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_no_history_returns_fallback(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    resp = await client.post(
+        f"/agent/sessions/{sid}/regenerate-title",
+        headers=REGEN_HEADERS,
+        json={"model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fallback"] is True
+    assert body["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_llm_success(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "Discuss project alpha plan"}])
+
+    fake_choice = type("C", (), {"message": type("M", (), {"content": "\u9879\u76ee\u65b9\u6848\u8ba8\u8bba"})()})()
+    fake_resp = type("R", (), {"choices": [fake_choice]})()
+
+    with patch("main.AsyncOpenAI") as mock_client_cls:
+        mock_create = AsyncMock(return_value=fake_resp)
+        mock_client_cls.return_value.chat.completions.create = mock_create
+        resp = await client.post(
+            f"/agent/sessions/{sid}/regenerate-title",
+            headers=REGEN_HEADERS,
+            json={"model": "gpt-4o-mini"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fallback"] is False
+    assert body["title"] == "\u9879\u76ee\u65b9\u6848\u8ba8\u8bba"
+    listed = await client.get("/agent/sessions", headers={"X-User-Id": "1"})
+    titles = [s["title"] for s in listed.json()]
+    assert "\u9879\u76ee\u65b9\u6848\u8ba8\u8bba" in titles
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_llm_returns_quoted(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "Hello"}])
+
+    fake_choice = type("C", (), {"message": type("M", (), {"content": "  \"Hello world\"\n"})()})()
+    fake_resp = type("R", (), {"choices": [fake_choice]})()
+
+    with patch("main.AsyncOpenAI") as mock_client_cls:
+        mock_client_cls.return_value.chat.completions.create = AsyncMock(return_value=fake_resp)
+        resp = await client.post(
+            f"/agent/sessions/{sid}/regenerate-title",
+            headers=REGEN_HEADERS,
+            json={"model": "gpt-4o-mini"},
+        )
+    assert resp.json()["title"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_llm_timeout_falls_back(client):
+    import asyncio
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "Test message body"}])
+
+    with patch("main.AsyncOpenAI") as mock_client_cls:
+        mock_client_cls.return_value.chat.completions.create = AsyncMock(
+            side_effect=asyncio.TimeoutError())
+        resp = await client.post(
+            f"/agent/sessions/{sid}/regenerate-title",
+            headers=REGEN_HEADERS,
+            json={"model": "gpt-4o-mini"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fallback"] is True
+    assert body["title"] == "Test message bod"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_history_truncated_to_2000(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "x" * 5000}])
+
+    fake_choice = type("C", (), {"message": type("M", (), {"content": "Title"})()})()
+    fake_resp = type("R", (), {"choices": [fake_choice]})()
+
+    with patch("main.AsyncOpenAI") as mock_client_cls:
+        mock_create = AsyncMock(return_value=fake_resp)
+        mock_client_cls.return_value.chat.completions.create = mock_create
+        await client.post(
+            f"/agent/sessions/{sid}/regenerate-title",
+            headers=REGEN_HEADERS,
+            json={"model": "gpt-4o-mini"},
+        )
+
+    call_args = mock_create.call_args
+    messages = call_args.kwargs["messages"]
+    user_content = next(m["content"] for m in messages if m["role"] == "user")
+    assert len(user_content) <= 2000

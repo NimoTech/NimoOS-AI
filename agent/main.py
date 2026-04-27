@@ -14,6 +14,8 @@ from pydantic import BaseModel
 import db as db_module
 from agent import AgentRunner
 from confirm import ConfirmManager
+from openai import AsyncOpenAI
+import title_gen
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
@@ -244,6 +246,80 @@ async def update_title(
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="session not found")
     return {"title": title, "updated_at": now}
+
+
+class RegenerateTitleRequest(BaseModel):
+    model: str = ""
+
+
+@app.post("/agent/sessions/{session_id}/regenerate-title")
+async def regenerate_title(
+    session_id: str,
+    body: RegenerateTitleRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_agent_provider_key: str = Header("", alias="X-Agent-Provider-Key"),
+    x_agent_provider_url: str = Header("", alias="X-Agent-Provider-Url"),
+):
+    row = _conn.execute(
+        "SELECT id FROM sessions WHERE id=? AND user_id=?",
+        (session_id, x_user_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    last_row = _conn.execute(
+        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    history = []
+    if last_row:
+        try:
+            history = json.loads(last_row["content"]) or []
+        except (json.JSONDecodeError, TypeError):
+            history = []
+
+    fallback_title = title_gen.first_user_fallback(history)
+
+    def _persist(title: str, fallback: bool):
+        if not title:
+            return {"title": "", "fallback": True}
+        now = int(time.time())
+        _conn.execute(
+            "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id=?",
+            (title[:30], now, session_id, x_user_id),
+        )
+        _conn.commit()
+        return {"title": title[:30], "fallback": fallback}
+
+    model = (body.model or "").strip()
+    if not model or not history:
+        return _persist(fallback_title, True)
+
+    excerpt = title_gen.extract_history_excerpt(history)
+    if not excerpt:
+        return _persist(fallback_title, True)
+
+    try:
+        client = AsyncOpenAI(base_url=x_agent_provider_url, api_key=x_agent_provider_key)
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": title_gen.SYSTEM_PROMPT},
+                    {"role": "user", "content": excerpt},
+                ],
+                temperature=0.3,
+                max_tokens=40,
+            ),
+            timeout=15.0,
+        )
+        raw = resp.choices[0].message.content if resp.choices else ""
+        cleaned = title_gen.clean_llm_title(raw or "")
+        if not cleaned:
+            return _persist(fallback_title, True)
+        return _persist(cleaned, False)
+    except (asyncio.TimeoutError, Exception):
+        return _persist(fallback_title, True)
 
 
 @app.post("/agent/sessions/{session_id}/run")
