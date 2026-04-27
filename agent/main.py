@@ -221,6 +221,31 @@ def _hydrate_messages(history: list) -> list:
     return result
 
 
+class TitleUpdate(BaseModel):
+    title: str
+
+
+@app.patch("/agent/sessions/{session_id}/title")
+async def update_title(
+    session_id: str,
+    body: TitleUpdate,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title must not be empty")
+    title = title[:30]
+    now = int(time.time())
+    cur = _conn.execute(
+        "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id=?",
+        (title, now, session_id, x_user_id),
+    )
+    _conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"title": title, "updated_at": now}
+
+
 @app.post("/agent/sessions/{session_id}/run")
 async def run_session(
     session_id: str,
