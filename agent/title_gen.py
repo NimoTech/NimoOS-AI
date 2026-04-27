@@ -1,10 +1,17 @@
-"""Pure helpers for AI title generation. No I/O — easy to unit test."""
+"""Pure helpers for AI title generation. No I/O -- easy to unit test."""
 from __future__ import annotations
 
 _HISTORY_MAX_ITEMS = 6
 _HISTORY_MAX_CHARS = 2000
 _TITLE_MAX_CHARS = 30
 _FALLBACK_MAX_CHARS = 16
+_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ('“', '”'),  # curly quotes U+201C U+201D
+    ('「', '」'),
+    ('『', '』'),
+)
 
 
 def _flatten_content(content) -> str:
@@ -55,9 +62,14 @@ def clean_llm_title(raw: str) -> str:
         return ""
     first_line = raw.strip().split("\n", 1)[0].strip()
     # Strip wrapping quotes (both ASCII and CJK styles)
-    for q in ('"', "'", "“", "”", "「", "」", "『", "』"):
-        if first_line.startswith(q) and first_line.endswith(q) and len(first_line) >= 2:
+    for open_q, close_q in _QUOTE_PAIRS:
+        if (
+            len(first_line) >= 2
+            and first_line.startswith(open_q)
+            and first_line.endswith(close_q)
+        ):
             first_line = first_line[1:-1].strip()
+            break
     # Strip a trailing common punctuation
     while first_line and first_line[-1] in ".。!！?？":
         first_line = first_line[:-1]

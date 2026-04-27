@@ -92,3 +92,11 @@ def test_first_user_message_fallback():
 def test_first_user_message_fallback_empty():
     from title_gen import first_user_fallback
     assert first_user_fallback([]) == ""
+
+def test_clean_llm_title_strips_cjk_quote_pairs():
+    from title_gen import clean_llm_title
+    # Test CJK corner brackets
+    assert clean_llm_title("「会话讨论」") == "会话讨论"
+    assert clean_llm_title("『Project』") == "Project"
+    # Test curly/smart quotes (U+201C and U+201D)
+    assert clean_llm_title("“Smart quotes”") == "Smart quotes"
