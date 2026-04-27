@@ -29,7 +29,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
 		AllowOrigins: []string{"*"},
-		AllowMethods: []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.OPTIONS},
+		AllowMethods: []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.PATCH, echo.OPTIONS},
 		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud", "X-User-Id", "X-Agent-Provider-Key", "X-Agent-Provider-Url"},
 	}))
 
