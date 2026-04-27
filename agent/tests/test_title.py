@@ -240,3 +240,27 @@ async def test_regenerate_title_history_truncated_to_2000(client):
     messages = call_args.kwargs["messages"]
     user_content = next(m["content"] for m in messages if m["role"] == "user")
     assert len(user_content) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_uses_reasoning_content_when_content_empty(client):
+    r = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
+    sid = r.json()["session_id"]
+    await _seed_history(client, sid, [{"role": "user", "content": "Reasoning model test"}])
+
+    fake_choice = type(
+        "C", (),
+        {"message": type("M", (), {"content": "", "reasoning_content": "推理模型标题"})()},
+    )()
+    fake_resp = type("R", (), {"choices": [fake_choice]})()
+
+    with patch("main.AsyncOpenAI") as mock_client_cls:
+        mock_client_cls.return_value.chat.completions.create = AsyncMock(return_value=fake_resp)
+        resp = await client.post(
+            f"/agent/sessions/{sid}/regenerate-title",
+            headers=REGEN_HEADERS,
+            json={"model": "deepseek-v4-flash"},
+        )
+    body = resp.json()
+    assert body["fallback"] is False
+    assert body["title"] == "推理模型标题"

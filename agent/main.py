@@ -309,13 +309,25 @@ async def regenerate_title(
                     {"role": "user", "content": excerpt},
                 ],
                 temperature=0.3,
-                max_tokens=40,
+                max_tokens=256,
             ),
             timeout=15.0,
         )
-        raw = resp.choices[0].message.content if resp.choices else ""
+        raw = ""
+        if resp.choices:
+            msg = resp.choices[0].message
+            raw = (
+                getattr(msg, "content", None)
+                or getattr(msg, "reasoning_content", None)
+                or ""
+            )
         cleaned = title_gen.clean_llm_title(raw or "")
         if not cleaned:
+            print(
+                f"[regenerate_title] LLM returned no usable content "
+                f"for session={session_id} model={model} raw_len={len(raw)}",
+                flush=True,
+            )
             return _persist(fallback_title, True)
         return _persist(cleaned, False)
     except (asyncio.TimeoutError, Exception):
