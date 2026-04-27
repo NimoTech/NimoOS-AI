@@ -47,6 +47,7 @@ func (h *ChatHandler) ChatCompletions(c echo.Context) error {
 	}
 
 	body = stripProviderPrefix(body)
+	body = stripInternalFields(body)
 	stream := isStreamRequest(body)
 
 	switch decision.Backend {
@@ -71,6 +72,9 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 		})
 	}
 	defer resp.Body.Close()
+	if stream {
+		return proxySSEResponse(c, resp)
+	}
 	return proxyResponse(c, resp)
 }
 
@@ -185,7 +189,7 @@ func stripProviderPrefix(body []byte) []byte {
 	if err := json.Unmarshal(modelRaw, &model); err != nil {
 		return body
 	}
-	if idx := strings.Index(model, ":"); idx >= 0 {
+	if idx := strings.Index(model, ":"); idx >= 0 && isNumeric(model[:idx]) {
 		model = model[idx+1:]
 		encoded, err := json.Marshal(model)
 		if err != nil {
@@ -199,6 +203,34 @@ func stripProviderPrefix(body []byte) []byte {
 		return out
 	}
 	return body
+}
+
+// stripInternalFields removes NimoOS-internal fields (e.g. _backend) before forwarding
+// to upstream APIs that don't understand them.
+func stripInternalFields(body []byte) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	delete(req, "_backend")
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// isNumeric returns true if s consists entirely of ASCII digits.
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isStreamRequest parses the body bytes to check if stream:true was requested.
@@ -220,6 +252,32 @@ func proxyResponse(c echo.Context, resp *http.Response) error {
 	c.Response().WriteHeader(resp.StatusCode)
 	_, err := io.Copy(c.Response(), resp.Body)
 	return err
+}
+
+// proxySSEResponse proxies a Server-Sent Events stream, flushing after each event
+// so the client receives tokens as they are generated rather than in one batch.
+func proxySSEResponse(c echo.Context, resp *http.Response) error {
+	for key, vals := range resp.Header {
+		for _, v := range vals {
+			c.Response().Header().Add(key, v)
+		}
+	}
+	c.Response().WriteHeader(resp.StatusCode)
+
+	w := c.Response()
+	flusher, canFlush := w.Writer.(http.Flusher)
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		w.Write(line)
+		w.Write([]byte("\n"))
+		// Flush on blank line — that's the SSE event boundary.
+		if len(line) == 0 && canFlush {
+			flusher.Flush()
+		}
+	}
+	return scanner.Err()
 }
 
 // convertAnthropicResponseToOpenAI converts a non-streaming Anthropic response to OpenAI format.

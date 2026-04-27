@@ -25,6 +25,16 @@ func NewAgentHandler(svc service.Services, agentURL string, timeout int) *AgentH
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.FlushInterval = 100 * time.Millisecond
 
+	// Strip the /v1/ai prefix so /v1/ai/agent/sessions → /agent/sessions
+	orig := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		orig(req)
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/v1/ai")
+		if req.URL.RawPath != "" {
+			req.URL.RawPath = strings.TrimPrefix(req.URL.RawPath, "/v1/ai")
+		}
+	}
+
 	h := &AgentHandler{
 		svc:      svc,
 		agentURL: agentURL,
@@ -87,7 +97,11 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 
 	c.Request().Header.Set("X-User-Id", userID)
 
-	if h.svc != nil {
+	providerType := c.Request().Header.Get("X-Agent-Provider-Type")
+	if providerType == "ollama" {
+		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
+		c.Request().Header.Set("X-Agent-Provider-Url", "http://127.0.0.1:11434/v1")
+	} else if h.svc != nil {
 		if key, provURL, ok := h.resolveProvider(userID); ok {
 			c.Request().Header.Set("X-Agent-Provider-Key", key)
 			c.Request().Header.Set("X-Agent-Provider-Url", provURL)
