@@ -3,7 +3,10 @@ from __future__ import annotations
 
 _HISTORY_MAX_ITEMS = 6
 _HISTORY_MAX_CHARS = 2000
-_TITLE_MAX_CHARS = 30
+# Hard truncation limit on stored titles. The SYSTEM_PROMPT asks the LLM for <=16 chars,
+# but we defend at 30 to absorb LLM non-compliance (especially with CJK output where
+# token-vs-char counting is fuzzy). Both numbers are intentional — don't collapse them.
+TITLE_MAX_CHARS = 30
 _FALLBACK_MAX_CHARS = 16
 _QUOTE_PAIRS = (
     ('"', '"'),
@@ -73,7 +76,7 @@ def clean_llm_title(raw: str) -> str:
     # Strip a trailing common punctuation
     while first_line and first_line[-1] in ".。!！?？":
         first_line = first_line[:-1]
-    return first_line[:_TITLE_MAX_CHARS]
+    return first_line[:TITLE_MAX_CHARS]
 
 
 def first_user_fallback(history: list) -> str:

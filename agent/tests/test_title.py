@@ -1,6 +1,25 @@
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from unittest.mock import patch, AsyncMock
+
+REGEN_HEADERS = {
+    "X-User-Id": "1",
+    "X-Agent-Provider-Key": "fake-key",
+    "X-Agent-Provider-Url": "http://fake/v1",
+}
+
+
+async def _seed_history(client, sid, history_json):
+    """Insert a history row directly into the test DB via the same connection."""
+    import main as _main
+    import json, time, uuid
+    _main._conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), sid, "history", json.dumps(history_json), int(time.time())),
+    )
+    _main._conn.commit()
+
 
 @pytest_asyncio.fixture
 async def client(tmp_path, monkeypatch):
@@ -100,25 +119,6 @@ def test_clean_llm_title_strips_cjk_quote_pairs():
     assert clean_llm_title("『Project』") == "Project"
     # Test curly/smart quotes (U+201C and U+201D)
     assert clean_llm_title("“Smart quotes”") == "Smart quotes"
-
-
-from unittest.mock import patch, AsyncMock
-
-REGEN_HEADERS = {
-    "X-User-Id": "1",
-    "X-Agent-Provider-Key": "fake-key",
-    "X-Agent-Provider-Url": "http://fake/v1",
-}
-
-async def _seed_history(client, sid, history_json):
-    """Insert a history row directly into the test DB via the same connection."""
-    import main as _main
-    import json, time, uuid
-    _main._conn.execute(
-        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-        (str(uuid.uuid4()), sid, "history", json.dumps(history_json), int(time.time())),
-    )
-    _main._conn.commit()
 
 
 @pytest.mark.asyncio

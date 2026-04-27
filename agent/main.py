@@ -236,7 +236,7 @@ async def update_title(
     title = body.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="title must not be empty")
-    title = title[:30]
+    title = title[:title_gen.TITLE_MAX_CHARS]
     now = int(time.time())
     cur = _conn.execute(
         "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id=?",
@@ -286,10 +286,10 @@ async def regenerate_title(
         now = int(time.time())
         _conn.execute(
             "UPDATE sessions SET title=?, updated_at=? WHERE id=? AND user_id=?",
-            (title[:30], now, session_id, x_user_id),
+            (title[:title_gen.TITLE_MAX_CHARS], now, session_id, x_user_id),
         )
         _conn.commit()
-        return {"title": title[:30], "fallback": fallback}
+        return {"title": title[:title_gen.TITLE_MAX_CHARS], "fallback": fallback}
 
     model = (body.model or "").strip()
     if not model or not history:
