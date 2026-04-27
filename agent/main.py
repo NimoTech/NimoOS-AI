@@ -80,6 +80,147 @@ async def delete_session(session_id: str, x_user_id: str = Header(..., alias="X-
     return {"ok": True}
 
 
+@app.get("/agent/sessions/{session_id}/messages")
+async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",
+                        (session_id, x_user_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    last_row = _conn.execute(
+        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        (session_id,)
+    ).fetchone()
+    if not last_row:
+        return []
+
+    try:
+        history = json.loads(last_row["content"])
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+    return _hydrate_messages(history)
+
+
+def _flatten_content(content) -> str:
+    # User input: plain string. Assistant output (Agents SDK to_input_list):
+    # list of blocks like [{"type": "output_text", "text": "..."}].
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in (
+                    "output_text", "text", "input_text", "reasoning_text"):
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return ""
+
+
+def _hydrate_messages(history: list) -> list:
+    # Translate Agents SDK to_input_list() into the UI's per-message shape:
+    #   user      → {role:'user', content:str}
+    #   assistant → {role:'assistant', blocks:[thinking|tool|md]} grouped per turn,
+    # so AssistantMessage.vue's BlockRenderer can replay the run as it happened.
+    result = []
+    state = {"counter": 0, "current": None, "pending": {}}
+
+    def new_id(prefix: str) -> str:
+        state["counter"] += 1
+        return f"h-{prefix}-{state['counter']}"
+
+    def flush():
+        if state["current"] and state["current"]["blocks"]:
+            result.append(state["current"])
+        state["current"] = None
+        state["pending"] = {}
+
+    def blocks():
+        if state["current"] is None:
+            state["current"] = {
+                "id": new_id("a"),
+                "role": "assistant",
+                "blocks": [],
+                "streaming": False,
+            }
+        return state["current"]["blocks"]
+
+    for item in history:
+        item_type = item.get("type")
+        role = item.get("role")
+
+        if role == "user":
+            flush()
+            text = _flatten_content(item.get("content"))
+            if text:
+                result.append({"id": new_id("u"), "role": "user", "content": text})
+            continue
+
+        if item_type == "reasoning":
+            text = _flatten_content(item.get("content"))
+            if text:
+                blocks().append({
+                    "type": "thinking",
+                    "text": text,
+                    "streaming": False,
+                    "defaultOpen": False,
+                })
+
+        elif item_type == "function_call":
+            name = item.get("name", "tool")
+            args_raw = item.get("arguments") or ""
+            try:
+                parsed = json.loads(args_raw) if args_raw else {}
+                args_pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+                preview = json.dumps(parsed, ensure_ascii=False)
+            except (ValueError, TypeError):
+                args_pretty = str(args_raw)
+                preview = args_pretty
+            bs = blocks()
+            bs.append({
+                "type": "tool",
+                "state": "success",
+                "name": name,
+                "argsPreview": preview[:80],
+                "sections": [{"label": "ARGUMENTS", "code": args_pretty}],
+            })
+            call_id = item.get("call_id") or item.get("id")
+            if call_id and call_id != "__fake_id__":
+                state["pending"][call_id] = len(bs) - 1
+
+        elif item_type == "function_call_output":
+            output = str(item.get("output", ""))
+            call_id = item.get("call_id") or item.get("id")
+            bs = blocks()
+            target = state["pending"].pop(call_id, None) if call_id and call_id != "__fake_id__" else None
+            if target is None:
+                # Fallback: most recent tool block without a RESULT section yet
+                for i in range(len(bs) - 1, -1, -1):
+                    blk = bs[i]
+                    if blk.get("type") == "tool" and not any(
+                            s.get("label") == "RESULT" for s in blk.get("sections", [])):
+                        target = i
+                        break
+            if target is not None:
+                bs[target].setdefault("sections", []).append({"label": "RESULT", "code": output})
+            else:
+                # Orphan output — still surface it so the user sees the result
+                bs.append({
+                    "type": "tool",
+                    "state": "success",
+                    "name": "result",
+                    "sections": [{"label": "RESULT", "code": output}],
+                })
+
+        elif item_type == "message" and role == "assistant":
+            text = _flatten_content(item.get("content"))
+            if text:
+                blocks().append({"type": "md", "text": text})
+
+    flush()
+    return result
+
+
 @app.post("/agent/sessions/{session_id}/run")
 async def run_session(
     session_id: str,
@@ -105,10 +246,12 @@ async def run_session(
         except RuntimeError as e:
             if "agent_busy" in str(e):
                 await queue.put({"type": "error", "content": "Agent is processing a previous message. Please wait."})
-                await queue.put({"type": "done"})
             else:
                 await queue.put({"type": "error", "content": str(e)})
-                await queue.put({"type": "done"})
+            await queue.put({"type": "done"})
+        except Exception as e:
+            await queue.put({"type": "error", "content": str(e)})
+            await queue.put({"type": "done"})
 
     asyncio.create_task(run_agent())
 
