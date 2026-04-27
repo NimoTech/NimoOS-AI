@@ -93,14 +93,15 @@ func NewLocalAdapter(baseURL string) *LocalAdapter {
 	}
 }
 
-// ChatCompletions forwards the request body to Ollama /api/chat and returns the raw response.
+// ChatCompletions forwards the request body to Ollama /v1/chat/completions (OpenAI-compatible
+// endpoint) so the response is already in OpenAI SSE format and can be proxied directly.
 // The caller is responsible for reading and closing resp.Body.
 func (l *LocalAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, l.baseURL+"/api/chat", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, l.baseURL+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}

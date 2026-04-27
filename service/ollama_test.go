@@ -85,11 +85,12 @@ func TestOllamaChecker_SetCallbacks(t *testing.T) {
 
 func TestLocalAdapter_ForwardsChatCompletions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/chat", r.URL.Path)
+		require.Equal(t, "/v1/chat/completions", r.URL.Path)
 		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":{"role":"assistant","content":"hello"},"done":true}`))
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hello"}}]}`))
+
 	}))
 	defer server.Close()
 
