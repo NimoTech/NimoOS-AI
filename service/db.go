@@ -134,6 +134,15 @@ func migrate(db *sql.DB) error {
 		downloaded_at TEXT NOT NULL DEFAULT '',
 		last_used_at  TEXT NOT NULL DEFAULT ''
 	);
+
+	CREATE TABLE IF NOT EXISTS hard_blacklist (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id    TEXT NOT NULL,
+		pattern    TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(user_id, pattern)
+	);
+	CREATE INDEX IF NOT EXISTS idx_blacklist_user ON hard_blacklist(user_id);
 	`)
 	if err != nil {
 		return err

@@ -19,6 +19,7 @@ type Services interface {
 	Providers() *providerService
 	ModelManager() *ModelManager
 	Sessions() *sessionService
+	Blacklist() *blacklistService
 }
 
 type services struct {
@@ -30,16 +31,18 @@ type services struct {
 	providers     *providerService
 	modelManager  *ModelManager
 	sessions      *sessionService
+	blacklist     *blacklistService
 }
 
-func (s *services) DB() *sql.DB                  { return s.db }
-func (s *services) MasterKey() *crypto.MasterKey  { return s.masterKey }
-func (s *services) OllamaChecker() *OllamaChecker { return s.ollamaChecker }
-func (s *services) LocalAdapter() *LocalAdapter   { return s.localAdapter }
-func (s *services) Router() *Router               { return s.router }
-func (s *services) Providers() *providerService   { return s.providers }
-func (s *services) ModelManager() *ModelManager   { return s.modelManager }
-func (s *services) Sessions() *sessionService     { return s.sessions }
+func (s *services) DB() *sql.DB                      { return s.db }
+func (s *services) MasterKey() *crypto.MasterKey      { return s.masterKey }
+func (s *services) OllamaChecker() *OllamaChecker     { return s.ollamaChecker }
+func (s *services) LocalAdapter() *LocalAdapter       { return s.localAdapter }
+func (s *services) Router() *Router                   { return s.router }
+func (s *services) Providers() *providerService       { return s.providers }
+func (s *services) ModelManager() *ModelManager       { return s.modelManager }
+func (s *services) Sessions() *sessionService         { return s.sessions }
+func (s *services) Blacklist() *blacklistService      { return s.blacklist }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -60,6 +63,7 @@ func NewService(cfg *config.Config) Services {
 	router := &Router{providers: providerSvc, db: db}
 	modelMgr := NewModelManager(common.OllamaBaseURL, db)
 	sessionSvc := &sessionService{db: db}
+	blacklistSvc := &blacklistService{db: db}
 
 	return &services{
 		db:            db,
@@ -70,5 +74,6 @@ func NewService(cfg *config.Config) Services {
 		providers:     providerSvc,
 		modelManager:  modelMgr,
 		sessions:      sessionSvc,
+		blacklist:     blacklistSvc,
 	}
 }
