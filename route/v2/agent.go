@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -97,6 +99,10 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 
 	c.Request().Header.Set("X-User-Id", userID)
 
+	if name := c.Request().Header.Get("X-NimoOS-User-Name"); name != "" {
+		c.Request().Header.Set("X-User-Name", name)
+	}
+
 	providerType := c.Request().Header.Get("X-Agent-Provider-Type")
 	if providerType == "ollama" {
 		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
@@ -105,6 +111,17 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 		if key, provURL, ok := h.resolveProvider(userID); ok {
 			c.Request().Header.Set("X-Agent-Provider-Key", key)
 			c.Request().Header.Set("X-Agent-Provider-Url", provURL)
+		}
+	}
+
+	// Inject base64(JSON([patterns])) for the user's hard blacklist.
+	if h.svc != nil {
+		patterns, err := h.svc.Blacklist().ListPatterns(userID)
+		if err == nil && len(patterns) > 0 {
+			if buf, err := json.Marshal(patterns); err == nil {
+				enc := base64.StdEncoding.EncodeToString(buf)
+				c.Request().Header.Set("X-Agent-User-Blacklist", enc)
+			}
 		}
 	}
 

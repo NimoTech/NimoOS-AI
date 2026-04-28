@@ -30,7 +30,12 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{echo.POST, echo.GET, echo.PUT, echo.DELETE, echo.PATCH, echo.OPTIONS},
-		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-NimoOS-Force-Cloud", "X-User-Id", "X-Agent-Provider-Key", "X-Agent-Provider-Url"},
+		AllowHeaders: []string{
+			echo.HeaderAuthorization, echo.HeaderContentType,
+			"X-NimoOS-Force-Cloud", "X-User-Id", "X-User-Name",
+			"X-Agent-Provider-Key", "X-Agent-Provider-Url",
+			"X-Agent-Provider-Type",
+		},
 	}))
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
@@ -45,6 +50,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 				return nil, echo.ErrUnauthorized
 			}
 			c.Request().Header.Set("X-NimoOS-User-ID", strconv.Itoa(claims.ID))
+			c.Request().Header.Set("X-NimoOS-User-Name", claims.Username)
 			return claims, nil
 		},
 		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
@@ -95,6 +101,16 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
+
+	// Filesystem mounts (picker scope)
+	fs := v2.NewFSHandler()
+	g.GET("/fs/mounts", fs.Mounts)
+
+	// Hard blacklist CRUD
+	blacklist := v2.NewBlacklistHandler(svc)
+	g.GET("/blacklist", blacklist.List)
+	g.POST("/blacklist", blacklist.Create)
+	g.DELETE("/blacklist/:id", blacklist.Delete)
 
 	return e
 }
