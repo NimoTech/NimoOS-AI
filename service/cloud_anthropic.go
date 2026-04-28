@@ -81,16 +81,23 @@ type anthropicChunkData struct {
 
 // ── Protocol conversion ────────────────────────────────────────
 
-// convertToAnthropic converts an OpenAI chat request to Anthropic format.
-// It extracts the system message from the messages array into the top-level System field.
-// If multiple system messages are present, only the last one is used.
-func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
-	const thinkingBudget = 8000
-	const thinkingMinTokens = 16000
+// ThinkingControl is the cross-provider abstraction propagated from the UI.
+type ThinkingControl struct {
+	Enabled bool
+	Level   string // "low" | "medium" | "high" | "max"
+}
 
+// ConvertToAnthropicWithThinking converts an OpenAI chat request to Anthropic
+// format and applies the user's thinking control as a budget_tokens setting.
+//
+// Mapping (matches docs/superpowers/specs/2026-04-28-thinking-intensity-design.md §4.2):
+//
+//	disabled            → no thinking field
+//	low / med / high / max → 4096 / 8192 / 16384 / 32768
+func ConvertToAnthropicWithThinking(req OpenAIChatRequest, tc ThinkingControl) AnthropicRequest {
 	maxTokens := req.MaxTokens
 	if maxTokens == 0 {
-		maxTokens = thinkingMinTokens
+		maxTokens = 16000
 	}
 
 	var system string
@@ -111,10 +118,35 @@ func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
 		Stream:    req.Stream,
 	}
 
-	if maxTokens >= thinkingMinTokens {
-		ar.Thinking = &AnthropicThinking{Type: "enabled", BudgetTokens: thinkingBudget}
+	if tc.Enabled {
+		budget := anthropicBudgetFor(tc.Level)
+		ar.Thinking = &AnthropicThinking{Type: "enabled", BudgetTokens: budget}
+		// Anthropic requires max_tokens > budget_tokens.
+		if ar.MaxTokens <= budget {
+			ar.MaxTokens = budget + 1024
+		}
 	}
 	return ar
+}
+
+func anthropicBudgetFor(level string) int {
+	switch level {
+	case "low":
+		return 4096
+	case "high":
+		return 16384
+	case "max":
+		return 32768
+	default: // "medium" or unknown
+		return 8192
+	}
+}
+
+// convertToAnthropic preserves the old signature (no thinking) for callers
+// that haven't migrated yet, but no longer auto-enables thinking based on
+// max_tokens. UI-driven thinking goes through ConvertToAnthropicWithThinking.
+func convertToAnthropic(req OpenAIChatRequest) AnthropicRequest {
+	return ConvertToAnthropicWithThinking(req, ThinkingControl{})
 }
 
 // ConvertAnthropicChunkToOpenAI converts an Anthropic SSE data payload to an OpenAI StreamChunk.
@@ -186,10 +218,10 @@ func (a *AnthropicAdapter) setHeaders(req *http.Request) {
 	req.Header.Set("anthropic-version", "2023-06-01")
 }
 
-// ChatCompletions accepts an OpenAI-format request, converts it to Anthropic format,
-// and returns the raw upstream *http.Response. Caller owns resp.Body and is responsible
-// for SSE parsing and protocol conversion for the /chat/completions endpoint.
-func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
+// ChatCompletionsWithThinking accepts an OpenAI-format request plus an explicit
+// ThinkingControl, converts to Anthropic format applying the thinking config,
+// and returns the raw upstream *http.Response.
+func (a *AnthropicAdapter) ChatCompletionsWithThinking(body io.Reader, tc ThinkingControl) (*http.Response, error) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
@@ -199,7 +231,7 @@ func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, erro
 		return nil, err
 	}
 
-	anthropicReq := convertToAnthropic(openaiReq)
+	anthropicReq := ConvertToAnthropicWithThinking(openaiReq, tc)
 	payload, err := json.Marshal(anthropicReq)
 	if err != nil {
 		return nil, err
@@ -211,6 +243,13 @@ func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, erro
 	}
 	a.setHeaders(req)
 	return a.client.Do(req)
+}
+
+// ChatCompletions accepts an OpenAI-format request, converts it to Anthropic format,
+// and returns the raw upstream *http.Response. Caller owns resp.Body and is responsible
+// for SSE parsing and protocol conversion for the /chat/completions endpoint.
+func (a *AnthropicAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
+	return a.ChatCompletionsWithThinking(body, ThinkingControl{})
 }
 
 // Messages transparently proxies an Anthropic-format request, only adding auth headers.

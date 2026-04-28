@@ -25,9 +25,9 @@ func TestConvertToAnthropic_BasicMessage(t *testing.T) {
 	require.Len(t, got.Messages, 1)
 	require.Equal(t, "user", got.Messages[0].Role)
 	require.Equal(t, "", got.System)
-	require.Equal(t, 16000, got.MaxTokens) // default with thinking enabled
-	require.NotNil(t, got.Thinking)
-	require.Equal(t, "enabled", got.Thinking.Type)
+	require.Equal(t, 16000, got.MaxTokens) // default max_tokens
+	// After refactor: convertToAnthropic (legacy path) no longer auto-enables thinking.
+	require.Nil(t, got.Thinking)
 }
 
 func TestConvertToAnthropic_ExtractsSystemPrompt(t *testing.T) {
@@ -93,14 +93,16 @@ func TestConvertAnthropicChunkToOpenAI_IgnoresNonTextDelta(t *testing.T) {
 }
 
 func TestConvertToAnthropic_EnablesThinkingForLargeContext(t *testing.T) {
+	// After refactor: thinking is only enabled when explicitly requested via ThinkingControl.
+	// This test verifies the explicit path still works (using ConvertToAnthropicWithThinking).
 	req := OpenAIChatRequest{
 		Model:    "claude-3-7-sonnet-20250219",
 		Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
 	}
-	got := convertToAnthropic(req)
+	got := ConvertToAnthropicWithThinking(req, ThinkingControl{Enabled: true, Level: "medium"})
 	require.NotNil(t, got.Thinking)
 	require.Equal(t, "enabled", got.Thinking.Type)
-	require.Equal(t, 8000, got.Thinking.BudgetTokens)
+	require.Equal(t, 8192, got.Thinking.BudgetTokens)
 	require.Equal(t, 16000, got.MaxTokens)
 }
 
@@ -206,4 +208,45 @@ func TestAnthropicAdapter_Messages_PassesThrough(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, originalBody, receivedBody)
+}
+
+func TestConvertToAnthropic_ThinkingConfig(t *testing.T) {
+	t.Run("disabled omits thinking", func(t *testing.T) {
+		req := OpenAIChatRequest{
+			Model: "claude-4-sonnet", MaxTokens: 8000,
+			Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
+		}
+		ar := ConvertToAnthropicWithThinking(req,
+			ThinkingControl{Enabled: false, Level: "medium"})
+		require.Nil(t, ar.Thinking)
+	})
+	t.Run("enabled medium → 8192 budget", func(t *testing.T) {
+		req := OpenAIChatRequest{Model: "claude-4-sonnet", MaxTokens: 0,
+			Messages: []OpenAIMessage{{Role: "user", Content: "hi"}}}
+		ar := ConvertToAnthropicWithThinking(req,
+			ThinkingControl{Enabled: true, Level: "medium"})
+		require.NotNil(t, ar.Thinking)
+		require.Equal(t, "enabled", ar.Thinking.Type)
+		require.Equal(t, 8192, ar.Thinking.BudgetTokens)
+	})
+	for _, c := range []struct {
+		level  string
+		budget int
+	}{
+		{"low", 4096}, {"medium", 8192}, {"high", 16384}, {"max", 32768},
+	} {
+		t.Run("level="+c.level, func(t *testing.T) {
+			req := OpenAIChatRequest{Model: "claude-4-sonnet",
+				Messages: []OpenAIMessage{{Role: "user", Content: "hi"}}}
+			ar := ConvertToAnthropicWithThinking(req,
+				ThinkingControl{Enabled: true, Level: c.level})
+			require.Equal(t, c.budget, ar.Thinking.BudgetTokens)
+		})
+	}
+	t.Run("legacy path: no thinking control = no thinking", func(t *testing.T) {
+		req := OpenAIChatRequest{Model: "claude-4-sonnet", MaxTokens: 32000}
+		ar := convertToAnthropic(req)
+		require.Nil(t, ar.Thinking,
+			"after refactor, max_tokens alone must NOT auto-enable thinking")
+	})
 }

@@ -114,8 +114,13 @@ func (h *ChatHandler) forwardToCloud(c echo.Context, userID string, body io.Read
 		return proxyResponse(c, resp)
 
 	case service.ProtocolAnthropic:
+		bodyBytes, err := io.ReadAll(body)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "failed to read request body")
+		}
+		tc := extractThinkingControl(bodyBytes)
 		adapter := service.NewAnthropicAdapter(provider.BaseURL, apiKey)
-		resp, err := adapter.ChatCompletions(body)
+		resp, err := adapter.ChatCompletionsWithThinking(bytes.NewReader(bodyBytes), tc)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadGateway, err.Error())
 		}
@@ -171,6 +176,63 @@ func (h *ChatHandler) Messages(c echo.Context) error {
 	}
 	defer resp.Body.Close()
 	return proxyResponse(c, resp)
+}
+
+// extractThinkingControl reads the raw OpenAI-format request body and returns a
+// ThinkingControl reflecting whatever thinking signal agent.py forwarded.
+// It reads two optional fields:
+//   - "reasoning_effort": "low"|"medium"|"high"|"max"  (maps 1:1 to thinking level)
+//   - "extra_body": {"thinking": {"type": "enabled"|"disabled"}}
+//
+// extra_body.thinking.type takes precedence for the enabled/disabled toggle.
+func extractThinkingControl(body []byte) service.ThinkingControl {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return service.ThinkingControl{}
+	}
+
+	tc := service.ThinkingControl{}
+
+	if rawEffort, ok := raw["reasoning_effort"]; ok {
+		var s string
+		if err := json.Unmarshal(rawEffort, &s); err == nil {
+			tc.Level = mapEffortToLevel(s)
+			tc.Enabled = s != "minimal"
+		}
+	}
+
+	if eb, ok := raw["extra_body"]; ok {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(eb, &m); err == nil {
+			if rawThinking, ok := m["thinking"]; ok {
+				var thinking map[string]any
+				if err := json.Unmarshal(rawThinking, &thinking); err == nil {
+					if typ, _ := thinking["type"].(string); typ == "disabled" {
+						tc.Enabled = false
+					} else if typ == "enabled" {
+						tc.Enabled = true
+					}
+				}
+			}
+		}
+	}
+
+	return tc
+}
+
+// mapEffortToLevel converts a reasoning_effort string to a ThinkingControl level.
+func mapEffortToLevel(s string) string {
+	switch s {
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "max":
+		return "max"
+	}
+	return "medium"
 }
 
 // stripProviderPrefix removes the "{providerID}:" prefix from the model field.
