@@ -25,6 +25,7 @@ type Provider struct {
 	Protocol     Protocol
 	Enabled      bool
 	DefaultModel string
+	ProviderType string   // NEW: deepseek|openai|anthropic|qwen|ollama|other
 	CreatedAt    time.Time
 }
 
@@ -149,5 +150,28 @@ func migrate(db *sql.DB) error {
 	}
 	// Idempotent column additions for existing databases
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN default_model TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT ''`)
+
+	// One-time backfill: classify rows whose provider_type is still empty.
+	rows, err := db.Query(`SELECT id, base_url, protocol FROM providers WHERE provider_type=''`)
+	if err == nil {
+		type row struct {
+			id       int64
+			baseURL  string
+			protocol string
+		}
+		var todo []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.baseURL, &r.protocol); err == nil {
+				todo = append(todo, r)
+			}
+		}
+		rows.Close()
+		for _, r := range todo {
+			pt := ClassifyProvider(r.baseURL, Protocol(r.protocol))
+			_, _ = db.Exec(`UPDATE providers SET provider_type=? WHERE id=?`, pt, r.id)
+		}
+	}
 	return nil
 }

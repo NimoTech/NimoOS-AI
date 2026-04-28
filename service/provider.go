@@ -13,9 +13,12 @@ func boolToInt(b bool) int {
 
 // CreateProvider inserts a new provider and sets p.ID
 func (s *providerService) CreateProvider(p *Provider) error {
+	if p.ProviderType == "" {
+		p.ProviderType = ClassifyProvider(p.BaseURL, p.Protocol)
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO providers (user_id, name, base_url, api_key, protocol, enabled, default_model) VALUES (?,?,?,?,?,?,?)`,
-		p.UserID, p.Name, p.BaseURL, p.APIKey, string(p.Protocol), boolToInt(p.Enabled), p.DefaultModel,
+		`INSERT INTO providers (user_id, name, base_url, api_key, protocol, enabled, default_model, provider_type) VALUES (?,?,?,?,?,?,?,?)`,
+		p.UserID, p.Name, p.BaseURL, p.APIKey, string(p.Protocol), boolToInt(p.Enabled), p.DefaultModel, p.ProviderType,
 	)
 	if err != nil {
 		return err
@@ -30,10 +33,10 @@ func (s *providerService) GetProvider(id int64, userID string) (*Provider, error
 	var enabled int
 	var protocol string
 	row := s.db.QueryRow(
-		`SELECT id, user_id, name, base_url, api_key, protocol, enabled, default_model FROM providers WHERE id=? AND user_id=?`,
+		`SELECT id, user_id, name, base_url, api_key, protocol, enabled, default_model, provider_type FROM providers WHERE id=? AND user_id=?`,
 		id, userID,
 	)
-	err := row.Scan(&p.ID, &p.UserID, &p.Name, &p.BaseURL, &p.APIKey, &protocol, &enabled, &p.DefaultModel)
+	err := row.Scan(&p.ID, &p.UserID, &p.Name, &p.BaseURL, &p.APIKey, &protocol, &enabled, &p.DefaultModel, &p.ProviderType)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +47,7 @@ func (s *providerService) GetProvider(id int64, userID string) (*Provider, error
 
 func (s *providerService) ListProviders(userID string) ([]*Provider, error) {
 	rows, err := s.db.Query(
-		`SELECT id, user_id, name, base_url, api_key, protocol, enabled, default_model FROM providers WHERE user_id=? ORDER BY id`,
+		`SELECT id, user_id, name, base_url, api_key, protocol, enabled, default_model, provider_type FROM providers WHERE user_id=? ORDER BY id`,
 		userID,
 	)
 	if err != nil {
@@ -57,7 +60,7 @@ func (s *providerService) ListProviders(userID string) ([]*Provider, error) {
 		p := &Provider{}
 		var enabled int
 		var protocol string
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.BaseURL, &p.APIKey, &protocol, &enabled, &p.DefaultModel); err != nil {
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.BaseURL, &p.APIKey, &protocol, &enabled, &p.DefaultModel, &p.ProviderType); err != nil {
 			return nil, err
 		}
 		p.Protocol = Protocol(protocol)
@@ -68,9 +71,12 @@ func (s *providerService) ListProviders(userID string) ([]*Provider, error) {
 }
 
 func (s *providerService) UpdateProvider(p *Provider) error {
+	if p.ProviderType == "" {
+		p.ProviderType = ClassifyProvider(p.BaseURL, p.Protocol)
+	}
 	res, err := s.db.Exec(
-		`UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, enabled=?, default_model=? WHERE id=? AND user_id=?`,
-		p.Name, p.BaseURL, p.APIKey, string(p.Protocol), boolToInt(p.Enabled), p.DefaultModel, p.ID, p.UserID,
+		`UPDATE providers SET name=?, base_url=?, api_key=?, protocol=?, enabled=?, default_model=?, provider_type=? WHERE id=? AND user_id=?`,
+		p.Name, p.BaseURL, p.APIKey, string(p.Protocol), boolToInt(p.Enabled), p.DefaultModel, p.ProviderType, p.ID, p.UserID,
 	)
 	if err != nil {
 		return err
