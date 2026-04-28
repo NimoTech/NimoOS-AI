@@ -316,17 +316,17 @@ async def revert_run(
 async def create_session(x_user_id: str = Header(..., alias="X-User-Id")):
     session_id = str(uuid.uuid4())
     now = int(time.time())
-    _conn.execute(
+    _db().execute(
         "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
         (session_id, x_user_id, None, now, now)
     )
-    _conn.commit()
+    _db().commit()
     return {"session_id": session_id}
 
 
 @app.get("/agent/sessions")
 async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
-    rows = _conn.execute(
+    rows = _db().execute(
         "SELECT id, title, created_at, updated_at FROM sessions WHERE user_id=? ORDER BY updated_at DESC",
         (x_user_id,)
     ).fetchall()
@@ -648,11 +648,86 @@ def _stream_replay_only(events: list[dict], prefix: list[dict] | None = None) ->
     return gen()
 
 
+_db_cache: dict[str, object] = {}
+_DB_PATH_INITIAL = _DB_PATH  # the path _conn was opened against at import time
+
+
+def _db():
+    """Return a SQLite connection for the current _DB_PATH.
+
+    - When _DB_PATH hasn't been monkeypatched (equals the original import-time
+      value), return the shared _conn so existing endpoints and tests that swap
+      _conn directly keep working.
+    - When _DB_PATH has been monkeypatched to a different path (as the new
+      settings-endpoint tests do), open and cache a fresh connection against
+      that path so each test gets an isolated DB.
+    """
+    path = _DB_PATH
+    if path == _DB_PATH_INITIAL:
+        return _conn
+    if path not in _db_cache:
+        _db_cache[path] = db_module.init_db(path)
+    return _db_cache[path]
+
+
 def _read_user_thinking_defaults(conn, user_id: str):
-    """Stub: returns the hard-coded default. Task 4 replaces this with a
-    real read from the user_settings table."""
-    from provider_adapters import ThinkingConfig, ThinkingLevel
-    return ThinkingConfig(enabled=True, level=ThinkingLevel.MEDIUM)
+    """Return ThinkingConfig from user_settings, or hard-coded default."""
+    from provider_adapters import ThinkingConfig
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='thinking_default'",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return ThinkingConfig(enabled=True, level=_ThinkingLevel.MEDIUM)
+    try:
+        v = json.loads(row["value"])
+        return ThinkingConfig(
+            enabled=bool(v.get("enabled", True)),
+            level=_ThinkingLevel(v.get("level", "medium")),
+        )
+    except (json.JSONDecodeError, ValueError):
+        return ThinkingConfig(enabled=True, level=_ThinkingLevel.MEDIUM)
+
+
+@app.get("/agent/user-settings/thinking")
+async def get_thinking_defaults(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    cfg = _read_user_thinking_defaults(_db(), user_id)
+    return {"enabled": cfg.enabled, "level": cfg.level.value}
+
+
+@app.put("/agent/user-settings/thinking")
+async def put_thinking_defaults(request: Request, body: ThinkingConfigPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    conn = _db()
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES(?, 'thinking_default', ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (user_id, json.dumps({"enabled": body.enabled,
+                              "level": body.level.value}),
+         int(time.time())),
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@app.patch("/agent/sessions/{session_id}/thinking")
+async def patch_session_thinking(session_id: str, request: Request,
+                                  body: ThinkingConfigPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    conn = _db()
+    cur = conn.execute(
+        "UPDATE sessions SET thinking_enabled=?, thinking_level=?, updated_at=? "
+        "WHERE id=? AND user_id=?",
+        (1 if body.enabled else 0, body.level.value,
+         int(time.time()), session_id, user_id),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "session not found")
+    return {"ok": True}
 
 
 def _start_run(session_id: str, user_id: str, message: str,
