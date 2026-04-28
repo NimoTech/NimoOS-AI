@@ -85,3 +85,86 @@ async def test_trigger_action_emits_confirm(setup_ctx):
     event = captured["event"]
     assert event["type"] == "confirmation_required"
     assert event["confirm_id"]
+
+
+import shutil
+import skills.shell as sh
+
+
+def test_shell_argv_shape(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    argv = sh._build_argv(work, "echo hi")
+    assert argv[0] == sh.PRLIMIT_BIN
+    assert sh.BWRAP_BIN in argv
+    # work dir bound at /work, cwd /work, network shared, all unshared
+    assert "--bind" in argv and str(work) in argv
+    assert "--share-net" in argv
+    assert "--unshare-all" in argv
+    assert "--die-with-parent" in argv
+    # the user's command is the trailing argument to bash -lc
+    assert argv[-3:] == ["/bin/bash", "-lc", "echo hi"]
+
+
+def test_shell_truncate():
+    assert sh._truncate(b"hello", 100) == "hello"
+    big = ("x" * 50_000).encode()
+    out = sh._truncate(big, 1000)
+    assert "truncated" in out
+    assert len(out) < 1500  # roughly limit + a marker
+
+
+@pytest.mark.asyncio
+async def test_shell_run_command_smoke(tmp_path, monkeypatch):
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap not installed")
+    monkeypatch.setenv("NIMOOS_AGENT_SHELL_ROOT", str(tmp_path))
+    sh.WORK_ROOT = tmp_path  # module already read env at import time
+    sh.SESSION_ID_VAR.set("smoke")
+    out = await sh.run_command.on_invoke_tool(
+        MagicMock(),
+        '{"command": "echo hello && pwd && id -u"}',
+    )
+    assert "[exit 0]" in out
+    assert "hello" in out
+    assert "/work" in out
+
+
+@pytest.mark.asyncio
+async def test_shell_isolation_etc_readonly(tmp_path):
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap not installed")
+    sh.WORK_ROOT = tmp_path
+    sh.SESSION_ID_VAR.set("iso")
+    out = await sh.run_command.on_invoke_tool(
+        MagicMock(),
+        '{"command": "touch /etc/should_fail 2>&1; echo done"}',
+    )
+    assert "done" in out
+    assert "Read-only" in out or "只读" in out or "Permission" in out
+
+
+@pytest.mark.asyncio
+async def test_shell_persists_within_session(tmp_path):
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap not installed")
+    sh.WORK_ROOT = tmp_path
+    sh.SESSION_ID_VAR.set("persist")
+    await sh.run_command.on_invoke_tool(
+        MagicMock(), '{"command": "echo state > marker.txt"}'
+    )
+    out = await sh.run_command.on_invoke_tool(
+        MagicMock(), '{"command": "cat marker.txt"}'
+    )
+    assert "state" in out
+
+
+@pytest.mark.asyncio
+async def test_shell_timeout_kills():
+    if not shutil.which("bwrap"):
+        pytest.skip("bwrap not installed")
+    sh.SESSION_ID_VAR.set("timeout")
+    out = await sh.run_command.on_invoke_tool(
+        MagicMock(), '{"command": "sleep 5", "timeout_sec": 1}'
+    )
+    assert "killed" in out
