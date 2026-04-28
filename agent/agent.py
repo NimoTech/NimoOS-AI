@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -11,8 +12,15 @@ from openai import AsyncOpenAI
 
 import db as db_module
 from skills import ALL_TOOLS
-from skills.app_management import SESSION_ID_VAR, EVENT_QUEUE_VAR, CONFIRM_MGR_VAR
+from skills.app_management import (
+    SESSION_ID_VAR as APP_SESSION_VAR,
+    EVENT_QUEUE_VAR as APP_EVENT_VAR,
+    CONFIRM_MGR_VAR as APP_CONFIRM_VAR,
+)
 import skills.message_bus as mb_skills
+import skills.filesystem as fs_skills
+import skills.init_doc as init_doc
+from fs.snapshots import SnapshotStore
 
 SYSTEM_PROMPT = """You are Nimo, a general-purpose AI assistant that also has the ability to manage the user's NimoOS NAS.
 
@@ -31,6 +39,8 @@ Behavior rules:
 - For write NAS operations (install, start, stop, restart, uninstall, update, trigger), call the tool — the system shows the user a confirmation prompt automatically.
 - Match the user's language. Be concise by default; expand when the task warrants it."""
 
+_SNAPSHOT_STORE = SnapshotStore()
+
 _session_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -38,6 +48,64 @@ def _get_lock(session_id: str) -> asyncio.Lock:
     if session_id not in _session_locks:
         _session_locks[session_id] = asyncio.Lock()
     return _session_locks[session_id]
+
+
+def _compose_system_prompt(conn, session_id: str, base: str,
+                            *, max_per_file: int = 8 * 1024,
+                            max_total: int = 32 * 1024) -> str:
+    rows = conn.execute(
+        "SELECT path, kind FROM visible_resources WHERE session_id=? "
+        "ORDER BY added_at",
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return base + (
+            "\n\nNo filesystem resources are currently authorized. "
+            "The user can grant access via @-mention or the right panel."
+        )
+    summary_lines = ["",
+                     "You currently have access to the following filesystem "
+                     "resources (reads return immediately; writes enter a "
+                     "staging area for user review):",
+                     ""]
+    md_blocks: list[str] = []
+    total = 0
+    truncated = 0
+    for r in rows:
+        marker = ""
+        if r["kind"] == "folder":
+            md_path = os.path.join(r["path"], "agent.md")
+            has_md = os.path.isfile(md_path)
+            if has_md:
+                marker = ", has agent.md"
+            summary_lines.append(f"- {r['path']} (folder{marker})")
+            if has_md:
+                if total >= max_total:
+                    truncated += 1
+                else:
+                    try:
+                        with open(md_path, "r", encoding="utf-8",
+                                  errors="replace") as f:
+                            body = f.read(max_per_file)
+                    except OSError:
+                        body = ""
+                    if body:
+                        if total + len(body) > max_total:
+                            truncated += 1
+                        else:
+                            md_blocks.append(
+                                f"--- {md_path} ---\n{body}\n"
+                            )
+                            total += len(body)
+        else:
+            summary_lines.append(f"- {r['path']} (single file)")
+    block = "\n".join(summary_lines)
+    if md_blocks:
+        block += "\n\nagent.md notes from authorized folders:\n\n"
+        block += "\n".join(md_blocks)
+    if truncated:
+        block += f"\n[...{truncated} more agent.md files truncated]"
+    return base + block
 
 
 class AgentRunner:
@@ -90,6 +158,11 @@ class AgentRunner:
         provider_key: str,
         provider_url: str,
         model_name: str,
+        *,
+        kind: str = "chat",
+        chat_username: str = "",
+        user_patterns: list | None = None,
+        run_id: str = "",
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -98,19 +171,31 @@ class AgentRunner:
         async with lock:
             # `sink` is anything with an async `put(event)`. Today that's a
             # RunSink (persists+pubsubs); skills don't care about the type.
-            SESSION_ID_VAR.set(session_id)
-            EVENT_QUEUE_VAR.set(sink)
-            CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            APP_SESSION_VAR.set(session_id)
+            APP_EVENT_VAR.set(sink)
+            APP_CONFIRM_VAR.set(self._confirm_mgr)
             mb_skills.SESSION_ID_VAR.set(session_id)
             mb_skills.EVENT_QUEUE_VAR.set(sink)
             mb_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
 
+            # NEW for filesystem tools
+            fs_skills.SESSION_ID_VAR.set(session_id)
+            fs_skills.RUN_ID_VAR.set(run_id)
+            fs_skills.EVENT_QUEUE_VAR.set(sink)
+            fs_skills.DB_VAR.set(self._conn)
+            fs_skills.STORE_VAR.set(_SNAPSHOT_STORE)
+            fs_skills.CHAT_USERNAME_VAR.set(chat_username)
+            fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             model = OpenAIChatCompletionsModel(model=model_name, openai_client=client)
 
+            base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
+            full_prompt = _compose_system_prompt(self._conn, session_id, base)
+
             agent = Agent(
                 name="NimoOS Agent",
-                instructions=SYSTEM_PROMPT,
+                instructions=full_prompt,
                 tools=ALL_TOOLS,
                 model=model,
             )
