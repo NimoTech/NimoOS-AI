@@ -15,15 +15,25 @@ import db as db_module
 from agent import AgentRunner
 from confirm import ConfirmManager
 from openai import AsyncOpenAI
+from run_sink import RunSink, load_events_from_db
 import title_gen
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
-_runner = AgentRunner(_conn)
 _confirm_mgr = ConfirmManager(_conn)
+# Pass the same _confirm_mgr through so /confirm POSTs and skill register/wait
+# operate on a single in-memory _pending dict.
+_runner = AgentRunner(_conn, confirm_mgr=_confirm_mgr)
 
-# Per-session SSE queues
-_session_queues: dict[str, asyncio.Queue] = {}
+# session_id -> live RunSink. Stays populated after a run finishes so that a
+# client reconnecting moments later can still replay the run; replaced when a
+# new run starts on the same session.
+_active_runs: dict[str, RunSink] = {}
+
+# Heartbeat cadence. SSE clients (and intermediate proxies) idle-disconnect
+# after ~30s without traffic; the comment-style heartbeat keeps the channel
+# warm during long confirmation waits without polluting the event log.
+_KEEPALIVE_SECONDS = 15
 
 app = FastAPI(title="nimoos-agent")
 
@@ -334,6 +344,130 @@ async def regenerate_title(
         return _persist(fallback_title, True)
 
 
+async def _stream_from_sink(sink: RunSink, prefix: list[dict] | None = None) -> AsyncGenerator[str, None]:
+    """SSE generator that replays past events for `sink`, then live-tails.
+
+    `prefix` is an optional list of synthetic events emitted before any real
+    sink events. The /run-stream resume endpoint uses this to surface the
+    user_message that triggered the run, since the frontend (which is just
+    coming back to this session) doesn't have it locally.
+    """
+    if prefix:
+        for ev in prefix:
+            yield f"data: {json.dumps(ev)}\n\n"
+    past, sub = sink.subscribe()
+    try:
+        for ev in past:
+            yield f"data: {json.dumps(ev)}\n\n"
+            if ev.get("type") == "done":
+                # Past events already include a terminal 'done' (run finished
+                # before this client connected). Stop after replay; no future
+                # events will come.
+                return
+        while True:
+            try:
+                event = await asyncio.wait_for(sub.get(), timeout=_KEEPALIVE_SECONDS)
+            except asyncio.TimeoutError:
+                # Comment line in SSE syntax — clients ignore it but the bytes
+                # keep proxies and browsers from idle-closing the stream.
+                yield ": ka\n\n"
+                continue
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") == "done":
+                return
+    finally:
+        sink.unsubscribe(sub)
+
+
+def _stream_replay_only(events: list[dict], prefix: list[dict] | None = None) -> AsyncGenerator[str, None]:
+    """SSE generator for a run whose in-memory sink is gone (process restart).
+    Replays the persisted log; if no terminal event was ever logged, appends
+    a synthetic one so the client unblocks instead of hanging."""
+    async def gen():
+        if prefix:
+            for ev in prefix:
+                yield f"data: {json.dumps(ev)}\n\n"
+        saw_done = False
+        for ev in events:
+            yield f"data: {json.dumps(ev)}\n\n"
+            if ev.get("type") == "done":
+                saw_done = True
+        if not saw_done:
+            yield 'data: {"type": "error", "content": "agent process restarted; this run was interrupted"}\n\n'
+            yield 'data: {"type": "done"}\n\n'
+    return gen()
+
+
+def _start_run(session_id: str, user_id: str, message: str,
+               provider_key: str, provider_url: str, model: str) -> RunSink:
+    """Allocate a run row + sink and spawn the detached agent task. Returns
+    the sink so the caller can immediately subscribe."""
+    run_id = str(uuid.uuid4())
+    now = int(time.time())
+    _conn.execute(
+        "INSERT INTO agent_runs (id, session_id, user_id, status, user_message, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (run_id, session_id, user_id, "running", message, now),
+    )
+    _conn.commit()
+
+    sink = RunSink(run_id, session_id, _conn)
+    _active_runs[session_id] = sink
+
+    async def run_agent():
+        error_msg: str | None = None
+        cancelled = False
+        try:
+            await _runner.run(
+                session_id, user_id, message, sink,
+                provider_key, provider_url, model,
+            )
+        except asyncio.CancelledError:
+            # User clicked stop, or session was cancelled. Surface a clean
+            # termination so the frontend can render it and the next /run
+            # isn't blocked by a busy lock. Re-raising would skip our own
+            # finally cleanup.
+            cancelled = True
+            error_msg = "cancelled"
+            try:
+                await sink.put({"type": "error", "content": "已停止"})
+                await sink.put({"type": "done"})
+            except asyncio.CancelledError:
+                pass
+        except RuntimeError as e:
+            error_msg = "agent_busy" if "agent_busy" in str(e) else str(e)
+            if error_msg == "agent_busy":
+                await sink.put({"type": "error", "content": "Agent is processing a previous message. Please wait."})
+            else:
+                await sink.put({"type": "error", "content": error_msg})
+            await sink.put({"type": "done"})
+        except Exception as e:
+            error_msg = str(e)
+            await sink.put({"type": "error", "content": error_msg})
+            await sink.put({"type": "done"})
+        finally:
+            try:
+                _conn.execute(
+                    "UPDATE agent_runs SET status=?, error=?, finished_at=? WHERE id=?",
+                    ("error" if error_msg else "done", error_msg, int(time.time()), run_id),
+                )
+                _conn.commit()
+            except Exception:
+                pass
+            # Don't leave references to a finished task pinned in _active_runs;
+            # the sink is still kept (so very-late subscribers can replay) but
+            # the task ref is cleared so GC can reclaim its frames.
+            sink.task = None
+        # Suppress CancelledError so it doesn't trigger asyncio's
+        # 'task exception was never retrieved' warnings; the sink already
+        # emitted error+done, which is the user-visible signal we want.
+        _ = cancelled
+
+    task = asyncio.create_task(run_agent())
+    sink.task = task
+    return sink
+
+
 @app.post("/agent/sessions/{session_id}/run")
 async def run_session(
     session_id: str,
@@ -347,44 +481,86 @@ async def run_session(
     if not row:
         raise HTTPException(status_code=404, detail="session not found")
 
-    queue: asyncio.Queue = asyncio.Queue()
-    _session_queues[session_id] = queue
+    # Reject overlapping runs on the same session. The agent.py lock would
+    # also catch this, but rejecting here means we don't allocate an empty
+    # run row for the rejected request.
+    existing = _active_runs.get(session_id)
+    if existing is not None and not existing.is_done:
+        raise HTTPException(status_code=409, detail="agent_busy")
 
-    async def run_agent():
-        try:
-            await _runner.run(
-                session_id, x_user_id, req.message, queue,
-                x_agent_provider_key, x_agent_provider_url, req.model,
-            )
-        except RuntimeError as e:
-            if "agent_busy" in str(e):
-                await queue.put({"type": "error", "content": "Agent is processing a previous message. Please wait."})
-            else:
-                await queue.put({"type": "error", "content": str(e)})
-            await queue.put({"type": "done"})
-        except Exception as e:
-            await queue.put({"type": "error", "content": str(e)})
-            await queue.put({"type": "done"})
+    sink = _start_run(
+        session_id, x_user_id, req.message,
+        x_agent_provider_key, x_agent_provider_url, req.model,
+    )
+    return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "Connection": "keep-alive",
+                                      "X-Accel-Buffering": "no"})
 
-    asyncio.create_task(run_agent())
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=120)
-                except asyncio.TimeoutError:
-                    yield 'data: {"type": "error", "content": "timeout"}\n\n'
-                    yield 'data: {"type": "done"}\n\n'
-                    break
-                yield f"data: {json.dumps(event)}\n\n"
-                if event.get("type") == "done":
-                    break
-        finally:
-            _session_queues.pop(session_id, None)
+@app.get("/agent/sessions/{session_id}/run-stream")
+async def stream_active_run(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    """Reattach to the latest run for this session.
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    Use this on page load / tab reopen to pick up a run that started in a
+    previous browser session. Replays everything from the event log, then
+    live-tails any new events until the run finishes.
+
+    Returns 204 (no body) when the session has never had a run, so the UI
+    can short-circuit without parsing an empty SSE stream.
+    """
+    row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",
+                        (session_id, x_user_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Three cases the resume endpoint serves:
+    #   1. Live sink, not yet done — stream with prefix (live tail).
+    #   2. Sink/DB run in 'error' state — _save_history never ran, /messages
+    #      misses this turn, so we replay from the event log to surface it.
+    #   3. Sink/DB run in 'done' state — /messages already has it; 204.
+    sse_headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    sink = _active_runs.get(session_id)
+    if sink is not None and not sink.is_done:
+        run_row = _conn.execute(
+            "SELECT user_message FROM agent_runs WHERE id=?",
+            (sink.run_id,),
+        ).fetchone()
+        prefix = []
+        if run_row and run_row["user_message"]:
+            prefix.append({"type": "user_message", "content": run_row["user_message"]})
+        return StreamingResponse(_stream_from_sink(sink, prefix=prefix),
+                                 media_type="text/event-stream", headers=sse_headers)
+
+    latest = _conn.execute(
+        "SELECT id, user_message, status FROM agent_runs "
+        "WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if not latest:
+        return JSONResponse(status_code=204, content=None)
+
+    if latest["status"] == "done":
+        # _save_history persisted this turn into messages, /messages will
+        # render it. Nothing for the resume stream to do.
+        return JSONResponse(status_code=204, content=None)
+
+    # status='error' (or anything non-'done' that slipped through). Replay
+    # whatever the event log captured so the user sees their interrupted turn.
+    events = load_events_from_db(_conn, latest["id"])
+    prefix = []
+    if latest["user_message"]:
+        prefix.append({"type": "user_message", "content": latest["user_message"]})
+    return StreamingResponse(_stream_replay_only(events, prefix=prefix),
+                             media_type="text/event-stream", headers=sse_headers)
 
 
 @app.post("/agent/sessions/{session_id}/confirm")
@@ -393,19 +569,25 @@ async def confirm_session(
     request: Request,
     x_user_id: str = Header(..., alias="X-User-Id"),
 ):
+    confirmed = True
+    confirm_id = ""
+    body = await request.body()
+    if body:
+        try:
+            import json as _json
+            data = _json.loads(body)
+            confirmed = bool(data.get("confirmed", True))
+            confirm_id = str(data.get("confirm_id") or "")
+        except Exception:
+            pass
+    if not confirm_id:
+        raise HTTPException(status_code=400, detail="confirm_id_required")
     try:
-        body = await request.body()
-        confirmed = True
-        if body:
-            try:
-                import json as _json
-                data = _json.loads(body)
-                confirmed = bool(data.get("confirmed", True))
-            except Exception:
-                pass
-        _confirm_mgr.resolve(session_id, confirmed)
-    except KeyError:
-        raise HTTPException(status_code=409, detail="session_expired")
+        _confirm_mgr.resolve(confirm_id, confirmed, expected_session_id=session_id)
+    except KeyError as e:
+        # confirm_expired (id unknown / already resolved / agent restarted) or
+        # confirm_session_mismatch (id belongs to another session). Both are 409.
+        raise HTTPException(status_code=409, detail=str(e.args[0]) if e.args else "confirm_expired")
     return {"ok": True}
 
 
@@ -414,11 +596,27 @@ async def cancel_session(
     session_id: str,
     x_user_id: str = Header(..., alias="X-User-Id"),
 ):
-    try:
-        _confirm_mgr.resolve(session_id, confirmed=False)
-    except KeyError:
-        raise HTTPException(status_code=409, detail="session_expired")
-    return {"ok": True}
+    # 1) Reject every in-flight confirmation for this session.
+    confirms_cancelled = _confirm_mgr.cancel_session(session_id)
+    # 2) Cancel the agent task itself if it's still running. Without this,
+    #    the per-session lock in agent.py stays held and the next /run is
+    #    rejected with agent_busy. The wrapper around _runner.run catches
+    #    CancelledError and emits a clean error+done pair.
+    #
+    # We AWAIT the task's completion before returning so that when the
+    # client's stop POST resolves, the lock is guaranteed released and an
+    # immediate follow-up /run won't race into agent_busy.
+    task_cancelled = False
+    sink = _active_runs.get(session_id)
+    if sink is not None and sink.task is not None and not sink.task.done():
+        sink.task.cancel()
+        task_cancelled = True
+        try:
+            await asyncio.wait_for(sink.task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            # We don't care why the task ended — only that the lock is freed.
+            pass
+    return {"ok": True, "confirms_cancelled": confirms_cancelled, "task_cancelled": task_cancelled}
 
 
 if __name__ == "__main__":

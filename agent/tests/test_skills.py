@@ -32,15 +32,20 @@ async def test_search_apps_validates_query():
 @pytest.mark.asyncio
 async def test_stop_app_emits_confirmation_event(setup_ctx):
     queue, mgr = setup_ctx
-    async def auto_confirm():
-        await asyncio.sleep(0.05)
-        mgr.resolve("test-session", confirmed=True)
-    asyncio.create_task(auto_confirm())
+    captured = {}
+
+    async def driver():
+        evt = await queue.get()
+        captured["event"] = evt
+        mgr.resolve(evt["confirm_id"], confirmed=True)
+
+    asyncio.create_task(driver())
     with patch("skills.app_management.run_cli", new_callable=AsyncMock, return_value="stopped"):
         await am.stop_app.on_invoke_tool(MagicMock(), '{"app_id": "42"}')
-    event = queue.get_nowait()
+    event = captured["event"]
     assert event["type"] == "confirmation_required"
     assert event["action"] == "stop_app"
+    assert event["confirm_id"]  # non-empty
 
 import skills.storage as st
 import skills.healthcheck as hc
@@ -66,12 +71,17 @@ async def test_trigger_action_emits_confirm(setup_ctx):
     mb.SESSION_ID_VAR.set("test-session")
     mb.EVENT_QUEUE_VAR.set(queue)
     mb.CONFIRM_MGR_VAR.set(mgr)
-    async def auto_cancel():
-        await asyncio.sleep(0.05)
-        mgr.resolve("test-session", confirmed=False)
-    asyncio.create_task(auto_cancel())
+    captured = {}
+
+    async def driver():
+        evt = await queue.get()
+        captured["event"] = evt
+        mgr.resolve(evt["confirm_id"], confirmed=False)
+
+    asyncio.create_task(driver())
     with patch("skills.message_bus.run_cli", new_callable=AsyncMock):
         result = await mb.trigger_action.on_invoke_tool(MagicMock(), '{"action_type": "backup.start", "data": "{}"}')
     assert "cancelled" in result.lower()
-    event = queue.get_nowait()
+    event = captured["event"]
     assert event["type"] == "confirmation_required"
+    assert event["confirm_id"]

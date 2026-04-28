@@ -42,13 +42,15 @@ async def trigger_action(action_type: str, data: str = "{}") -> str:
     description = f"Trigger MessageBus action '{action_type}' with data: {data}"
     command = f"nimoos-cli message-bus trigger action --type {action_type} --data {data}"
 
+    confirm_id = mgr.register(session_id, "trigger_action", description, command)
     await queue.put({
         "type": "confirmation_required",
+        "confirm_id": confirm_id,
         "action": "trigger_action",
         "description": description,
         "command": command,
     })
-    confirmed = await mgr.wait(session_id, "trigger_action", description, command)
+    confirmed = await mgr.wait(confirm_id)
     if not confirmed:
         return "Operation cancelled by user."
     return await run_cli([CLI_BIN, "message-bus", "trigger", "action",

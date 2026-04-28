@@ -61,13 +61,15 @@ async def show_app(app_id: str) -> str:
 async def _write_op(action: str, description: str, command_preview: str, cli_cmd: list[str]) -> str:
     """Common pattern for write operations: emit confirm event, wait, execute."""
     session_id = _session_id()
+    confirm_id = _mgr().register(session_id, action, description, command_preview)
     await _queue().put({
         "type": "confirmation_required",
+        "confirm_id": confirm_id,
         "action": action,
         "description": description,
         "command": command_preview,
     })
-    confirmed = await _mgr().wait(session_id, action, description, command_preview)
+    confirmed = await _mgr().wait(confirm_id)
     if not confirmed:
         return "Operation cancelled by user."
     return await run_cli(cli_cmd)
@@ -79,13 +81,15 @@ async def install_app(yaml_content: str) -> str:
     session_id = _session_id()
     description = "Install a new application from YAML definition. Confirm to proceed."
     command = "nimoos-cli app-management install <yaml>"
+    confirm_id = _mgr().register(session_id, "install_app", description, command)
     await _queue().put({
         "type": "confirmation_required",
+        "confirm_id": confirm_id,
         "action": "install_app",
         "description": description,
         "command": command,
     })
-    confirmed = await _mgr().wait(session_id, "install_app", description, command)
+    confirmed = await _mgr().wait(confirm_id)
     if not confirmed:
         return "Operation cancelled by user."
     return await run_cli_with_yaml([CLI_BIN, "app-management", "install"], yaml_content)
