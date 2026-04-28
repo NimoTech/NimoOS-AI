@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 from agents import Agent, Runner
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+from agents.models.reasoning_content_replay import default_should_replay_reasoning_content
 from openai import AsyncOpenAI
 
 import db as db_module
@@ -19,6 +20,7 @@ from skills.app_management import (
 )
 import skills.message_bus as mb_skills
 import skills.filesystem as fs_skills
+import skills.shell as shell_skills
 import skills.init_doc as init_doc
 from fs.snapshots import SnapshotStore
 
@@ -187,8 +189,22 @@ class AgentRunner:
             fs_skills.CHAT_USERNAME_VAR.set(chat_username)
             fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
 
+            shell_skills.SESSION_ID_VAR.set(session_id)
+
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
-            model = OpenAIChatCompletionsModel(model=model_name, openai_client=client)
+            # `should_replay_reasoning_content` lets the SDK inject prior
+            # `reasoning_content` back onto assistant messages when replaying
+            # history. DeepSeek thinking-mode (deepseek-v4-flash, deepseek-reasoner)
+            # rejects requests where this field is missing on assistant turns
+            # that originally produced it. The SDK ships a default policy that
+            # handles DeepSeek correctly; not passing it (default None) means
+            # no replay, which is why those models hit "reasoning_content must
+            # be passed back" 400s mid-conversation.
+            model = OpenAIChatCompletionsModel(
+                model=model_name,
+                openai_client=client,
+                should_replay_reasoning_content=default_should_replay_reasoning_content,
+            )
 
             base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
             full_prompt = _compose_system_prompt(self._conn, session_id, base)
@@ -202,6 +218,7 @@ class AgentRunner:
 
             history = self._load_history(session_id)
             input_messages = history + [{"role": "user", "content": message}]
+            input_messages = _inject_synthetic_reasoning(input_messages)
 
             try:
                 stream = Runner.run_streamed(agent, input_messages)
@@ -244,6 +261,46 @@ class AgentRunner:
                 await sink.put({"type": "error", "content": str(e)})
             finally:
                 await sink.put({"type": "done"})
+
+
+def _inject_synthetic_reasoning(items: list) -> list:
+    """Insert a placeholder reasoning item before any assistant message that
+    isn't already preceded by one.
+
+    DeepSeek thinking-mode rejects requests where any prior assistant turn is
+    missing `reasoning_content`. The Agents SDK only fills that field when a
+    reasoning item directly precedes the message; if the SDK didn't capture
+    one (which happens occasionally for short summary turns), the resulting
+    chat-completions message has no reasoning_content and the API returns 400.
+    A non-empty placeholder summary keeps the conversation valid without
+    pretending the model "thought" anything specific.
+    """
+    if not isinstance(items, list):
+        return items
+    out: list = []
+    for it in items:
+        is_assistant_msg = (
+            isinstance(it, dict)
+            and it.get("type") == "message"
+            and it.get("role") == "assistant"
+        )
+        if is_assistant_msg:
+            prev = out[-1] if out else None
+            prev_is_reasoning = (
+                isinstance(prev, dict) and prev.get("type") == "reasoning"
+            )
+            if not prev_is_reasoning:
+                out.append({
+                    "type": "reasoning",
+                    "id": "__synthetic__",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "(no reasoning captured for this turn)",
+                    }],
+                    "provider_data": {"model": "deepseek-synthetic"},
+                })
+        out.append(it)
+    return out
 
 
 def _raw_attr(obj, key, default=None):
@@ -352,6 +409,7 @@ def _convert_event(event, call_names: dict[str, str] | None = None,
                     "type": "tool_call",
                     "tool": name,
                     "args": args,
+                    "call_id": call_id or "",
                 }
 
             # Tool result — output item only carries call_id, so look up the
@@ -368,6 +426,7 @@ def _convert_event(event, call_names: dict[str, str] | None = None,
                     "type": "tool_result",
                     "tool": tool_name,
                     "content": str(output) if output is not None else "",
+                    "call_id": call_id or "",
                 }
 
     except Exception:
