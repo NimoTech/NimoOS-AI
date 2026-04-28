@@ -25,15 +25,31 @@ type providerRequest struct {
 	DefaultModel *string           `json:"default_model"`
 }
 
-// safeProvider is the response shape — never exposes the encrypted api_key.
-type safeProvider struct {
-	ID           int64            `json:"id"`
-	Name         string           `json:"name"`
-	BaseURL      string           `json:"base_url"`
-	Protocol     service.Protocol `json:"protocol"`
-	Enabled      bool             `json:"enabled"`
-	HasKey       bool             `json:"has_key"`
-	DefaultModel string           `json:"default_model"`
+// providerDTO is the response shape — never exposes the encrypted api_key.
+type providerDTO struct {
+	ID               int64            `json:"id"`
+	Name             string           `json:"name"`
+	BaseURL          string           `json:"base_url"`
+	Protocol         service.Protocol `json:"protocol"`
+	Enabled          bool             `json:"enabled"`
+	HasKey           bool             `json:"has_key"`
+	DefaultModel     string           `json:"default_model"`
+	ProviderType     string           `json:"provider_type"`
+	SupportsThinking bool             `json:"supports_thinking"`
+}
+
+func toDTO(p *service.Provider) providerDTO {
+	return providerDTO{
+		ID:               p.ID,
+		Name:             p.Name,
+		BaseURL:          p.BaseURL,
+		Protocol:         p.Protocol,
+		Enabled:          p.Enabled,
+		HasKey:           p.APIKey != "",
+		DefaultModel:     p.DefaultModel,
+		ProviderType:     p.ProviderType,
+		SupportsThinking: service.SupportsThinking(p.ProviderType, p.DefaultModel),
+	}
 }
 
 func (h *ProvidersHandler) List(c echo.Context) error {
@@ -45,13 +61,9 @@ func (h *ProvidersHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	result := make([]safeProvider, len(providers))
+	result := make([]providerDTO, len(providers))
 	for i, p := range providers {
-		result[i] = safeProvider{
-			ID: p.ID, Name: p.Name, BaseURL: p.BaseURL,
-			Protocol: p.Protocol, Enabled: p.Enabled, HasKey: p.APIKey != "",
-			DefaultModel: p.DefaultModel,
-		}
+		result[i] = toDTO(p)
 	}
 	return c.JSON(http.StatusOK, result)
 }
