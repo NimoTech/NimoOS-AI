@@ -12,6 +12,9 @@ from agents.models.reasoning_content_replay import default_should_replay_reasoni
 from openai import AsyncOpenAI
 
 import db as db_module
+from provider_adapters import (
+    ProviderType, ThinkingConfig, build_model_settings,
+)
 from skills import ALL_TOOLS
 from skills.app_management import (
     SESSION_ID_VAR as APP_SESSION_VAR,
@@ -161,6 +164,8 @@ class AgentRunner:
         provider_url: str,
         model_name: str,
         *,
+        provider_type: str = "other",
+        thinking: "ThinkingConfig | None" = None,
         kind: str = "chat",
         chat_username: str = "",
         user_patterns: list | None = None,
@@ -200,9 +205,16 @@ class AgentRunner:
             # handles DeepSeek correctly; not passing it (default None) means
             # no replay, which is why those models hit "reasoning_content must
             # be passed back" 400s mid-conversation.
+            try:
+                pt = ProviderType(provider_type)
+            except ValueError:
+                pt = ProviderType.OTHER
+            model_settings = build_model_settings(pt, thinking)
+
             model = OpenAIChatCompletionsModel(
                 model=model_name,
                 openai_client=client,
+                model_settings=model_settings,
                 should_replay_reasoning_content=default_should_replay_reasoning_content,
             )
 

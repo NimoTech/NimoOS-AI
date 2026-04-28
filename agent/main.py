@@ -72,11 +72,20 @@ _KEEPALIVE_SECONDS = 15
 app = FastAPI(title="nimoos-agent")
 
 
+from provider_adapters import ThinkingLevel as _ThinkingLevel
+
+
+class ThinkingConfigPayload(BaseModel):
+    enabled: bool
+    level: _ThinkingLevel
+
+
 class RunRequest(BaseModel):
     message: str
     model: str = "gpt-4o-mini"
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
+    thinking: ThinkingConfigPayload | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -639,10 +648,18 @@ def _stream_replay_only(events: list[dict], prefix: list[dict] | None = None) ->
     return gen()
 
 
+def _read_user_thinking_defaults(conn, user_id: str):
+    """Stub: returns the hard-coded default. Task 4 replaces this with a
+    real read from the user_settings table."""
+    from provider_adapters import ThinkingConfig, ThinkingLevel
+    return ThinkingConfig(enabled=True, level=ThinkingLevel.MEDIUM)
+
+
 def _start_run(session_id: str, user_id: str, message: str,
                provider_key: str, provider_url: str, model: str,
                *, kind: str = "chat", chat_username: str = "",
-               user_patterns: list[str] | None = None) -> RunSink:
+               user_patterns: list[str] | None = None,
+               thinking=None, provider_type: str = "other") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -667,6 +684,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                 kind=kind, chat_username=chat_username,
                 user_patterns=user_patterns or [],
                 run_id=run_id,
+                provider_type=provider_type,
+                thinking=thinking,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -748,11 +767,38 @@ async def run_session(
         raise HTTPException(status_code=409, detail="agent_busy")
 
     user_patterns = _user_patterns_from_header(request)
+
+    # Resolve thinking config: request body → session row → user_settings default.
+    from provider_adapters import ThinkingConfig, ThinkingLevel
+    thinking_cfg = None
+    if req.thinking is not None:
+        thinking_cfg = ThinkingConfig(
+            enabled=req.thinking.enabled,
+            level=req.thinking.level,
+        )
+    else:
+        row = _conn.execute(
+            "SELECT thinking_enabled, thinking_level FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if row and row["thinking_enabled"] is not None and row["thinking_level"]:
+            thinking_cfg = ThinkingConfig(
+                enabled=bool(row["thinking_enabled"]),
+                level=ThinkingLevel(row["thinking_level"]),
+            )
+        else:
+            # Fall back to user-level defaults; if missing, hard-code.
+            thinking_cfg = _read_user_thinking_defaults(_conn, x_user_id)
+
+    provider_type = request.headers.get("X-Agent-Provider-Type", "other")
+
     sink = _start_run(
         session_id, x_user_id, req.message,
         x_agent_provider_key, x_agent_provider_url, req.model,
         kind=req.kind, chat_username=x_user_name,
         user_patterns=user_patterns,
+        thinking=thinking_cfg,
+        provider_type=provider_type,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
