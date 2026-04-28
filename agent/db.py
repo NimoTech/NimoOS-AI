@@ -1,3 +1,5 @@
+import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -62,7 +64,43 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_pending_session_id ON pending_confirmations(session_id);
 CREATE INDEX IF NOT EXISTS idx_runs_session ON agent_runs(session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS visible_resources (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK(kind IN ('folder','file')),
+    added_at    INTEGER NOT NULL,
+    UNIQUE(session_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS staged_changes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id          TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    op              TEXT NOT NULL CHECK(op IN
+                       ('write','edit','delete_file','delete_dir','mkdir','rename')),
+    path            TEXT NOT NULL,
+    dst_path        TEXT,
+    snapshot_path   TEXT,
+    snapshot_kind   TEXT CHECK(snapshot_kind IN ('file','tar') OR snapshot_kind IS NULL),
+    original_uid    INTEGER,
+    original_gid    INTEGER,
+    original_mode   INTEGER,
+    size_bytes      INTEGER,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                     CHECK(status IN ('pending','committed','reverted','orphan')),
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_staged_run ON staged_changes(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_staged_session_pending
+  ON staged_changes(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_visible_session
+  ON visible_resources(session_id);
 """
+
+_DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
 
 _CRASHED_ERROR_PAYLOAD = (
     '{"type": "error", "content": "agent process restarted; this run was interrupted"}'
@@ -70,9 +108,10 @@ _CRASHED_ERROR_PAYLOAD = (
 _CRASHED_DONE_PAYLOAD = '{"type": "done"}'
 
 
-def init_db(path: str | None = None) -> sqlite3.Connection:
+def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlite3.Connection:
     import time
     db_path = path or str(_DB_PATH)
+    snaps = snapshots_root or _DEFAULT_SNAPSHOTS_ROOT
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # Drop the transient pending_confirmations table on every startup. Rows
@@ -109,6 +148,33 @@ def init_db(path: str | None = None) -> sqlite3.Connection:
             "UPDATE agent_runs SET status='error', error='agent_restarted', finished_at=? WHERE id=?",
             (now, run_id),
         )
+
+    # NEW: staged_changes orphan detection — pending rows whose snapshot files
+    # no longer exist on disk are marked orphan so they cannot be reverted.
+    pending = conn.execute(
+        "SELECT id, snapshot_path, op FROM staged_changes WHERE status='pending'"
+    ).fetchall()
+    for row in pending:
+        sp = row["snapshot_path"]
+        op = row["op"]
+        # Ops that do not require a snapshot: mkdir, rename
+        if op in ("mkdir", "rename"):
+            continue
+        if sp and not os.path.exists(sp):
+            conn.execute("UPDATE staged_changes SET status='orphan' WHERE id=?",
+                         (row["id"],))
+
+    # NEW: prune ghost sidecar dirs (session dirs whose session_id is no longer
+    # in the sessions table — left over from a deleted or never-committed session).
+    if os.path.isdir(snaps):
+        live = {r["id"] for r in conn.execute("SELECT id FROM sessions")}
+        for entry in os.listdir(snaps):
+            full = os.path.join(snaps, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry not in live:
+                shutil.rmtree(full, ignore_errors=True)
+
     conn.commit()
     return conn
 
