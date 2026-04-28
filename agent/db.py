@@ -10,11 +10,21 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,
+    id                TEXT PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    title             TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    thinking_enabled  INTEGER,
+    thinking_level    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
     user_id     TEXT NOT NULL,
-    title       TEXT,
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (user_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -119,6 +129,12 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     # this also handles the schema migration from the old session_id PK shape.
     conn.execute("DROP TABLE IF EXISTS pending_confirmations")
     conn.executescript(_SCHEMA)
+    # Idempotent ALTER for existing databases without thinking columns.
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "thinking_enabled" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN thinking_enabled INTEGER")
+    if "thinking_level" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN thinking_level TEXT")
     conn.execute("PRAGMA foreign_keys=ON")
 
     # Any run still flagged 'running' on startup means the prior process died
