@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import json
 import os
+import shutil
 import time
 import uuid
 from typing import AsyncGenerator
@@ -17,6 +19,10 @@ from confirm import ConfirmManager
 from openai import AsyncOpenAI
 from run_sink import RunSink, load_events_from_db
 import title_gen
+from fs import paths as _fs_paths
+from fs import ignore as _fs_ignore
+from fs import staging as _fs_staging
+from fs.snapshots import SnapshotStore
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
@@ -24,6 +30,34 @@ _confirm_mgr = ConfirmManager(_conn)
 # Pass the same _confirm_mgr through so /confirm POSTs and skill register/wait
 # operate on a single in-memory _pending dict.
 _runner = AgentRunner(_conn, confirm_mgr=_confirm_mgr)
+
+_SNAPSHOTS_ROOT = os.environ.get(
+    "AGENT_SNAPSHOTS_ROOT", "/var/lib/nimoos/ai/agent/snapshots")
+_snapshots_root = _SNAPSHOTS_ROOT  # exposed for tests to monkeypatch
+_snapshot_store = SnapshotStore(root=_SNAPSHOTS_ROOT)
+
+
+def _user_patterns_from_header(request: Request) -> list[str]:
+    raw = request.headers.get("X-Agent-User-Blacklist", "")
+    if not raw:
+        return []
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        data = json.loads(decoded)
+        if isinstance(data, list):
+            return [str(s) for s in data][:1024]
+    except Exception:
+        return []
+    return []
+
+
+def _assert_owns_session(session_id: str, user_id: str) -> None:
+    row = _conn.execute(
+        "SELECT id FROM sessions WHERE id=? AND user_id=?",
+        (session_id, user_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
 
 # session_id -> live RunSink. Stays populated after a run finishes so that a
 # client reconnecting moments later can still replay the run; replaced when a
@@ -41,6 +75,8 @@ app = FastAPI(title="nimoos-agent")
 class RunRequest(BaseModel):
     message: str
     model: str = "gpt-4o-mini"
+    kind: str = "chat"          # 'chat' | 'init'
+    init_target: str | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -61,6 +97,210 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/agent/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# /agent/fs/list
+# ---------------------------------------------------------------------------
+
+@app.get("/agent/fs/list")
+async def fs_list(
+    path: str,
+    request: Request,
+    show_ignored: int = 0,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    abs_ = os.path.abspath(path)
+    if not os.path.isdir(abs_):
+        raise HTTPException(status_code=404, detail="not a directory")
+    user_patterns = _user_patterns_from_header(request)
+
+    out = []
+    try:
+        entries = list(os.scandir(abs_))
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="permission denied")
+    for entry in sorted(entries, key=lambda e: e.name):
+        item = {
+            "name": entry.name,
+            "path": entry.path,
+            "kind": "dir" if entry.is_dir(follow_symlinks=False) else "file",
+            "ignored": False,
+            "ignored_reason": None,
+        }
+        try:
+            st = entry.stat(follow_symlinks=False)
+            item["size"] = st.st_size
+            item["modified"] = int(st.st_mtime)
+        except OSError:
+            item["size"] = None
+            item["modified"] = None
+        try:
+            _fs_ignore.gate(entry.path, [], user_patterns,
+                            allow_gitignore_override=False)
+        except _fs_ignore.BlockedImplicit:
+            continue
+        except _fs_ignore.BlockedHardBlacklist:
+            continue
+        except _fs_ignore.BlockedGitignore:
+            if not show_ignored:
+                continue
+            item["ignored"] = True
+            item["ignored_reason"] = "gitignore"
+        out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Visible-resources endpoints
+# ---------------------------------------------------------------------------
+
+class VisibleResourceCreate(BaseModel):
+    path: str
+    kind: str = "folder"  # 'folder' | 'file'
+    force: bool = False
+
+
+@app.get("/agent/sessions/{session_id}/visible-resources")
+async def list_visible_resources(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    rows = _conn.execute(
+        "SELECT id, path, kind, added_at FROM visible_resources "
+        "WHERE session_id=? ORDER BY added_at",
+        (session_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/agent/sessions/{session_id}/visible-resources")
+async def add_visible_resource(
+    session_id: str,
+    body: VisibleResourceCreate,
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    if body.kind not in ("folder", "file"):
+        raise HTTPException(status_code=400, detail="kind must be folder|file")
+    abs_ = os.path.abspath(body.path)
+    if not os.path.exists(abs_):
+        raise HTTPException(status_code=404, detail="path does not exist")
+    if (body.kind == "folder") != os.path.isdir(abs_):
+        raise HTTPException(status_code=400, detail="kind/type mismatch")
+
+    user_patterns = _user_patterns_from_header(request)
+    # For directories we probe with a trailing slash so that directory-anchored
+    # blacklist patterns (e.g. "/etc/") are correctly matched by pathspec.
+    gate_path = (abs_ + "/") if body.kind == "folder" else abs_
+    try:
+        _fs_ignore.gate(gate_path, [], user_patterns,
+                        allow_gitignore_override=body.force)
+    except _fs_ignore.BlockedImplicit:
+        raise HTTPException(status_code=403, detail="implicit ignore")
+    except _fs_ignore.BlockedHardBlacklist:
+        raise HTTPException(status_code=403, detail="hard blacklist")
+    except _fs_ignore.BlockedGitignore:
+        raise HTTPException(status_code=409,
+                            detail="gitignore: pass force=true to override")
+
+    # Reject if agent currently busy on this session
+    from agent import _get_lock
+    if _get_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="agent_busy")
+
+    cur = _conn.execute(
+        "INSERT INTO visible_resources (session_id, path, kind, added_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(session_id, path) DO NOTHING",
+        (session_id, abs_, body.kind, int(time.time())),
+    )
+    _conn.commit()
+    rid = cur.lastrowid
+    return {"id": rid, "path": abs_, "kind": body.kind}
+
+
+@app.delete("/agent/sessions/{session_id}/visible-resources/{res_id}")
+async def remove_visible_resource(
+    session_id: str,
+    res_id: int,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    from agent import _get_lock
+    if _get_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="agent_busy")
+    _conn.execute(
+        "DELETE FROM visible_resources WHERE id=? AND session_id=?",
+        (res_id, session_id),
+    )
+    _conn.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Staged-changes endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/agent/sessions/{session_id}/staged-changes")
+async def list_staged_changes(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    rows = _conn.execute(
+        "SELECT id, run_id, seq, op, path, dst_path, snapshot_path, "
+        "       size_bytes, status, created_at "
+        "FROM staged_changes "
+        "WHERE session_id=? AND status IN ('pending','orphan') "
+        "ORDER BY run_id, seq",
+        (session_id,),
+    ).fetchall()
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        sm = (bool(r["snapshot_path"]) and not os.path.exists(r["snapshot_path"])) \
+             or r["status"] == "orphan"
+        run = grouped.setdefault(r["run_id"], {
+            "run_id": r["run_id"], "created_at": r["created_at"], "items": []
+        })
+        run["items"].append({
+            "seq": r["seq"], "op": r["op"], "path": r["path"],
+            "dst_path": r["dst_path"], "size_bytes": r["size_bytes"],
+            "snapshot_missing": sm,
+        })
+    return list(grouped.values())
+
+
+@app.post("/agent/sessions/{session_id}/staged-changes/commit")
+async def commit_staged(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    from agent import _get_lock
+    if _get_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="agent_busy")
+    _fs_staging.commit_session(_conn, _snapshot_store, session_id)
+    return {"ok": True}
+
+
+@app.post("/agent/sessions/{session_id}/staged-changes/runs/{run_id}/revert")
+async def revert_run(
+    session_id: str,
+    run_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    from agent import _get_lock
+    if _get_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="agent_busy")
+    res = _fs_staging.revert_run(_conn, _snapshot_store, session_id, run_id)
+    if res["status"] == "snapshot_missing":
+        raise HTTPException(status_code=409, detail="snapshot_missing")
+    if res["status"] == "partial":
+        return JSONResponse(status_code=207, content=res)
+    return res
 
 
 @app.post("/agent/sessions")
@@ -89,6 +329,7 @@ async def delete_session(session_id: str, x_user_id: str = Header(..., alias="X-
     _conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
     _conn.execute("DELETE FROM sessions WHERE id=? AND user_id=?", (session_id, x_user_id))
     _conn.commit()
+    shutil.rmtree(os.path.join(_snapshots_root, session_id), ignore_errors=True)
     return {"ok": True}
 
 
@@ -399,7 +640,9 @@ def _stream_replay_only(events: list[dict], prefix: list[dict] | None = None) ->
 
 
 def _start_run(session_id: str, user_id: str, message: str,
-               provider_key: str, provider_url: str, model: str) -> RunSink:
+               provider_key: str, provider_url: str, model: str,
+               *, kind: str = "chat", chat_username: str = "",
+               user_patterns: list[str] | None = None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -421,6 +664,9 @@ def _start_run(session_id: str, user_id: str, message: str,
             await _runner.run(
                 session_id, user_id, message, sink,
                 provider_key, provider_url, model,
+                kind=kind, chat_username=chat_username,
+                user_patterns=user_patterns or [],
+                run_id=run_id,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -472,14 +718,27 @@ def _start_run(session_id: str, user_id: str, message: str,
 async def run_session(
     session_id: str,
     req: RunRequest,
+    request: Request,
     x_user_id: str = Header(..., alias="X-User-Id"),
+    x_user_name: str = Header("", alias="X-User-Name"),
     x_agent_provider_key: str = Header(..., alias="X-Agent-Provider-Key"),
     x_agent_provider_url: str = Header(..., alias="X-Agent-Provider-Url"),
 ):
-    row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",
-                        (session_id, x_user_id)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="session not found")
+    _assert_owns_session(session_id, x_user_id)
+
+    if req.kind == "init":
+        if not req.init_target:
+            raise HTTPException(status_code=400,
+                                detail="init_target required when kind=init")
+        target = os.path.abspath(req.init_target)
+        if not os.path.isdir(target):
+            raise HTTPException(status_code=404, detail="init_target not a directory")
+        _conn.execute(
+            "INSERT INTO visible_resources (session_id, path, kind, added_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(session_id, path) DO NOTHING",
+            (session_id, target, "folder", int(time.time())),
+        )
+        _conn.commit()
 
     # Reject overlapping runs on the same session. The agent.py lock would
     # also catch this, but rejecting here means we don't allocate an empty
@@ -488,9 +747,12 @@ async def run_session(
     if existing is not None and not existing.is_done:
         raise HTTPException(status_code=409, detail="agent_busy")
 
+    user_patterns = _user_patterns_from_header(request)
     sink = _start_run(
         session_id, x_user_id, req.message,
         x_agent_provider_key, x_agent_provider_url, req.model,
+        kind=req.kind, chat_username=x_user_name,
+        user_patterns=user_patterns,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
