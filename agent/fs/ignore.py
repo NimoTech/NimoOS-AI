@@ -33,15 +33,17 @@ IMPLICIT_IGNORE = [
 ]
 
 BUILTIN_HARD_BLACKLIST = [
-    # credentials / keys
+    # credentials / keys (unanchored: block anywhere in the tree)
     ".ssh/", ".gnupg/", ".pki/", ".aws/",
     ".config/gcloud/", ".docker/config.json",
     "*.key", "*.pem", "*.p12", "*.pfx",
     "id_rsa*", "id_ed25519*", "id_ecdsa*",
-    # absolute system paths (matched after stripping leading slash for spec lib)
-    "etc/", "root/", "proc/", "sys/", "dev/", "boot/",
-    "usr/", "bin/", "sbin/", "lib/", "lib64/",
-    "var/lib/nimoos/", "usr/share/nimoos/", "opt/nimoos/",
+    # absolute system paths (anchored with / so they only match at filesystem
+    # root, not inside user project dirs that happen to contain a dir named
+    # "root", "lib", etc.)
+    "/etc/", "/root/", "/proc/", "/sys/", "/dev/", "/boot/",
+    "/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
+    "/var/lib/nimoos/", "/usr/share/nimoos/", "/opt/nimoos/",
 ]
 
 _IMPLICIT_SPEC = PathSpec.from_lines("gitignore", IMPLICIT_IGNORE)
