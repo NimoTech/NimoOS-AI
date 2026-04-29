@@ -214,18 +214,22 @@ class AgentRunner:
             model = OpenAIChatCompletionsModel(
                 model=model_name,
                 openai_client=client,
-                model_settings=model_settings,
                 should_replay_reasoning_content=default_should_replay_reasoning_content,
             )
 
             base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
             full_prompt = _compose_system_prompt(self._conn, session_id, base)
 
+            # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
+            # the SDK constructor only takes (model, openai_client,
+            # should_replay_reasoning_content). The Runner pulls model_settings
+            # off Agent and threads it into each call.
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
                 tools=ALL_TOOLS,
                 model=model,
+                model_settings=model_settings,
             )
 
             history = self._load_history(session_id)

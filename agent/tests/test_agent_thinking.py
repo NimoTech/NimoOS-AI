@@ -25,24 +25,22 @@ def test_run_request_thinking_optional():
 
 @pytest.mark.asyncio
 async def test_agent_runner_passes_thinking_to_model_settings(monkeypatch):
-    """When thinking config is provided, AgentRunner attaches a ModelSettings
-    with the appropriate extra_body/extra_args to the model."""
+    """When thinking config is provided, AgentRunner attaches the resulting
+    ModelSettings to the Agent (NOT to the OpenAIChatCompletionsModel — that
+    constructor doesn't accept model_settings; the Runner reads it off Agent)."""
+    from agents import Agent
     from agent import AgentRunner
     from provider_adapters import ThinkingConfig
 
     captured = {}
 
-    def fake_model_init(self, *, model, openai_client, model_settings=None,
-                       should_replay_reasoning_content=None, **kwargs):
-        captured["model_settings"] = model_settings
-        captured["model"] = model
-        # Stub out the rest to avoid real network calls
-        self.model = model
+    real_agent_init = Agent.__init__
 
-    monkeypatch.setattr(
-        "agents.models.openai_chatcompletions.OpenAIChatCompletionsModel.__init__",
-        fake_model_init,
-    )
+    def spy_agent_init(self, *args, **kwargs):
+        captured["model_settings"] = kwargs.get("model_settings")
+        return real_agent_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Agent, "__init__", spy_agent_init)
 
     # Stub Runner.run_streamed to immediately end without making API calls
     class _FakeStream:
