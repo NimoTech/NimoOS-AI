@@ -713,6 +713,29 @@ async def put_thinking_defaults(request: Request, body: ThinkingConfigPayload):
     return {"ok": True}
 
 
+@app.get("/agent/sessions/{session_id}/thinking")
+async def get_session_thinking(session_id: str, request: Request):
+    """Return the session's thinking override, or null fields if unset.
+
+    The frontend calls this on session load so it can show the user the
+    actual saved enabled/level for the session (falling back to user-level
+    defaults if NULL). 404 only when the session doesn't exist for this user.
+    """
+    user_id = request.headers.get("X-User-Id", "")
+    row = _db().execute(
+        "SELECT thinking_enabled, thinking_level FROM sessions "
+        "WHERE id=? AND user_id=?",
+        (session_id, user_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "session not found")
+    return {
+        "thinking_enabled": (None if row["thinking_enabled"] is None
+                             else bool(row["thinking_enabled"])),
+        "thinking_level": row["thinking_level"],
+    }
+
+
 @app.patch("/agent/sessions/{session_id}/thinking")
 async def patch_session_thinking(session_id: str, request: Request,
                                   body: ThinkingConfigPayload):

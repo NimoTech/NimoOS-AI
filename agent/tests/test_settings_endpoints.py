@@ -57,3 +57,48 @@ async def test_patch_session_thinking(tmp_path, monkeypatch):
         ).fetchone()
         assert row["thinking_enabled"] == 1
         assert row["thinking_level"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_get_session_thinking_unset(tmp_path, monkeypatch):
+    """A fresh session has NULL thinking columns; GET returns nulls."""
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        await ac.post("/agent/sessions", headers={"X-User-Id": "u1"},
+                      json={"title": "t"})
+        r = await ac.get("/agent/sessions", headers={"X-User-Id": "u1"})
+        sid = r.json()[0]["id"]
+
+        r = await ac.get(f"/agent/sessions/{sid}/thinking",
+                         headers={"X-User-Id": "u1"})
+    assert r.status_code == 200
+    assert r.json() == {"thinking_enabled": None, "thinking_level": None}
+
+
+@pytest.mark.asyncio
+async def test_get_session_thinking_after_patch(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        await ac.post("/agent/sessions", headers={"X-User-Id": "u1"},
+                      json={"title": "t"})
+        r = await ac.get("/agent/sessions", headers={"X-User-Id": "u1"})
+        sid = r.json()[0]["id"]
+        await ac.patch(f"/agent/sessions/{sid}/thinking",
+                       headers={"X-User-Id": "u1"},
+                       json={"enabled": False, "level": "high"})
+        r = await ac.get(f"/agent/sessions/{sid}/thinking",
+                         headers={"X-User-Id": "u1"})
+    assert r.status_code == 200
+    assert r.json() == {"thinking_enabled": False, "thinking_level": "high"}
+
+
+@pytest.mark.asyncio
+async def test_get_session_thinking_404_for_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.get("/agent/sessions/does-not-exist/thinking",
+                         headers={"X-User-Id": "u1"})
+    assert r.status_code == 404
