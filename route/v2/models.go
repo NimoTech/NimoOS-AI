@@ -3,6 +3,7 @@ package v2
 import (
 	"log"
 	"net/http"
+	"net/url"
 
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
@@ -109,6 +110,11 @@ func (h *ModelsHandler) Delete(c echo.Context) error {
 	if name == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
 	}
+	decoded, err := url.PathUnescape(name)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid name encoding")
+	}
+	name = decoded
 	if err := h.svc.ModelManager().DeleteModel(name); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
