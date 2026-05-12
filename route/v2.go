@@ -83,6 +83,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/models/hf/search", models.SearchHF)
 	g.GET("/models/hf/files", models.ListHFFiles)
 	g.POST("/models/hf/import", models.ImportHF)
+	g.GET("/models/hf/import/status", models.ImportStatus)
+	g.DELETE("/models/hf/import/cancel", models.CancelImport)
 	g.DELETE("/models/:name", models.Delete)
 
 	// Chat session persistence

@@ -3,8 +3,10 @@ package service
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +25,24 @@ type PullProgress struct {
 	Completed int64  `json:"completed"`
 	Total     int64  `json:"total"`
 	Error     string `json:"error,omitempty"`
+}
+
+// ImportJobSnapshot is the read-only view returned to HTTP callers.
+type ImportJobSnapshot struct {
+	Status    string `json:"status"`
+	Completed int64  `json:"completed"`
+	Total     int64  `json:"total"`
+	Error     string `json:"error,omitempty"`
+}
+
+type ImportJob struct {
+	Repo      string
+	Filename  string
+	Status    string // "downloading" | "creating model" | "success" | "error" | "cancelled"
+	Completed int64
+	Total     int64
+	Error     string
+	cancelFn  context.CancelFunc
 }
 
 type ollamaTagsResponse struct {
@@ -39,6 +60,8 @@ type ModelManager struct {
 	hfBaseURL     string
 	db            *sql.DB
 	client        *http.Client // no timeout: model downloads can be very long
+	jobs          map[string]*ImportJob
+	jobsMu        sync.RWMutex
 }
 
 func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
@@ -47,6 +70,7 @@ func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
 		hfBaseURL:     defaultHFBaseURL,
 		db:            db,
 		client:        &http.Client{},
+		jobs:          make(map[string]*ImportJob),
 	}
 }
 
@@ -212,9 +236,13 @@ func (m *ModelManager) ListGGUFFiles(repoID string) ([]string, error) {
 	return files, nil
 }
 
-func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, progress chan<- PullProgress) error {
+func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filename, modelDir string) error {
 	downloadURL := fmt.Sprintf("%s/%s/resolve/main/%s", m.hfBaseURL, repoID, filename)
-	resp, err := m.client.Get(downloadURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("build download request: %w", err)
+	}
+	resp, err := m.client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("GGUF download failed: %w", err)
 	}
@@ -244,7 +272,7 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 	}()
 
 	total := resp.ContentLength
-	var downloaded int64
+	var downloaded, lastReported int64
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := resp.Body.Read(buf)
@@ -253,8 +281,14 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 				return fmt.Errorf("write GGUF: %w", err)
 			}
 			downloaded += int64(n)
-			if progress != nil {
-				progress <- PullProgress{Status: "downloading", Completed: downloaded, Total: total}
+			if downloaded-lastReported >= 1<<20 { // update job every 1 MB
+				m.jobsMu.Lock()
+				if j, ok := m.jobs[filename]; ok {
+					j.Completed = downloaded
+					j.Total = total
+				}
+				m.jobsMu.Unlock()
+				lastReported = downloaded
 			}
 		}
 		if readErr == io.EOF {
@@ -265,9 +299,13 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 		}
 	}
 
-	if progress != nil {
-		progress <- PullProgress{Status: "creating model"}
+	m.jobsMu.Lock()
+	if j, ok := m.jobs[filename]; ok {
+		j.Status = "creating model"
+		j.Completed = downloaded
+		j.Total = total
 	}
+	m.jobsMu.Unlock()
 
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close GGUF file: %w", err)
@@ -297,10 +335,6 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 		return fmt.Errorf("ollama create returned %d: %s", createResp.StatusCode, body)
 	}
 
-	if progress != nil {
-		progress <- PullProgress{Status: "success"}
-	}
-
 	if m.db != nil {
 		now := time.Now().UTC().Format(time.RFC3339)
 		quantization := extractQuantization(filename)
@@ -321,6 +355,58 @@ func (m *ModelManager) ImportFromHuggingFace(repoID, filename, modelDir string, 
 	}
 	succeeded = true
 	return nil
+}
+
+func (m *ModelManager) StartImportJob(repo, filename string, cancelFn context.CancelFunc) {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+	m.jobs[filename] = &ImportJob{
+		Repo:     repo,
+		Filename: filename,
+		Status:   "downloading",
+		cancelFn: cancelFn,
+	}
+}
+
+func (m *ModelManager) FinishImportJob(filename string, err error) {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+	j, ok := m.jobs[filename]
+	if !ok {
+		return
+	}
+	if err == nil {
+		j.Status = "success"
+	} else if errors.Is(err, context.Canceled) {
+		delete(m.jobs, filename)
+	} else {
+		j.Status = "error"
+		j.Error = err.Error()
+	}
+}
+
+func (m *ModelManager) GetImportStatus(filename string) (ImportJobSnapshot, bool) {
+	m.jobsMu.RLock()
+	defer m.jobsMu.RUnlock()
+	j, ok := m.jobs[filename]
+	if !ok {
+		return ImportJobSnapshot{}, false
+	}
+	return ImportJobSnapshot{
+		Status:    j.Status,
+		Completed: j.Completed,
+		Total:     j.Total,
+		Error:     j.Error,
+	}, true
+}
+
+func (m *ModelManager) CancelImport(filename string) {
+	m.jobsMu.RLock()
+	j, ok := m.jobs[filename]
+	m.jobsMu.RUnlock()
+	if ok && j.cancelFn != nil {
+		j.cancelFn()
+	}
 }
 
 func extractQuantization(filename string) string {

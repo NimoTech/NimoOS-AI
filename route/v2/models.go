@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/url"
@@ -91,15 +92,43 @@ func (h *ModelsHandler) ImportHF(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.Repo == "" || req.Filename == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "repo and filename are required")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.svc.ModelManager().StartImportJob(req.Repo, req.Filename, cancel)
 	go func() {
-		progress := make(chan service.PullProgress, 50)
-		go func() { for range progress {} }() // drain progress
-		if err := h.svc.ModelManager().ImportFromHuggingFace(req.Repo, req.Filename, h.modelDir, progress); err != nil {
+		err := h.svc.ModelManager().ImportFromHuggingFace(ctx, req.Repo, req.Filename, h.modelDir)
+		if err != nil {
 			log.Printf("ImportFromHuggingFace %q/%q: %v", req.Repo, req.Filename, err)
 		}
-		close(progress)
+		h.svc.ModelManager().FinishImportJob(req.Filename, err)
 	}()
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "importing", "filename": req.Filename})
+}
+
+func (h *ModelsHandler) ImportStatus(c echo.Context) error {
+	if c.Request().Header.Get("X-NimoOS-User-ID") == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "missing user identity")
+	}
+	filename := c.QueryParam("filename")
+	if filename == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "filename is required")
+	}
+	snap, ok := h.svc.ModelManager().GetImportStatus(filename)
+	if !ok {
+		return echo.NewHTTPError(http.StatusNotFound, "no active import for this filename")
+	}
+	return c.JSON(http.StatusOK, snap)
+}
+
+func (h *ModelsHandler) CancelImport(c echo.Context) error {
+	if c.Request().Header.Get("X-NimoOS-User-ID") == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "missing user identity")
+	}
+	filename := c.QueryParam("filename")
+	if filename == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "filename is required")
+	}
+	h.svc.ModelManager().CancelImport(filename)
+	return c.NoContent(http.StatusNoContent)
 }
 
 func (h *ModelsHandler) Delete(c echo.Context) error {
