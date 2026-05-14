@@ -14,6 +14,7 @@ import time
 from contextvars import ContextVar
 from typing import Optional
 
+import httpx
 import pathspec
 from agents import function_tool
 
@@ -139,3 +140,181 @@ async def wiki_recent_changes(path: str, since_days: int = 7,
         limit: Max events to return (1..200, default 50).
     """
     return await _wiki_recent_changes_impl(path, since_days, limit)
+
+
+# ---------------------------------------------------------------------------
+# Write tools (Task 7)
+# ---------------------------------------------------------------------------
+
+TEXT_PREVIEW_CAP = 200
+
+
+def _preview(text: str) -> str:
+    if len(text) <= TEXT_PREVIEW_CAP:
+        return text
+    return f"{text[:TEXT_PREVIEW_CAP]}…(+{len(text) - TEXT_PREVIEW_CAP} more chars)"
+
+
+async def _request_confirm(action: str, description: str, command: str) -> bool:
+    """Register a ConfirmRequest, emit the SSE event, await the resolution."""
+    mgr = CONFIRM_MGR_VAR.get()
+    sink = EVENT_QUEUE_VAR.get()
+    session_id = SESSION_ID_VAR.get()
+    if mgr is None or sink is None or not session_id:
+        # Misconfigured runtime — refuse write rather than silently bypass.
+        return False
+    confirm_id = mgr.register(session_id, action, description, command)
+    await sink.put({
+        "type": "confirmation_required",
+        "confirm_id": confirm_id,
+        "action": action,
+        "description": description,
+        "command": command,
+    })
+    return await mgr.wait(confirm_id)
+
+
+async def _wiki_append_user_notes_impl(path: str, text: str) -> str:
+    if blocked := _gate(path):
+        return blocked
+    client = WIKI_CLIENT_VAR.get()
+    if client is None:
+        return json.dumps({"error": "wiki service unavailable"})
+
+    try:
+        node = await client.get_node(path)
+    except Exception as e:
+        return json.dumps({"error": f"wiki request failed: {e}"})
+    if node is None:
+        return json.dumps({"error": "node not found", "path": path})
+
+    description = f"Append note to Wiki: {path}"
+    command = (f"PUT /v1/wiki/user-notes path={path}\n"
+               f"+ {_preview(text)}")
+    if not await _request_confirm("wiki_append_notes", description, command):
+        return json.dumps({"error": "user declined"})
+
+    prior = node.get("user_notes", "")
+    if prior:
+        new_body = prior.rstrip() + "\n\n" + text + "\n"
+    else:
+        new_body = text + "\n"
+
+    etag = node.get("etag")
+    try:
+        res = await client.put_user_notes(path, new_body, if_match=etag)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 409:
+            return json.dumps({"error": f"wiki request failed: HTTP {e.response.status_code}"})
+        # 409 → retry once: fetch fresh etag, re-append on the new base.
+        client.invalidate_node(path)
+        try:
+            node2 = await client.get_node(path)
+        except Exception as e2:
+            return json.dumps({"error": f"wiki request failed on retry: {e2}"})
+        if node2 is None:
+            return json.dumps({"error": "node disappeared during retry"})
+        prior2 = node2.get("user_notes", "")
+        body2 = (prior2.rstrip() + "\n\n" + text + "\n") if prior2 else (text + "\n")
+        try:
+            res = await client.put_user_notes(path, body2, if_match=node2.get("etag"))
+        except httpx.HTTPStatusError as e3:
+            if e3.response.status_code == 409:
+                return json.dumps({"error": "etag conflict", "path": path})
+            return json.dumps({"error": f"wiki request failed: HTTP {e3.response.status_code}"})
+
+    client.invalidate_node(path)
+    return json.dumps({"ok": True, "etag": res.get("etag")})
+
+
+async def _wiki_replace_user_notes_impl(path: str, text: str) -> str:
+    if blocked := _gate(path):
+        return blocked
+    client = WIKI_CLIENT_VAR.get()
+    if client is None:
+        return json.dumps({"error": "wiki service unavailable"})
+
+    try:
+        node = await client.get_node(path)
+    except Exception as e:
+        return json.dumps({"error": f"wiki request failed: {e}"})
+    if node is None:
+        return json.dumps({"error": "node not found", "path": path})
+
+    description = f"Replace Wiki notes at {path}"
+    command = (f"PUT /v1/wiki/user-notes path={path} (REPLACE)\n"
+               f"→ {_preview(text)}")
+    if not await _request_confirm("wiki_replace_notes", description, command):
+        return json.dumps({"error": "user declined"})
+
+    etag = node.get("etag")
+    try:
+        res = await client.put_user_notes(path, text, if_match=etag)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 409:
+            # Replace is destructive — do NOT retry. Let LLM re-read and confirm.
+            return json.dumps({
+                "error": "content modified by others, please review new content first",
+                "path": path,
+            })
+        return json.dumps({"error": f"wiki request failed: HTTP {e.response.status_code}"})
+
+    client.invalidate_node(path)
+    return json.dumps({"ok": True, "etag": res.get("etag")})
+
+
+async def _wiki_register_root_impl(path: str, level: str = "project") -> str:
+    if blocked := _gate(path):
+        return blocked
+    client = WIKI_CLIENT_VAR.get()
+    if client is None:
+        return json.dumps({"error": "wiki service unavailable"})
+
+    description = f"Register Wiki root: {path} as {level}"
+    command = f"POST /v1/wiki/roots path={path} level={level}"
+    if not await _request_confirm("wiki_register_root", description, command):
+        return json.dumps({"error": "user declined"})
+
+    try:
+        res = await client.post_root(path, level)
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:
+            pass
+        return json.dumps({
+            "error": f"wiki request failed: HTTP {e.response.status_code}",
+            "detail": body,
+        })
+    return json.dumps({"ok": True, "root_id": res.get("id"), "path": res.get("path")})
+
+
+@function_tool
+async def wiki_append_user_notes(path: str, text: str) -> str:
+    """Append text to a Wiki node's user notes. Pops a confirmation to the
+    user — they see the path and a preview of `text`.
+
+    Args:
+        path: Absolute Wiki node path
+        text: Body to append (preserved verbatim, separated from prior notes
+            by a blank line)
+    """
+    return await _wiki_append_user_notes_impl(path, text)
+
+
+@function_tool
+async def wiki_replace_user_notes(path: str, text: str) -> str:
+    """Replace the entire user-notes body at a Wiki node. Confirms with the
+    user. If someone else modified the notes since you last read them, this
+    fails with a clear error — re-read with wiki_get_node and try again.
+    """
+    return await _wiki_replace_user_notes_impl(path, text)
+
+
+@function_tool
+async def wiki_register_root(path: str, level: str = "project") -> str:
+    """Register a new Wiki Root. Confirms with the user. Level is usually
+    "project"; "space" is reserved for storage-volume-level roots.
+    """
+    return await _wiki_register_root_impl(path, level)
