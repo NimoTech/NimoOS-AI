@@ -343,14 +343,7 @@ async def test_register_then_get_then_append_then_context(running_wiki, tmp_path
             f"user_notes not updated: {node2!r}"
         )
 
-        # 5. Verify tree endpoint returns the registered node when queried by
-        # root_id.  The GET /v1/wiki/tree endpoint requires an explicit root_id;
-        # calling it with root_id="" does WHERE root_id='' which never matches
-        # any seeded node (they have UUID root_ids).  WikiContextBuilder.build()
-        # calls list_full_tree() without a root_id, so it gets an empty tree on
-        # a fresh wiki instance.  That's a known limitation of the current tree
-        # API — the builder degrades gracefully to the placeholder.  We verify
-        # the per-root tree query works correctly instead.
+        # 5. Tree endpoint with root_id returns the registered node.
         root_id = reg["id"]
         tree = await c.list_full_tree(root_id=root_id)
         assert any(n["path"] == str(target) for n in tree), (
@@ -361,19 +354,25 @@ async def test_register_then_get_then_append_then_context(running_wiki, tmp_path
             f"registered node should have level='space', got: {tree[0]!r}"
         )
 
-        # 6. WikiContextBuilder.build() exercises the full builder code path.
-        # With a fresh wiki, list_full_tree(root_id="") returns empty (see note
-        # above), so the builder returns the "no spaces" placeholder.  We assert
-        # the builder runs without exception and returns the expected markdown
-        # headers — confirming Python→Go→Python HTTP round-trip is wired up.
-        block = await WikiContextBuilder(c).build(user_patterns=[])
-        assert "NimoOS 存储空间地图" in block, (
-            f"WikiContextBuilder.build() should always return the map header. "
-            f"Got:\n{block!r}"
+        # 6. Tree endpoint with NO root_id returns all roots (the path
+        # WikiContextBuilder uses).  Drop the per-instance cache first so we
+        # actually hit the network for the "" key.
+        c.reset_cache()
+        full_tree = await c.list_full_tree()
+        assert any(n["path"] == str(target) for n in full_tree), (
+            f"target path {str(target)!r} not in full tree (no root_id). "
+            f"Tree: {full_tree!r}"
         )
-        assert "用户笔记" in block, (
-            f"WikiContextBuilder.build() should always return the notes header. "
-            f"Got:\n{block!r}"
+
+        # 7. WikiContextBuilder.build() — the production injection path.
+        # Builder calls list_full_tree() (no root_id), groups by space, and
+        # renders the map block.  The registered root should appear.
+        c.reset_cache()
+        block = await WikiContextBuilder(c).build(user_patterns=[])
+        assert "NimoOS 存储空间地图" in block
+        assert "用户笔记" in block
+        assert str(target) in block, (
+            f"registered root path {str(target)!r} missing from builder block:\n{block}"
         )
 
     finally:
