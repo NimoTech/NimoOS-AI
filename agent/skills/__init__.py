@@ -5,6 +5,13 @@ from skills.message_bus import ALL_TOOLS as MESSAGEBUS_TOOLS
 from skills.filesystem import ALL_TOOLS as FS_TOOLS
 from skills.shell import ALL_TOOLS as SHELL_TOOLS
 from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
+from skills.wiki import (
+    wiki_get_node, wiki_list_full_tree, wiki_recent_changes,
+)
+
+# Wiki tools — write tools added in Task 7.
+WIKI_TOOLS = [wiki_get_node, wiki_list_full_tree, wiki_recent_changes]
 
 ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
-             + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS)
+             + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
+             + WIKI_TOOLS)
