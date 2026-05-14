@@ -25,7 +25,10 @@ import skills.message_bus as mb_skills
 import skills.filesystem as fs_skills
 import skills.shell as shell_skills
 import skills.init_doc as init_doc
+import skills.wiki as wiki_skills
 from fs.snapshots import SnapshotStore
+from wiki_client import WikiClient
+from wiki_context import WikiContextBuilder
 
 SYSTEM_PROMPT = """You are Nimo, a general-purpose AI assistant that also has the ability to manage the user's NimoOS NAS.
 
@@ -124,6 +127,14 @@ class AgentRunner:
             from confirm import ConfirmManager as _CM
             confirm_mgr = _CM(conn)
         self._confirm_mgr = confirm_mgr
+        # Session-scoped Wiki clients. try_open() returns None when wiki.url
+        # is missing — those sessions run with wiki integration disabled.
+        self._wiki_clients: dict[str, "WikiClient | None"] = {}
+
+    def _wiki_client_for(self, session_id: str, user_id: str) -> "WikiClient | None":
+        if session_id not in self._wiki_clients:
+            self._wiki_clients[session_id] = WikiClient.try_open(user_id=str(user_id))
+        return self._wiki_clients[session_id]
 
     def _load_history(self, session_id: str) -> list:
         # Each _save_history row already stores the full cumulative snapshot
@@ -196,6 +207,16 @@ class AgentRunner:
 
             shell_skills.SESSION_ID_VAR.set(session_id)
 
+            # --- Wiki integration ---
+            wiki_client = self._wiki_client_for(session_id, user_id)
+            if wiki_client is not None:
+                wiki_client.reset_cache()  # turn-scoped: fresh tree per turn
+            wiki_skills.WIKI_CLIENT_VAR.set(wiki_client)
+            wiki_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            wiki_skills.SESSION_ID_VAR.set(session_id)
+            wiki_skills.EVENT_QUEUE_VAR.set(sink)
+            wiki_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             # `should_replay_reasoning_content` lets the SDK inject prior
             # `reasoning_content` back onto assistant messages when replaying
@@ -218,7 +239,20 @@ class AgentRunner:
             )
 
             base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
-            full_prompt = _compose_system_prompt(self._conn, session_id, base)
+
+            # Prepend the Wiki context block. 5s budget: if Wiki is slow we'd
+            # rather drop the block than stall the user's chat.
+            wiki_block = ""
+            if wiki_client is not None:
+                try:
+                    wiki_block = await asyncio.wait_for(
+                        WikiContextBuilder(wiki_client).build(user_patterns or []),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    wiki_block = ""
+            base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
+            full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
