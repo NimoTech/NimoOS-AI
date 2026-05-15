@@ -114,6 +114,7 @@ class RunRequest(BaseModel):
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
+    attachment_ids: list[str] = []
 
 
 class ConfirmRequest(BaseModel):
@@ -902,7 +903,9 @@ def _start_run(session_id: str, user_id: str, message: str,
                provider_key: str, provider_url: str, model: str,
                *, kind: str = "chat", chat_username: str = "",
                user_patterns: list[str] | None = None,
-               thinking=None, provider_type: str = "other") -> RunSink:
+               thinking=None, provider_type: str = "other",
+               attachment_ids: list[str] = (),
+               user_msg_id: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -988,6 +991,24 @@ async def run_session(
 ):
     _assert_owns_session(session_id, x_user_id)
 
+    # Validate attachment_ids belong to this session and are unbound
+    if req.attachment_ids:
+        placeholders = ",".join(["?"] * len(req.attachment_ids))
+        rows = _conn.execute(
+            f"SELECT id, message_id FROM attachments "
+            f"WHERE id IN ({placeholders}) AND session_id = ?",
+            (*req.attachment_ids, session_id),
+        ).fetchall()
+        found = {r["id"]: r["message_id"] for r in rows}
+        if len(found) != len(req.attachment_ids):
+            missing = [a for a in req.attachment_ids if a not in found]
+            raise HTTPException(status_code=422,
+                                detail=f"attachment not in session: {missing}")
+        bound = [a for a, mid in found.items() if mid is not None]
+        if bound:
+            raise HTTPException(status_code=422,
+                                detail=f"attachment already used: {bound}")
+
     if req.kind == "init":
         if not req.init_target:
             raise HTTPException(status_code=400,
@@ -1035,6 +1056,16 @@ async def run_session(
 
     provider_type = request.headers.get("X-Agent-Provider-Type", "other")
 
+    user_msg_id = "msg_" + uuid.uuid4().hex[:12]
+    if req.attachment_ids:
+        placeholders = ",".join(["?"] * len(req.attachment_ids))
+        _conn.execute(
+            f"UPDATE attachments SET message_id = ? "
+            f"WHERE id IN ({placeholders}) AND session_id = ?",
+            (user_msg_id, *req.attachment_ids, session_id),
+        )
+        _conn.commit()
+
     sink = _start_run(
         session_id, x_user_id, req.message,
         x_agent_provider_key, x_agent_provider_url, req.model,
@@ -1042,6 +1073,8 @@ async def run_session(
         user_patterns=user_patterns,
         thinking=thinking_cfg,
         provider_type=provider_type,
+        attachment_ids=req.attachment_ids,
+        user_msg_id=user_msg_id,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
