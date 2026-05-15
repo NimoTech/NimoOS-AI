@@ -108,6 +108,21 @@ CREATE INDEX IF NOT EXISTS idx_staged_session_pending
   ON staged_changes(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_visible_session
   ON visible_resources(session_id);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id   TEXT,
+    filename     TEXT NOT NULL,
+    mime         TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary')),
+    size_bytes   INTEGER NOT NULL,
+    rel_path     TEXT NOT NULL,
+    meta_json    TEXT,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_msg     ON attachments(message_id);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
