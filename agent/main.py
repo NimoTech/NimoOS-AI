@@ -507,7 +507,7 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     except (json.JSONDecodeError, KeyError):
         return []
 
-    return _hydrate_messages(history)
+    return _hydrate_messages(history, session_id_for_urls=session_id)
 
 
 def _flatten_content(content) -> str:
@@ -525,7 +525,7 @@ def _flatten_content(content) -> str:
     return ""
 
 
-def _hydrate_messages(history: list) -> list:
+def _hydrate_messages(history: list, session_id_for_urls: str | None = None) -> list:
     # Translate Agents SDK to_input_list() into the UI's per-message shape:
     #   user      → {role:'user', content:str}
     #   assistant → {role:'assistant', blocks:[thinking|tool|md]} grouped per turn,
@@ -559,7 +559,40 @@ def _hydrate_messages(history: list) -> list:
 
         if role == "user":
             flush()
-            text = _flatten_content(item.get("content"))
+            content = item.get("content")
+            if isinstance(content, list):
+                # User turn with attachments — emit a structured message that
+                # carries both text and image refs for UI rendering.
+                ui_blocks = []
+                for blk in content:
+                    if (isinstance(blk, dict)
+                            and blk.get("type") == "input_image"
+                            and "attachment_id" in blk):
+                        aid = blk["attachment_id"]
+                        url = (
+                            f"/v1/ai/agent/sessions/{session_id_for_urls}"
+                            f"/attachments/{aid}/raw"
+                            if session_id_for_urls else None
+                        )
+                        ui_blocks.append({
+                            "type": "image",
+                            "attachment_id": aid,
+                            "url": url,
+                        })
+                    elif (isinstance(blk, dict)
+                            and blk.get("type") in ("input_text", "text")):
+                        text = blk.get("text", "")
+                        if text:
+                            ui_blocks.append({"type": "text", "text": text})
+                if ui_blocks:
+                    result.append({
+                        "id": new_id("u"),
+                        "role": "user",
+                        "blocks": ui_blocks,
+                    })
+                continue
+            # Backward compat: string content
+            text = _flatten_content(content)
             if text:
                 result.append({"id": new_id("u"), "role": "user", "content": text})
             continue

@@ -177,6 +177,35 @@ def build_user_content(message: str, attachment_ids, *,
     return blocks
 
 
+def compact_image_blocks(history, *, image_id_resolver):
+    """Walk the SDK history; replace any inline image data URL with a compact
+    `{type: input_image, attachment_id: <id>}` block.
+
+    `image_id_resolver(url) -> attachment_id | None` is called for each
+    image_url found. Return None to leave the block unchanged.
+    """
+    out = []
+    for item in history:
+        content = item.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for blk in content:
+                if (isinstance(blk, dict)
+                        and blk.get("type") == "input_image"
+                        and "image_url" in blk):
+                    aid = image_id_resolver(blk["image_url"])
+                    if aid:
+                        new_content.append({"type": "input_image",
+                                            "attachment_id": aid})
+                    else:
+                        new_content.append(blk)
+                else:
+                    new_content.append(blk)
+            item = {**item, "content": new_content}
+        out.append(item)
+    return out
+
+
 def select_tools_for_run(attachment_ids, *, session_id: str):
     """Return tool list; conditionally appends `read_attachment` when at least
     one attachment is non-image. Image-only or empty → unchanged ALL_TOOLS."""
@@ -422,7 +451,29 @@ class AgentRunner:
                     if final and isinstance(final, str) and final.strip():
                         await sink.put({"type": "message", "content": final})
 
-                self._save_history(session_id, stream.to_input_list())
+                final_history = stream.to_input_list()
+                url_to_aid: dict[str, str] = {}
+                if attachment_ids:
+                    for r in _fetch_attachments(attachment_ids, session_id):
+                        if r["kind"] != "image":
+                            continue
+                        full = os.path.join(
+                            data_root, "sessions", session_id, "attachments",
+                            r["rel_path"])
+                        try:
+                            with open(full, "rb") as f:
+                                data = f.read()
+                            url = (
+                                f"data:{r['mime']};base64,"
+                                f"{base64.b64encode(data).decode('ascii')}"
+                            )
+                            url_to_aid[url] = r["id"]
+                        except FileNotFoundError:
+                            pass
+                final_history = compact_image_blocks(
+                    final_history,
+                    image_id_resolver=lambda u: url_to_aid.get(u))
+                self._save_history(session_id, final_history)
             except Exception as e:
                 await sink.put({"type": "error", "content": str(e)})
             finally:
