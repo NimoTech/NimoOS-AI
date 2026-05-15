@@ -111,8 +111,13 @@ func main() {
 	logger.Info("NimoOS-AI listening", zap.String("address", listener.Addr().String()))
 
 	s := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
+		Handler: handler,
+		// Increased from 5s to 30s — multipart-upload routes (/agent/sessions/*/attachments)
+		// can spend longer reading their headers under slow networks. The body itself
+		// is intentionally unbounded so 500MB uploads can complete; only header read
+		// is gated here. The /agent/* reverse proxy uses the default Transport, which
+		// also has no body-read timeout.
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 	if err := s.Serve(listener); err != nil && err != http.ErrServerClosed {
 		logger.Error("server error", zap.Error(err))
