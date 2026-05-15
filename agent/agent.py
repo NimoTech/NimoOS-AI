@@ -378,6 +378,11 @@ class AgentRunner:
                 if att_block:
                     full_prompt = full_prompt + "\n\n" + att_block
 
+            data_root = os.environ.get(
+                "NIMOOS_AGENT_DATA_ROOT",
+                str(db_module._DB_PATH.parent),
+            )
+
             # Set context vars for the conditional read_attachment skill before
             # tool selection / Agent construction so tool invocations during
             # this run resolve the right session.
@@ -385,11 +390,13 @@ class AgentRunner:
                 SESSION_ID_VAR as _ATT_S,
                 USER_ID_VAR as _ATT_U,
                 MAX_CHARS_VAR as _ATT_C,
+                DATA_ROOT_VAR as _ATT_D,
             )
             _ATT_S.set(session_id)
             _ATT_U.set(user_id)
             _ATT_C.set(int(os.environ.get(
                 "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
+            _ATT_D.set(data_root)
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
@@ -403,10 +410,6 @@ class AgentRunner:
                 model_settings=model_settings,
             )
 
-            data_root = os.environ.get(
-                "NIMOOS_AGENT_DATA_ROOT",
-                str(db_module._DB_PATH.parent),
-            )
             user_content = build_user_content(
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,

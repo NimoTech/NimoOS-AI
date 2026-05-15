@@ -114,3 +114,31 @@ def test_file_vanished(setup):
         "a7", session_id="s1", user_id="u1", max_chars=100,
         conn=conn, data_root=str(root))
     assert result.get("error") == "vanished"
+
+
+def test_function_tool_reads_via_context_vars(setup):
+    """Regression: AgentRunner.run must set DATA_ROOT_VAR so the LLM-invoked
+    @function_tool wrapper can resolve attachment paths."""
+    conn, root, skill = setup
+    _mk_att(conn, root, aid="ctx1", kind="text", mime="text/plain",
+            content_bytes=b"hello via context", filename="x.txt")
+
+    # Bind context vars the way AgentRunner.run does (post-fix).
+    skill.SESSION_ID_VAR.set("s1")
+    skill.USER_ID_VAR.set("u1")
+    skill.MAX_CHARS_VAR.set(1024)
+    skill.DATA_ROOT_VAR.set(str(root))
+    skill.DB_VAR.set(conn)
+
+    # Call the impl with no explicit conn/data_root so it falls back to vars.
+    # (The @function_tool decorator wraps in an SDK-specific callable that's
+    # awkward to invoke directly in tests; calling _impl with default kwargs
+    # exercises the same fallback paths.)
+    result = skill._read_attachment_impl(
+        "ctx1",
+        session_id=skill.SESSION_ID_VAR.get(),
+        user_id=skill.USER_ID_VAR.get(),
+        max_chars=skill.MAX_CHARS_VAR.get(),
+    )
+    assert result["kind"] == "text"
+    assert result["content"] == "hello via context"
