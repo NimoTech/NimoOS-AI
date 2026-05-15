@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -23,6 +23,8 @@ from fs import paths as _fs_paths
 from fs import ignore as _fs_ignore
 from fs import staging as _fs_staging
 from fs.snapshots import SnapshotStore
+from attachments import upload as att_upload
+from attachments.paths import build_storage_path
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
@@ -35,6 +37,14 @@ _SNAPSHOTS_ROOT = os.environ.get(
     "AGENT_SNAPSHOTS_ROOT", "/var/lib/nimoos/ai/agent/snapshots")
 _snapshots_root = _SNAPSHOTS_ROOT  # exposed for tests to monkeypatch
 _snapshot_store = SnapshotStore(root=_SNAPSHOTS_ROOT)
+
+
+def _data_root() -> str:
+    """Root directory for per-session attachment storage."""
+    return os.environ.get(
+        "NIMOOS_AGENT_DATA_ROOT",
+        str(db_module._DB_PATH.parent),
+    )
 
 
 def _user_patterns_from_header(request: Request) -> list[str]:
@@ -264,6 +274,46 @@ async def remove_visible_resource(
     )
     _conn.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Attachments endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/agent/sessions/{session_id}/attachments", status_code=201)
+async def upload_attachment(
+    session_id: str,
+    file: UploadFile = File(...),
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    conn = _db()
+
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM attachments WHERE session_id=?", (session_id,)
+    ).fetchone()[0]
+    if cnt >= MAX_ATTACHMENTS_PER_SESSION:
+        raise HTTPException(status_code=409,
+                            detail="MaxAttachmentsPerSession reached")
+
+    # Stream to a temp .part path; handle_upload then renames to att_xxx__name
+    tmp_id = uuid.uuid4().hex
+    part_path = build_storage_path(_data_root(), session_id, tmp_id, "upload.part")
+    os.makedirs(os.path.dirname(part_path), exist_ok=True)
+
+    size = await att_upload.stream_to_disk(file, part_path, MAX_ATTACHMENT_SIZE)
+
+    result = att_upload.handle_upload(
+        conn=conn,
+        data_root=_data_root(),
+        session_id=session_id,
+        original_name=file.filename or "untitled",
+        part_path=part_path,
+        size=size,
+        max_image_size=MAX_IMAGE_ATTACHMENT_SIZE,
+        ffprobe_timeout=FFPROBE_TIMEOUT,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
