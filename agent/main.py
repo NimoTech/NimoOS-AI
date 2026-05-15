@@ -69,6 +69,24 @@ _active_runs: dict[str, RunSink] = {}
 # warm during long confirmation waits without polluting the event log.
 _KEEPALIVE_SECONDS = 15
 
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+MAX_ATTACHMENT_SIZE         = _env_int("NIMOOS_MAX_ATTACHMENT_SIZE",         524_288_000)
+MAX_IMAGE_ATTACHMENT_SIZE   = _env_int("NIMOOS_MAX_IMAGE_ATTACHMENT_SIZE",   20_971_520)
+MAX_ATTACHMENTS_PER_SESSION = _env_int("NIMOOS_MAX_ATTACHMENTS_PER_SESSION", 50)
+MAX_ATTACHMENT_TEXT_CHARS   = _env_int("NIMOOS_MAX_ATTACHMENT_TEXT_CHARS",   32_768)
+FFPROBE_TIMEOUT             = _env_int("NIMOOS_FFPROBE_TIMEOUT",             5)
+ATTACHMENT_GC_AGE           = _env_int("NIMOOS_ATTACHMENT_GC_AGE",           86_400)
+
 app = FastAPI(title="nimoos-agent")
 
 
