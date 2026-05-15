@@ -100,6 +100,26 @@ ATTACHMENT_GC_AGE           = _env_int("NIMOOS_ATTACHMENT_GC_AGE",           86_
 app = FastAPI(title="nimoos-agent")
 
 
+@app.on_event("startup")
+async def _attachments_startup():
+    """Run attachment GC at agent startup.
+
+    Cleans up:
+    - Draft attachments (message_id IS NULL) older than ATTACHMENT_GC_AGE seconds
+    - Orphan session directories not matching any sessions.id row
+
+    Errors during GC are logged and swallowed — they must never block startup.
+    """
+    try:
+        from attachments.gc import run_startup_gc
+        run_startup_gc(_db(), _data_root(),
+                       age_seconds=ATTACHMENT_GC_AGE)
+    except Exception as e:
+        import logging
+        logging.getLogger("nimoos-agent").warning(
+            "attachment GC failed: %s", e)
+
+
 from provider_adapters import ThinkingLevel as _ThinkingLevel
 
 
