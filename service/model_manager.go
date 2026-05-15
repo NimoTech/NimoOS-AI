@@ -65,10 +65,11 @@ func (m *ModelManager) ListModels() ([]*Model, error) {
 	models := make([]*Model, 0, len(tags.Models))
 	for _, t := range tags.Models {
 		models = append(models, &Model{
-			Name:         t.Name,
-			Source:       ModelSourceOllama,
-			SizeBytes:    t.Size,
-			Quantization: t.Details.QuantizationLevel,
+			Name:             t.Name,
+			Source:           ModelSourceOllama,
+			SizeBytes:        t.Size,
+			Quantization:     t.Details.QuantizationLevel,
+			SupportsThinking: SupportsThinking("ollama", t.Name),
 		})
 	}
 	return models, nil
@@ -87,6 +88,7 @@ func (m *ModelManager) listCachedModels() ([]*Model, error) {
 	for rows.Next() {
 		var mod Model
 		rows.Scan(&mod.ID, &mod.Name, &mod.Source, &mod.SizeBytes, &mod.Quantization, &mod.DownloadedAt, &mod.LastUsedAt)
+		mod.SupportsThinking = SupportsThinking(mod.Source, mod.Name)
 		models = append(models, &mod)
 	}
 	return models, nil

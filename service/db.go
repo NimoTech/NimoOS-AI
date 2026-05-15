@@ -70,13 +70,14 @@ func NewDB(path string) (*sql.DB, error) {
 }
 
 type Model struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Source       string `json:"source"`
-	SizeBytes    int64  `json:"size_bytes"`
-	Quantization string `json:"quantization"`
-	DownloadedAt string `json:"downloaded_at"`
-	LastUsedAt   string `json:"last_used_at"`
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Source           string `json:"source"`
+	SizeBytes        int64  `json:"size_bytes"`
+	Quantization     string `json:"quantization"`
+	DownloadedAt     string `json:"downloaded_at"`
+	LastUsedAt       string `json:"last_used_at"`
+	SupportsThinking bool   `json:"supports_thinking"`
 }
 
 const (
