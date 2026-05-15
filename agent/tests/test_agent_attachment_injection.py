@@ -40,7 +40,9 @@ def test_image_appears_inline_as_input_image(setup):
     _mk_att(conn, root, aid="i1", kind="image", mime="image/png",
             filename="x.png", body=b"\x89PNG\x00\x00")
     content = ag.build_user_content("hello", ["i1"], session_id="s1",
-                                    data_root=str(root))
+                                    data_root=str(root),
+                                    model_name="gpt-4o",
+                                    provider_type="openai")
     assert isinstance(content, list)
     assert content[0] == {"type": "input_text", "text": "hello"}
     img = next(c for c in content if c["type"] == "input_image")

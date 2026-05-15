@@ -114,3 +114,24 @@ def build_model_settings(
 
     # ANTHROPIC handled in Go service. OTHER: pass through.
     return ModelSettings()
+
+
+_VISION_KNOWN_TRUE = {
+    "openai": lambda m: m.startswith(("gpt-4o", "gpt-4-vision", "o1", "gpt-4.1")),
+    "anthropic": lambda m: m.startswith("claude-3") or m.startswith("claude-4"),
+    "qwen": lambda m: "vl" in m.lower(),
+    "deepseek": lambda m: False,
+}
+
+
+def model_supports_vision(provider_type: str, model_name: str) -> bool:
+    """Best-effort capability check. Cloud unknown → True (let provider 4xx).
+    Local (ollama) unknown → False (most local models lack vision)."""
+    if not model_name:
+        return False
+    pt = (provider_type or "other").lower()
+    if pt in _VISION_KNOWN_TRUE:
+        return _VISION_KNOWN_TRUE[pt](model_name)
+    if pt == "ollama":
+        return any(tag in model_name.lower() for tag in ("llava", "vision", "qwen2-vl"))
+    return True

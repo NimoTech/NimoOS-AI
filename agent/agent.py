@@ -134,29 +134,46 @@ def _fetch_attachments(attachment_ids, session_id):
 
 
 def build_user_content(message: str, attachment_ids, *,
-                       session_id: str, data_root: str):
+                       session_id: str, data_root: str,
+                       model_name: str = "", provider_type: str = "other"):
     """Compose the SDK `input` content for the user turn.
-    Returns a string when there are no attachments (backward compat),
-    or a list of content blocks otherwise (input_text + input_image…).
+
+    Returns a string when no attachments (backward compat). Otherwise returns
+    a list of content blocks. For image kinds: inline base64 image_url block
+    when the (provider_type, model_name) supports vision; otherwise a text
+    fallback note describing the image.
     """
     if not attachment_ids:
         return message
+
+    from provider_adapters import model_supports_vision
+    has_vision = model_supports_vision(provider_type, model_name)
+
     blocks = [{"type": "input_text", "text": message}]
+    degraded_notes = []
     for row in _fetch_attachments(attachment_ids, session_id):
         if row["kind"] != "image":
             continue
         full = os.path.join(data_root, "sessions", session_id, "attachments",
                             row["rel_path"])
-        try:
-            with open(full, "rb") as f:
-                data = f.read()
-        except FileNotFoundError:
-            continue
-        b64 = base64.b64encode(data).decode("ascii")
-        blocks.append({
-            "type": "input_image",
-            "image_url": f"data:{row['mime']};base64,{b64}",
-        })
+        if has_vision:
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            blocks.append({
+                "type": "input_image",
+                "image_url": f"data:{row['mime']};base64,{b64}",
+            })
+        else:
+            kb = max(1, row["size_bytes"] // 1024)
+            degraded_notes.append(
+                f"[image attachment {row['filename']}, {kb} KB, model does not support vision]"
+            )
+    if degraded_notes:
+        blocks.append({"type": "input_text", "text": "\n".join(degraded_notes)})
     return blocks
 
 
@@ -363,7 +380,8 @@ class AgentRunner:
             )
             user_content = build_user_content(
                 message, attachment_ids,
-                session_id=session_id, data_root=data_root)
+                session_id=session_id, data_root=data_root,
+                model_name=model_name, provider_type=provider_type)
             history = self._load_history(session_id)
             input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
