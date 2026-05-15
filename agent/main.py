@@ -10,7 +10,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 import db as db_module
@@ -314,6 +314,83 @@ async def upload_attachment(
         ffprobe_timeout=FFPROBE_TIMEOUT,
     )
     return result
+
+
+@app.get("/agent/sessions/{session_id}/attachments")
+async def list_attachments(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    rows = _db().execute(
+        "SELECT id, message_id, filename, mime, kind, size_bytes, "
+        "       meta_json, created_at "
+        "FROM attachments WHERE session_id = ? ORDER BY created_at",
+        (session_id,)
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "message_id": r["message_id"],
+            "filename": r["filename"],
+            "mime": r["mime"],
+            "kind": r["kind"],
+            "size_bytes": r["size_bytes"],
+            "meta": json.loads(r["meta_json"]) if r["meta_json"] else None,
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+@app.delete("/agent/sessions/{session_id}/attachments/{attachment_id}")
+async def delete_attachment(
+    session_id: str,
+    attachment_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    row = _db().execute(
+        "SELECT message_id, rel_path FROM attachments "
+        "WHERE id = ? AND session_id = ?", (attachment_id, session_id)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    if row["message_id"] is not None:
+        raise HTTPException(status_code=409, detail="already bound to message")
+    full = os.path.join(_data_root(), "sessions", session_id,
+                        "attachments", row["rel_path"])
+    try:
+        os.remove(full)
+    except FileNotFoundError:
+        pass
+    _db().execute(
+        "DELETE FROM attachments WHERE id = ? AND session_id = ?",
+        (attachment_id, session_id))
+    _db().commit()
+    return {"ok": True}
+
+
+@app.get("/agent/sessions/{session_id}/attachments/{attachment_id}/raw")
+async def download_attachment(
+    session_id: str,
+    attachment_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    row = _db().execute(
+        "SELECT filename, mime, rel_path FROM attachments "
+        "WHERE id = ? AND session_id = ?", (attachment_id, session_id)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    full = os.path.join(_data_root(), "sessions", session_id,
+                        "attachments", row["rel_path"])
+    return FileResponse(
+        full, media_type=row["mime"],
+        headers={"Content-Disposition":
+                 f'inline; filename="{row["filename"]}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
