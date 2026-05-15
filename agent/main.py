@@ -932,6 +932,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 run_id=run_id,
                 provider_type=provider_type,
                 thinking=thinking,
+                attachment_ids=attachment_ids,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean

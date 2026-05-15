@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -116,6 +117,77 @@ def _compose_system_prompt(conn, session_id: str, base: str,
     return base + block
 
 
+def _fetch_attachments(attachment_ids, session_id):
+    """Return rows for the given attachment_ids scoped to session_id,
+    ordered by created_at. Returns [] when attachment_ids is empty."""
+    if not attachment_ids:
+        return []
+    conn = db_module.get_connection()
+    placeholders = ",".join(["?"] * len(attachment_ids))
+    rows = conn.execute(
+        f"SELECT id, filename, mime, kind, size_bytes, rel_path "
+        f"FROM attachments WHERE id IN ({placeholders}) AND session_id = ? "
+        f"ORDER BY created_at",
+        (*attachment_ids, session_id),
+    ).fetchall()
+    return list(rows)
+
+
+def build_user_content(message: str, attachment_ids, *,
+                       session_id: str, data_root: str):
+    """Compose the SDK `input` content for the user turn.
+    Returns a string when there are no attachments (backward compat),
+    or a list of content blocks otherwise (input_text + input_image…).
+    """
+    if not attachment_ids:
+        return message
+    blocks = [{"type": "input_text", "text": message}]
+    for row in _fetch_attachments(attachment_ids, session_id):
+        if row["kind"] != "image":
+            continue
+        full = os.path.join(data_root, "sessions", session_id, "attachments",
+                            row["rel_path"])
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            continue
+        b64 = base64.b64encode(data).decode("ascii")
+        blocks.append({
+            "type": "input_image",
+            "image_url": f"data:{row['mime']};base64,{b64}",
+        })
+    return blocks
+
+
+def select_tools_for_run(attachment_ids, *, session_id: str):
+    """Return tool list; conditionally appends `read_attachment` when at least
+    one attachment is non-image. Image-only or empty → unchanged ALL_TOOLS."""
+    rows = _fetch_attachments(attachment_ids, session_id)
+    has_non_image = any(r["kind"] != "image" for r in rows)
+    if has_non_image:
+        from skills.attachments import read_attachment
+        return list(ALL_TOOLS) + [read_attachment]
+    return list(ALL_TOOLS)
+
+
+def attachment_system_block(attachment_ids, *, session_id: str) -> str:
+    """System-prompt suffix listing non-image attachments. Empty string when
+    there are no non-image attachments."""
+    rows = _fetch_attachments(attachment_ids, session_id)
+    non_image = [r for r in rows if r["kind"] != "image"]
+    if not non_image:
+        return ""
+    lines = ["The user attached the following files to their message:"]
+    for r in non_image:
+        size_kb = max(1, r["size_bytes"] // 1024)
+        lines.append(f"- id={r['id']}, name=\"{r['filename']}\", "
+                     f"kind={r['kind']}, size={size_kb} KB")
+    lines.append("Use read_attachment(id) to inspect contents. "
+                 "Image attachments are already visible — don't call this on them.")
+    return "\n".join(lines)
+
+
 class AgentRunner:
     def __init__(self, conn: sqlite3.Connection, confirm_mgr=None):
         self._conn = conn
@@ -181,6 +253,7 @@ class AgentRunner:
         chat_username: str = "",
         user_patterns: list | None = None,
         run_id: str = "",
+        attachment_ids: list[str] = (),
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -254,6 +327,24 @@ class AgentRunner:
             base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
             full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
 
+            if attachment_ids:
+                att_block = attachment_system_block(attachment_ids, session_id=session_id)
+                if att_block:
+                    full_prompt = full_prompt + "\n\n" + att_block
+
+            # Set context vars for the conditional read_attachment skill before
+            # tool selection / Agent construction so tool invocations during
+            # this run resolve the right session.
+            from skills.attachments import (
+                SESSION_ID_VAR as _ATT_S,
+                USER_ID_VAR as _ATT_U,
+                MAX_CHARS_VAR as _ATT_C,
+            )
+            _ATT_S.set(session_id)
+            _ATT_U.set(user_id)
+            _ATT_C.set(int(os.environ.get(
+                "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
+
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
             # should_replay_reasoning_content). The Runner pulls model_settings
@@ -261,13 +352,20 @@ class AgentRunner:
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
-                tools=ALL_TOOLS,
+                tools=select_tools_for_run(attachment_ids, session_id=session_id),
                 model=model,
                 model_settings=model_settings,
             )
 
+            data_root = os.environ.get(
+                "NIMOOS_AGENT_DATA_ROOT",
+                str(db_module._DB_PATH.parent),
+            )
+            user_content = build_user_content(
+                message, attachment_ids,
+                session_id=session_id, data_root=data_root)
             history = self._load_history(session_id)
-            input_messages = history + [{"role": "user", "content": message}]
+            input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             try:
