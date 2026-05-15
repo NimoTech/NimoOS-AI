@@ -47,7 +47,7 @@ def confirm_setup():
 
 def _make_client(handler) -> WikiClient:
     transport = httpx.MockTransport(handler)
-    c = WikiClient("http://wiki.test", user_id="u1")
+    c = WikiClient(user_id="u1", base_url="http://wiki.test")
     c._http = httpx.AsyncClient(transport=transport, base_url="http://wiki.test")
     return c
 

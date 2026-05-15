@@ -1,23 +1,26 @@
 """HTTP wrapper for nimoos-wiki.
 
 One instance per Agent session; cache lives on the instance and is cleared at
-the top of every AgentRunner.run call via reset_cache(). All requests carry
-X-NimoOS-User-ID; wiki's middleware grants a localhost JWT exemption for
-in-host services (agent, nimoos-cli).
+the top of every AgentRunner.run call via reset_cache(). All requests go
+through the gateway (localhost:80) so wiki port churn on restart is invisible
+to us. Wiki's middleware grants a localhost JWT exemption for in-host services
+(agent, nimoos-cli) and honors the X-NimoOS-User-ID header we attach.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import httpx
 
 
-DEFAULT_URL_FILE = "/var/run/nimoos/wiki.url"
+DEFAULT_BASE_URL = os.environ.get("WIKI_BASE_URL", "http://127.0.0.1")
 DEFAULT_TIMEOUT = 5.0
 
 
 class WikiClient:
-    def __init__(self, base_url: str, *, user_id: str = "",
+    def __init__(self, *, user_id: str = "",
+                 base_url: str = DEFAULT_BASE_URL,
                  timeout: float = DEFAULT_TIMEOUT) -> None:
         self.base = base_url.rstrip("/")
         self.user_id = user_id
@@ -25,17 +28,6 @@ class WikiClient:
         self._http: httpx.AsyncClient | None = None
         self._node_cache: dict[str, dict] = {}
         self._tree_cache: dict[str, list[dict]] = {}  # keyed by root_id ("" for all)
-
-    @classmethod
-    def try_open(cls, *, url_file: str = DEFAULT_URL_FILE,
-                 user_id: str = "") -> "WikiClient | None":
-        try:
-            url = open(url_file).read().strip()
-        except OSError:
-            return None
-        if not url:
-            return None
-        return cls(url, user_id=user_id)
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None:

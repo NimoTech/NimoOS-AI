@@ -127,13 +127,13 @@ class AgentRunner:
             from confirm import ConfirmManager as _CM
             confirm_mgr = _CM(conn)
         self._confirm_mgr = confirm_mgr
-        # Session-scoped Wiki clients. try_open() returns None when wiki.url
-        # is missing — those sessions run with wiki integration disabled.
-        self._wiki_clients: dict[str, "WikiClient | None"] = {}
+        # Session-scoped Wiki clients. Calls go through the gateway, so wiki
+        # service restarts (new random port) are transparent to us.
+        self._wiki_clients: dict[str, WikiClient] = {}
 
-    def _wiki_client_for(self, session_id: str, user_id: str) -> "WikiClient | None":
+    def _wiki_client_for(self, session_id: str, user_id: str) -> WikiClient:
         if session_id not in self._wiki_clients:
-            self._wiki_clients[session_id] = WikiClient.try_open(user_id=str(user_id))
+            self._wiki_clients[session_id] = WikiClient(user_id=str(user_id))
         return self._wiki_clients[session_id]
 
     def _load_history(self, session_id: str) -> list:

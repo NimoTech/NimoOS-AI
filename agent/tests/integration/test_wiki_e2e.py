@@ -307,7 +307,7 @@ async def test_register_then_get_then_append_then_context(running_wiki, tmp_path
     target.mkdir()
     (target / "README.md").write_text("hello from e2e test\n")
 
-    c = WikiClient(running_wiki, user_id="42")
+    c = WikiClient(user_id="42", base_url=running_wiki)
     try:
         # 1. Register the root
         reg = await c.post_root(str(target), "space")

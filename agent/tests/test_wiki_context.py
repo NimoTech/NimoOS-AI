@@ -12,7 +12,7 @@ from wiki_context import WikiContextBuilder
 
 def _build_client(handler):
     transport = httpx.MockTransport(handler)
-    c = WikiClient("http://w.test", user_id="u1")
+    c = WikiClient(user_id="u1", base_url="http://w.test")
     c._http = httpx.AsyncClient(transport=transport, base_url="http://w.test")
     return c
 

@@ -11,7 +11,7 @@ from wiki_client import WikiClient
 def _client_with_handler(handler, *, user_id: str = "u1") -> WikiClient:
     """Build a WikiClient whose AsyncClient routes through MockTransport."""
     transport = httpx.MockTransport(handler)
-    c = WikiClient("http://wiki.test", user_id=user_id)
+    c = WikiClient(user_id=user_id, base_url="http://wiki.test")
     c._http = httpx.AsyncClient(transport=transport, base_url="http://wiki.test")
     return c
 
@@ -172,15 +172,22 @@ async def test_post_root_sends_payload():
     assert res["id"] == "new-root"
 
 
-def test_try_open_returns_none_when_url_file_missing(tmp_path):
-    missing = str(tmp_path / "nope.url")
-    assert WikiClient.try_open(url_file=missing) is None
-
-
-def test_try_open_returns_client_when_url_file_present(tmp_path):
-    url_file = tmp_path / "wiki.url"
-    url_file.write_text("http://127.0.0.1:39133\n")
-    c = WikiClient.try_open(url_file=str(url_file), user_id="u7")
-    assert c is not None
-    assert c.base == "http://127.0.0.1:39133"
+def test_default_base_url_is_gateway():
+    c = WikiClient(user_id="u7")
+    # Default points at the gateway on localhost; wiki port churn is invisible.
+    assert c.base == "http://127.0.0.1"
     assert c.user_id == "u7"
+
+
+def test_env_var_overrides_base_url(monkeypatch):
+    monkeypatch.setenv("WIKI_BASE_URL", "http://other.host:9999")
+    # Re-import so module-level DEFAULT_BASE_URL is re-evaluated.
+    import importlib
+    import wiki_client as wc
+    importlib.reload(wc)
+    try:
+        c = wc.WikiClient(user_id="u")
+        assert c.base == "http://other.host:9999"
+    finally:
+        monkeypatch.delenv("WIKI_BASE_URL", raising=False)
+        importlib.reload(wc)
