@@ -365,3 +365,30 @@ def test_pptx_garbage_returns_parse_error(tmp_path):
                                  max_uncompressed_bytes=10_000_000)
     # Non-ZIP fails _zipbomb_check → zip_bomb (consistent with docx/xlsx)
     assert result == {"ok": False, "error": "zip_bomb"} or result == {"ok": False, "error": "parse_error"}
+
+
+def test_docx_table_divider_matches_column_count(tmp_path):
+    """Regression test: docx table divider must have exactly ncols columns,
+    not ncols+1 (which would be invalid Markdown)."""
+    import docx
+    d = docx.Document()
+    table = d.add_table(rows=2, cols=3)
+    hdr = table.rows[0].cells
+    hdr[0].text = "A"; hdr[1].text = "B"; hdr[2].text = "C"
+    body = table.rows[1].cells
+    body[0].text = "1"; body[1].text = "2"; body[2].text = "3"
+    p = tmp_path / "tbl.docx"
+    d.save(str(p))
+
+    from attachments.extract import extract_to_markdown
+    result = extract_to_markdown(str(p), "docx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    md = result["markdown"]
+    # Divider line should have EXACTLY 3 "---" cells.
+    divider_lines = [line for line in md.splitlines()
+                     if line.strip().startswith("| ---")]
+    assert len(divider_lines) == 1, f"expected exactly 1 divider line, got: {divider_lines}"
+    # Count "---" tokens in the divider — must equal column count (3).
+    assert divider_lines[0].count("---") == 3, divider_lines[0]

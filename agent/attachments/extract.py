@@ -163,17 +163,20 @@ def _extract_docx(path: str, *, max_chars: int,
             for table in d.tables:
                 if truncated:
                     break
+                # Determine column count from the first row that has cells.
+                ncols = 0
                 rows = []
                 for row in table.rows:
                     cells = [(cell.text or "").replace("|", "\\|").replace("\n", " ")
                              for cell in row.cells]
+                    if not ncols:
+                        ncols = len(cells)
                     rows.append("| " + " | ".join(cells) + " |")
-                if not rows:
+                if not rows or ncols == 0:
                     continue
-                header = rows[0]
-                divider = "| " + " | ".join(["---"] * header.count("|") if header.count("|") > 1 else ["---"]) + " |"
+                divider = "| " + " | ".join(["---"] * ncols) + " |"
                 if emit(""): break
-                if emit(header): break
+                if emit(rows[0]): break
                 if emit(divider): break
                 for body_row in rows[1:]:
                     if emit(body_row):

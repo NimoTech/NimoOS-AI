@@ -161,7 +161,8 @@ def read_attachment(attachment_id: str) -> dict:
         zip_bomb (file rejected for size),
         timeout (too large/complex to extract in time),
         parse_error (corrupt or unsupported variant),
-        sidecar_write_failed (transient server error).
+        sidecar_write_failed (transient server error),
+        vanished (file or its extracted text is no longer available; ask the user to re-upload).
         In all error cases, explain in the user's language what's wrong and
         suggest a remedy (e.g., share a text PDF, paste the content, retry).
     """
