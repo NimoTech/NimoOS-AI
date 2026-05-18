@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS attachments (
     message_id   TEXT,
     filename     TEXT NOT NULL,
     mime         TEXT NOT NULL,
-    kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary')),
+    kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary','document')),
     size_bytes   INTEGER NOT NULL,
     rel_path     TEXT NOT NULL,
     meta_json    TEXT,
@@ -144,6 +144,35 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     # this also handles the schema migration from the old session_id PK shape.
     conn.execute("DROP TABLE IF EXISTS pending_confirmations")
     conn.executescript(_SCHEMA)
+    # Migration: rebuild attachments table if its CHECK constraint predates
+    # kind='document'. Idempotent — runs at most once per DB.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'"
+    ).fetchone()
+    if row and row[0] and "'document'" not in row[0]:
+        conn.executescript("""
+        CREATE TABLE attachments_new (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            message_id   TEXT,
+            filename     TEXT NOT NULL,
+            mime         TEXT NOT NULL,
+            kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary','document')),
+            size_bytes   INTEGER NOT NULL,
+            rel_path     TEXT NOT NULL,
+            meta_json    TEXT,
+            created_at   INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO attachments_new
+            SELECT id, session_id, message_id, filename, mime, kind,
+                   size_bytes, rel_path, meta_json, created_at
+            FROM attachments;
+        DROP TABLE attachments;
+        ALTER TABLE attachments_new RENAME TO attachments;
+        CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id);
+        CREATE INDEX IF NOT EXISTS idx_attachments_msg     ON attachments(message_id);
+        """)
     # Idempotent ALTER for existing databases without thinking columns.
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
     if "thinking_enabled" not in existing:
