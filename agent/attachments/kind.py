@@ -49,7 +49,7 @@ def _is_utf8_text(path: str) -> bool:
 
 def classify(path: str, original_name: str) -> tuple[str, str]:
     """
-    Returns (mime, kind). kind in {image, text, video, audio, binary}.
+    Returns (mime, kind). kind in {image, text, video, audio, document, binary}.
     Order: magic-bytes major type for image/video/audio first; then text
     by (whitelist suffix AND utf-8 decodable); else binary.
     """
