@@ -40,10 +40,62 @@ def extract_to_markdown(path: str, ext: str, *,
 # not_installed so the dispatcher is fully exercisable today.
 def _extract_pdf(path: str, *, max_chars: int) -> dict:
     try:
-        import pypdf  # noqa: F401
+        import pypdf
     except ImportError:
         return {"ok": False, "error": "not_installed"}
-    return {"ok": False, "error": "not_installed"}  # replaced in Task 3
+
+    try:
+        reader = pypdf.PdfReader(path)
+
+        if reader.is_encrypted:
+            # decrypt('') returns 0 when the empty password fails, 1/2 on success.
+            try:
+                ok = reader.decrypt("")
+            except Exception:
+                ok = 0
+            if not ok:
+                return {"ok": False, "error": "encrypted"}
+
+        pages = list(reader.pages)
+        buf: list[str] = []
+        total = 0
+        truncated = False
+        for page in pages:
+            try:
+                raw = page.extract_text() or ""
+            except Exception:
+                # Per-page failure shouldn't sink the whole document; emit a
+                # marker so the model knows that page was lost.
+                raw = "[unreadable page]"
+            text = raw.strip()
+            if not text:
+                continue
+            if total + len(text) >= max_chars:
+                buf.append(text[: max_chars - total])
+                total = max_chars
+                truncated = True
+                break
+            buf.append(text)
+            total += len(text)
+            buf.append("\n\n---\n\n")
+            total += 7
+
+        if not buf:
+            return {"ok": False, "error": "empty_scanned"}
+
+        markdown = "".join(buf).rstrip()
+
+        return {
+            "ok": True,
+            "markdown": markdown,
+            "pages": len(pages),
+            "chars": len(markdown),
+            "truncated": truncated,
+            "extractor": "pypdf",
+        }
+    except Exception:
+        log.exception("pypdf extraction failed for %s", path)
+        return {"ok": False, "error": "parse_error"}
 
 
 def _extract_docx(path: str, *, max_chars: int,
