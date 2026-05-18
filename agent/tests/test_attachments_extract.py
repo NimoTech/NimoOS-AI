@@ -135,3 +135,69 @@ def test_pdf_unexpected_exception_caught(tmp_path, monkeypatch):
                                          max_chars=1000,
                                          max_uncompressed_bytes=10_000_000)
     assert result == {"ok": False, "error": "parse_error"}
+
+
+def _build_docx(tmp_path, paragraphs):
+    """Build an in-memory .docx using python-docx and return its path."""
+    import docx
+    d = docx.Document()
+    for p in paragraphs:
+        d.add_paragraph(p)
+    p = tmp_path / "doc.docx"
+    d.save(str(p))
+    return str(p)
+
+
+def test_docx_happy_path(tmp_path):
+    from attachments.extract import extract_to_markdown
+    path = _build_docx(tmp_path, ["First paragraph.", "Second paragraph."])
+    result = extract_to_markdown(path, "docx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert "First paragraph." in result["markdown"]
+    assert "Second paragraph." in result["markdown"]
+    assert result["extractor"] == "python-docx"
+    assert result["truncated"] is False
+
+
+def test_docx_truncation(tmp_path):
+    from attachments.extract import extract_to_markdown
+    big = "x" * 500
+    path = _build_docx(tmp_path, [big, big, big])
+    result = extract_to_markdown(path, "docx",
+                                 max_chars=100,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["markdown"]) <= 100
+
+
+def test_docx_garbage_returns_parse_error(tmp_path):
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "junk.docx"
+    p.write_bytes(b"not a zip at all")
+    result = extract_to_markdown(str(p), "docx",
+                                 max_chars=1000,
+                                 max_uncompressed_bytes=10_000_000)
+    # Garbage that isn't even a ZIP fails the zip-bomb precheck (BadZipFile
+    # → returns False → zip_bomb branch). If your implementation chose a
+    # different signaling for "not even a zip", adjust this assertion to
+    # match — but document the choice in the helper's docstring.
+    assert result == {"ok": False, "error": "zip_bomb"} or result == {"ok": False, "error": "parse_error"}
+
+
+def test_docx_zip_bomb_precheck(tmp_path):
+    """A ZIP whose summed uncompressed size exceeds the cap is rejected
+    before python-docx ever touches it."""
+    import zipfile
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "bomb.docx"
+    # Two entries totalling ~3000 bytes uncompressed; cap of 1000 rejects.
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("a.xml", "A" * 2000)
+        z.writestr("b.xml", "B" * 1000)
+    result = extract_to_markdown(str(p), "docx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=1000)
+    assert result == {"ok": False, "error": "zip_bomb"}
