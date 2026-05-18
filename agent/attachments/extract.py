@@ -199,10 +199,105 @@ def _extract_docx(path: str, *, max_chars: int,
 def _extract_xlsx(path: str, *, max_chars: int,
                   max_uncompressed_bytes: int) -> dict:
     try:
-        import openpyxl  # noqa: F401
+        import openpyxl
     except ImportError:
         return {"ok": False, "error": "not_installed"}
-    return {"ok": False, "error": "not_installed"}  # replaced in Task 5
+
+    if not _zipbomb_check(path, max_uncompressed_bytes):
+        return {"ok": False, "error": "zip_bomb"}
+
+    def _emit_sheet(ws, buf, total, truncated):
+        """Append one sheet's markdown to buf. Returns
+        (new_total, truncated, saw_any_value)."""
+        saw_any_value = False
+        rows_iter = ws.iter_rows(values_only=True)
+        first_row = None
+        for row in rows_iter:
+            first_row = row
+            break
+        if first_row is None:
+            return total, truncated, saw_any_value
+
+        def cell_str(v):
+            nonlocal saw_any_value
+            if v is not None:
+                saw_any_value = True
+            return "" if v is None else str(v).replace("|", "\\|").replace("\n", " ")
+
+        def append(line):
+            nonlocal total, truncated
+            if total + len(line) + 1 >= max_chars:
+                buf.append(line[: max_chars - total])
+                total = max_chars
+                truncated = True
+                return True
+            buf.append(line + "\n")
+            total += len(line) + 1
+            return False
+
+        if append(f"## {ws.title}"):
+            return total, truncated, saw_any_value
+        if append(""):
+            return total, truncated, saw_any_value
+
+        header_cells = [cell_str(v) for v in first_row]
+        header_line = "| " + " | ".join(header_cells) + " |"
+        divider_line = "| " + " | ".join(["---"] * len(header_cells)) + " |"
+        if append(header_line):
+            return total, truncated, saw_any_value
+        if append(divider_line):
+            return total, truncated, saw_any_value
+        for row in rows_iter:
+            body_cells = [cell_str(v) for v in row]
+            if append("| " + " | ".join(body_cells) + " |"):
+                return total, truncated, saw_any_value
+        if append(""):
+            return total, truncated, saw_any_value
+        return total, truncated, saw_any_value
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet_count = len(wb.sheetnames)
+        buf: list[str] = []
+        total = 0
+        truncated = False
+        any_value_seen = False
+        for ws in wb.worksheets:
+            if truncated:
+                break
+            total, truncated, saw_any = _emit_sheet(ws, buf, total, truncated)
+            any_value_seen = any_value_seen or saw_any
+        wb.close()
+
+        # Fallback: if every cell came back None (Python-generated xlsx with
+        # no cached calc values), re-open with data_only=False to surface
+        # formula text.
+        if not any_value_seen and sheet_count > 0:
+            buf = []
+            total = 0
+            truncated = False
+            wb2 = openpyxl.load_workbook(path, read_only=True, data_only=False)
+            for ws in wb2.worksheets:
+                if truncated:
+                    break
+                total, truncated, _ = _emit_sheet(ws, buf, total, truncated)
+            wb2.close()
+
+        markdown = "".join(buf).rstrip()
+        if not markdown.strip():
+            return {"ok": False, "error": "empty_scanned"}
+
+        return {
+            "ok": True,
+            "markdown": markdown,
+            "pages": sheet_count,
+            "chars": len(markdown),
+            "truncated": truncated,
+            "extractor": "openpyxl",
+        }
+    except Exception:
+        log.exception("openpyxl extraction failed for %s", path)
+        return {"ok": False, "error": "parse_error"}
 
 
 def _extract_pptx(path: str, *, max_chars: int,

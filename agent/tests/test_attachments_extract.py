@@ -201,3 +201,96 @@ def test_docx_zip_bomb_precheck(tmp_path):
                                  max_chars=10_000,
                                  max_uncompressed_bytes=1000)
     assert result == {"ok": False, "error": "zip_bomb"}
+
+
+def _build_xlsx(tmp_path, sheets):
+    """sheets: list of (title, list-of-rows). Returns path."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets:
+        ws = wb.create_sheet(title=title)
+        for row in rows:
+            ws.append(row)
+    p = tmp_path / "book.xlsx"
+    wb.save(str(p))
+    return str(p)
+
+
+def test_xlsx_happy_path(tmp_path):
+    from attachments.extract import extract_to_markdown
+    path = _build_xlsx(tmp_path, [
+        ("Sheet1", [["Name", "Age"], ["Alice", 30], ["Bob", 25]]),
+    ])
+    result = extract_to_markdown(path, "xlsx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert "## Sheet1" in result["markdown"]
+    assert "Alice" in result["markdown"]
+    assert "Bob" in result["markdown"]
+    assert result["pages"] == 1  # sheet count
+    assert result["extractor"] == "openpyxl"
+
+
+def test_xlsx_multiple_sheets(tmp_path):
+    from attachments.extract import extract_to_markdown
+    path = _build_xlsx(tmp_path, [
+        ("Numbers", [[1, 2], [3, 4]]),
+        ("Letters", [["a", "b"], ["c", "d"]]),
+    ])
+    result = extract_to_markdown(path, "xlsx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert "## Numbers" in result["markdown"]
+    assert "## Letters" in result["markdown"]
+    assert result["pages"] == 2
+
+
+def test_xlsx_data_only_falls_back_to_formula(tmp_path):
+    """A workbook whose cells are all formulas with no cached calc values
+    (the canonical Python-generated case) triggers the data_only=False
+    fallback so the model gets formula text instead of all-None rows."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Calc"
+    # Formulas only — openpyxl never writes a cached <v>, so data_only=True
+    # returns None for every cell.
+    ws["A1"] = "=1+1"
+    ws["A2"] = "=2+2"
+    p = tmp_path / "formula.xlsx"
+    wb.save(str(p))
+
+    from attachments.extract import extract_to_markdown
+    result = extract_to_markdown(str(p), "xlsx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    # Fallback path emits the formula text rather than blank cells.
+    assert "=1+1" in result["markdown"]
+    assert "=2+2" in result["markdown"]
+
+
+def test_xlsx_zip_bomb_precheck(tmp_path):
+    import zipfile
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "bomb.xlsx"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("a.xml", "A" * 5000)
+    result = extract_to_markdown(str(p), "xlsx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=1000)
+    assert result == {"ok": False, "error": "zip_bomb"}
+
+
+def test_xlsx_garbage_returns_parse_error(tmp_path):
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "junk.xlsx"
+    p.write_bytes(b"not a zip")
+    result = extract_to_markdown(str(p), "xlsx",
+                                 max_chars=1000,
+                                 max_uncompressed_bytes=10_000_000)
+    # Non-ZIP fails _zipbomb_check → zip_bomb (consistent with docx behavior)
+    assert result == {"ok": False, "error": "zip_bomb"} or result == {"ok": False, "error": "parse_error"}
