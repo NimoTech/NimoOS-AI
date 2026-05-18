@@ -14,6 +14,14 @@ TEXT_EXT_WHITELIST = {
     "html", "css", "xml", "sql", "sh",
 }
 
+DOCUMENT_EXT_MAP = {
+    "pdf":  "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
 _UTF8_PROBE = 8192  # bytes
 
 
@@ -56,6 +64,9 @@ def classify(path: str, original_name: str) -> tuple[str, str]:
         return mime, "audio"
 
     ext = os.path.splitext(original_name)[1].lstrip(".").lower()
+    if ext in DOCUMENT_EXT_MAP:
+        return DOCUMENT_EXT_MAP[ext], "document"
+
     if ext in TEXT_EXT_WHITELIST and _is_utf8_text(path):
         return mime if major == "text" else "text/plain", "text"
 

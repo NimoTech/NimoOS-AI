@@ -43,3 +43,25 @@ def test_invalid_utf8_text_extension_is_binary(tmp_path):
     path = _write(tmp_path, "bad.txt", b"\xff\xfe\x00binary\xff")
     mime, kind = classify(path, "bad.txt")
     assert kind == "binary"
+
+
+import pytest
+
+DOC_EXTS_AND_MIMES = [
+    ("a.pdf",  "application/pdf"),
+    ("a.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("a.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("a.xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"),
+    ("a.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+]
+
+
+@pytest.mark.parametrize("name,expected_mime", DOC_EXTS_AND_MIMES)
+def test_document_extension_classified_as_document(tmp_path, name, expected_mime):
+    # Bytes don't have to be a real document; classify is by extension.
+    path = tmp_path / name
+    path.write_bytes(b"not really a document, just placeholder bytes")
+    from attachments.kind import classify
+    mime, kind = classify(str(path), name)
+    assert kind == "document", f"{name} should be document, got {kind}"
+    assert mime == expected_mime
