@@ -327,7 +327,7 @@ async def upload_attachment(
 
     size = await att_upload.stream_to_disk(file, part_path, MAX_ATTACHMENT_SIZE)
 
-    result = att_upload.handle_upload(
+    result = await att_upload.handle_upload(
         conn=conn,
         data_root=_data_root(),
         session_id=session_id,
@@ -336,6 +336,9 @@ async def upload_attachment(
         size=size,
         max_image_size=MAX_IMAGE_ATTACHMENT_SIZE,
         ffprobe_timeout=FFPROBE_TIMEOUT,
+        max_doc_chars=MAX_DOC_CHARS,
+        max_doc_uncompressed_bytes=MAX_DOC_UNCOMPRESSED_BYTES,
+        max_extract_seconds=MAX_DOC_EXTRACT_SECONDS,
     )
     return result
 
