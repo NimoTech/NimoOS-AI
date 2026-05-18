@@ -86,11 +86,14 @@ async def handle_upload(*, conn: sqlite3.Connection, data_root: str,
 
     elif kind == "document":
         ext = os.path.splitext(original_name)[1].lstrip(".").lower()
+        loop = asyncio.get_running_loop()
+        # Per-request executor (not the default) + shutdown(wait=False) so
+        # asyncio.run()'s shutdown_default_executor() at loop teardown
+        # doesn't block waiting for a still-running extraction thread on
+        # timeout. See spec §3 — thread leakage on timeout is bounded by
+        # upload size cap + zip-bomb precheck and accepted for Phase 1.
+        _pool: concurrent.futures.ThreadPoolExecutor | None = None
         try:
-            loop = asyncio.get_event_loop()
-            # Use a non-blocking executor submit (no `with` block so the
-            # ThreadPoolExecutor.__exit__ does not block on thread completion
-            # when wait_for times out).
             _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = loop.run_in_executor(
                 _pool,
@@ -104,8 +107,8 @@ async def handle_upload(*, conn: sqlite3.Connection, data_root: str,
         except asyncio.TimeoutError:
             result = {"ok": False, "error": "timeout"}
         finally:
-            # Allow threads to finish in background; don't block.
-            _pool.shutdown(wait=False)
+            if _pool is not None:
+                _pool.shutdown(wait=False)
 
         if result["ok"]:
             extracted_markdown = result["markdown"]
