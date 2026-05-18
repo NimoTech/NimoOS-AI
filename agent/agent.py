@@ -230,7 +230,10 @@ def attachment_system_block(attachment_ids, *, session_id: str) -> str:
         lines.append(f"- id={r['id']}, name=\"{r['filename']}\", "
                      f"kind={r['kind']}, size={size_kb} KB")
     lines.append("Use read_attachment(id) to inspect contents. "
-                 "Image attachments are already visible — don't call this on them.")
+                 "Image attachments are already visible — don't call this on them. "
+                 "For kind=document, the response may include an `error` field "
+                 "(e.g., empty_scanned, encrypted, timeout) — relay it to the user "
+                 "in plain language in their own language.")
     return "\n".join(lines)
 
 
