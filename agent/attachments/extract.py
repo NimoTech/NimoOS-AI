@@ -303,7 +303,68 @@ def _extract_xlsx(path: str, *, max_chars: int,
 def _extract_pptx(path: str, *, max_chars: int,
                   max_uncompressed_bytes: int) -> dict:
     try:
-        import pptx  # noqa: F401
+        from pptx import Presentation
     except ImportError:
         return {"ok": False, "error": "not_installed"}
-    return {"ok": False, "error": "not_installed"}  # replaced in Task 6
+
+    if not _zipbomb_check(path, max_uncompressed_bytes):
+        return {"ok": False, "error": "zip_bomb"}
+
+    try:
+        deck = Presentation(path)
+        slides = list(deck.slides)
+        buf: list[str] = []
+        total = 0
+        truncated = False
+
+        def emit(line: str) -> bool:
+            nonlocal total, truncated
+            if total + len(line) + 1 >= max_chars:
+                buf.append(line[: max_chars - total])
+                total = max_chars
+                truncated = True
+                return True
+            buf.append(line + "\n")
+            total += len(line) + 1
+            return False
+
+        for i, slide in enumerate(slides, start=1):
+            if truncated:
+                break
+            if emit(f"## Slide {i}"):
+                break
+            for shape in slide.shapes:
+                if truncated:
+                    break
+                if not getattr(shape, "has_text_frame", False):
+                    continue
+                for para in shape.text_frame.paragraphs:
+                    text = "".join(run.text for run in para.runs).strip()
+                    if not text:
+                        continue
+                    if emit(f"- {text}"):
+                        break
+            if not truncated:
+                if emit(""):
+                    break
+
+        markdown = "".join(buf).rstrip()
+        body_lines = [
+            line for line in markdown.splitlines()
+            if line.strip() and not line.startswith("## Slide ")
+        ]
+        if not body_lines:
+            # All we got was slide headers and no body text — treat as empty.
+            return {"ok": False, "error": "empty_scanned"}
+
+        return {
+            "ok": True,
+            "markdown": markdown,
+            "pages": len(slides),
+            "chars": len(markdown),
+            "truncated": truncated,
+            "extractor": "python-pptx",
+        }
+    except Exception:
+        log.exception("python-pptx extraction failed for %s", path)
+        return {"ok": False, "error": "parse_error"}

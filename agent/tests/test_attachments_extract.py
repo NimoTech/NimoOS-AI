@@ -294,3 +294,74 @@ def test_xlsx_garbage_returns_parse_error(tmp_path):
                                  max_uncompressed_bytes=10_000_000)
     # Non-ZIP fails _zipbomb_check → zip_bomb (consistent with docx behavior)
     assert result == {"ok": False, "error": "zip_bomb"} or result == {"ok": False, "error": "parse_error"}
+
+
+def _build_pptx(tmp_path, slides_text):
+    """slides_text: list[list[str]] — per slide, list of paragraphs."""
+    from pptx import Presentation
+    p = Presentation()
+    layout = p.slide_layouts[5]  # title only
+    for paragraphs in slides_text:
+        slide = p.slides.add_slide(layout)
+        title = slide.shapes.title
+        title.text = paragraphs[0] if paragraphs else ""
+        if len(paragraphs) > 1:
+            txbox = slide.shapes.add_textbox(left=0, top=0, width=100, height=100)
+            tf = txbox.text_frame
+            tf.text = paragraphs[1]
+            for extra in paragraphs[2:]:
+                tf.add_paragraph().text = extra
+    out = tmp_path / "deck.pptx"
+    p.save(str(out))
+    return str(out)
+
+
+def test_pptx_happy_path(tmp_path):
+    from attachments.extract import extract_to_markdown
+    path = _build_pptx(tmp_path, [
+        ["Title One", "Body of slide 1"],
+        ["Title Two", "Body of slide 2", "Another paragraph"],
+    ])
+    result = extract_to_markdown(path, "pptx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert "Title One" in result["markdown"]
+    assert "Title Two" in result["markdown"]
+    assert "Body of slide 1" in result["markdown"]
+    assert result["pages"] == 2
+    assert result["extractor"] == "python-pptx"
+
+
+def test_pptx_truncation(tmp_path):
+    from attachments.extract import extract_to_markdown
+    path = _build_pptx(tmp_path, [["T", "x" * 5000]] * 3)
+    result = extract_to_markdown(path, "pptx",
+                                 max_chars=200,
+                                 max_uncompressed_bytes=10_000_000)
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["markdown"]) <= 200
+
+
+def test_pptx_zip_bomb_precheck(tmp_path):
+    import zipfile
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "bomb.pptx"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("a.xml", "A" * 5000)
+    result = extract_to_markdown(str(p), "pptx",
+                                 max_chars=10_000,
+                                 max_uncompressed_bytes=1000)
+    assert result == {"ok": False, "error": "zip_bomb"}
+
+
+def test_pptx_garbage_returns_parse_error(tmp_path):
+    from attachments.extract import extract_to_markdown
+    p = tmp_path / "junk.pptx"
+    p.write_bytes(b"not a zip")
+    result = extract_to_markdown(str(p), "pptx",
+                                 max_chars=1000,
+                                 max_uncompressed_bytes=10_000_000)
+    # Non-ZIP fails _zipbomb_check → zip_bomb (consistent with docx/xlsx)
+    assert result == {"ok": False, "error": "zip_bomb"} or result == {"ok": False, "error": "parse_error"}
