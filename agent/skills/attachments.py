@@ -83,6 +83,44 @@ def _read_attachment_impl(attachment_id: str, *, session_id: str,
             "total_bytes": size_bytes,
         }
 
+    if kind == "document":
+        meta = json.loads(meta_json) if meta_json else {}
+
+        if "extract_error" in meta:
+            return {
+                "kind": "document",
+                "filename": filename,
+                "mime": mime,
+                "error": meta["extract_error"],
+                "total_bytes": size_bytes,
+            }
+
+        sidecar_name = meta.get("sidecar")
+        if not sidecar_name:
+            return {"error": "vanished"}
+        sidecar_path = os.path.join(data_root, "sessions", session_id,
+                                    "attachments", sidecar_name)
+        if not os.path.exists(sidecar_path):
+            return {"error": "vanished"}
+
+        read_bytes = max_chars * 4
+        with open(sidecar_path, "rb") as f:
+            raw = f.read(read_bytes + 1)
+        decoded = raw.decode("utf-8", errors="ignore")
+        truncated = (len(decoded) > max_chars
+                     or len(raw) > read_bytes
+                     or bool(meta.get("truncated")))
+        return {
+            "kind": "document",
+            "filename": filename,
+            "mime": mime,
+            "extractor": meta.get("extractor"),
+            "pages": meta.get("pages"),
+            "content": decoded[:max_chars],
+            "truncated": truncated,
+            "total_bytes": size_bytes,
+        }
+
     if kind in ("video", "audio"):
         if not os.path.exists(full):
             return {"error": "vanished"}
@@ -113,6 +151,19 @@ def read_attachment(attachment_id: str) -> dict:
     Use this when the user references a file (PDF, video, log, etc.) you don't
     already see inline. Image attachments are already visible — don't call this
     on them.
+
+    For kind=document attachments, the response is either:
+      • {"kind":"document", "content": "<markdown>", "extractor": ..., "pages": ...}
+        — extracted text is available.
+      • {"kind":"document", "error": "<reason>"} — extraction failed. Reasons:
+        empty_scanned (likely scanned PDF; you don't have OCR),
+        encrypted (password-protected PDF),
+        zip_bomb (file rejected for size),
+        timeout (too large/complex to extract in time),
+        parse_error (corrupt or unsupported variant),
+        sidecar_write_failed (transient server error).
+        In all error cases, explain in the user's language what's wrong and
+        suggest a remedy (e.g., share a text PDF, paste the content, retry).
     """
     return _read_attachment_impl(
         attachment_id,

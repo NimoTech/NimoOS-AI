@@ -142,3 +142,51 @@ def test_function_tool_reads_via_context_vars(setup):
     )
     assert result["kind"] == "text"
     assert result["content"] == "hello via context"
+
+
+def test_document_with_sidecar_returns_content(setup, tmp_path):
+    conn, root, skill = setup
+    # Original file (bytes don't matter for read_attachment in document path,
+    # but we keep one on disk to mirror real upload state).
+    _mk_att(conn, root, aid="d1", kind="document", mime="application/pdf",
+            content_bytes=b"%PDF-1.4\n", filename="r.pdf",
+            meta={"sidecar": "d1__r.pdf.md", "extractor": "pypdf",
+                  "pages": 4, "chars": 12, "truncated": False})
+    # Drop sidecar next to the original.
+    side = root / "sessions" / "s1" / "attachments" / "d1__r.pdf.md"
+    side.write_text("# Title\nbody text", encoding="utf-8")
+
+    result = skill._read_attachment_impl(
+        "d1", session_id="s1", user_id="u1", max_chars=1000,
+        conn=conn, data_root=str(root))
+    assert result["kind"] == "document"
+    assert result["content"] == "# Title\nbody text"
+    assert result["extractor"] == "pypdf"
+    assert result["pages"] == 4
+    assert result["truncated"] is False
+
+
+def test_document_with_extract_error_returns_error_field(setup):
+    conn, root, skill = setup
+    _mk_att(conn, root, aid="d2", kind="document", mime="application/pdf",
+            content_bytes=b"%PDF-1.4\n", filename="scan.pdf",
+            meta={"extract_error": "empty_scanned"})
+    result = skill._read_attachment_impl(
+        "d2", session_id="s1", user_id="u1", max_chars=1000,
+        conn=conn, data_root=str(root))
+    assert result == {"kind": "document", "filename": "scan.pdf",
+                      "mime": "application/pdf", "error": "empty_scanned",
+                      "total_bytes": len(b"%PDF-1.4\n")}
+
+
+def test_document_sidecar_missing_returns_vanished(setup):
+    conn, root, skill = setup
+    _mk_att(conn, root, aid="d3", kind="document", mime="application/pdf",
+            content_bytes=b"%PDF-1.4\n", filename="r.pdf",
+            meta={"sidecar": "d3__r.pdf.md", "extractor": "pypdf",
+                  "pages": 1, "chars": 0, "truncated": False})
+    # Sidecar deliberately NOT written.
+    result = skill._read_attachment_impl(
+        "d3", session_id="s1", user_id="u1", max_chars=1000,
+        conn=conn, data_root=str(root))
+    assert result == {"error": "vanished"}
