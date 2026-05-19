@@ -1,6 +1,7 @@
 package service
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -36,4 +37,58 @@ func TestSkillsStore_RejectsBadID(t *testing.T) {
 	}
 	_ = filepath.Join // keep import
 	_ = s             // keep s used
+}
+
+func TestSkillsStore_LoadManifest(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+
+	dir := s.BuiltinPath("photo-curator")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{
+		"schema_version": 1,
+		"id": "photo-curator",
+		"name": "photo-curator",
+		"title": "Photo curator",
+		"description": "Cluster photos",
+		"color": "purple",
+		"icon": "image",
+		"trigger": "auto",
+		"examples": ["Cluster last week"],
+		"version": "0.1.0",
+		"author": "Nimo"
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"),
+		[]byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"),
+		[]byte("## hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := s.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if m.ID != "photo-curator" || m.Color != "purple" || m.Trigger != "auto" {
+		t.Fatalf("bad manifest: %+v", m)
+	}
+	if len(m.Examples) != 1 || m.Examples[0] != "Cluster last week" {
+		t.Fatalf("examples: %+v", m.Examples)
+	}
+}
+
+func TestSkillsStore_LoadManifest_RejectsBad(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := filepath.Join(root, "broken")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "manifest.json"),
+		[]byte(`{"id":"","trigger":"bogus"}`), 0o644)
+	if _, err := s.LoadManifest(dir); err == nil {
+		t.Fatal("expected error")
+	}
 }
