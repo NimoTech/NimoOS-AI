@@ -73,6 +73,29 @@ func NewService(cfg *config.Config) Services {
 	store := &SkillsStore{Root: skillsRoot}
 	skillsSvc := &skillsService{db: db, store: store}
 
+	// Rebuild .runtime/<uid>/ for every user we know about. The skill_state
+	// table lists users; if a user has no row, the agent layer rebuilds on
+	// first agent run.
+	if rows, err := db.Query(`SELECT DISTINCT user_id FROM skill_state`); err == nil {
+		for rows.Next() {
+			var uid string
+			if rows.Scan(&uid) == nil {
+				uninstalled := map[string]bool{}
+				uRows, _ := db.Query(
+					`SELECT skill_id FROM skill_state WHERE user_id=? AND uninstalled=1`, uid)
+				for uRows.Next() {
+					var id string
+					if uRows.Scan(&id) == nil {
+						uninstalled[id] = true
+					}
+				}
+				uRows.Close()
+				_ = RebuildRuntimeView(store, uid, uninstalled)
+			}
+		}
+		rows.Close()
+	}
+
 	return &services{
 		db:            db,
 		masterKey:     mk,

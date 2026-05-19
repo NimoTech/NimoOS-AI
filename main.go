@@ -59,6 +59,14 @@ func main() {
 
 	logger.LogInit(config.Cfg.LogPath, "nimoos-ai", "log")
 
+	// Seed built-in skill bundles into the data dir. Non-fatal: if this
+	// fails (e.g., disk full), the service still starts; users just don't
+	// see built-in skills until next start.
+	skillsRoot := filepath.Join(config.Cfg.DataPath, "skills")
+	if err := service.SeedBuiltinSkills(skillsRoot, BuiltinSkillsFS()); err != nil {
+		logger.Error("skills seed failed", zap.Error(err))
+	}
+
 	svc := service.NewService(config.Cfg)
 
 	// Start Ollama health checker
