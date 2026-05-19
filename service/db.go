@@ -145,6 +145,37 @@ func migrate(db *sql.DB) error {
 		UNIQUE(user_id, pattern)
 	);
 	CREATE INDEX IF NOT EXISTS idx_blacklist_user ON hard_blacklist(user_id);
+
+	CREATE TABLE IF NOT EXISTS user_skills (
+		id             TEXT NOT NULL,
+		user_id        TEXT NOT NULL,
+		name           TEXT NOT NULL,
+		title          TEXT NOT NULL DEFAULT '',
+		description    TEXT NOT NULL DEFAULT '',
+		trigger_kind   TEXT NOT NULL DEFAULT 'auto',
+		trigger_human  TEXT NOT NULL DEFAULT '',
+		color          TEXT NOT NULL DEFAULT 'blue',
+		icon           TEXT NOT NULL DEFAULT 'sparkle',
+		enabled        INTEGER NOT NULL DEFAULT 1,
+		author         TEXT NOT NULL DEFAULT 'You',
+		last_used      TEXT NOT NULL DEFAULT '',
+		calls          INTEGER NOT NULL DEFAULT 0,
+		files_json     TEXT NOT NULL DEFAULT '[]',
+		examples_json  TEXT NOT NULL DEFAULT '[]',
+		md             TEXT NOT NULL DEFAULT '',
+		created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (user_id, id)
+	);
+
+	CREATE TABLE IF NOT EXISTS skill_state (
+		user_id     TEXT NOT NULL,
+		skill_id    TEXT NOT NULL,
+		enabled     INTEGER NOT NULL DEFAULT 1,
+		uninstalled INTEGER NOT NULL DEFAULT 0,
+		last_used   TEXT NOT NULL DEFAULT '',
+		calls       INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, skill_id)
+	);
 	`)
 	if err != nil {
 		return err

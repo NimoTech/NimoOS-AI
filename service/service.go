@@ -20,6 +20,7 @@ type Services interface {
 	ModelManager() *ModelManager
 	Sessions() *sessionService
 	Blacklist() *blacklistService
+	Skills() *skillsService
 }
 
 type services struct {
@@ -32,6 +33,7 @@ type services struct {
 	modelManager  *ModelManager
 	sessions      *sessionService
 	blacklist     *blacklistService
+	skills        *skillsService
 }
 
 func (s *services) DB() *sql.DB                      { return s.db }
@@ -43,6 +45,7 @@ func (s *services) Providers() *providerService       { return s.providers }
 func (s *services) ModelManager() *ModelManager       { return s.modelManager }
 func (s *services) Sessions() *sessionService         { return s.sessions }
 func (s *services) Blacklist() *blacklistService      { return s.blacklist }
+func (s *services) Skills() *skillsService            { return s.skills }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -64,6 +67,7 @@ func NewService(cfg *config.Config) Services {
 	modelMgr := NewModelManager(common.OllamaBaseURL, db)
 	sessionSvc := &sessionService{db: db}
 	blacklistSvc := &blacklistService{db: db}
+	skillsSvc := &skillsService{db: db}
 
 	return &services{
 		db:            db,
@@ -75,5 +79,6 @@ func NewService(cfg *config.Config) Services {
 		modelManager:  modelMgr,
 		sessions:      sessionSvc,
 		blacklist:     blacklistSvc,
+		skills:        skillsSvc,
 	}
 }

@@ -122,5 +122,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.POST("/blacklist", blacklist.Create)
 	g.DELETE("/blacklist/:id", blacklist.Delete)
 
+	// Skill management
+	skills := v2.NewSkillsHandler(svc)
+	g.GET("/skills", skills.List)
+	g.POST("/skills", skills.Create)
+	g.GET("/skills/:id", skills.Get)
+	g.PATCH("/skills/:id", skills.Update)
+	g.DELETE("/skills/:id", skills.Delete)
+	g.POST("/skills/:id/test", skills.Test)
+
 	return e
 }
