@@ -8,10 +8,21 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-type SkillsHandler struct{ svc service.Services }
+type SkillsHandler struct {
+	svc        service.Services
+	agentURL   string
+	httpClient *http.Client
+}
 
 func NewSkillsHandler(svc service.Services) *SkillsHandler {
-	return &SkillsHandler{svc: svc}
+	return &SkillsHandler{svc: svc, httpClient: &http.Client{Timeout: 0}}
+}
+
+// NewSkillsHandlerFull wires the upstream Python agent URL for the
+// streaming test endpoint. Production code uses this; unit tests that
+// don't exercise streaming can use NewSkillsHandler.
+func NewSkillsHandlerFull(svc service.Services, agentURL string) *SkillsHandler {
+	return &SkillsHandler{svc: svc, agentURL: agentURL, httpClient: &http.Client{Timeout: 0}}
 }
 
 func (h *SkillsHandler) List(c echo.Context) error {

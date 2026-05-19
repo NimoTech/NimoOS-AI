@@ -123,13 +123,13 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.DELETE("/blacklist/:id", blacklist.Delete)
 
 	// Skill management
-	skills := v2.NewSkillsHandler(svc)
+	skills := v2.NewSkillsHandlerFull(svc, agentURL)
 	g.GET("/skills", skills.List)
 	g.POST("/skills", skills.Create)
 	g.GET("/skills/:id", skills.Get)
 	g.PATCH("/skills/:id", skills.Update)
 	g.DELETE("/skills/:id", skills.Delete)
-	// g.POST("/skills/:id/test", skills.Test)  // re-added in Task 16 as TestStream
+	g.POST("/skills/:id/test", skills.TestStream)
 	g.GET("/skills/:id/files/*", skills.GetFile)
 	g.GET("/skills/:id/export", skills.ExportTarGz)
 
