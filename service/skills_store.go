@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 func slugify(s string) string {
@@ -290,6 +292,61 @@ func (s *SkillsStore) CreateFromForm(userID string, r CreateSkillReq) (*SkillMan
 		return nil, err
 	}
 	return m, nil
+}
+
+var ErrNotFound = errors.New("skill not found")
+
+func (s *SkillsStore) DeleteUser(userID, id string) error {
+	if err := ValidateSkillID(id); err != nil {
+		return err
+	}
+	dir := s.UserPath(userID, id)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return ErrNotFound
+	}
+	return os.RemoveAll(dir)
+}
+
+// ReadFile reads a file from a bundle, safe against symlink escape.
+//
+// `filepath.Abs` is purely lexical; if the bundle contains a symlink to
+// /etc/passwd, the lexical check would pass but the read would follow the
+// symlink. We resolve the full real path with EvalSymlinks and re-check.
+//
+// In addition, we open with O_NOFOLLOW on the final component so a
+// concurrent symlink-swap after the EvalSymlinks check can't TOCTOU us.
+func (s *SkillsStore) ReadFile(bundleDir, relPath string) ([]byte, error) {
+	cleaned := filepath.Clean(relPath)
+	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
+		return nil, ErrBadPath
+	}
+	full := filepath.Join(bundleDir, cleaned)
+
+	// Resolve symlinks in the FULL path. EvalSymlinks fails if the path
+	// doesn't exist — propagate that as ErrNotExist.
+	realFull, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		return nil, err
+	}
+	realBundle, err := filepath.EvalSymlinks(bundleDir)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(realFull, realBundle+string(filepath.Separator)) &&
+		realFull != realBundle {
+		return nil, ErrBadPath
+	}
+
+	// O_NOFOLLOW guards against TOCTOU between EvalSymlinks and open(2).
+	// Note: this prevents the *final* component from being a symlink; the
+	// realBundle check above ensured the parent path is clean.
+	f, err := os.OpenFile(realFull, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// Cap reads at 10 MiB — bundle files larger than this are pathological.
+	return io.ReadAll(io.LimitReader(f, 10*1024*1024))
 }
 
 func checkUploads(files []SkillFileUpload) error {

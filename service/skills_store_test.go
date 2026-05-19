@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -210,5 +211,61 @@ func TestSkillsStore_CreateFromForm_RejectsPathEscape(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected escape error")
+	}
+}
+
+func TestSkillsStore_DeleteUser(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	_, err := s.CreateFromForm("42", CreateSkillReq{
+		Name: "x", Description: "d", Color: "blue", Trigger: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser("42", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.UserPath("42", "x")); !os.IsNotExist(err) {
+		t.Fatalf("expected gone, err=%v", err)
+	}
+}
+
+func TestSkillsStore_DeleteUser_NotFound(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	if err := s.DeleteUser("42", "ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestSkillsStore_ReadFile_RejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+
+	// Build a "bundle" with a symlink trying to point at the host system.
+	bundleDir := filepath.Join(root, "evil")
+	_ = os.MkdirAll(bundleDir, 0o755)
+	target := filepath.Join(root, "outside.txt")
+	_ = os.WriteFile(target, []byte("secret"), 0o644)
+	_ = os.Symlink(target, filepath.Join(bundleDir, "escape"))
+
+	if _, err := s.ReadFile(bundleDir, "escape"); err == nil {
+		t.Fatal("expected symlink escape to be rejected")
+	}
+}
+
+func TestSkillsStore_ReadFile_AllowsNormalFile(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	bundleDir := filepath.Join(root, "ok")
+	_ = os.MkdirAll(bundleDir, 0o755)
+	_ = os.WriteFile(filepath.Join(bundleDir, "SKILL.md"), []byte("## hi"), 0o644)
+	data, err := s.ReadFile(bundleDir, "SKILL.md")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "## hi" {
+		t.Fatalf("got %q", string(data))
 	}
 }
