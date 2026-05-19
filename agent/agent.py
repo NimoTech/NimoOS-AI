@@ -492,30 +492,66 @@ class AgentRunner:
                 #     Used to suppress the SDK's final consolidated
                 #     message_output_item (it would duplicate the streamed text).
                 conv_state: dict = {"streamed_message": False}
-                message_emitted = False  # any user-visible message text reached the client
+                message_emitted = False
+                t_start = time.monotonic()
+                t_first_token: float | None = None
+                output_bytes = 0
+                FIRST_TOKEN_TYPES = ("message_delta", "thinking", "tool_call")
+                BYTE_COUNT_TYPES = ("message_delta", "thinking")
 
                 async for event in stream.stream_events():
                     sse_event = _convert_event(event, call_names, conv_state)
                     if sse_event is None:
                         continue
-                    if sse_event["type"] == "message_delta":
+                    et = sse_event["type"]
+                    if et in FIRST_TOKEN_TYPES and t_first_token is None:
+                        t_first_token = time.monotonic()
+                    if et in BYTE_COUNT_TYPES:
+                        output_bytes += len((sse_event.get("content") or "").encode("utf-8"))
+                    if et == "message_delta":
                         message_emitted = True
-                    elif sse_event["type"] == "message":
-                        # End-of-turn consolidated text from message_output_item.
-                        # Drop if we already streamed the same content via deltas.
+                    elif et == "message":
                         if conv_state["streamed_message"]:
                             continue
                         message_emitted = True
                     await sink.put(sse_event)
 
-                # Reasoning-only models (e.g. deepseek-v4-flash) emit the full
-                # answer as reasoning_content with no content delta and no
-                # message_output_item — fall back to final_output so the user
-                # sees something.
+                # Reasoning-only fallback. The fallback text also counts toward
+                # output_bytes so the token count is meaningful for these models.
                 if not message_emitted:
                     final = getattr(stream, "final_output", None)
                     if final and isinstance(final, str) and final.strip():
                         await sink.put({"type": "message", "content": final})
+                        output_bytes += len(final.encode("utf-8"))
+
+                # stats_final — decoupled token count from timing:
+                # output_tokens needs only bytes; tok/s and ttft need first-token.
+                t_end = time.monotonic()
+                total_ms = int((t_end - t_start) * 1000)
+                output_tokens = (
+                    max(1, round(output_bytes / 3)) if output_bytes > 0 else None
+                )
+                if t_first_token is not None:
+                    ttft_ms = int((t_first_token - t_start) * 1000)
+                    generation_ms = int((t_end - t_first_token) * 1000)
+                    tokens_per_sec = (
+                        round(output_tokens * 1000 / generation_ms, 1)
+                        if output_tokens is not None and generation_ms > 0 else None
+                    )
+                else:
+                    ttft_ms = None
+                    generation_ms = None
+                    tokens_per_sec = None
+
+                await sink.put({
+                    "type": "stats_final",
+                    "ttft_ms": ttft_ms,
+                    "generation_ms": generation_ms,
+                    "total_ms": total_ms,
+                    "output_tokens": output_tokens,
+                    "tokens_per_sec": tokens_per_sec,
+                    "source": "client_estimate",
+                })
 
                 final_history = stream.to_input_list()
                 url_to_aid: dict[str, str] = {}
