@@ -57,6 +57,35 @@ type skillState struct {
 	calls                int
 }
 
+// loadUninstalledMap returns the set of built-in skill IDs the user has
+// marked uninstalled. Used to filter the runtime view rebuild.
+func (s *skillsService) loadUninstalledMap(userID string) (map[string]bool, error) {
+	rows, err := s.db.Query(
+		`SELECT skill_id FROM skill_state WHERE user_id=? AND uninstalled=1`,
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			out[id] = true
+		}
+	}
+	return out, nil
+}
+
+// rebuildAfter atomically rebuilds the user's runtime view after a
+// mutating call (CreateUser / SetEnabled / Delete). Best-effort: a
+// rebuild failure logs but doesn't fail the call (the next service
+// start re-runs RebuildRuntimeView for every user).
+func (s *skillsService) rebuildAfter(userID string) {
+	u, _ := s.loadUninstalledMap(userID)
+	_ = RebuildRuntimeView(s.store, userID, u)
+}
+
 // loadStateMap returns the skill_state overlay for a user.
 func (s *skillsService) loadStateMap(userID string) (map[string]skillState, error) {
 	out := map[string]skillState{}
@@ -232,6 +261,7 @@ func (s *skillsService) CreateUser(userID string, r CreateSkillReq) (*Skill, err
 	if err != nil {
 		return nil, err
 	}
+	defer s.rebuildAfter(userID)
 	_, _ = s.db.Exec(
 		`INSERT INTO user_skills(id, user_id, last_used, calls) VALUES(?,?,?,?)`,
 		m.ID, userID, "Just now", 0,
@@ -246,6 +276,7 @@ func (s *skillsService) CreateUser(userID string, r CreateSkillReq) (*Skill, err
 
 // SetEnabled updates the enabled state. Works for both built-in and user skills.
 func (s *skillsService) SetEnabled(userID, id string, enabled bool) error {
+	defer s.rebuildAfter(userID)
 	// Built-in?
 	if _, err := os.Stat(s.store.BuiltinPath(id)); err == nil {
 		_, err := s.db.Exec(
@@ -275,6 +306,7 @@ func (s *skillsService) SetEnabled(userID, id string, enabled bool) error {
 // from a previous half-failure), we still clean up the DB rows. This
 // prevents "ghost" rows that can never be deleted. (Fix 2.2.)
 func (s *skillsService) Delete(userID, id string) error {
+	defer s.rebuildAfter(userID)
 	if _, err := os.Stat(s.store.BuiltinPath(id)); err == nil {
 		_, err := s.db.Exec(
 			`INSERT INTO skill_state(user_id, skill_id, enabled, uninstalled)

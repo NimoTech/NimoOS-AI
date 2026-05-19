@@ -305,3 +305,26 @@ func TestSkillsService_ListMergesBuiltinAndUser(t *testing.T) {
 		t.Errorf("[1]=%+v", list[1])
 	}
 }
+
+func TestSkillsService_DeleteRebuildsRuntimeView(t *testing.T) {
+	root := t.TempDir()
+	store := &SkillsStore{Root: root}
+	db, _ := NewDB(filepath.Join(root, "ai.db"))
+	defer db.Close()
+	svc := &skillsService{db: db, store: store}
+
+	// seed one user skill + rebuild
+	_, _ = svc.CreateUser("42", CreateSkillReq{
+		Name: "my-skill", Description: "d", Color: "blue", Trigger: "auto",
+	})
+	// CreateUser should have rebuilt; verify the symlink exists
+	if _, err := os.Lstat(filepath.Join(store.RuntimePath("42"), "my-skill")); err != nil {
+		t.Fatal("symlink missing after create")
+	}
+
+	// delete → runtime view should not see it
+	_ = svc.Delete("42", "my-skill")
+	if _, err := os.Lstat(filepath.Join(store.RuntimePath("42"), "my-skill")); !os.IsNotExist(err) {
+		t.Fatalf("symlink still present, err=%v", err)
+	}
+}
