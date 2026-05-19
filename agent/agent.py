@@ -398,6 +398,15 @@ class AgentRunner:
                 "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills"))
             skills_registry.USER_ID_VAR.set(str(user_id))
 
+            # Mount the user's skill runtime view into the bwrap sandbox via
+            # ContextVar (not os.environ, which would be clobbered by concurrent
+            # async requests in the same process — Fix 1.1).
+            skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+            runtime_view = os.path.join(skills_root, ".runtime", str(user_id))
+            if os.path.isdir(runtime_view):
+                shell_skills.SANDBOX_SKILLS_VAR.set(runtime_view)
+            # SANDBOX_SHELL_ROOT_VAR stays default (real persistent work dir for chat).
+
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             # `should_replay_reasoning_content` lets the SDK inject prior
             # `reasoning_content` back onto assistant messages when replaying
