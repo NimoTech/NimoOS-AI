@@ -135,6 +135,7 @@ _CRASHED_DONE_PAYLOAD = '{"type": "done"}'
 
 def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlite3.Connection:
     import time
+    global _conn
     db_path = path or str(_DB_PATH)
     snaps = snapshots_root or _DEFAULT_SNAPSHOTS_ROOT
     conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -236,6 +237,14 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
                 shutil.rmtree(full, ignore_errors=True)
 
     conn.commit()
+    # Publish the just-initialized connection as the module singleton so
+    # `get_connection()` returns this same handle. Without this, callers that
+    # lazy-fetch via `get_connection()` (agent._fetch_attachments,
+    # skills.attachments.read_attachment) end up opening a SECOND sqlite file
+    # at the default `_DB_PATH` (next to db.py), bypassing whatever path the
+    # service started with — attachments uploaded against the real DB become
+    # invisible to the agent run loop.
+    _conn = conn
     return conn
 
 _conn: sqlite3.Connection | None = None
