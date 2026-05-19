@@ -140,6 +140,12 @@ class RunRequest(BaseModel):
     attachment_ids: list[str] = []
 
 
+class SandboxRunRequest(BaseModel):
+    skill_id: str
+    prompt: str
+    network: bool = False  # informational; --unshare-net is forced for sandbox
+
+
 class ConfirmRequest(BaseModel):
     confirmed: bool = True
 
@@ -1313,6 +1319,60 @@ async def confirm_session(
         # confirm_session_mismatch (id belongs to another session). Both are 409.
         raise HTTPException(status_code=409, detail=str(e.args[0]) if e.args else "confirm_expired")
     return {"ok": True}
+
+
+@app.post("/agent/sandbox-run")
+async def sandbox_run_endpoint(
+    req: SandboxRunRequest,
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_user_name: str = Header("", alias="X-User-Name"),
+    x_agent_provider_key: str = Header(..., alias="X-Agent-Provider-Key"),
+    x_agent_provider_url: str = Header(..., alias="X-Agent-Provider-Url"),
+):
+    """Run a skill in an isolated, no-DB sandbox session."""
+    import re
+    if not re.match(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$", req.skill_id):
+        raise HTTPException(status_code=400, detail="invalid skill_id")
+    skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+    bundle_dir = None
+    for candidate in (
+        os.path.join(skills_root, "builtin", req.skill_id),
+        os.path.join(skills_root, "users", x_user_id, req.skill_id),
+    ):
+        if os.path.isdir(candidate):
+            bundle_dir = candidate
+            break
+    if bundle_dir is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+
+    sink = RunSink("sandbox-" + uuid.uuid4().hex[:8], "sandbox", _conn)
+    from sandbox_run import run_sandbox
+
+    async def runner_task():
+        await run_sandbox(
+            runner=_runner,
+            bundle_dir=bundle_dir,
+            user_prompt=req.prompt,
+            user_id=x_user_id,
+            skills_root=skills_root,
+            provider_key=x_agent_provider_key,
+            provider_url=x_agent_provider_url,
+            model="",  # provider default
+            provider_type=request.headers.get("X-Agent-Provider-Type", "other"),
+            sink=sink,
+        )
+
+    asyncio.create_task(runner_task())
+    return StreamingResponse(
+        _stream_from_sink(sink),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/agent/sessions/{session_id}/cancel")
