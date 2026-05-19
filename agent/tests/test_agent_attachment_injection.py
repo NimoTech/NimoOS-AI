@@ -103,6 +103,65 @@ def test_select_tools_no_attachments(setup):
     assert "read_attachment" not in names
 
 
+def test_hydrate_image_blocks_inlines_base64_from_attachment_id(setup):
+    # On a follow-up turn the run loop reads stored history that contains
+    # the compact {type:input_image, attachment_id:...} shape — without
+    # rehydration the SDK adapter raises "Only image URLs are supported
+    # for input_image". hydrate_image_blocks must turn it back into a
+    # real image_url data URL.
+    conn, root, ag = setup
+    body = b"\x89PNG\x00\x01\x02\x03"
+    _mk_att(conn, root, aid="i9", kind="image", mime="image/png",
+            filename="x.png", body=body)
+    history = [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "earlier turn"},
+            {"type": "input_image", "attachment_id": "i9"},
+        ],
+    }]
+    out = ag.hydrate_image_blocks(history, session_id="s1",
+                                  data_root=str(root))
+    blocks = out[0]["content"]
+    assert blocks[0] == {"type": "input_text", "text": "earlier turn"}
+    assert blocks[1]["type"] == "input_image"
+    assert blocks[1]["image_url"].startswith("data:image/png;base64,")
+    assert "attachment_id" not in blocks[1]
+
+
+def test_hydrate_image_blocks_drops_missing_attachment(setup):
+    # If the attachment row is gone (session purged) or the file vanished,
+    # silently drop the image block instead of crashing the whole run.
+    conn, root, ag = setup
+    history = [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "t"},
+            {"type": "input_image", "attachment_id": "does-not-exist"},
+        ],
+    }]
+    out = ag.hydrate_image_blocks(history, session_id="s1",
+                                  data_root=str(root))
+    blocks = out[0]["content"]
+    assert blocks == [{"type": "input_text", "text": "t"}]
+
+
+def test_hydrate_image_blocks_passthrough_for_image_url(setup):
+    # Already-hydrated blocks (mid-turn, before storage compaction) must
+    # be left untouched so the function is idempotent.
+    conn, root, ag = setup
+    history = [{
+        "role": "user",
+        "content": [{
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+        }],
+    }]
+    out = ag.hydrate_image_blocks(history, session_id="s1",
+                                  data_root=str(root))
+    assert out == history
+
+
 def test_attachment_system_prompt_block(setup):
     conn, root, ag = setup
     _mk_att(conn, root, aid="t3", kind="text", mime="text/plain",

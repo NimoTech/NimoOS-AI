@@ -177,6 +177,59 @@ def build_user_content(message: str, attachment_ids, *,
     return blocks
 
 
+def hydrate_image_blocks(history, *, session_id: str, data_root: str):
+    """Inverse of `compact_image_blocks`: replace stored compact
+    `{type:input_image, attachment_id}` blocks with real
+    `{type:input_image, image_url:"data:<mime>;base64,..."}` blocks by
+    reading the attachment file from disk.
+
+    History rows are saved in the compact shape to keep SQLite small, but
+    the OpenAI Agents SDK's chat-completions adapter only accepts
+    image_url-style blocks; feeding back the compact shape on a follow-up
+    turn raises "Only image URLs are supported for input_image".
+
+    Blocks whose attachment row or file is missing are dropped silently —
+    that's better than re-raising and breaking the whole conversation.
+    """
+    out = []
+    for item in history:
+        content = item.get("content")
+        if not isinstance(content, list):
+            out.append(item)
+            continue
+        new_content = []
+        for blk in content:
+            if (isinstance(blk, dict)
+                    and blk.get("type") == "input_image"
+                    and "attachment_id" in blk
+                    and "image_url" not in blk):
+                aid = blk["attachment_id"]
+                row = db_module.get_connection().execute(
+                    "SELECT mime, rel_path FROM attachments "
+                    "WHERE id=? AND session_id=?",
+                    (aid, session_id),
+                ).fetchone()
+                if row is None:
+                    continue
+                full = os.path.join(data_root, "sessions", session_id,
+                                    "attachments", row["rel_path"])
+                try:
+                    with open(full, "rb") as f:
+                        data = f.read()
+                except FileNotFoundError:
+                    continue
+                b64 = base64.b64encode(data).decode("ascii")
+                new_content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{row['mime']};base64,{b64}",
+                })
+            else:
+                new_content.append(blk)
+        item = {**item, "content": new_content}
+        out.append(item)
+    return out
+
+
 def compact_image_blocks(history, *, image_id_resolver):
     """Walk the SDK history; replace any inline image data URL with a compact
     `{type: input_image, attachment_id: <id>}` block.
@@ -418,6 +471,13 @@ class AgentRunner:
                 session_id=session_id, data_root=data_root,
                 model_name=model_name, provider_type=provider_type)
             history = self._load_history(session_id)
+            # Earlier turns' image blocks were stored in compact form
+            # (attachment_id only) to keep the DB small. Re-inline the base64
+            # data URL before re-feeding to the SDK — the chat-completions
+            # adapter rejects the compact shape with "Only image URLs are
+            # supported for input_image".
+            history = hydrate_image_blocks(
+                history, session_id=session_id, data_root=data_root)
             input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
