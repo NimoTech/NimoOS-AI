@@ -2,10 +2,14 @@ import asyncio
 import base64
 import json
 import os
+import re
 import shutil
 import time
 import uuid
 from typing import AsyncGenerator
+
+_SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
+_MAX_SKILL_MD_BYTES = 50 * 1024
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -1201,6 +1205,35 @@ async def run_session(
             thinking_cfg = _read_user_thinking_defaults(_conn, x_user_id)
 
     provider_type = request.headers.get("X-Agent-Provider-Type", "other")
+
+    # Inject SKILL.md into the message when X-Skill-Id header is present.
+    # Fix 1.2: validate skill_id via regex BEFORE any path operations.
+    skill_id = request.headers.get("X-Skill-Id", "").strip()
+    if skill_id:
+        if not _SKILL_ID_RE.match(skill_id):
+            # Refuse silently — malformed id would have been a 400 in the Go layer.
+            skill_id = ""
+    if skill_id:
+        skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+        bundle = os.path.join(skills_root, ".runtime", str(x_user_id), skill_id)
+        md_path = os.path.join(bundle, "SKILL.md")
+        # Belt + suspenders: even after regex, double-check resolved real path
+        # stays inside the runtime view (defense against symlink games).
+        try:
+            real_md = os.path.realpath(md_path)
+            real_root = os.path.realpath(skills_root)
+            if not real_md.startswith(real_root + os.sep):
+                md_path = None
+        except OSError:
+            md_path = None
+        if md_path and os.path.isfile(md_path):
+            size = os.path.getsize(md_path)
+            if size <= _MAX_SKILL_MD_BYTES:
+                with open(md_path) as f:
+                    md = f.read()
+                req = req.model_copy(update={
+                    "message": f"(Using skill `{skill_id}`. SKILL.md follows.)\n\n{md}\n\n---\n\n{req.message}"
+                })
 
     user_msg_id = "msg_" + uuid.uuid4().hex[:12]
     if req.attachment_ids:
