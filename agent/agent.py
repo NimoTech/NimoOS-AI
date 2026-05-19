@@ -492,22 +492,24 @@ class AgentRunner:
                 #     Used to suppress the SDK's final consolidated
                 #     message_output_item (it would duplicate the streamed text).
                 conv_state: dict = {"streamed_message": False}
-                message_emitted = False
+                message_emitted = False  # any user-visible message text reached the client
                 t_start = time.monotonic()
                 t_first_token: float | None = None
                 output_bytes = 0
-                FIRST_TOKEN_TYPES = ("message_delta", "thinking", "tool_call")
-                BYTE_COUNT_TYPES = ("message_delta", "thinking")
+                FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
+                BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
 
                 async for event in stream.stream_events():
                     sse_event = _convert_event(event, call_names, conv_state)
                     if sse_event is None:
                         continue
                     et = sse_event["type"]
-                    if et in FIRST_TOKEN_TYPES and t_first_token is None:
+                    if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
                         t_first_token = time.monotonic()
                     if et in BYTE_COUNT_TYPES:
-                        output_bytes += len((sse_event.get("content") or "").encode("utf-8"))
+                        content = sse_event.get("content")
+                        if isinstance(content, str):
+                            output_bytes += len(content.encode("utf-8"))
                     if et == "message_delta":
                         message_emitted = True
                     elif et == "message":
