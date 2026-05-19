@@ -269,3 +269,39 @@ func TestSkillsStore_ReadFile_AllowsNormalFile(t *testing.T) {
 		t.Fatalf("got %q", string(data))
 	}
 }
+
+func TestSkillsService_ListMergesBuiltinAndUser(t *testing.T) {
+	root := t.TempDir()
+	store := &SkillsStore{Root: root}
+	dir := store.BuiltinPath("photo-curator")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(`{
+		"schema_version":1,"id":"photo-curator","name":"photo-curator","title":"Photo curator",
+		"trigger":"auto","color":"purple","icon":"image","description":"d",
+		"version":"0.1.0","author":"Nimo","examples":[]}`), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("## hi"), 0o644)
+
+	dbPath := filepath.Join(t.TempDir(), "ai.db")
+	db, _ := NewDB(dbPath)
+	defer db.Close()
+	svc := &skillsService{db: db, store: store}
+
+	_, _ = svc.CreateUser("42", CreateSkillReq{
+		Name: "my-skill", Description: "d", Color: "blue", Trigger: "auto",
+	})
+
+	list, err := svc.List("42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("got %d skills, want 2: %+v", len(list), list)
+	}
+	// Built-in first (system=true), user after.
+	if !list[0].System || list[0].ID != "photo-curator" {
+		t.Errorf("[0]=%+v", list[0])
+	}
+	if list[1].System || list[1].ID != "my-skill" {
+		t.Errorf("[1]=%+v", list[1])
+	}
+}

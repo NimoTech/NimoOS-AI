@@ -2,6 +2,7 @@ package service
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 
 	"github.com/NimoTech/NimoOS-AI/common"
@@ -67,7 +68,10 @@ func NewService(cfg *config.Config) Services {
 	modelMgr := NewModelManager(common.OllamaBaseURL, db)
 	sessionSvc := &sessionService{db: db}
 	blacklistSvc := &blacklistService{db: db}
-	skillsSvc := &skillsService{db: db}
+	skillsRoot := filepath.Join(cfg.DataPath, "skills")
+	_ = os.MkdirAll(skillsRoot, 0o755)
+	store := &SkillsStore{Root: skillsRoot}
+	skillsSvc := &skillsService{db: db, store: store}
 
 	return &services{
 		db:            db,
@@ -80,5 +84,13 @@ func NewService(cfg *config.Config) Services {
 		sessions:      sessionSvc,
 		blacklist:     blacklistSvc,
 		skills:        skillsSvc,
+	}
+}
+
+// NewServiceFromParts is for tests that need to inject a SkillsStore.
+func NewServiceFromParts(db *sql.DB, store *SkillsStore) Services {
+	return &services{
+		db:     db,
+		skills: &skillsService{db: db, store: store},
 	}
 }
