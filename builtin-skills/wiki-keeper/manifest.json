@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "wiki-keeper",
+  "name": "wiki-keeper",
+  "title": "Wiki keeper",
+  "description": "Maintain the personal wiki — answer questions from its content and append new notes when asked.",
+  "color": "teal",
+  "icon": "book",
+  "trigger": "auto",
+  "examples": [
+    "Add a note under /people/alice",
+    "What did I write about home networking?"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}

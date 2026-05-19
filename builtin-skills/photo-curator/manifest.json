@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "photo-curator",
+  "name": "photo-curator",
+  "title": "Photo curator",
+  "description": "Automatically organize photos by event, place, and people. Clusters shots into scenes and picks the sharpest frame per moment.",
+  "color": "purple",
+  "icon": "image",
+  "trigger": "auto",
+  "examples": [
+    "Group last week's iPhone imports by scene",
+    "Pick the best shot of each subject",
+    "Auto-build an album for the weekend trip"
+  ],
+  "entrypoint": "scripts/cluster.py",
+  "permissions": { "network": false, "writable_paths": ["/Photos/Auto"] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}

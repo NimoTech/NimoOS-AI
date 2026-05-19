@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "doc-summarizer",
+  "name": "doc-summarizer",
+  "title": "Document summarizer",
+  "description": "Read PDFs, Markdown, and Word docs in a folder and produce a one-page recap, key entities, action items, and a Q&A index.",
+  "color": "blue",
+  "icon": "file",
+  "trigger": "slash",
+  "examples": [
+    "Summarize all Q1 invoices",
+    "Make a one-pager from the lease folder"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}
