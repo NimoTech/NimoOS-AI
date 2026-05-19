@@ -27,6 +27,7 @@ import skills.filesystem as fs_skills
 import skills.shell as shell_skills
 import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
+import skills.skills_registry as skills_registry
 from fs.snapshots import SnapshotStore
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
@@ -391,6 +392,11 @@ class AgentRunner:
             wiki_skills.SESSION_ID_VAR.set(session_id)
             wiki_skills.EVENT_QUEUE_VAR.set(sink)
             wiki_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+
+            # Skills registry: tells list_skills() which user's runtime view to scan.
+            skills_registry.SKILLS_ROOT_VAR.set(os.environ.get(
+                "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills"))
+            skills_registry.USER_ID_VAR.set(str(user_id))
 
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             # `should_replay_reasoning_content` lets the SDK inject prior

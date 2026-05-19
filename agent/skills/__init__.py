@@ -9,6 +9,7 @@ from skills.wiki import (
     wiki_get_node, wiki_list_full_tree, wiki_recent_changes,
     wiki_append_user_notes, wiki_replace_user_notes, wiki_register_root,
 )
+from skills.skills_registry import ALL_TOOLS as SKILLS_REGISTRY_TOOLS
 
 # Wiki tools — write tools added in Task 7.
 WIKI_TOOLS = [
@@ -18,4 +19,4 @@ WIKI_TOOLS = [
 
 ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
              + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
-             + WIKI_TOOLS)
+             + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS)
