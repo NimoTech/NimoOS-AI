@@ -130,6 +130,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.PATCH("/skills/:id", skills.Update)
 	g.DELETE("/skills/:id", skills.Delete)
 	g.POST("/skills/:id/test", skills.Test)
+	g.GET("/skills/:id/files/*", skills.GetFile)
+	g.GET("/skills/:id/export", skills.ExportTarGz)
 
 	return e
 }
