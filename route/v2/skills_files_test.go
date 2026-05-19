@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,5 +62,31 @@ func TestSkillsFiles_GetFile_RejectsTraversal(t *testing.T) {
 	c.SetParamValues("hello", "../../etc/passwd")
 	if err := h.GetFile(c); err == nil {
 		t.Fatal("expected refusal")
+	}
+}
+
+func TestSkillsHandler_Create_FormPath(t *testing.T) {
+	h, _ := newTestSkillsHandler(t)
+	e := echo.New()
+	body := map[string]any{
+		"name":        "invoice-tagger",
+		"description": "Tag invoices",
+		"color":       "orange",
+		"icon":        "file",
+		"trigger":     "slash",
+		"md":          "## Invoice tagger",
+		"examples":    []string{"Tag last quarter"},
+	}
+	bb, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/skills", bytes.NewReader(bb))
+	req.Header.Set("X-NimoOS-User-ID", "42")
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if err := h.Create(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

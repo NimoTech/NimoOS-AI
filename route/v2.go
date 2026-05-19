@@ -129,7 +129,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/skills/:id", skills.Get)
 	g.PATCH("/skills/:id", skills.Update)
 	g.DELETE("/skills/:id", skills.Delete)
-	g.POST("/skills/:id/test", skills.Test)
+	// g.POST("/skills/:id/test", skills.Test)  // re-added in Task 16 as TestStream
 	g.GET("/skills/:id/files/*", skills.GetFile)
 	g.GET("/skills/:id/export", skills.ExportTarGz)
 
