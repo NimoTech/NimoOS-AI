@@ -45,9 +45,12 @@ def test_vision_model_uses_input_image(setup):
 def test_nonvision_model_falls_back_to_text(setup):
     conn, root, ag = setup
     _mk_image(conn, root)
+    # DeepSeek is the only family we still mark text-only by default;
+    # any other unknown provider/model is assumed vision-capable.
     content = ag.build_user_content("hi", ["i1"], session_id="s1",
                                     data_root=str(root),
-                                    model_name="llama3:8b", provider_type="ollama")
+                                    model_name="deepseek-chat",
+                                    provider_type="deepseek")
     assert all(c["type"] != "input_image" for c in content)
     text_blocks = [c["text"] for c in content if c["type"] == "input_text"]
     joined = " ".join(text_blocks)
@@ -57,8 +60,16 @@ def test_nonvision_model_falls_back_to_text(setup):
 
 def test_vision_capability_lookup():
     import provider_adapters as pa
+    # Default-True policy: unknown providers/models are assumed vision-capable;
+    # the provider's 4xx surfaces a real error if they aren't, which is better
+    # than silently dropping the image. Only the known text-only families
+    # (currently just DeepSeek) return False.
     assert pa.model_supports_vision("openai", "gpt-4o") is True
     assert pa.model_supports_vision("anthropic", "claude-3-5-sonnet-20241022") is True
-    assert pa.model_supports_vision("ollama", "llama3:8b") is False
-    assert pa.model_supports_vision("ollama", "anything") is False
+    assert pa.model_supports_vision("ollama", "llama3:8b") is True
+    assert pa.model_supports_vision("ollama", "qwen3.5:9b") is True
+    assert pa.model_supports_vision("qwen", "qwen-plus") is True
     assert pa.model_supports_vision("other", "anything") is True
+    assert pa.model_supports_vision("deepseek", "deepseek-chat") is False
+    # Empty model name stays False — caller hasn't decided on a model yet.
+    assert pa.model_supports_vision("openai", "") is False

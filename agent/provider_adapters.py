@@ -116,22 +116,22 @@ def build_model_settings(
     return ModelSettings()
 
 
-_VISION_KNOWN_TRUE = {
-    "openai": lambda m: m.startswith(("gpt-4o", "gpt-4-vision", "o1", "gpt-4.1")),
-    "anthropic": lambda m: m.startswith("claude-3") or m.startswith("claude-4"),
-    "qwen": lambda m: "vl" in m.lower(),
-    "deepseek": lambda m: False,
+_VISION_KNOWN_FALSE = {
+    # Confirmed text-only families. Anything not in this list is assumed
+    # vision-capable; if the model actually rejects the image, the provider
+    # surfaces a 4xx that the user sees directly. That tradeoff is better
+    # than silently degrading to text and having the model claim it cannot
+    # see attachments the user clearly attached.
+    "deepseek": lambda m: True,
 }
 
 
 def model_supports_vision(provider_type: str, model_name: str) -> bool:
-    """Best-effort capability check. Cloud unknown → True (let provider 4xx).
-    Local (ollama) unknown → False (most local models lack vision)."""
+    """Best-effort capability check. Default True for unknown (provider/model);
+    only return False for families we know are text-only."""
     if not model_name:
         return False
     pt = (provider_type or "other").lower()
-    if pt in _VISION_KNOWN_TRUE:
-        return _VISION_KNOWN_TRUE[pt](model_name)
-    if pt == "ollama":
-        return any(tag in model_name.lower() for tag in ("llava", "vision", "qwen2-vl"))
+    if pt in _VISION_KNOWN_FALSE:
+        return not _VISION_KNOWN_FALSE[pt](model_name)
     return True
