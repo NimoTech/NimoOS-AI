@@ -55,8 +55,18 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 		},
 		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
 			func(c echo.Context) ([]string, error) {
-				auth := c.Request().Header.Get(echo.HeaderAuthorization)
-				return []string{strings.TrimPrefix(auth, "Bearer ")}, nil
+				if auth := c.Request().Header.Get(echo.HeaderAuthorization); auth != "" {
+					return []string{strings.TrimPrefix(auth, "Bearer ")}, nil
+				}
+				// Browsers can't attach Authorization to <img src> or
+				// <a href target="_blank"> requests, so attachment raw
+				// downloads need a query-string fallback. The token is the
+				// same short-lived user JWT; on a single-user home NAS the
+				// leak surface is the user's own access logs.
+				if tok := c.QueryParam("token"); tok != "" {
+					return []string{tok}, nil
+				}
+				return nil, echo.ErrUnauthorized
 			},
 		},
 	}))
