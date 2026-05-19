@@ -150,3 +150,65 @@ func TestSkillsStore_ListUser_EmptyForUnknownUser(t *testing.T) {
 		t.Fatalf("expected 0, got %d", len(got))
 	}
 }
+
+func TestSkillsStore_CreateFromForm(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+
+	m, err := s.CreateFromForm("42", CreateSkillReq{
+		Name:        "invoice-tagger",
+		Title:       "Invoice tagger",
+		Description: "Tag invoices",
+		Color:       "orange",
+		Icon:        "file",
+		Trigger:     "slash",
+		MD:          "## Invoice tagger\n\nReads PDFs.",
+		Examples:    []string{"Tag last quarter"},
+		Scripts: []SkillFileUpload{
+			{Path: "scripts/extract.py", Content: []byte("print('hi')")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromForm: %v", err)
+	}
+	if m.ID != "invoice-tagger" {
+		t.Fatalf("id: %s", m.ID)
+	}
+
+	dir := s.UserPath("42", "invoice-tagger")
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "scripts", "extract.py")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSkillsStore_CreateFromForm_RejectsDuplicate(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	req := CreateSkillReq{Name: "dup", Description: "x", Color: "blue", Trigger: "auto"}
+	if _, err := s.CreateFromForm("42", req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFromForm("42", req); err == nil {
+		t.Fatal("expected duplicate error")
+	}
+}
+
+func TestSkillsStore_CreateFromForm_RejectsPathEscape(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	_, err := s.CreateFromForm("42", CreateSkillReq{
+		Name: "bad", Description: "x", Color: "blue", Trigger: "auto",
+		Scripts: []SkillFileUpload{
+			{Path: "../escape", Content: []byte("x")},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected escape error")
+	}
+}

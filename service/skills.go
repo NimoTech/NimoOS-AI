@@ -61,26 +61,6 @@ func validColor(c string) bool {
 	return false
 }
 
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	var b strings.Builder
-	dash := false
-	for _, r := range s {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			b.WriteRune(r)
-			dash = false
-		default:
-			if !dash && b.Len() > 0 {
-				b.WriteRune('-')
-				dash = true
-			}
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	return out
-}
-
 // ---------- Built-in catalog ----------
 
 func builtinCatalog() []Skill {

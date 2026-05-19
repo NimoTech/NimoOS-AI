@@ -11,6 +11,26 @@ import (
 	"strings"
 )
 
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	dash := false
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			dash = false
+		default:
+			if !dash && b.Len() > 0 {
+				b.WriteRune('-')
+				dash = true
+			}
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	return out
+}
+
 var ErrBadSkillID = errors.New("invalid skill id")
 
 // SkillsStore owns disk paths and writes for skill bundles.
@@ -138,4 +158,161 @@ func (s *SkillsStore) listDir(dir string) ([]*SkillManifest, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+const (
+	MaxBundleBytes = 50 * 1024 * 1024
+	MaxBundleFiles = 500
+)
+
+type SkillFileUpload struct {
+	Path    string
+	Content []byte
+}
+
+type CreateSkillReq struct {
+	Name        string
+	Title       string
+	Description string
+	Color       string
+	Icon        string
+	Trigger     string
+	MD          string
+	Examples    []string
+	Scripts     []SkillFileUpload
+}
+
+var ErrDuplicateSkill = errors.New("skill already exists")
+var ErrBadPath = errors.New("invalid file path in bundle")
+var ErrBundleTooLarge = errors.New("bundle exceeds size limits")
+
+// CreateFromForm writes a user bundle from the simple form upload. Atomic:
+// builds in a temp dir, then rename()s into place.
+func (s *SkillsStore) CreateFromForm(userID string, r CreateSkillReq) (*SkillManifest, error) {
+	id := slugify(r.Name)
+	if err := ValidateSkillID(id); err != nil {
+		return nil, err
+	}
+	if r.Description == "" {
+		return nil, fmt.Errorf("description required")
+	}
+	if len(r.MD) > MaxSkillMDBytes {
+		return nil, fmt.Errorf("SKILL.md exceeds %d bytes (got %d)", MaxSkillMDBytes, len(r.MD))
+	}
+
+	dst := s.UserPath(userID, id)
+	if _, err := os.Stat(dst); err == nil {
+		return nil, ErrDuplicateSkill
+	}
+	// Also reject collision with built-ins
+	if _, err := os.Stat(s.BuiltinPath(id)); err == nil {
+		return nil, ErrDuplicateSkill
+	}
+
+	if err := checkUploads(r.Scripts); err != nil {
+		return nil, err
+	}
+
+	icon := r.Icon
+	if icon == "" {
+		icon = "sparkle"
+	}
+	color := r.Color
+	switch color {
+	case "blue", "purple", "pink", "orange", "green", "teal", "slate":
+	default:
+		color = "blue"
+	}
+	triggerHuman := ""
+	switch r.Trigger {
+	case "auto":
+		triggerHuman = "Automatic"
+	case "slash":
+		triggerHuman = "/" + id
+	case "manual":
+		triggerHuman = "Manual"
+	default:
+		r.Trigger = "auto"
+		triggerHuman = "Automatic"
+	}
+
+	title := r.Title
+	if title == "" {
+		title = r.Name
+	}
+	md := r.MD
+	if md == "" {
+		md = fmt.Sprintf("## %s\n\n%s", title, r.Description)
+	}
+
+	m := &SkillManifest{
+		SchemaVersion: 1,
+		ID:            id,
+		Name:          id,
+		Title:         title,
+		Description:   r.Description,
+		Color:         color,
+		Icon:          icon,
+		Trigger:       r.Trigger,
+		Examples:      r.Examples,
+		Version:       "0.1.0",
+		Author:        "You",
+	}
+	_ = triggerHuman // not stored; UI derives from trigger
+
+	// Build in a sibling temp dir so we can rename() atomically.
+	if err := os.MkdirAll(filepath.Join(s.Root, "users", userID), 0o755); err != nil {
+		return nil, err
+	}
+	tmp, err := os.MkdirTemp(filepath.Join(s.Root, "users", userID), ".tmp-"+id+"-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp) // no-op if rename succeeded
+
+	manifestBytes, _ := json.MarshalIndent(m, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmp, "manifest.json"), manifestBytes, 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "SKILL.md"), []byte(md), 0o644); err != nil {
+		return nil, err
+	}
+	for _, f := range r.Scripts {
+		full := filepath.Join(tmp, f.Path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(full, f.Content, 0o644); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func checkUploads(files []SkillFileUpload) error {
+	if len(files) > MaxBundleFiles {
+		return ErrBundleTooLarge
+	}
+	total := 0
+	for _, f := range files {
+		// Reject absolute, parent traversal, or symlink-style paths.
+		if filepath.IsAbs(f.Path) ||
+			strings.Contains(f.Path, "..") ||
+			strings.HasPrefix(f.Path, "/") ||
+			strings.Contains(f.Path, "\x00") {
+			return ErrBadPath
+		}
+		cleaned := filepath.Clean(f.Path)
+		if cleaned != f.Path || strings.HasPrefix(cleaned, "..") {
+			return ErrBadPath
+		}
+		total += len(f.Content)
+		if total > MaxBundleBytes {
+			return ErrBundleTooLarge
+		}
+	}
+	return nil
 }
