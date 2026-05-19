@@ -533,7 +533,87 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     except (json.JSONDecodeError, KeyError):
         return []
 
-    return _hydrate_messages(history, session_id_for_urls=session_id)
+    messages = _hydrate_messages(history, session_id_for_urls=session_id)
+    return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
+
+
+def _enrich_with_attachments(messages: list, *, session_id: str, conn) -> list:
+    """Backfill user messages with their attachments.
+
+    The SDK input list only includes image attachments as input_image blocks;
+    documents and other non-image attachments are passed to the model via the
+    system prompt and read_attachment tool, so they don't appear in the
+    history JSON. To make historical sessions render correctly, walk the
+    attachments table for this session, group by message_id in chronological
+    order, and assign each group to the N-th user turn that originally had
+    attachments (detected as a hydrated message with a `blocks` field rather
+    than a `content` string — `build_user_content` returns a list iff
+    attachment_ids is non-empty, which becomes a blocks-shaped hydrated
+    message).
+
+    For images already represented as input_image blocks, just backfill the
+    filename + mime. For non-image attachments, append a new
+    `{type:"attachment", attachment_id, kind, filename, mime, url}` block.
+    """
+    if not messages:
+        return messages
+    rows = conn.execute(
+        "SELECT message_id FROM attachments "
+        "WHERE session_id=? AND message_id IS NOT NULL "
+        "GROUP BY message_id ORDER BY MIN(created_at)",
+        (session_id,),
+    ).fetchall()
+    ordered_msg_ids = [r["message_id"] for r in rows]
+    if not ordered_msg_ids:
+        return messages
+
+    idx = 0
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        # blocks-shaped (vs content-shaped) ⇔ original turn had attachments
+        if not isinstance(msg.get("blocks"), list):
+            continue
+        if idx >= len(ordered_msg_ids):
+            break
+        msg_id = ordered_msg_ids[idx]
+        idx += 1
+        atts = conn.execute(
+            "SELECT id, filename, mime, kind FROM attachments "
+            "WHERE message_id=? AND session_id=? ORDER BY created_at",
+            (msg_id, session_id),
+        ).fetchall()
+        existing_aids = {b.get("attachment_id") for b in msg["blocks"]
+                         if b.get("attachment_id")}
+        for r in atts:
+            aid = r["id"]
+            if aid in existing_aids:
+                # Image already represented as input_image; backfill the
+                # filename + mime so the UI can show a meaningful chip.
+                for b in msg["blocks"]:
+                    if b.get("attachment_id") == aid:
+                        b.setdefault("filename", r["filename"])
+                        b.setdefault("mime", r["mime"])
+                continue
+            url = (f"/v1/ai/agent/sessions/{session_id}/attachments/{aid}/raw")
+            if r["kind"] == "image":
+                msg["blocks"].append({
+                    "type": "image",
+                    "attachment_id": aid,
+                    "url": url,
+                    "filename": r["filename"],
+                    "mime": r["mime"],
+                })
+            else:
+                msg["blocks"].append({
+                    "type": "attachment",
+                    "attachment_id": aid,
+                    "kind": r["kind"],
+                    "url": url,
+                    "filename": r["filename"],
+                    "mime": r["mime"],
+                })
+    return messages
 
 
 def _flatten_content(content) -> str:
