@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strings"
 )
 
 var ErrBadSkillID = errors.New("invalid skill id")
@@ -104,4 +106,36 @@ func (s *SkillsStore) LoadManifest(dir string) (*SkillManifest, error) {
 		return nil, fmt.Errorf("SKILL.md exceeds %d bytes (got %d)", MaxSkillMDBytes, info.Size())
 	}
 	return &m, nil
+}
+
+func (s *SkillsStore) ListBuiltin() ([]*SkillManifest, error) {
+	return s.listDir(filepath.Join(s.Root, "builtin"))
+}
+
+func (s *SkillsStore) ListUser(userID string) ([]*SkillManifest, error) {
+	return s.listDir(filepath.Join(s.Root, "users", userID))
+}
+
+func (s *SkillsStore) listDir(dir string) ([]*SkillManifest, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]*SkillManifest, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		m, err := s.LoadManifest(filepath.Join(dir, e.Name()))
+		if err != nil {
+			// Bad bundle: skip but don't fail the whole list.
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -90,5 +91,62 @@ func TestSkillsStore_LoadManifest_RejectsBad(t *testing.T) {
 		[]byte(`{"id":"","trigger":"bogus"}`), 0o644)
 	if _, err := s.LoadManifest(dir); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestSkillsStore_ListBuiltin(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+
+	for _, id := range []string{"alpha", "beta"} {
+		dir := s.BuiltinPath(id)
+		_ = os.MkdirAll(dir, 0o755)
+		_ = os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(fmt.Sprintf(
+			`{"schema_version":1,"id":%q,"name":%q,"title":"%s","trigger":"auto","color":"blue","icon":"sparkle","description":"d","version":"0.1.0","author":"Nimo","examples":[]}`,
+			id, id, id)), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("## "+id), 0o644)
+	}
+
+	got, err := s.ListBuiltin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d", len(got))
+	}
+	// Listed sorted by id
+	if got[0].ID != "alpha" || got[1].ID != "beta" {
+		t.Fatalf("order: %+v", got)
+	}
+}
+
+func TestSkillsStore_ListUser(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := s.UserPath("42", "my-skill")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(
+		`{"schema_version":1,"id":"my-skill","name":"my-skill","title":"My","trigger":"manual","color":"green","icon":"sparkle","description":"d","version":"0.1.0","author":"You","examples":[]}`),
+		0o644)
+	_ = os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("## My"), 0o644)
+
+	got, err := s.ListUser("42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "my-skill" {
+		t.Fatalf("got: %+v", got)
+	}
+}
+
+func TestSkillsStore_ListUser_EmptyForUnknownUser(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	got, err := s.ListUser("nobody")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0, got %d", len(got))
 	}
 }
