@@ -241,3 +241,34 @@ bash nimo_os_docs/scripts/start-ai.sh
 2. **无 localhost 豁免**:与其他服务不同,AI 服务即使来自本机也强制 JWT,因为它代理别人的云密钥。
 3. **硬黑名单分层**:Go 侧管理用户级黑名单(SQLite),Agent 启动每个会话时把当前用户的黑名单通过 Header 注入 Python 侧,Python 侧再叠加 `pathspec` 做文件忽略。
 4. **路由决策与 UI 解耦**:UI 只发请求,`X-NimoOS-Force-Cloud` 由 UI 上的"升级到云"按钮触发;最终允许与否由后端 Policy 决定。
+
+---
+
+## Skills (v2)
+
+Skill bundles live at:
+- `/var/lib/nimoos/skills/builtin/<id>/` — read-only, seeded from `//go:embed` on service start.
+- `/var/lib/nimoos/skills/users/<uid>/<id>/` — user-writable.
+- `/var/lib/nimoos/skills/.runtime/<uid>/` — per-user symlink view, ro-bind-mounted into bwrap at `/skill` for every agent run.
+
+Each bundle is a directory containing:
+- `manifest.json` — metadata (id, name, trigger, color, icon, description, examples, version, author).
+- `SKILL.md` — instructions the LLM reads to use the skill (capped at 50 KiB).
+- `scripts/` — optional executable scripts.
+- `resources/` — optional supporting files.
+
+LLM-visible tool: `list_skills()` returns the user's enabled skills (manual-trigger skills are hidden from the list and surface only via UI "Try in chat" injection).
+
+REST endpoints (`/v1/ai/skills/*`):
+- `GET /` — list all skills with state overlay
+- `POST /` — create a user skill (simple-form JSON; tar.gz upload deferred to v2)
+- `GET /:id` — get a single skill
+- `PATCH /:id` — toggle enabled (only field accepted)
+- `DELETE /:id` — uninstall built-in or delete user skill
+- `GET /:id/files/*` — read a single file inside a bundle (symlink-escape safe)
+- `GET /:id/export` — download bundle as tar.gz
+- `POST /:id/test` — streaming SSE sandbox run (proxies to Python `/agent/sandbox-run`)
+
+Sandbox testing: `POST /v1/ai/skills/<id>/test` proxies to the Python agent's `POST /agent/sandbox-run` which runs a one-shot, no-DB session inside a fresh tmpfs sandbox with `--unshare-net`. The bundle is ro-mounted at `/skill/<id>/`. Per-request ContextVars (`SANDBOX_SKILLS_VAR`, `SANDBOX_SHELL_ROOT_VAR`) keep concurrent runs isolated.
+
+Bundle path safety: `ValidateSkillID` allows `[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`. `ReadFile` resolves symlinks with `EvalSymlinks` and opens with `O_NOFOLLOW`. The X-Skill-Id header (used by "Try in chat") is regex-validated on the Python side before any path-join.
