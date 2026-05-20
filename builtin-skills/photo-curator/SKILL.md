@@ -1,17 +1,29 @@
-## Photo curator
+## Photo finder
 
-Cluster and rank photos in a folder by scene, location, and time.
+Find photos in the on-device photo library by natural-language query.
 
 ### When to use
-- The user asks to organize / dedupe / pick best photos in a folder
-- A photo import folder is mentioned
+- The user asks to find, look up, or search for photos
+- A description, person, place, or year is mentioned alongside "photo" / "picture" / "image"
 
 ### How to run
-1. Confirm the target folder (default: `/Photos/_inbox`).
-2. Run: `python /skill/photo-curator/scripts/cluster.py <folder>`
-3. Use the existing `photos_search` tool to verify outputs land in `<folder>/Auto/`.
+Call the `search_photos` function tool with:
+- `query` (required) — natural-language description, e.g. `"beach at sunset"`, `"cat"`, `"weekend trip"`
+- `year` (optional, default 0 = any) — filter by year
+- `limit` (optional, default 20) — max results
+
+Example: user says "show me beach pictures from 2024" →
+`search_photos(query="beach", year=2024, limit=20)`
+
+### Output format
+The tool returns a list of photo paths with date, location (if known), and
+caption. Surface the top results as a numbered list and offer to open the
+folder. If results are empty, suggest broader queries (drop the year filter,
+try synonyms).
 
 ### Guardrails
-- Never delete originals; the script only writes to `<folder>/Auto/`.
-- Skip folders tagged `do-not-touch`.
-- Ask before running on > 2000 files.
+- This skill is **read-only**. Never call `delete_path`, `rename`, or move
+  files from inside this skill.
+- If the user asks to organize, delete, or move photos, hand off explicitly
+  ("I'll need to use a different tool for moving — is that OK?") rather than
+  silently doing it.

@@ -3,16 +3,15 @@
   "id": "duplicate-sweeper",
   "name": "duplicate-sweeper",
   "title": "Duplicate sweeper",
-  "description": "Find exact and near-duplicate files across the NAS using perceptual hashes. Always asks before deleting.",
+  "description": "Find exact-duplicate files in a folder using SHA-256. Reports candidates but never deletes — moves to /Recycled only after explicit confirmation.",
   "color": "orange",
   "icon": "copy",
   "trigger": "manual",
   "examples": [
-    "Scan /Downloads for duplicates over 10 MB",
-    "Find near-duplicates of /Photos/2024-trip"
+    "Find duplicates in /Downloads larger than 10 MB",
+    "Find duplicates in /Photos/2024"
   ],
-  "entrypoint": "scripts/sweep.py",
   "permissions": { "network": false, "writable_paths": ["/Recycled"] },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Nimo"
 }

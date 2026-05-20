@@ -2,18 +2,17 @@
   "schema_version": 1,
   "id": "photo-curator",
   "name": "photo-curator",
-  "title": "Photo curator",
-  "description": "Automatically organize photos by event, place, and people. Clusters shots into scenes and picks the sharpest frame per moment.",
+  "title": "Photo finder",
+  "description": "Find photos by description, person, place, or year using the on-device photo index.",
   "color": "purple",
   "icon": "image",
   "trigger": "auto",
   "examples": [
-    "Group last week's iPhone imports by scene",
-    "Pick the best shot of each subject",
-    "Auto-build an album for the weekend trip"
+    "Find photos from the weekend trip",
+    "Show me beach pictures from 2024",
+    "Pictures with the cat"
   ],
-  "entrypoint": "scripts/cluster.py",
-  "permissions": { "network": false, "writable_paths": ["/Photos/Auto"] },
-  "version": "0.1.0",
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.2.0",
   "author": "Nimo"
 }
