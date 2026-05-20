@@ -57,24 +57,34 @@ type skillState struct {
 	calls                int
 }
 
-// loadUninstalledMap returns the set of built-in skill IDs the user has
-// marked uninstalled. Used to filter the runtime view rebuild.
-func (s *skillsService) loadUninstalledMap(userID string) (map[string]bool, error) {
+// loadRuntimeFilterMaps returns the uninstalled and disabled skill_id sets
+// used to filter the per-user runtime view. Disabled skills (`enabled=0`)
+// stay installed but are hidden from the agent so the LLM cannot see or
+// load them.
+func (s *skillsService) loadRuntimeFilterMaps(userID string) (uninstalled, disabled map[string]bool, err error) {
+	uninstalled = map[string]bool{}
+	disabled = map[string]bool{}
 	rows, err := s.db.Query(
-		`SELECT skill_id FROM skill_state WHERE user_id=? AND uninstalled=1`,
+		`SELECT skill_id, enabled, uninstalled FROM skill_state WHERE user_id=?`,
 		userID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	out := map[string]bool{}
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err == nil {
-			out[id] = true
+		var en, un int
+		if err := rows.Scan(&id, &en, &un); err != nil {
+			continue
+		}
+		if un != 0 {
+			uninstalled[id] = true
+		}
+		if en == 0 && un == 0 {
+			disabled[id] = true
 		}
 	}
-	return out, nil
+	return uninstalled, disabled, nil
 }
 
 // rebuildAfter atomically rebuilds the user's runtime view after a
@@ -82,8 +92,19 @@ func (s *skillsService) loadUninstalledMap(userID string) (map[string]bool, erro
 // rebuild failure logs but doesn't fail the call (the next service
 // start re-runs RebuildRuntimeView for every user).
 func (s *skillsService) rebuildAfter(userID string) {
-	u, _ := s.loadUninstalledMap(userID)
-	_ = RebuildRuntimeView(s.store, userID, u)
+	u, d, _ := s.loadRuntimeFilterMaps(userID)
+	_ = RebuildRuntimeView(s.store, userID, u, d)
+}
+
+// EnsureRuntimeView builds .runtime/<uid>/ if it's missing. A fresh user
+// (no skill_state rows) is skipped by the startup rebuild loop, so the
+// agent's list_skills tool would see an empty view until the user toggled
+// something in the UI. Callers on hot paths (agent proxy, List) invoke
+// this lazily so the agent can always discover built-in skills.
+func (s *skillsService) EnsureRuntimeView(userID string) {
+	if _, err := os.Stat(s.store.RuntimePath(userID)); errors.Is(err, os.ErrNotExist) {
+		s.rebuildAfter(userID)
+	}
 }
 
 // loadStateMap returns the skill_state overlay for a user.
@@ -214,6 +235,7 @@ func (s *skillsService) List(userID string) ([]Skill, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.EnsureRuntimeView(userID)
 	out := []Skill{}
 	builtIns, err := s.store.ListBuiltin()
 	if err != nil {

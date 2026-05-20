@@ -81,16 +81,23 @@ func NewService(cfg *config.Config) Services {
 			var uid string
 			if rows.Scan(&uid) == nil {
 				uninstalled := map[string]bool{}
+				disabled := map[string]bool{}
 				uRows, _ := db.Query(
-					`SELECT skill_id FROM skill_state WHERE user_id=? AND uninstalled=1`, uid)
+					`SELECT skill_id, enabled, uninstalled FROM skill_state WHERE user_id=?`, uid)
 				for uRows.Next() {
 					var id string
-					if uRows.Scan(&id) == nil {
-						uninstalled[id] = true
+					var en, un int
+					if uRows.Scan(&id, &en, &un) == nil {
+						if un != 0 {
+							uninstalled[id] = true
+						}
+						if en == 0 && un == 0 {
+							disabled[id] = true
+						}
 					}
 				}
 				uRows.Close()
-				_ = RebuildRuntimeView(store, uid, uninstalled)
+				_ = RebuildRuntimeView(store, uid, uninstalled, disabled)
 			}
 		}
 		rows.Close()
