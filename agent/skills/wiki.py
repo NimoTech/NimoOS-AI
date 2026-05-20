@@ -314,7 +314,15 @@ async def wiki_replace_user_notes(path: str, text: str) -> str:
 
 @function_tool
 async def wiki_register_root(path: str, level: str = "project") -> str:
-    """Register a new Wiki Root. Confirms with the user. Level is usually
-    "project"; "space" is reserved for storage-volume-level roots.
+    """Register a new Wiki Root. Confirms with the user.
+
+    IMPORTANT: NimoOS Wiki does NOT auto-discover folders — only paths
+    registered via this tool appear in the map. If the user mentions a
+    project path that isn't in the system-prompt map, the right behavior
+    is usually to ASK whether they'd like to register it (via this tool),
+    not to assume it doesn't exist on the NAS.
+
+    Level is usually "project"; "space" is reserved for storage-volume-
+    level roots (e.g., the root of a mounted drive like /DATA).
     """
     return await _wiki_register_root_impl(path, level)

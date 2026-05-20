@@ -52,9 +52,21 @@ class WikiContextBuilder:
         spaces = [n for n in tree if n.get("level") == "space"]
         spaces.sort(key=lambda n: n["path"])
         lines = ["## NimoOS 存储空间地图", ""]
+
         if not spaces:
-            lines.append("_(暂无注册的 Wiki 空间)_")
+            lines.append(
+                "_(暂无注册的 Wiki 空间。Wiki 不会自动扫描文件树 —— "
+                "若用户希望某个目录被纳入,主动建议调用 `wiki_register_root` "
+                "登记。)_"
+            )
             return "\n".join(lines)
+
+        lines.append(
+            "_(下面是用户已显式登记到 Wiki 的空间/项目。Wiki 不会自动扫描文件树 —— "
+            "若用户提到的路径不在下面,你应主动询问是否调用 `wiki_register_root` "
+            "把它登记进来。)_"
+        )
+        lines.append("")
 
         for space in spaces:
             sp = space["path"]

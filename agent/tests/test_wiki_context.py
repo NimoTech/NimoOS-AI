@@ -153,3 +153,20 @@ async def test_build_truncates_long_notes():
     assert "Y" * 500 in out
     assert "Y" * 501 not in out
     assert "更多见 wiki_get_node" in out
+
+
+@pytest.mark.asyncio
+async def test_render_map_includes_user_declared_preamble():
+    """Map block should tell the LLM that Wiki nodes are user-declared."""
+    def handler(request):
+        if request.url.path == "/v1/wiki/tree":
+            return httpx.Response(200, json=[
+                {"path": "/DATA", "level": "space", "ai_label": "主盘",
+                 "last_modified_ms": 1000, "user_notes_updated_at": 0},
+            ])
+        return httpx.Response(404)
+
+    client = _build_client(handler)
+    block = await WikiContextBuilder(client).build([])
+    assert "用户登记" in block or "显式" in block or "user-declared" in block.lower(), \
+        f"map preamble missing in:\n{block}"
