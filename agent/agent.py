@@ -395,13 +395,13 @@ class AgentRunner:
 
             # Skills registry: tells list_skills() which user's runtime view to scan.
             skills_registry.SKILLS_ROOT_VAR.set(os.environ.get(
-                "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills"))
+                "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills"))
             skills_registry.USER_ID_VAR.set(str(user_id))
 
             # Mount the user's skill runtime view into the bwrap sandbox via
             # ContextVar (not os.environ, which would be clobbered by concurrent
             # async requests in the same process — Fix 1.1).
-            skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+            skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
             runtime_view = os.path.join(skills_root, ".runtime", str(user_id))
             if os.path.isdir(runtime_view):
                 shell_skills.SANDBOX_SKILLS_VAR.set(runtime_view)

@@ -99,6 +99,13 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 
 	c.Request().Header.Set("X-User-Id", userID)
 
+	// A fresh user with no skill_state rows never gets .runtime/<uid>/ built,
+	// so the agent's list_skills tool would return []. Build it lazily here
+	// so the very first agent request can see built-in skills.
+	if h.svc != nil {
+		h.svc.Skills().EnsureRuntimeView(userID)
+	}
+
 	if name := c.Request().Header.Get("X-NimoOS-User-Name"); name != "" {
 		c.Request().Header.Set("X-User-Name", name)
 	}

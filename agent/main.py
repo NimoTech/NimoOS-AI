@@ -1214,7 +1214,7 @@ async def run_session(
             # Refuse silently — malformed id would have been a 400 in the Go layer.
             skill_id = ""
     if skill_id:
-        skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+        skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
         bundle = os.path.join(skills_root, ".runtime", str(x_user_id), skill_id)
         md_path = os.path.join(bundle, "SKILL.md")
         # Belt + suspenders: even after regex, double-check resolved real path
@@ -1367,7 +1367,7 @@ async def sandbox_run_endpoint(
     import re
     if not re.match(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$", req.skill_id):
         raise HTTPException(status_code=400, detail="invalid skill_id")
-    skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/skills")
+    skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
     bundle_dir = None
     for candidate in (
         os.path.join(skills_root, "builtin", req.skill_id),
