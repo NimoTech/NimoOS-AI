@@ -38,6 +38,47 @@ def _read(p: Path) -> str:
 _USERS_DB = Path("/var/lib/nimoos/db/user.db")
 
 
+def resolve_model_and_routing(cfg) -> tuple:
+    """Pick (model_name, force_cloud) for the next chat-completions call.
+
+    Order of preference:
+      1. cfg.model non-empty → use it as-is, force_cloud=False (let user's
+         privacy policy on ai.db decide local/cloud routing).
+      2. cfg.model empty → query /v1/ai/_internal/models?user_id=X:
+         a. if local list non-empty → return (local[0]["name"], False)
+         b. else if cloud list non-empty → return (cloud[0]["default_model"], True)
+         c. both empty → raise RuntimeError (no model available; the worker
+            will treat this as transient and break the round).
+
+    The force_cloud=True case sets X-NimoOS-Force-Cloud header so ai-service's
+    Router.Decide bypasses the user's local-by-default policy when there's no
+    local model installed.
+    """
+    if cfg.model:
+        return cfg.model, False
+
+    import httpx  # local import — discovery.resolve_user_id doesn't need it
+    user_id = resolve_user_id(cfg)
+    try:
+        with httpx.Client(timeout=5) as c:
+            r = c.get(ai_url() + "/v1/ai/_internal/models",
+                      params={"user_id": user_id})
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"cannot resolve model: /_internal/models failed: {e}") from e
+
+    local = data.get("local") or []
+    cloud = data.get("cloud") or []
+
+    if local:
+        return local[0]["name"], False
+    if cloud:
+        return cloud[0]["default_model"], True
+
+    raise RuntimeError("no model available: local Ollama empty and no enabled cloud providers")
+
+
 def resolve_user_id(cfg) -> str:
     """Pick the X-NimoOS-User-ID header value for chat-completions calls.
 

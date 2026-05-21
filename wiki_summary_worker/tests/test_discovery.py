@@ -52,3 +52,96 @@ def test_resolve_user_id_fallback_to_system_when_table_empty(monkeypatch, tmp_pa
     conn.close()
     monkeypatch.setattr(discovery, "_USERS_DB", db)
     assert discovery.resolve_user_id(Config()) == "system"
+
+
+# ---------------------------------------------------------------------------
+# resolve_model_and_routing tests
+# ---------------------------------------------------------------------------
+
+def test_resolve_model_uses_explicit_cfg(monkeypatch):
+    cfg = Config(model="explicit-model")
+    # should not even hit HTTP
+    assert discovery.resolve_model_and_routing(cfg) == ("explicit-model", False)
+
+
+def test_resolve_model_prefers_local(monkeypatch):
+    import httpx
+
+    def handler(req):
+        return httpx.Response(200, json={
+            "local": [{"name": "qwen3.5:9b"}, {"name": "qwen3.5:0.8b"}],
+            "cloud": [{"provider_id": 1, "default_model": "gpt-4o"}],
+        })
+
+    # Capture the real Client before patching to avoid infinite recursion.
+    _real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client",
+                        lambda *a, **kw: _real_client(
+                            transport=httpx.MockTransport(handler),
+                            base_url="http://ai.test"))
+    monkeypatch.setattr(discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(discovery, "resolve_user_id", lambda cfg: "1")
+
+    cfg = Config(model="")
+    assert discovery.resolve_model_and_routing(cfg) == ("qwen3.5:9b", False)
+
+
+def test_resolve_model_falls_back_to_cloud(monkeypatch):
+    import httpx
+
+    def handler(req):
+        return httpx.Response(200, json={
+            "local": [],
+            "cloud": [{"provider_id": 2, "default_model": "doubao-x"}],
+        })
+
+    _real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client",
+                        lambda *a, **kw: _real_client(
+                            transport=httpx.MockTransport(handler),
+                            base_url="http://ai.test"))
+    monkeypatch.setattr(discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(discovery, "resolve_user_id", lambda cfg: "1")
+
+    cfg = Config(model="")
+    name, force_cloud = discovery.resolve_model_and_routing(cfg)
+    assert name == "doubao-x"
+    assert force_cloud is True
+
+
+def test_resolve_model_raises_when_no_model(monkeypatch):
+    import httpx
+    import pytest as _pytest
+
+    def handler(req):
+        return httpx.Response(200, json={"local": [], "cloud": []})
+
+    _real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client",
+                        lambda *a, **kw: _real_client(
+                            transport=httpx.MockTransport(handler),
+                            base_url="http://ai.test"))
+    monkeypatch.setattr(discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(discovery, "resolve_user_id", lambda cfg: "1")
+
+    with _pytest.raises(RuntimeError):
+        discovery.resolve_model_and_routing(Config(model=""))
+
+
+def test_resolve_model_raises_on_http_error(monkeypatch):
+    import httpx
+    import pytest as _pytest
+
+    def handler(req):
+        raise httpx.ConnectError("nope")
+
+    _real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client",
+                        lambda *a, **kw: _real_client(
+                            transport=httpx.MockTransport(handler),
+                            base_url="http://ai.test"))
+    monkeypatch.setattr(discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(discovery, "resolve_user_id", lambda cfg: "1")
+
+    with _pytest.raises(RuntimeError):
+        discovery.resolve_model_and_routing(Config(model=""))

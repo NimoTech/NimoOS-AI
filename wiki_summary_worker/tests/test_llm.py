@@ -19,6 +19,8 @@ def _stub_ai(monkeypatch, handler):
     monkeypatch.setattr(llm, "_make_client", lambda timeout=60: _client(handler))
     monkeypatch.setattr(llm.discovery, "ai_url", lambda: "http://ai.test")
     monkeypatch.setattr(llm.discovery, "resolve_user_id", lambda cfg: "42")
+    monkeypatch.setattr(llm.discovery, "resolve_model_and_routing",
+                        lambda cfg: ("test-model", False))
 
 
 def test_summarize_clean_json(monkeypatch):
@@ -140,3 +142,37 @@ def test_summarize_sends_user_id_header(monkeypatch):
     _stub_ai(monkeypatch, handler)
     llm.summarize(_evidence(), Config())
     assert seen["uid"] == "42", "must use the user-id resolved at call time"
+
+
+def test_summarize_sends_force_cloud_when_resolver_says_so(monkeypatch):
+    monkeypatch.setattr(llm.discovery, "resolve_model_and_routing",
+                        lambda cfg: ("doubao-x", True))
+    seen = {}
+    def handler(req):
+        seen["force"] = req.headers.get("X-NimoOS-Force-Cloud")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"ai_label":"L","summary":"S"}'}}]
+        })
+    monkeypatch.setattr(llm, "_make_client", lambda timeout=60: _client(handler))
+    monkeypatch.setattr(llm.discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(llm.discovery, "resolve_user_id", lambda cfg: "1")
+
+    llm.summarize(_evidence(), Config())
+    assert seen["force"] == "true"
+
+
+def test_summarize_no_force_cloud_when_resolver_says_local(monkeypatch):
+    monkeypatch.setattr(llm.discovery, "resolve_model_and_routing",
+                        lambda cfg: ("local-model", False))
+    seen = {}
+    def handler(req):
+        seen["force"] = req.headers.get("X-NimoOS-Force-Cloud")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"ai_label":"L","summary":"S"}'}}]
+        })
+    monkeypatch.setattr(llm, "_make_client", lambda timeout=60: _client(handler))
+    monkeypatch.setattr(llm.discovery, "ai_url", lambda: "http://ai.test")
+    monkeypatch.setattr(llm.discovery, "resolve_user_id", lambda cfg: "1")
+
+    llm.summarize(_evidence(), Config())
+    assert seen["force"] is None

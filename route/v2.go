@@ -79,6 +79,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// Internal endpoints: localhost-only, no JWT (e.g. wiki-summary worker)
 	internal := g.Group("/_internal", LocalhostOnly)
 	internal.POST("/chat/completions", chat.ChatCompletions)
+	internal.GET("/models", models.ListInternal)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)

@@ -33,8 +33,13 @@ def _make_client(timeout: int = 60) -> httpx.Client:
 
 
 def summarize(evidence: Evidence, cfg: Config) -> dict:
+    # RuntimeError from resolve_model_and_routing intentionally NOT caught —
+    # worker.run_once treats it as a transient round failure, which is
+    # correct for "ai-service unavailable" or "no model anywhere" scenarios.
+    model, force_cloud = discovery.resolve_model_and_routing(cfg)
+
     body = {
-        "model": cfg.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": prompt.SYSTEM},
             {"role": "user", "content": prompt.serialize_user_message(evidence)},
@@ -44,6 +49,8 @@ def summarize(evidence: Evidence, cfg: Config) -> dict:
         "response_format": {"type": "json_object"},  # defense 1
     }
     headers = {"X-NimoOS-User-ID": discovery.resolve_user_id(cfg)}
+    if force_cloud:
+        headers["X-NimoOS-Force-Cloud"] = "true"
 
     try:
         with _make_client(cfg.llm_timeout_sec) as c:
