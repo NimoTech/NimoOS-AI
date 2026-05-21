@@ -40,7 +40,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
 		Skipper: func(c echo.Context) bool {
-			return false // no localhost exemption: prevents unauthorized access to other users' cloud API keys
+			// _internal routes are localhost-only (LocalhostOnly middleware) and
+			// accept X-NimoOS-User-ID from the request directly. They serve local
+			// daemon traffic (e.g. wiki-summary worker) that has no JWT.
+			return strings.HasPrefix(c.Path(), common.V2APIPath+"/_internal/")
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
@@ -72,6 +75,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	}))
 
 	g := e.Group(common.V2APIPath)
+
+	// Internal endpoints: localhost-only, no JWT (e.g. wiki-summary worker)
+	internal := g.Group("/_internal", LocalhostOnly)
+	internal.POST("/chat/completions", chat.ChatCompletions)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
