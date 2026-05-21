@@ -10,8 +10,8 @@ ConditionPathExists=/var/run/nimoos/ai.url
 Type=oneshot
 User=root
 Group=root
-WorkingDirectory=/usr/share/nimoos-ai
-Environment=PYTHONPATH=/usr/share/nimoos-ai
+WorkingDirectory=/usr/share/nimoos
+Environment=PYTHONPATH=/usr/share/nimoos
 ExecStart=/usr/bin/python3 -m wiki_summary_worker
 StandardOutput=journal
 StandardError=journal
