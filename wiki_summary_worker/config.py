@@ -19,7 +19,8 @@ class Config:
     max_bytes_per_file: int = 51200
     max_text_files: int = 10
     max_pdf_files: int = 5
-    user_id_header: str = "system"  # passed as X-NimoOS-User-ID to chat-completions
+    # user_id_header: empty means auto-detect from /var/lib/nimoos/db/user.db; non-empty overrides.
+    user_id_header: str = ""  # passed as X-NimoOS-User-ID to chat-completions
 
     @property
     def llm_timeout_sec(self) -> int:
@@ -46,5 +47,5 @@ def load(path: str = "/etc/nimoos/wiki.conf") -> Config:
         max_bytes_per_file=sec.getint("MaxBytesPerFile", 51200),
         max_text_files=sec.getint("MaxTextFiles", 10),
         max_pdf_files=sec.getint("MaxPdfFiles", 5),
-        user_id_header=sec.get("UserIdHeader", "system"),
+        user_id_header=sec.get("UserIdHeader", ""),
     )
