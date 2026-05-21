@@ -42,6 +42,13 @@ class Evidence:
     pdf_excerpts: list[FileExcerpt] = field(default_factory=list)
     skipped: list[dict[str, Any]] = field(default_factory=list)
 
+    def is_empty(self) -> bool:
+        """True when wiki returned NO file_index rows for this node at all —
+        no children, no text, no pdf, no skipped binary samples. This is the
+        signal for the 'empty directory' short-circuit in worker.run_once."""
+        return (not self.child_map and not self.text_files
+                and not self.pdf_excerpts and not self.skipped)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "node_path": self.node_path,

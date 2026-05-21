@@ -18,15 +18,36 @@ def _no_rate_limit(monkeypatch):
                         MagicMock(return_value=MagicMock(take_or_die=lambda _: None)))
 
 
-def test_run_once_short_circuits_empty_dir(monkeypatch):
+def test_run_once_short_circuits_on_empty_evidence(monkeypatch):
     monkeypatch.setattr(worker.wiki_io, "fetch_needs_summary",
-                        lambda limit: [_node("/empty", child_count=0)])
+                        lambda limit: [_node("/empty", child_count=99)])  # child_count is now irrelevant
     posted = []
     monkeypatch.setattr(worker.wiki_io, "post_summary",
                         lambda **kw: posted.append(kw))
+    monkeypatch.setattr(worker.sampler, "gather",
+                        lambda path, cfg: sampler.Evidence(node_path=path))  # all fields default to empty
     _no_rate_limit(monkeypatch)
 
-    n = worker.run_once(Config())
+    cfg = Config()
+    n = worker.run_once(cfg)
+    assert n == 1
+    assert len(posted) == 1
+    assert posted[0]["ai_label"] == "空目录"
+    assert "+failed" not in posted[0]["generator_version"]
+
+
+def test_run_once_with_nonzero_child_count_but_empty_evidence(monkeypatch):
+    monkeypatch.setattr(worker.wiki_io, "fetch_needs_summary",
+                        lambda limit: [_node("/empty", child_count=5)])
+    posted = []
+    monkeypatch.setattr(worker.wiki_io, "post_summary",
+                        lambda **kw: posted.append(kw))
+    monkeypatch.setattr(worker.sampler, "gather",
+                        lambda path, cfg: sampler.Evidence(node_path=path))  # all fields default to empty
+    _no_rate_limit(monkeypatch)
+
+    cfg = Config()
+    n = worker.run_once(cfg)
     assert n == 1
     assert len(posted) == 1
     assert posted[0]["ai_label"] == "空目录"
@@ -40,7 +61,8 @@ def test_run_once_writes_placeholder_on_llm_error(monkeypatch):
     monkeypatch.setattr(worker.wiki_io, "post_summary",
                         lambda **kw: posted.append(kw))
     monkeypatch.setattr(worker.sampler, "gather",
-                        lambda path, cfg: sampler.Evidence(node_path=path))
+                        lambda path, cfg: sampler.Evidence(node_path=path,
+                            text_files=[sampler.FileExcerpt("a.md", 5, "hello")]))
     monkeypatch.setattr(worker.llm, "summarize",
                         lambda ev, cfg: (_ for _ in ()).throw(llm.LLMError("boom")))
     _no_rate_limit(monkeypatch)
@@ -58,7 +80,8 @@ def test_run_once_writes_placeholder_on_jsonparse(monkeypatch):
     monkeypatch.setattr(worker.wiki_io, "post_summary",
                         lambda **kw: posted.append(kw))
     monkeypatch.setattr(worker.sampler, "gather",
-                        lambda path, cfg: sampler.Evidence(node_path=path))
+                        lambda path, cfg: sampler.Evidence(node_path=path,
+                            text_files=[sampler.FileExcerpt("a.md", 5, "hello")]))
     monkeypatch.setattr(worker.llm, "summarize",
                         lambda ev, cfg: (_ for _ in ()).throw(llm.JSONParseError("bad")))
     _no_rate_limit(monkeypatch)

@@ -55,7 +55,8 @@ def run_once(cfg) -> int:
             break
 
         try:
-            if node["child_count"] == 0:
+            evidence = sampler.gather(node["path"], cfg)
+            if evidence.is_empty():
                 wiki_io.post_summary(
                     path=node["path"],
                     ai_label="空目录",
@@ -66,7 +67,6 @@ def run_once(cfg) -> int:
                 processed += 1
                 continue
 
-            evidence = sampler.gather(node["path"], cfg)
             result = llm.summarize(evidence, cfg)
             wiki_io.post_summary(
                 path=node["path"],

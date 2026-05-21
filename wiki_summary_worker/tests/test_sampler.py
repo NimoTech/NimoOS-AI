@@ -98,3 +98,20 @@ def test_gather_propagates_http_error(monkeypatch, tmp_path):
     monkeypatch.setattr(sampler.wiki_io, "fetch_node_evidence", fake_evidence)
     with pytest.raises(httpx.HTTPError):
         sampler.gather(str(tmp_path), Config())
+
+
+def test_evidence_is_empty_when_everything_empty():
+    ev = sampler.Evidence(node_path="/x")
+    assert ev.is_empty() is True
+
+
+def test_evidence_not_empty_when_child_map_has_items():
+    ev = sampler.Evidence(node_path="/x",
+                          child_map=[{"name": "a", "size": 0, "is_dir": False, "ext": ""}])
+    assert ev.is_empty() is False
+
+
+def test_evidence_not_empty_when_skipped_has_items():
+    ev = sampler.Evidence(node_path="/x",
+                          skipped=[{"path": "/x/a.jpg", "ext": "jpg", "size": 1, "reason": "image"}])
+    assert ev.is_empty() is False
