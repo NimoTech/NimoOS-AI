@@ -40,7 +40,7 @@ def summarize(evidence: Evidence, cfg: Config) -> dict:
             {"role": "user", "content": prompt.serialize_user_message(evidence)},
         ],
         "temperature": 0.2,
-        "max_tokens": 400,
+        "max_tokens": 2000,
         "response_format": {"type": "json_object"},  # defense 1
     }
     headers = {"X-NimoOS-User-ID": discovery.resolve_user_id(cfg)}
