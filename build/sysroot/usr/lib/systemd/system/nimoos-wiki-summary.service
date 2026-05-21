@@ -1,0 +1,19 @@
+[Unit]
+Description=NimoOS Wiki Summary Worker (one-shot)
+Documentation=https://github.com/NimoTech/NimoOS-AI
+After=nimoos-wiki.service nimoos-ai.service
+Wants=nimoos-wiki.service nimoos-ai.service
+ConditionPathExists=/var/run/nimoos/wiki.url
+ConditionPathExists=/var/run/nimoos/ai.url
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/usr/share/nimoos-ai
+Environment=PYTHONPATH=/usr/share/nimoos-ai
+ExecStart=/usr/bin/python3 -m wiki_summary_worker
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
+Restart=no

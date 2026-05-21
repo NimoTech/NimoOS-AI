@@ -1,0 +1,27 @@
+# Wiki summary worker configuration. Append this section to /etc/nimoos/wiki.conf.
+# All values shown are the built-in defaults.
+
+[wiki-summary]
+# Toggle the whole worker on/off (timer still fires but exits immediately when false).
+Enabled = true
+
+# Max nodes to summarize per timer-fired round.
+BatchSize = 3
+
+# Hard cap on LLM calls per hour, worker-wide. Worker breaks the round if hit.
+MaxPerHour = 100
+
+# Default model (sent as `model` in chat-completions request).
+Model = gpt-4o-mini
+
+# Per-node sampling caps.
+MaxFilesPerNode = 20
+MaxBytesPerFile = 51200
+MaxTextFiles = 10
+MaxPdfFiles = 5
+
+# User-ID header sent to /v1/ai/chat/completions.
+# Empty (default) = auto-detect: prefer an admin user from /var/lib/nimoos/db/user.db,
+#                  fall back to the lowest-id user, finally to the literal "system".
+# Set this to a numeric user-id ONLY if you want to bypass auto-detection.
+UserIdHeader =
