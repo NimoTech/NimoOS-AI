@@ -48,7 +48,7 @@ def summarize(evidence: Evidence, cfg: Config) -> dict:
     try:
         with _make_client(cfg.llm_timeout_sec) as c:
             r = c.post(
-                discovery.ai_url() + "/v1/ai/chat/completions",
+                discovery.ai_url() + "/v1/ai/_internal/chat/completions",
                 json=body, headers=headers,
             )
             r.raise_for_status()
