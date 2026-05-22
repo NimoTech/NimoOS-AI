@@ -20,5 +20,8 @@ if [ -f "${CONF_FILE}" ]; then
     fi
 fi
 
+# Create runtime directory for rate-limit calls.log (root-writable, world-readable).
+install -d -m 0755 /var/lib/nimoos/wiki-summary
+
 systemctl daemon-reload
 systemctl enable --force --no-ask-password "nimoos-wiki-summary.timer"

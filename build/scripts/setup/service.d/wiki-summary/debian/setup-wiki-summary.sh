@@ -27,6 +27,9 @@ else
     echo "warning: ${CONF_FILE} not found — wiki service must be installed first"
 fi
 
+# Create runtime directory for rate-limit calls.log (root-writable, world-readable).
+install -d -m 0755 /var/lib/nimoos/wiki-summary
+
 systemctl daemon-reload
 
 echo "Enabling timer..."

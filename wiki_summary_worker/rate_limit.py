@@ -1,6 +1,6 @@
 """Worker-side rolling-window rate limiter.
 
-Persists call timestamps to ~/.cache/nimoos-wiki-summary/calls.log so the
+Persists call timestamps to /var/lib/nimoos/wiki-summary/calls.log so the
 limit holds across worker invocations (systemd Type=oneshot relaunches the
 worker every 5min). Single-instance assumption: systemd unit ensures no
 two copies run concurrently — no file lock needed.
@@ -15,7 +15,7 @@ class RateLimitExceeded(Exception):
 
 
 class RateLimiter:
-    PATH = Path("~/.cache/nimoos-wiki-summary/calls.log").expanduser()
+    PATH = Path("/var/lib/nimoos/wiki-summary/calls.log")
 
     def take_or_die(self, max_per_hour: int) -> None:
         now_ms = int(time.time() * 1000)
