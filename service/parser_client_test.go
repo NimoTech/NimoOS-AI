@@ -1,6 +1,7 @@
 package service
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -61,5 +62,38 @@ func TestParserClient_RereadsDiscoveryOnConnError(t *testing.T) {
 	}
 	if status != 200 || string(body) != "ok" {
 		t.Fatalf("body = %s status = %d", body, status)
+	}
+}
+
+func TestParserClient_PostRetrySendsFullBody(t *testing.T) {
+	dir := t.TempDir()
+	discovery := filepath.Join(dir, "parser.url")
+	os.WriteFile(discovery, []byte("http://127.0.0.1:1"), 0644) // bad
+
+	var seen [][]byte
+	srvOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		seen = append(seen, b)
+		w.Write([]byte(`{}`))
+	}))
+	defer srvOK.Close()
+
+	pc := NewParserClient(discovery)
+	pc.SetCachedBaseURL("http://127.0.0.1:1") // bad cache forces retry
+	os.WriteFile(discovery, []byte(srvOK.URL), 0644)
+
+	body := []byte(`{"n":1}`)
+	_, status, err := pc.Post("/anything", body)
+	if err != nil {
+		t.Fatalf("Post failed: %v", err)
+	}
+	if status != 200 {
+		t.Fatalf("status = %d", status)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("expected exactly 1 request received; got %d", len(seen))
+	}
+	if string(seen[0]) != `{"n":1}` {
+		t.Fatalf("body received = %q, want %q", seen[0], `{"n":1}`)
 	}
 }

@@ -54,7 +54,7 @@ func (c *ParserClient) SetCachedBaseURL(url string) {
 	c.mu.Unlock()
 }
 
-func (c *ParserClient) do(ctx context.Context, method, path string, body io.Reader) ([]byte, int, error) {
+func (c *ParserClient) do(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
 	base, err := c.baseURL()
 	if err != nil {
 		return nil, 0, err
@@ -75,13 +75,17 @@ func (c *ParserClient) do(ctx context.Context, method, path string, body io.Read
 	return c.readBody(resp)
 }
 
-func (c *ParserClient) tryOnce(ctx context.Context, method, url string, body io.Reader) (*http.Response, error) {
+func (c *ParserClient) tryOnce(ctx context.Context, method, url string, body []byte) (*http.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
 	var req *http.Request
 	var err error
 	if ctx != nil {
-		req, err = http.NewRequestWithContext(ctx, method, url, body)
+		req, err = http.NewRequestWithContext(ctx, method, url, reader)
 	} else {
-		req, err = http.NewRequest(method, url, body)
+		req, err = http.NewRequest(method, url, reader)
 	}
 	if err != nil {
 		return nil, err
@@ -106,7 +110,7 @@ func (c *ParserClient) Get(path string) ([]byte, int, error) {
 }
 
 func (c *ParserClient) Post(path string, body []byte) ([]byte, int, error) {
-	return c.do(nil, "POST", path, bytes.NewReader(body))
+	return c.do(nil, "POST", path, body)
 }
 
 func (c *ParserClient) GetWithContext(ctx context.Context, path string) ([]byte, int, error) {
@@ -114,5 +118,5 @@ func (c *ParserClient) GetWithContext(ctx context.Context, path string) ([]byte,
 }
 
 func (c *ParserClient) PostWithContext(ctx context.Context, path string, body []byte) ([]byte, int, error) {
-	return c.do(ctx, "POST", path, bytes.NewReader(body))
+	return c.do(ctx, "POST", path, body)
 }
