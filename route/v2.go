@@ -116,6 +116,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// Services status (ollama + agent)
 	g.GET("/services/status", services.Status)
 
+	// Parser proxy
+	parserProxy := &v2.ParserProxy{Client: parserClient}
+	g.GET("/parser/stats", parserProxy.Stats)
+	g.GET("/parser/jobs", parserProxy.Jobs)
+	g.GET("/parser/folders", parserProxy.Folders)
+	g.GET("/parser/state", parserProxy.State)
+	g.POST("/parser/control", parserProxy.Control)
+
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
 	g.Any("/agent/*", func(c echo.Context) error {
