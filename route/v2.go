@@ -123,6 +123,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/parser/folders", parserProxy.Folders)
 	g.GET("/parser/state", parserProxy.State)
 	g.POST("/parser/control", parserProxy.Control)
+	g.POST("/parser/test/analyze", parserProxy.TestAnalyze)
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)

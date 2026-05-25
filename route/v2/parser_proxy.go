@@ -2,6 +2,8 @@ package v2
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 
 	"github.com/labstack/echo/v4"
 )
@@ -9,10 +11,28 @@ import (
 type ParserClientIface interface {
 	Get(path string) ([]byte, int, error)
 	Post(path string, body []byte) ([]byte, int, error)
+	Forward(method, path, contentType string, body []byte) ([]byte, int, error)
 }
 
 type ParserProxy struct {
 	Client ParserClientIface
+}
+
+// TestAnalyze forwards a multipart upload to /v1/parser/test/analyze.
+// Caps the upload at 6 MiB to match Parser's 5 MiB cap plus form overhead.
+func (p *ParserProxy) TestAnalyze(c echo.Context) error {
+	const maxBody = 6 * 1024 * 1024
+	c.Request().Body = http.MaxBytesReader(c.Response().Writer, c.Request().Body, maxBody)
+	body, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.JSON(413, echo.Map{"error": "upload too large or read failed"})
+	}
+	ct := c.Request().Header.Get("Content-Type")
+	resp, code, err := p.Client.Forward("POST", "/v1/parser/test/analyze", ct, body)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", resp)
 }
 
 func (p *ParserProxy) Stats(c echo.Context) error {
