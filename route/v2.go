@@ -24,7 +24,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	sessions := v2.NewSessionsHandler(svc)
 	agent := v2.NewAgentHandler(svc, agentURL, 60)
 	agent.StartHealthMonitor()
-	services := v2.NewServicesStatusHandler(agent, ollamaURL)
+	parserClient := service.NewParserClient(runtimePath + "/parser.url")
+	searchClient := service.NewSearchClient(runtimePath + "/search.url")
+	services := v2.NewServicesStatusHandler(agent, ollamaURL, parserClient, searchClient)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
