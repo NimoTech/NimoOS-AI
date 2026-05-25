@@ -60,6 +60,7 @@ func (p *ParserProxy) State(c echo.Context) error {
 type controlReq struct {
 	Action string `json:"action"`
 	N      *int   `json:"n,omitempty"`
+	Device string `json:"device,omitempty"`
 }
 
 func (p *ParserProxy) Control(c echo.Context) error {
@@ -86,6 +87,16 @@ func (p *ParserProxy) Control(c echo.Context) error {
 		}
 		b, _ := json.Marshal(echo.Map{"n": *req.N})
 		body, code, err := p.Client.Post("/v1/parser/control/concurrency", b)
+		if err != nil {
+			return c.JSON(502, echo.Map{"error": err.Error()})
+		}
+		return c.Blob(code, "application/json", body)
+	case "set_device":
+		if req.Device == "" {
+			return c.JSON(400, echo.Map{"error": "device required"})
+		}
+		b, _ := json.Marshal(echo.Map{"device": req.Device})
+		body, code, err := p.Client.Post("/v1/parser/control/device", b)
 		if err != nil {
 			return c.JSON(502, echo.Map{"error": err.Error()})
 		}
