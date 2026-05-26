@@ -124,6 +124,13 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/parser/state", parserProxy.State)
 	g.POST("/parser/control", parserProxy.Control)
 	g.POST("/parser/test/analyze", parserProxy.TestAnalyze)
+	g.DELETE("/parser/jobs/:id", parserProxy.DeleteJob)
+	g.POST("/parser/jobs/clear-failed", parserProxy.ClearFailedJobs)
+	g.GET("/parser/allowlist/extensions", parserProxy.GetAllowlistExtensions)
+	g.PATCH("/parser/allowlist/extensions", parserProxy.PatchAllowlistExtension)
+	g.GET("/parser/allowlist/folders", parserProxy.GetAllowlistFolders)
+	g.POST("/parser/allowlist/folders", parserProxy.PostAllowlistFolder)
+	g.DELETE("/parser/allowlist/folders/:id", parserProxy.DeleteAllowlistFolder)
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)

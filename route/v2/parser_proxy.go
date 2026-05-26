@@ -136,3 +136,85 @@ func (p *ParserProxy) Control(c echo.Context) error {
 		return c.JSON(400, echo.Map{"error": "unknown action"})
 	}
 }
+
+// DeleteJob proxies DELETE /v1/ai/parser/jobs/{id} → /v1/parser/jobs/{id}.
+func (p *ParserProxy) DeleteJob(c echo.Context) error {
+	id := c.Param("id")
+	body, code, err := p.Client.Forward("DELETE",
+		"/v1/parser/jobs/"+id, "", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	if len(body) == 0 {
+		return c.NoContent(code)
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// ClearFailedJobs proxies POST /v1/ai/parser/jobs/clear-failed.
+func (p *ParserProxy) ClearFailedJobs(c echo.Context) error {
+	body, code, err := p.Client.Post("/v1/parser/jobs/clear-failed", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// GetAllowlistExtensions proxies GET /v1/ai/parser/allowlist/extensions.
+func (p *ParserProxy) GetAllowlistExtensions(c echo.Context) error {
+	body, code, err := p.Client.Get("/v1/parser/allowlist/extensions")
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// PatchAllowlistExtension proxies PATCH /v1/ai/parser/allowlist/extensions.
+func (p *ParserProxy) PatchAllowlistExtension(c echo.Context) error {
+	raw, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.JSON(400, echo.Map{"error": "read body: " + err.Error()})
+	}
+	body, code, err := p.Client.Forward("PATCH",
+		"/v1/parser/allowlist/extensions", "application/json", raw)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// GetAllowlistFolders proxies GET /v1/ai/parser/allowlist/folders.
+func (p *ParserProxy) GetAllowlistFolders(c echo.Context) error {
+	body, code, err := p.Client.Get("/v1/parser/allowlist/folders")
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// PostAllowlistFolder proxies POST /v1/ai/parser/allowlist/folders.
+func (p *ParserProxy) PostAllowlistFolder(c echo.Context) error {
+	raw, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.JSON(400, echo.Map{"error": "read body: " + err.Error()})
+	}
+	body, code, err := p.Client.Post("/v1/parser/allowlist/folders", raw)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// DeleteAllowlistFolder proxies DELETE /v1/ai/parser/allowlist/folders/{id}.
+func (p *ParserProxy) DeleteAllowlistFolder(c echo.Context) error {
+	id := c.Param("id")
+	body, code, err := p.Client.Forward("DELETE",
+		"/v1/parser/allowlist/folders/"+id, "", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	if len(body) == 0 {
+		return c.NoContent(code)
+	}
+	return c.Blob(code, "application/json", body)
+}
