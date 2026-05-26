@@ -19,9 +19,9 @@ type ParserProxy struct {
 }
 
 // TestAnalyze forwards a multipart upload to /v1/parser/test/analyze.
-// Caps the upload at 6 MiB to match Parser's 5 MiB cap plus form overhead.
+// Caps the upload at 32 MiB to match Parser's 30 MiB cap plus form overhead.
 func (p *ParserProxy) TestAnalyze(c echo.Context) error {
-	const maxBody = 6 * 1024 * 1024
+	const maxBody = 32 * 1024 * 1024
 	c.Request().Body = http.MaxBytesReader(c.Response().Writer, c.Request().Body, maxBody)
 	body, err := io.ReadAll(c.Request().Body)
 	if err != nil {
