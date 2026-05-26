@@ -78,9 +78,10 @@ func (p *ParserProxy) State(c echo.Context) error {
 }
 
 type controlReq struct {
-	Action string `json:"action"`
-	N      *int   `json:"n,omitempty"`
-	Device string `json:"device,omitempty"`
+	Action  string `json:"action"`
+	N       *int   `json:"n,omitempty"`
+	Device  string `json:"device,omitempty"`
+	Enabled *bool  `json:"enabled,omitempty"`
 }
 
 func (p *ParserProxy) Control(c echo.Context) error {
@@ -117,6 +118,16 @@ func (p *ParserProxy) Control(c echo.Context) error {
 		}
 		b, _ := json.Marshal(echo.Map{"device": req.Device})
 		body, code, err := p.Client.Post("/v1/parser/control/device", b)
+		if err != nil {
+			return c.JSON(502, echo.Map{"error": err.Error()})
+		}
+		return c.Blob(code, "application/json", body)
+	case "set_ocr":
+		if req.Enabled == nil {
+			return c.JSON(400, echo.Map{"error": "enabled required"})
+		}
+		b, _ := json.Marshal(echo.Map{"enabled": *req.Enabled})
+		body, code, err := p.Client.Post("/v1/parser/control/ocr", b)
 		if err != nil {
 			return c.JSON(502, echo.Map{"error": err.Error()})
 		}
