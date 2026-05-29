@@ -232,3 +232,31 @@ func (p *ParserProxy) DeleteAllowlistFolder(c echo.Context) error {
 	}
 	return c.Blob(code, "application/json", body)
 }
+
+// ListFiles forwards GET /v1/ai/parser/files → /v1/parser/files.
+// Query string passes through verbatim.
+func (p *ParserProxy) ListFiles(c echo.Context) error {
+	path := "/v1/parser/files"
+	if q := c.QueryString(); q != "" {
+		path += "?" + q
+	}
+	body, code, err := p.Client.Get(path)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// ReindexFiles forwards POST /v1/ai/parser/files/reindex → /v1/parser/files/reindex.
+// Body passes through verbatim (file_ids XOR filter, plus optional reason).
+func (p *ParserProxy) ReindexFiles(c echo.Context) error {
+	raw, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.JSON(400, echo.Map{"error": "read body: " + err.Error()})
+	}
+	body, code, err := p.Client.Post("/v1/parser/files/reindex", raw)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}

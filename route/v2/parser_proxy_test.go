@@ -354,3 +354,59 @@ func TestParserProxy_DeleteAllowlistFolder(t *testing.T) {
 		t.Fatalf("captured = %+v", *captured)
 	}
 }
+
+func TestParserProxy_ReindexFilesForwardsBody(t *testing.T) {
+	srv, captured, mu := startUpstream(t, map[string]string{
+		"/v1/parser/files/reindex": `{"queued":2,"tombstoned":2,"job_ids":[1,2],"skipped":[]}`,
+	})
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("POST", "/v1/ai/parser/files/reindex",
+		strings.NewReader(`{"file_ids":["a","b"],"reason":"ui"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if err := p.ReindexFiles(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*captured) != 1 || (*captured)[0].Method != "POST" ||
+		(*captured)[0].Path != "/v1/parser/files/reindex" ||
+		!strings.Contains((*captured)[0].Body, `"file_ids":["a","b"]`) {
+		t.Fatalf("captured = %+v", *captured)
+	}
+}
+
+func TestParserProxy_ListFilesForwardsQueryString(t *testing.T) {
+	var gotRawQuery string
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"total":0,"limit":100,"offset":0,"files":[]}`))
+	}))
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("GET", "/v1/ai/parser/files?root_id=media&limit=50", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if err := p.ListFiles(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if gotPath != "/v1/parser/files" {
+		t.Fatalf("upstream path = %q, want /v1/parser/files", gotPath)
+	}
+	if gotRawQuery != "root_id=media&limit=50" {
+		t.Fatalf("upstream query = %q, want root_id=media&limit=50", gotRawQuery)
+	}
+}
