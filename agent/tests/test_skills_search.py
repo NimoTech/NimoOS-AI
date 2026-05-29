@@ -1,20 +1,16 @@
+import json
+
+import httpx
 import pytest
 
 from skills import ALL_TOOLS
+from skills.search import search as search_skill
 
 
 def test_search_tools_in_all_tools():
     tool_names = {t.name for t in ALL_TOOLS}
     assert "nimoos_search" in tool_names
     assert "read_file_chunk" in tool_names
-
-
-import json
-
-import httpx
-import pytest
-
-from skills.search import search as search_skill
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +37,7 @@ async def test_nimoos_search_propagates_user_id(monkeypatch):
     assert calls["name"] == "nimoos_search"
     assert calls["arguments"]["query"] == "hello"
     assert calls["arguments"]["top_k"] == 3
+    assert calls["arguments"]["modality"] == "auto"
     assert json.loads(out) == {"hits": []}
 
 
@@ -102,3 +99,13 @@ async def test_nimoos_search_returns_error_json_on_bad_filters(monkeypatch):
     out = await search_skill._nimoos_search_impl("hi", filters="{not json")
     data = json.loads(out)
     assert "error" in data
+
+
+@pytest.mark.asyncio
+async def test_read_file_chunk_returns_error_json_on_http_error(monkeypatch):
+    async def fake_invoke(name, arguments, user_id=None):
+        raise httpx.HTTPError("timeout")
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    out = await search_skill._read_file_chunk_impl("f1", "body", 0)
+    assert "error" in json.loads(out)
