@@ -109,3 +109,11 @@ async def test_read_file_chunk_returns_error_json_on_http_error(monkeypatch):
     monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
     out = await search_skill._read_file_chunk_impl("f1", "body", 0)
     assert "error" in json.loads(out)
+
+
+def test_agent_imports_search_skills_module():
+    # Guards the new `import skills.search as search_skills` in agent.py and
+    # that agent.py references the same USER_ID_VAR object the skill reads.
+    import agent as agent_module
+    from skills.search import search as search_skill
+    assert agent_module.search_skills.USER_ID_VAR is search_skill.USER_ID_VAR

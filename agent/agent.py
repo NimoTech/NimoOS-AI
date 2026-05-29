@@ -28,6 +28,7 @@ import skills.shell as shell_skills
 import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
+import skills.search as search_skills
 from fs.snapshots import SnapshotStore
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
@@ -397,6 +398,13 @@ class AgentRunner:
             skills_registry.SKILLS_ROOT_VAR.set(os.environ.get(
                 "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills"))
             skills_registry.USER_ID_VAR.set(str(user_id))
+
+            # Search tools resolve the caller's accessible Wiki Roots from this
+            # user_id (sent as X-NimoOS-User-ID). Without it, search returns
+            # no_accessible_roots → empty hits. Per-skill var, matching the
+            # established pattern (see spec 2026-05-29; unified context is a
+            # tracked follow-up).
+            search_skills.USER_ID_VAR.set(str(user_id))
 
             # Mount the user's skill runtime view into the bwrap sandbox via
             # ContextVar (not os.environ, which would be clobbered by concurrent
