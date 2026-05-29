@@ -197,6 +197,33 @@ func TestParserProxy_ClearFailedJobs(t *testing.T) {
 	}
 }
 
+func TestParserProxy_RetryJobsForwardsFileIDs(t *testing.T) {
+	srv, captured, mu := startUpstream(t, map[string]string{
+		"/v1/parser/jobs/retry": `{"retried":2}`,
+	})
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("POST", "/v1/ai/parser/jobs/retry",
+		strings.NewReader(`{"file_ids":["a","b"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if err := p.RetryJobs(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*captured) != 1 || (*captured)[0].Method != "POST" ||
+		(*captured)[0].Path != "/v1/parser/jobs/retry" ||
+		!strings.Contains((*captured)[0].Body, `"file_ids":["a","b"]`) {
+		t.Fatalf("captured = %+v", *captured)
+	}
+}
+
 func TestParserProxy_GetAllowlistExtensions(t *testing.T) {
 	srv, _, _ := startUpstream(t, map[string]string{
 		"/v1/parser/allowlist/extensions": `{"extensions":[".pdf",".txt"]}`,

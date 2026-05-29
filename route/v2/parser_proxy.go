@@ -160,6 +160,20 @@ func (p *ParserProxy) ClearFailedJobs(c echo.Context) error {
 	return c.Blob(code, "application/json", body)
 }
 
+// RetryJobs proxies POST /v1/ai/parser/jobs/retry → /v1/parser/jobs/retry.
+// Body is {"file_ids": [...] | null}; null re-enqueues all failed jobs.
+func (p *ParserProxy) RetryJobs(c echo.Context) error {
+	raw, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.JSON(400, echo.Map{"error": "read body: " + err.Error()})
+	}
+	body, code, err := p.Client.Post("/v1/parser/jobs/retry", raw)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
 // GetAllowlistExtensions proxies GET /v1/ai/parser/allowlist/extensions.
 func (p *ParserProxy) GetAllowlistExtensions(c echo.Context) error {
 	body, code, err := p.Client.Get("/v1/parser/allowlist/extensions")

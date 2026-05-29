@@ -124,6 +124,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/parser/state", parserProxy.State)
 	g.POST("/parser/control", parserProxy.Control)
 	g.POST("/parser/test/analyze", parserProxy.TestAnalyze)
+	g.POST("/parser/jobs/retry", parserProxy.RetryJobs)
 	g.DELETE("/parser/jobs/:id", parserProxy.DeleteJob)
 	g.POST("/parser/jobs/clear-failed", parserProxy.ClearFailedJobs)
 	g.GET("/parser/allowlist/extensions", parserProxy.GetAllowlistExtensions)
@@ -131,6 +132,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/parser/allowlist/folders", parserProxy.GetAllowlistFolders)
 	g.POST("/parser/allowlist/folders", parserProxy.PostAllowlistFolder)
 	g.DELETE("/parser/allowlist/folders/:id", parserProxy.DeleteAllowlistFolder)
+
+	// Search proxy → forwards /v1/ai/search/* to the Search service (/v1/search/*)
+	searchProxy := &v2.SearchProxy{Client: searchClient}
+	g.Any("/search/*", searchProxy.Proxy)
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
