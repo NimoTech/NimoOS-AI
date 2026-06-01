@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -141,7 +142,7 @@ func TestModelManager_ImportFromHuggingFace_OllamaCreateFails_CleansUpGGUF(t *te
 		client:        &http.Client{},
 	}
 
-	err := mm.ImportFromHuggingFace("TheBloke/Test", "Test.Q4_K_M.gguf", modelDir, nil)
+	err := mm.ImportFromHuggingFace(context.Background(), "TheBloke/Test", "Test.Q4_K_M.gguf", modelDir)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "500")
 
