@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -101,10 +103,73 @@ func (l *LocalAdapter) ChatCompletions(body io.Reader) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	req, err := http.NewRequest(http.MethodPost, l.baseURL+"/v1/chat/completions", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	return l.client.Do(req)
+}
+
+// injectThinkFalse appends "/no_think" to the last user message to disable Qwen3
+// thinking mode. Qwen3 (and compatible models) look for this token at the end of
+// the user turn to suppress the internal reasoning phase. Ollama's OpenAI-compatible
+// endpoint does not propagate options.think to template variables, so direct message
+// modification is the only reliable approach.
+//
+// The injection is skipped if the last user message already ends with "/think" or
+// "/no_think" (caller opted in explicitly).
+func injectThinkFalse(body []byte) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	messagesRaw, ok := req["messages"]
+	if !ok {
+		return body
+	}
+	var messages []map[string]json.RawMessage
+	if err := json.Unmarshal(messagesRaw, &messages); err != nil {
+		return body
+	}
+
+	// Find the last user message and append /no_think if not already set.
+	for i := len(messages) - 1; i >= 0; i-- {
+		var role string
+		if err := json.Unmarshal(messages[i]["role"], &role); err != nil || role != "user" {
+			continue
+		}
+		contentRaw, hasContent := messages[i]["content"]
+		if !hasContent {
+			break
+		}
+		var content string
+		if err := json.Unmarshal(contentRaw, &content); err != nil {
+			break
+		}
+		// Respect explicit caller intent.
+		if strings.HasSuffix(strings.TrimSpace(content), "/think") ||
+			strings.HasSuffix(strings.TrimSpace(content), "/no_think") {
+			break
+		}
+		encoded, err := json.Marshal(content + " /no_think")
+		if err != nil {
+			break
+		}
+		messages[i]["content"] = encoded
+		messagesEncoded, err := json.Marshal(messages)
+		if err != nil {
+			break
+		}
+		req["messages"] = messagesEncoded
+		break
+	}
+
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
 }

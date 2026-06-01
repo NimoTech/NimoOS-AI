@@ -358,6 +358,7 @@ class AgentRunner:
         user_patterns: list | None = None,
         run_id: str = "",
         attachment_ids: list[str] = (),
+        context_photo=None,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -476,6 +477,14 @@ class AgentRunner:
             _ATT_C.set(int(os.environ.get(
                 "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
             _ATT_D.set(data_root)
+
+            if context_photo is not None:
+                parts = [f'[Viewing photo: "{context_photo.name}"']
+                if context_photo.takenAt:
+                    parts.append(f"taken {context_photo.takenAt}")
+                if context_photo.place:
+                    parts.append(f"location: {context_photo.place}")
+                full_prompt += "\n\n" + ", ".join(parts) + "]"
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,

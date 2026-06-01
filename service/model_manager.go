@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -273,6 +275,7 @@ func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filena
 		}
 	}()
 
+	hasher := sha256.New()
 	total := resp.ContentLength
 	var downloaded, lastReported int64
 	buf := make([]byte, 32*1024)
@@ -282,6 +285,7 @@ func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filena
 			if _, err := f.Write(buf[:n]); err != nil {
 				return fmt.Errorf("write GGUF: %w", err)
 			}
+			hasher.Write(buf[:n])
 			downloaded += int64(n)
 			if downloaded-lastReported >= 1<<20 { // update job every 1 MB
 				m.jobsMu.Lock()
@@ -300,6 +304,7 @@ func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filena
 			return fmt.Errorf("read GGUF: %w", readErr)
 		}
 	}
+	digest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 
 	m.jobsMu.Lock()
 	if j, ok := m.jobs[filename]; ok {
@@ -313,19 +318,37 @@ func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filena
 		return fmt.Errorf("close GGUF file: %w", err)
 	}
 
-	modelName := strings.TrimSuffix(filename, ".gguf")
-	modelfilePath := filepath.Join(modelDir, modelName+".Modelfile")
-	modelfileContent := fmt.Sprintf("FROM %s\n", ggufPath)
-	if err := os.WriteFile(modelfilePath, []byte(modelfileContent), 0644); err != nil {
-		return fmt.Errorf("write Modelfile: %w", err)
+	// Upload GGUF as Ollama blob (required by Ollama >= 0.6 / 0.23.x API)
+	blobFile, err := os.Open(ggufPath)
+	if err != nil {
+		return fmt.Errorf("open GGUF for blob upload: %w", err)
 	}
-	defer os.Remove(modelfilePath)
+	defer blobFile.Close()
 
-	payload, _ := json.Marshal(map[string]interface{}{
-		"name":      modelName,
-		"modelfile": modelfileContent,
-		"stream":    false,
-	})
+	blobReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.ollamaBaseURL+"/api/blobs/"+digest, blobFile)
+	if err != nil {
+		return fmt.Errorf("build blob upload request: %w", err)
+	}
+	blobReq.Header.Set("Content-Type", "application/octet-stream")
+	blobResp, err := m.client.Do(blobReq)
+	if err != nil {
+		return fmt.Errorf("blob upload failed: %w", err)
+	}
+	blobResp.Body.Close()
+	if blobResp.StatusCode != http.StatusCreated && blobResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("blob upload returned %d", blobResp.StatusCode)
+	}
+
+	modelName := strings.TrimSuffix(filename, ".gguf")
+	createBody := map[string]interface{}{
+		"model":  modelName,
+		"files":  map[string]string{"model.gguf": digest},
+		"stream": false,
+	}
+	if tmpl := ollamaTemplateForRepo(repoID); tmpl != "" {
+		createBody["template"] = tmpl
+	}
+	payload, _ := json.Marshal(createBody)
 	createResp, err := m.client.Post(m.ollamaBaseURL+"/api/create", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("ollama create failed: %w", err)
@@ -362,6 +385,9 @@ func (m *ModelManager) ImportFromHuggingFace(ctx context.Context, repoID, filena
 func (m *ModelManager) StartImportJob(repo, filename string, cancelFn context.CancelFunc) {
 	m.jobsMu.Lock()
 	defer m.jobsMu.Unlock()
+	if prev, ok := m.jobs[filename]; ok && prev.cancelFn != nil {
+		prev.cancelFn()
+	}
 	m.jobs[filename] = &ImportJob{
 		Repo:     repo,
 		Filename: filename,
@@ -419,3 +445,174 @@ func extractQuantization(filename string) string {
 	}
 	return ""
 }
+
+// ollamaTemplateForRepo returns the Ollama chat template for known model families,
+// enabling tool calling and structured chat formatting on import.
+// Templates sourced from registry.ollama.ai official model manifests.
+func ollamaTemplateForRepo(repoID string) string {
+	lower := strings.ToLower(repoID)
+	switch {
+	case strings.Contains(lower, "qwen3"):
+		return qwen3Template
+	case strings.Contains(lower, "qwen2.5"):
+		return qwen25Template
+	case strings.Contains(lower, "llama-3"), strings.Contains(lower, "llama3"):
+		return llama3Template
+	case strings.Contains(lower, "gemma-3"), strings.Contains(lower, "gemma3"):
+		return gemma3Template
+	case strings.Contains(lower, "mistral"):
+		return mistralTemplate
+	default:
+		return ""
+	}
+}
+
+// Qwen3 template — thinking disabled by pre-filling the think block in the
+// assistant turn. This causes the model to skip its reasoning phase and respond
+// directly, eliminating the empty <think></think> prefix in the output.
+const qwen3Template = `{{- if or .System .Tools }}<|im_start|>system
+{{ if .System }}
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end -}}
+<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+<think>
+
+</think>
+
+{{ end }}
+{{- end }}`
+
+// Qwen2.5 template (ChatML, no thinking mode)
+const qwen25Template = `{{- if or .System .Tools }}<|im_start|>system
+{{ if .System }}{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}`
+
+// Llama3 template
+const llama3Template = `{{- if or .System .Tools }}<|start_header_id|>system<|end_header_id|>
+{{ if .System }}{{ .System }}
+{{ end }}
+{{- if .Tools }}When you receive a tool call response, use the output to format an answer to the original user question.
+
+You are a helpful assistant with tool calling capabilities.
+{{- end }}<|eot_id|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|start_header_id|>user<|end_header_id|>
+{{ if and $.Tools $last }}Given the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.
+
+Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. Do not use variables.
+
+{{ range $.Tools }}
+{{- . }}
+{{ end }}
+Question: {{ .Content }}<|eot_id|>
+{{- else }}{{ .Content }}<|eot_id|>
+{{- end }}{{ if $last }}<|start_header_id|>assistant<|end_header_id|>
+{{ end }}
+{{- else if eq .Role "assistant" }}<|start_header_id|>assistant<|end_header_id|>
+{{ if .ToolCalls }}
+{{- range .ToolCalls }}{"name": "{{ .Function.Name }}", "parameters": {{ .Function.Arguments }}}
+{{ end }}
+{{- else }}{{ .Content }}
+{{- end }}{{ if not $last }}<|eot_id|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|start_header_id|>ipython<|end_header_id|>
+{{ .Content }}<|eot_id|>
+{{ end }}
+{{- end }}`
+
+// Gemma3 template
+const gemma3Template = `{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<start_of_turn>user
+{{ .Content }}<end_of_turn>
+{{ if $last }}<start_of_turn>model
+{{ end }}
+{{- else if eq .Role "assistant" }}<start_of_turn>model
+{{ .Content }}{{ if not $last }}<end_of_turn>
+{{ end }}
+{{- end }}
+{{- end }}`
+
+// Mistral template
+const mistralTemplate = `{{ if .System }}[INST] {{ .System }} [/INST]
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}[INST] {{ .Content }} [/INST]{{ else if eq .Role "assistant" }} {{ .Content }}{{ if not $last }}</s>{{ end }}{{ end }}
+{{- end }}`

@@ -135,6 +135,13 @@ class ThinkingConfigPayload(BaseModel):
     level: _ThinkingLevel
 
 
+class ContextPhoto(BaseModel):
+    id: str
+    name: str = ""
+    takenAt: str = ""
+    place: str = ""
+
+
 class RunRequest(BaseModel):
     message: str
     model: str = "gpt-4o-mini"
@@ -142,6 +149,7 @@ class RunRequest(BaseModel):
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
     attachment_ids: list[str] = []
+    context_photo: ContextPhoto | None = None
 
 
 class SandboxRunRequest(BaseModel):
@@ -1054,7 +1062,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                user_patterns: list[str] | None = None,
                thinking=None, provider_type: str = "other",
                attachment_ids: list[str] = (),
-               user_msg_id: str = "") -> RunSink:
+               user_msg_id: str = "",
+               context_photo=None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1082,6 +1091,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 provider_type=provider_type,
                 thinking=thinking,
                 attachment_ids=attachment_ids,
+                context_photo=context_photo,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1254,6 +1264,7 @@ async def run_session(
         provider_type=provider_type,
         attachment_ids=req.attachment_ids,
         user_msg_id=user_msg_id,
+        context_photo=req.context_photo,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

@@ -1,3 +1,5 @@
+import json
+
 import httpx
 from agents import function_tool
 
@@ -23,7 +25,7 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
     """
     base_url = _photos_base_url()
     if not base_url:
-        return "Photos service is unavailable (photos.url not found)."
+        return json.dumps({"error": "Photos service is unavailable."})
 
     if limit < 1 or limit > 50:
         limit = 20
@@ -39,23 +41,74 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
                 json=payload,
             )
         if resp.status_code != 200:
-            return f"Photos search error: HTTP {resp.status_code}"
+            return json.dumps({"error": f"HTTP {resp.status_code}"})
 
-        results = resp.json()
-        if not results:
-            return "No matching photos found."
+        raw = resp.json()
+        if not raw:
+            return json.dumps({"query": query, "count": 0, "results": []})
 
-        lines = [f"Found {len(results)} photo(s) matching '{query}':\n"]
-        for item in results:
-            name = item.get("originalName", item.get("id", "unknown"))
-            taken = item.get("takenAt", "")
-            asset_id = item.get("id", "")
-            thumb_url = f"{base_url}/v1/photos/assets/{asset_id}/thumbnail" if asset_id else ""
-            lines.append(f"- {name} ({taken[:10] if taken else 'no date'}) thumbnail: {thumb_url}")
-        return "\n".join(lines)
+        results = [
+            {
+                "id": item.get("id", ""),
+                "name": item.get("originalName", item.get("id", "unknown")),
+                "takenAt": (item.get("takenAt") or "")[:10],
+            }
+            for item in raw
+        ]
+        return json.dumps({"query": query, "count": len(results), "results": results})
 
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@function_tool
+async def create_album(name: str) -> str:
+    """Create a new photo album.
+
+    Args:
+        name: The album name, e.g. "Summer 2024".
+    """
+    base_url = _photos_base_url()
+    if not base_url:
+        return "Photos service is unavailable."
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{base_url}/v1/photos/albums",
+                json={"name": name},
+            )
+        if resp.status_code not in (200, 201):
+            return f"Failed to create album: HTTP {resp.status_code}"
+        data = resp.json()
+        return f"Album '{name}' created (id: {data.get('id', '?')})"
     except Exception as e:
         return f"Photos service error: {e}"
 
 
-ALL_TOOLS = [search_photos]
+@function_tool
+async def add_to_album(album_id: str, asset_ids: list[str]) -> str:
+    """Add one or more photos to an existing album.
+
+    Args:
+        album_id:  The album ID (from create_album).
+        asset_ids: List of asset IDs to add.
+    """
+    base_url = _photos_base_url()
+    if not base_url:
+        return "Photos service is unavailable."
+    success = 0
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            for asset_id in asset_ids:
+                resp = await client.post(
+                    f"{base_url}/v1/photos/albums/{album_id}/assets",
+                    json={"assetId": asset_id},
+                )
+                if resp.status_code == 200:
+                    success += 1
+        return f"Added {success}/{len(asset_ids)} photo(s) to album {album_id}"
+    except Exception as e:
+        return f"Photos service error: {e}"
+
+
+ALL_TOOLS = [search_photos, create_album, add_to_album]
