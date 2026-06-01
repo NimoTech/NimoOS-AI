@@ -1,7 +1,7 @@
 package common
 
 const (
-	AIVersion = "0.1.0"
+	AIVersion = "1.9.0-alpha1"
 
 	OllamaBaseURL    = "http://127.0.0.1:11434"
 	OllamaHealthPath = "/api/tags"
