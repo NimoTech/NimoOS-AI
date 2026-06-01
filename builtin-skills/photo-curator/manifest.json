@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "photo-curator",
+  "name": "photo-curator",
+  "title": "Photo finder",
+  "description": "Find photos by description, person, place, or year using the on-device photo index.",
+  "color": "purple",
+  "icon": "image",
+  "trigger": "auto",
+  "examples": [
+    "Find photos from the weekend trip",
+    "Show me beach pictures from 2024",
+    "Pictures with the cat"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.2.0",
+  "author": "Nimo"
+}

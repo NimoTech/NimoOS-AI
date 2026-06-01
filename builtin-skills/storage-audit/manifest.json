@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "storage-audit",
+  "name": "storage-audit",
+  "title": "Storage audit",
+  "description": "Audit disk usage by folder and surface the largest space hogs.",
+  "color": "slate",
+  "icon": "drive",
+  "trigger": "slash",
+  "examples": [
+    "What's eating the most space on /data?",
+    "Audit /Backups for files older than a year"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}

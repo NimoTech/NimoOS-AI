@@ -10,3 +10,11 @@ MasterKeyPath = /etc/nimoos/ai_master.key
 AgentURL = http://127.0.0.1:8282
 AgentTimeout = 60
 OllamaURL = http://127.0.0.1:11434
+
+# Attachment limits (override via env NIMOOS_MAX_ATTACHMENT_SIZE etc.)
+MaxAttachmentSize         = 524288000     ; 500 MB, global upper bound
+MaxImageAttachmentSize    = 20971520      ; 20 MB, image kind only
+MaxAttachmentsPerSession  = 50
+MaxAttachmentTextChars    = 32768         ; per read_attachment() call
+FFProbeTimeout            = 5             ; seconds
+AttachmentGCAge           = 86400         ; seconds, draft cleanup threshold

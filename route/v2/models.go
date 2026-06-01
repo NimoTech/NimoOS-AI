@@ -131,6 +131,58 @@ func (h *ModelsHandler) CancelImport(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// ListInternal handles GET /v1/ai/_internal/models.
+//
+// Unlike List, this variant does NOT require JWT (the _internal group is
+// localhost-only) and returns BOTH local Ollama models AND the user's
+// enabled cloud providers. Wiki summary worker uses this to auto-detect
+// what model to use:
+//   - prefer local (cheapest),
+//   - fall back to cloud if Ollama is empty/unavailable.
+func (h *ModelsHandler) ListInternal(c echo.Context) error {
+	userID := c.QueryParam("user_id")
+	if userID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "missing user_id query param")
+	}
+
+	var localOut []map[string]any
+	if models, err := h.svc.ModelManager().ListModels(); err == nil {
+		for _, m := range models {
+			localOut = append(localOut, map[string]any{
+				"name":              m.Name,
+				"size_bytes":        m.SizeBytes,
+				"supports_thinking": m.SupportsThinking,
+			})
+		}
+	}
+	if localOut == nil {
+		localOut = []map[string]any{}
+	}
+
+	var cloudOut []map[string]any
+	if providers, err := h.svc.Providers().ListProviders(userID); err == nil {
+		for _, p := range providers {
+			if !p.Enabled {
+				continue
+			}
+			cloudOut = append(cloudOut, map[string]any{
+				"provider_id":   p.ID,
+				"provider_name": p.Name,
+				"default_model": p.DefaultModel,
+				"enabled":       p.Enabled,
+			})
+		}
+	}
+	if cloudOut == nil {
+		cloudOut = []map[string]any{}
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"local": localOut,
+		"cloud": cloudOut,
+	})
+}
+
 func (h *ModelsHandler) Delete(c echo.Context) error {
 	if c.Request().Header.Get("X-NimoOS-User-ID") == "" {
 		return echo.NewHTTPError(http.StatusUnauthorized, "missing user identity")

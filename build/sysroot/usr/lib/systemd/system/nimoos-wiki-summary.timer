@@ -1,0 +1,13 @@
+[Unit]
+Description=Run NimoOS Wiki Summary Worker every 5 minutes
+Documentation=https://github.com/NimoTech/NimoOS-AI
+Requires=nimoos-wiki-summary.service
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+Unit=nimoos-wiki-summary.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

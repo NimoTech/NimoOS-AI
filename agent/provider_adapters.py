@@ -66,13 +66,30 @@ def build_model_settings(
         return ModelSettings()
 
     if provider_type == ProviderType.DEEPSEEK:
+        # parallel_tool_calls=False: DeepSeek strictly validates that every
+        # assistant `tool_calls[i].id` is followed by a matching `tool` message.
+        # When the Agents SDK runs parallel tools via asyncio.gather and one
+        # raises, the sibling tasks get cancelled and produce no
+        # function_call_output, leaving the next request with a dangling
+        # tool_call → 400. Serial execution prevents the cancel cascade.
+        #
+        # reasoning_effort goes in extra_body (not extra_args): the SDK always
+        # emits a `reasoning_effort` key in its typed kwargs (from
+        # ModelSettings.reasoning) and raises TypeError on overlap with
+        # extra_args. extra_body is merged into the raw JSON body, bypassing
+        # both the overlap check and Pydantic's Literal validation — necessary
+        # because DeepSeek's "max" effort isn't in the OpenAI Literal.
         if not thinking.enabled:
             return ModelSettings(
+                parallel_tool_calls=False,
                 extra_body={"thinking": {"type": "disabled"}},
             )
         return ModelSettings(
-            extra_body={"thinking": {"type": "enabled"}},
-            extra_args={"reasoning_effort": _DEEPSEEK_EFFORT[thinking.level]},
+            parallel_tool_calls=False,
+            extra_body={
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": _DEEPSEEK_EFFORT[thinking.level],
+            },
         )
 
     if provider_type == ProviderType.OPENAI:
@@ -82,5 +99,39 @@ def build_model_settings(
             extra_args={"reasoning_effort": _OPENAI_EFFORT[thinking.level]},
         )
 
-    # ANTHROPIC handled in Go service. QWEN/OLLAMA/OTHER: pass through.
+    if provider_type in (ProviderType.OLLAMA, ProviderType.QWEN):
+        # Ollama's OpenAI-compatible endpoint accepts a top-level `think` bool
+        # (forwarded to /api/chat). For Qwen3 served by Ollama or DashScope this
+        # toggles the <think> block emission. `chat_template_kwargs.enable_thinking`
+        # is sent alongside as a fallback for backends that read template kwargs
+        # (vLLM, SGLang, recent Ollama builds) instead of the bespoke `think` field.
+        return ModelSettings(
+            extra_body={
+                "think": bool(thinking.enabled),
+                "chat_template_kwargs": {"enable_thinking": bool(thinking.enabled)},
+            },
+        )
+
+    # ANTHROPIC handled in Go service. OTHER: pass through.
     return ModelSettings()
+
+
+_VISION_KNOWN_FALSE = {
+    # Confirmed text-only families. Anything not in this list is assumed
+    # vision-capable; if the model actually rejects the image, the provider
+    # surfaces a 4xx that the user sees directly. That tradeoff is better
+    # than silently degrading to text and having the model claim it cannot
+    # see attachments the user clearly attached.
+    "deepseek": lambda m: True,
+}
+
+
+def model_supports_vision(provider_type: str, model_name: str) -> bool:
+    """Best-effort capability check. Default True for unknown (provider/model);
+    only return False for families we know are text-only."""
+    if not model_name:
+        return False
+    pt = (provider_type or "other").lower()
+    if pt in _VISION_KNOWN_FALSE:
+        return not _VISION_KNOWN_FALSE[pt](model_name)
+    return True

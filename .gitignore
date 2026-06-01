@@ -7,3 +7,4 @@ nimoos-ai
 __pycache__/
 *.pyc
 agent/venv/
+NimoOS-AI

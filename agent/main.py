@@ -2,15 +2,19 @@ import asyncio
 import base64
 import json
 import os
+import re
 import shutil
 import time
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Header, HTTPException, Request
+_SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
+_MAX_SKILL_MD_BYTES = 50 * 1024
+
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 import db as db_module
@@ -23,6 +27,8 @@ from fs import paths as _fs_paths
 from fs import ignore as _fs_ignore
 from fs import staging as _fs_staging
 from fs.snapshots import SnapshotStore
+from attachments import upload as att_upload
+from attachments.paths import build_storage_path
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
@@ -35,6 +41,14 @@ _SNAPSHOTS_ROOT = os.environ.get(
     "AGENT_SNAPSHOTS_ROOT", "/var/lib/nimoos/ai/agent/snapshots")
 _snapshots_root = _SNAPSHOTS_ROOT  # exposed for tests to monkeypatch
 _snapshot_store = SnapshotStore(root=_SNAPSHOTS_ROOT)
+
+
+def _data_root() -> str:
+    """Root directory for per-session attachment storage."""
+    return os.environ.get(
+        "NIMOOS_AGENT_DATA_ROOT",
+        str(db_module._DB_PATH.parent),
+    )
 
 
 def _user_patterns_from_header(request: Request) -> list[str]:
@@ -69,7 +83,48 @@ _active_runs: dict[str, RunSink] = {}
 # warm during long confirmation waits without polluting the event log.
 _KEEPALIVE_SECONDS = 15
 
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+MAX_ATTACHMENT_SIZE         = _env_int("NIMOOS_MAX_ATTACHMENT_SIZE",         524_288_000)
+MAX_IMAGE_ATTACHMENT_SIZE   = _env_int("NIMOOS_MAX_IMAGE_ATTACHMENT_SIZE",   20_971_520)
+MAX_ATTACHMENTS_PER_SESSION = _env_int("NIMOOS_MAX_ATTACHMENTS_PER_SESSION", 50)
+MAX_ATTACHMENT_TEXT_CHARS   = _env_int("NIMOOS_MAX_ATTACHMENT_TEXT_CHARS",   32_768)
+FFPROBE_TIMEOUT             = _env_int("NIMOOS_FFPROBE_TIMEOUT",             5)
+ATTACHMENT_GC_AGE           = _env_int("NIMOOS_ATTACHMENT_GC_AGE",           86_400)
+MAX_DOC_CHARS               = _env_int("NIMOOS_MAX_DOC_CHARS",               262_144)
+MAX_DOC_EXTRACT_SECONDS     = _env_int("NIMOOS_MAX_DOC_EXTRACT_SECONDS",     8)
+MAX_DOC_UNCOMPRESSED_BYTES  = _env_int("NIMOOS_MAX_DOC_UNCOMPRESSED_BYTES",  209_715_200)
+
 app = FastAPI(title="nimoos-agent")
+
+
+@app.on_event("startup")
+async def _attachments_startup():
+    """Run attachment GC at agent startup.
+
+    Cleans up:
+    - Draft attachments (message_id IS NULL) older than ATTACHMENT_GC_AGE seconds
+    - Orphan session directories not matching any sessions.id row
+
+    Errors during GC are logged and swallowed — they must never block startup.
+    """
+    try:
+        from attachments.gc import run_startup_gc
+        run_startup_gc(_db(), _data_root(),
+                       age_seconds=ATTACHMENT_GC_AGE)
+    except Exception as e:
+        import logging
+        logging.getLogger("nimoos-agent").warning(
+            "attachment GC failed: %s", e)
 
 
 from provider_adapters import ThinkingLevel as _ThinkingLevel
@@ -86,6 +141,13 @@ class RunRequest(BaseModel):
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
+    attachment_ids: list[str] = []
+
+
+class SandboxRunRequest(BaseModel):
+    skill_id: str
+    prompt: str
+    network: bool = False  # informational; --unshare-net is forced for sandbox
 
 
 class ConfirmRequest(BaseModel):
@@ -249,6 +311,126 @@ async def remove_visible_resource(
 
 
 # ---------------------------------------------------------------------------
+# Attachments endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/agent/sessions/{session_id}/attachments", status_code=201)
+async def upload_attachment(
+    session_id: str,
+    file: UploadFile = File(...),
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    conn = _db()
+
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM attachments WHERE session_id=?", (session_id,)
+    ).fetchone()[0]
+    if cnt >= MAX_ATTACHMENTS_PER_SESSION:
+        raise HTTPException(status_code=409,
+                            detail="MaxAttachmentsPerSession reached")
+
+    # Stream to a temp .part path; handle_upload then renames to att_xxx__name
+    tmp_id = uuid.uuid4().hex
+    part_path = build_storage_path(_data_root(), session_id, tmp_id, "upload.part")
+    os.makedirs(os.path.dirname(part_path), exist_ok=True)
+
+    size = await att_upload.stream_to_disk(file, part_path, MAX_ATTACHMENT_SIZE)
+
+    result = await att_upload.handle_upload(
+        conn=conn,
+        data_root=_data_root(),
+        session_id=session_id,
+        original_name=file.filename or "untitled",
+        part_path=part_path,
+        size=size,
+        max_image_size=MAX_IMAGE_ATTACHMENT_SIZE,
+        ffprobe_timeout=FFPROBE_TIMEOUT,
+        max_doc_chars=MAX_DOC_CHARS,
+        max_doc_uncompressed_bytes=MAX_DOC_UNCOMPRESSED_BYTES,
+        max_extract_seconds=MAX_DOC_EXTRACT_SECONDS,
+    )
+    return result
+
+
+@app.get("/agent/sessions/{session_id}/attachments")
+async def list_attachments(
+    session_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    rows = _db().execute(
+        "SELECT id, message_id, filename, mime, kind, size_bytes, "
+        "       meta_json, created_at "
+        "FROM attachments WHERE session_id = ? ORDER BY created_at",
+        (session_id,)
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "message_id": r["message_id"],
+            "filename": r["filename"],
+            "mime": r["mime"],
+            "kind": r["kind"],
+            "size_bytes": r["size_bytes"],
+            "meta": json.loads(r["meta_json"]) if r["meta_json"] else None,
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+@app.delete("/agent/sessions/{session_id}/attachments/{attachment_id}")
+async def delete_attachment(
+    session_id: str,
+    attachment_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    row = _db().execute(
+        "SELECT message_id, rel_path FROM attachments "
+        "WHERE id = ? AND session_id = ?", (attachment_id, session_id)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    if row["message_id"] is not None:
+        raise HTTPException(status_code=409, detail="already bound to message")
+    full = os.path.join(_data_root(), "sessions", session_id,
+                        "attachments", row["rel_path"])
+    try:
+        os.remove(full)
+    except FileNotFoundError:
+        pass
+    _db().execute(
+        "DELETE FROM attachments WHERE id = ? AND session_id = ?",
+        (attachment_id, session_id))
+    _db().commit()
+    return {"ok": True}
+
+
+@app.get("/agent/sessions/{session_id}/attachments/{attachment_id}/raw")
+async def download_attachment(
+    session_id: str,
+    attachment_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    row = _db().execute(
+        "SELECT filename, mime, rel_path FROM attachments "
+        "WHERE id = ? AND session_id = ?", (attachment_id, session_id)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    full = os.path.join(_data_root(), "sessions", session_id,
+                        "attachments", row["rel_path"])
+    return FileResponse(
+        full, media_type=row["mime"],
+        headers={"Content-Disposition":
+                 f'inline; filename="{row["filename"]}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Staged-changes endpoints
 # ---------------------------------------------------------------------------
 
@@ -361,7 +543,87 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     except (json.JSONDecodeError, KeyError):
         return []
 
-    return _hydrate_messages(history)
+    messages = _hydrate_messages(history, session_id_for_urls=session_id)
+    return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
+
+
+def _enrich_with_attachments(messages: list, *, session_id: str, conn) -> list:
+    """Backfill user messages with their attachments.
+
+    The SDK input list only includes image attachments as input_image blocks;
+    documents and other non-image attachments are passed to the model via the
+    system prompt and read_attachment tool, so they don't appear in the
+    history JSON. To make historical sessions render correctly, walk the
+    attachments table for this session, group by message_id in chronological
+    order, and assign each group to the N-th user turn that originally had
+    attachments (detected as a hydrated message with a `blocks` field rather
+    than a `content` string — `build_user_content` returns a list iff
+    attachment_ids is non-empty, which becomes a blocks-shaped hydrated
+    message).
+
+    For images already represented as input_image blocks, just backfill the
+    filename + mime. For non-image attachments, append a new
+    `{type:"attachment", attachment_id, kind, filename, mime, url}` block.
+    """
+    if not messages:
+        return messages
+    rows = conn.execute(
+        "SELECT message_id FROM attachments "
+        "WHERE session_id=? AND message_id IS NOT NULL "
+        "GROUP BY message_id ORDER BY MIN(created_at)",
+        (session_id,),
+    ).fetchall()
+    ordered_msg_ids = [r["message_id"] for r in rows]
+    if not ordered_msg_ids:
+        return messages
+
+    idx = 0
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        # blocks-shaped (vs content-shaped) ⇔ original turn had attachments
+        if not isinstance(msg.get("blocks"), list):
+            continue
+        if idx >= len(ordered_msg_ids):
+            break
+        msg_id = ordered_msg_ids[idx]
+        idx += 1
+        atts = conn.execute(
+            "SELECT id, filename, mime, kind FROM attachments "
+            "WHERE message_id=? AND session_id=? ORDER BY created_at",
+            (msg_id, session_id),
+        ).fetchall()
+        existing_aids = {b.get("attachment_id") for b in msg["blocks"]
+                         if b.get("attachment_id")}
+        for r in atts:
+            aid = r["id"]
+            if aid in existing_aids:
+                # Image already represented as input_image; backfill the
+                # filename + mime so the UI can show a meaningful chip.
+                for b in msg["blocks"]:
+                    if b.get("attachment_id") == aid:
+                        b.setdefault("filename", r["filename"])
+                        b.setdefault("mime", r["mime"])
+                continue
+            url = (f"/v1/ai/agent/sessions/{session_id}/attachments/{aid}/raw")
+            if r["kind"] == "image":
+                msg["blocks"].append({
+                    "type": "image",
+                    "attachment_id": aid,
+                    "url": url,
+                    "filename": r["filename"],
+                    "mime": r["mime"],
+                })
+            else:
+                msg["blocks"].append({
+                    "type": "attachment",
+                    "attachment_id": aid,
+                    "kind": r["kind"],
+                    "url": url,
+                    "filename": r["filename"],
+                    "mime": r["mime"],
+                })
+    return messages
 
 
 def _flatten_content(content) -> str:
@@ -379,7 +641,7 @@ def _flatten_content(content) -> str:
     return ""
 
 
-def _hydrate_messages(history: list) -> list:
+def _hydrate_messages(history: list, session_id_for_urls: str | None = None) -> list:
     # Translate Agents SDK to_input_list() into the UI's per-message shape:
     #   user      → {role:'user', content:str}
     #   assistant → {role:'assistant', blocks:[thinking|tool|md]} grouped per turn,
@@ -413,7 +675,40 @@ def _hydrate_messages(history: list) -> list:
 
         if role == "user":
             flush()
-            text = _flatten_content(item.get("content"))
+            content = item.get("content")
+            if isinstance(content, list):
+                # User turn with attachments — emit a structured message that
+                # carries both text and image refs for UI rendering.
+                ui_blocks = []
+                for blk in content:
+                    if (isinstance(blk, dict)
+                            and blk.get("type") == "input_image"
+                            and "attachment_id" in blk):
+                        aid = blk["attachment_id"]
+                        url = (
+                            f"/v1/ai/agent/sessions/{session_id_for_urls}"
+                            f"/attachments/{aid}/raw"
+                            if session_id_for_urls else None
+                        )
+                        ui_blocks.append({
+                            "type": "image",
+                            "attachment_id": aid,
+                            "url": url,
+                        })
+                    elif (isinstance(blk, dict)
+                            and blk.get("type") in ("input_text", "text")):
+                        text = blk.get("text", "")
+                        if text:
+                            ui_blocks.append({"type": "text", "text": text})
+                if ui_blocks:
+                    result.append({
+                        "id": new_id("u"),
+                        "role": "user",
+                        "blocks": ui_blocks,
+                    })
+                continue
+            # Backward compat: string content
+            text = _flatten_content(content)
             if text:
                 result.append({"id": new_id("u"), "role": "user", "content": text})
             continue
@@ -757,7 +1052,9 @@ def _start_run(session_id: str, user_id: str, message: str,
                provider_key: str, provider_url: str, model: str,
                *, kind: str = "chat", chat_username: str = "",
                user_patterns: list[str] | None = None,
-               thinking=None, provider_type: str = "other") -> RunSink:
+               thinking=None, provider_type: str = "other",
+               attachment_ids: list[str] = (),
+               user_msg_id: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -784,6 +1081,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 run_id=run_id,
                 provider_type=provider_type,
                 thinking=thinking,
+                attachment_ids=attachment_ids,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -843,6 +1141,24 @@ async def run_session(
 ):
     _assert_owns_session(session_id, x_user_id)
 
+    # Validate attachment_ids belong to this session and are unbound
+    if req.attachment_ids:
+        placeholders = ",".join(["?"] * len(req.attachment_ids))
+        rows = _conn.execute(
+            f"SELECT id, message_id FROM attachments "
+            f"WHERE id IN ({placeholders}) AND session_id = ?",
+            (*req.attachment_ids, session_id),
+        ).fetchall()
+        found = {r["id"]: r["message_id"] for r in rows}
+        if len(found) != len(req.attachment_ids):
+            missing = [a for a in req.attachment_ids if a not in found]
+            raise HTTPException(status_code=422,
+                                detail=f"attachment not in session: {missing}")
+        bound = [a for a, mid in found.items() if mid is not None]
+        if bound:
+            raise HTTPException(status_code=422,
+                                detail=f"attachment already used: {bound}")
+
     if req.kind == "init":
         if not req.init_target:
             raise HTTPException(status_code=400,
@@ -890,6 +1206,45 @@ async def run_session(
 
     provider_type = request.headers.get("X-Agent-Provider-Type", "other")
 
+    # Inject SKILL.md into the message when X-Skill-Id header is present.
+    # Fix 1.2: validate skill_id via regex BEFORE any path operations.
+    skill_id = request.headers.get("X-Skill-Id", "").strip()
+    if skill_id:
+        if not _SKILL_ID_RE.match(skill_id):
+            # Refuse silently — malformed id would have been a 400 in the Go layer.
+            skill_id = ""
+    if skill_id:
+        skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
+        bundle = os.path.join(skills_root, ".runtime", str(x_user_id), skill_id)
+        md_path = os.path.join(bundle, "SKILL.md")
+        # Belt + suspenders: even after regex, double-check resolved real path
+        # stays inside the runtime view (defense against symlink games).
+        try:
+            real_md = os.path.realpath(md_path)
+            real_root = os.path.realpath(skills_root)
+            if not real_md.startswith(real_root + os.sep):
+                md_path = None
+        except OSError:
+            md_path = None
+        if md_path and os.path.isfile(md_path):
+            size = os.path.getsize(md_path)
+            if size <= _MAX_SKILL_MD_BYTES:
+                with open(md_path) as f:
+                    md = f.read()
+                req = req.model_copy(update={
+                    "message": f"(Using skill `{skill_id}`. SKILL.md follows.)\n\n{md}\n\n---\n\n{req.message}"
+                })
+
+    user_msg_id = "msg_" + uuid.uuid4().hex[:12]
+    if req.attachment_ids:
+        placeholders = ",".join(["?"] * len(req.attachment_ids))
+        _conn.execute(
+            f"UPDATE attachments SET message_id = ? "
+            f"WHERE id IN ({placeholders}) AND session_id = ?",
+            (user_msg_id, *req.attachment_ids, session_id),
+        )
+        _conn.commit()
+
     sink = _start_run(
         session_id, x_user_id, req.message,
         x_agent_provider_key, x_agent_provider_url, req.model,
@@ -897,6 +1252,8 @@ async def run_session(
         user_patterns=user_patterns,
         thinking=thinking_cfg,
         provider_type=provider_type,
+        attachment_ids=req.attachment_ids,
+        user_msg_id=user_msg_id,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -995,6 +1352,60 @@ async def confirm_session(
         # confirm_session_mismatch (id belongs to another session). Both are 409.
         raise HTTPException(status_code=409, detail=str(e.args[0]) if e.args else "confirm_expired")
     return {"ok": True}
+
+
+@app.post("/agent/sandbox-run")
+async def sandbox_run_endpoint(
+    req: SandboxRunRequest,
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_user_name: str = Header("", alias="X-User-Name"),
+    x_agent_provider_key: str = Header(..., alias="X-Agent-Provider-Key"),
+    x_agent_provider_url: str = Header(..., alias="X-Agent-Provider-Url"),
+):
+    """Run a skill in an isolated, no-DB sandbox session."""
+    import re
+    if not re.match(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$", req.skill_id):
+        raise HTTPException(status_code=400, detail="invalid skill_id")
+    skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
+    bundle_dir = None
+    for candidate in (
+        os.path.join(skills_root, "builtin", req.skill_id),
+        os.path.join(skills_root, "users", x_user_id, req.skill_id),
+    ):
+        if os.path.isdir(candidate):
+            bundle_dir = candidate
+            break
+    if bundle_dir is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+
+    sink = RunSink("sandbox-" + uuid.uuid4().hex[:8], "sandbox", _conn)
+    from sandbox_run import run_sandbox
+
+    async def runner_task():
+        await run_sandbox(
+            runner=_runner,
+            bundle_dir=bundle_dir,
+            user_prompt=req.prompt,
+            user_id=x_user_id,
+            skills_root=skills_root,
+            provider_key=x_agent_provider_key,
+            provider_url=x_agent_provider_url,
+            model="",  # provider default
+            provider_type=request.headers.get("X-Agent-Provider-Type", "other"),
+            sink=sink,
+        )
+
+    asyncio.create_task(runner_task())
+    return StreamingResponse(
+        _stream_from_sink(sink),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/agent/sessions/{session_id}/cancel")

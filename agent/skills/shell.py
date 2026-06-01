@@ -18,6 +18,8 @@ from agents import function_tool
 
 
 SESSION_ID_VAR: ContextVar[str] = ContextVar("shell_session_id", default="_default")
+SANDBOX_SKILLS_VAR: ContextVar[str] = ContextVar("sandbox_skills", default="")
+SANDBOX_SHELL_ROOT_VAR: ContextVar[str] = ContextVar("sandbox_shell_root", default="")
 
 BWRAP_BIN = os.environ.get("BWRAP_PATH", "/usr/bin/bwrap")
 PRLIMIT_BIN = os.environ.get("PRLIMIT_PATH", "/usr/bin/prlimit")
@@ -35,13 +37,14 @@ WORK_ROOT = Path(os.environ.get(
 
 
 def _work_dir(session_id: str) -> Path:
-    p = WORK_ROOT / session_id / "work"
+    root = SANDBOX_SHELL_ROOT_VAR.get() or str(WORK_ROOT)
+    p = Path(root) / session_id / "work"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def _build_argv(work: Path, command: str) -> list[str]:
-    return [
+    argv = [
         PRLIMIT_BIN,
         f"--as={MEM_BYTES}",
         f"--cpu={MAX_TIMEOUT_SEC}",
@@ -58,6 +61,11 @@ def _build_argv(work: Path, command: str) -> list[str]:
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--bind", str(work), "/work",
+    ]
+    skills_view = SANDBOX_SKILLS_VAR.get()
+    if skills_view:
+        argv += ["--ro-bind", skills_view, "/skill"]
+    argv += [
         "--chdir", "/work",
         "--unshare-all",
         "--share-net",
@@ -69,6 +77,7 @@ def _build_argv(work: Path, command: str) -> list[str]:
         "--",
         "/bin/bash", "-lc", command,
     ]
+    return argv
 
 
 def _truncate(data: bytes, limit: int) -> str:

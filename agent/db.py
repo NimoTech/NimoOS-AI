@@ -108,6 +108,21 @@ CREATE INDEX IF NOT EXISTS idx_staged_session_pending
   ON staged_changes(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_visible_session
   ON visible_resources(session_id);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id   TEXT,
+    filename     TEXT NOT NULL,
+    mime         TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary','document')),
+    size_bytes   INTEGER NOT NULL,
+    rel_path     TEXT NOT NULL,
+    meta_json    TEXT,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_msg     ON attachments(message_id);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -120,6 +135,7 @@ _CRASHED_DONE_PAYLOAD = '{"type": "done"}'
 
 def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlite3.Connection:
     import time
+    global _conn
     db_path = path or str(_DB_PATH)
     snaps = snapshots_root or _DEFAULT_SNAPSHOTS_ROOT
     conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -129,6 +145,35 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     # this also handles the schema migration from the old session_id PK shape.
     conn.execute("DROP TABLE IF EXISTS pending_confirmations")
     conn.executescript(_SCHEMA)
+    # Migration: rebuild attachments table if its CHECK constraint predates
+    # kind='document'. Idempotent — runs at most once per DB.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'"
+    ).fetchone()
+    if row and row[0] and "'document'" not in row[0]:
+        conn.executescript("""
+        CREATE TABLE attachments_new (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            message_id   TEXT,
+            filename     TEXT NOT NULL,
+            mime         TEXT NOT NULL,
+            kind         TEXT NOT NULL CHECK(kind IN ('image','text','video','audio','binary','document')),
+            size_bytes   INTEGER NOT NULL,
+            rel_path     TEXT NOT NULL,
+            meta_json    TEXT,
+            created_at   INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO attachments_new
+            SELECT id, session_id, message_id, filename, mime, kind,
+                   size_bytes, rel_path, meta_json, created_at
+            FROM attachments;
+        DROP TABLE attachments;
+        ALTER TABLE attachments_new RENAME TO attachments;
+        CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id);
+        CREATE INDEX IF NOT EXISTS idx_attachments_msg     ON attachments(message_id);
+        """)
     # Idempotent ALTER for existing databases without thinking columns.
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
     if "thinking_enabled" not in existing:
@@ -192,6 +237,14 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
                 shutil.rmtree(full, ignore_errors=True)
 
     conn.commit()
+    # Publish the just-initialized connection as the module singleton so
+    # `get_connection()` returns this same handle. Without this, callers that
+    # lazy-fetch via `get_connection()` (agent._fetch_attachments,
+    # skills.attachments.read_attachment) end up opening a SECOND sqlite file
+    # at the default `_DB_PATH` (next to db.py), bypassing whatever path the
+    # service started with — attachments uploaded against the real DB become
+    # invisible to the agent run loop.
+    _conn = conn
     return conn
 
 _conn: sqlite3.Connection | None = None

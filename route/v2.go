@@ -24,7 +24,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	sessions := v2.NewSessionsHandler(svc)
 	agent := v2.NewAgentHandler(svc, agentURL, 60)
 	agent.StartHealthMonitor()
-	services := v2.NewServicesStatusHandler(agent, ollamaURL)
+	parserClient := service.NewParserClient(runtimePath + "/parser.url")
+	searchClient := service.NewSearchClient(runtimePath + "/search.url")
+	services := v2.NewServicesStatusHandler(agent, ollamaURL, parserClient, searchClient)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -40,7 +42,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
 		Skipper: func(c echo.Context) bool {
-			return false // no localhost exemption: prevents unauthorized access to other users' cloud API keys
+			// _internal routes are localhost-only (LocalhostOnly middleware) and
+			// accept X-NimoOS-User-ID from the request directly. They serve local
+			// daemon traffic (e.g. wiki-summary worker) that has no JWT.
+			return strings.HasPrefix(c.Path(), common.V2APIPath+"/_internal/")
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
@@ -55,13 +60,28 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 		},
 		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
 			func(c echo.Context) ([]string, error) {
-				auth := c.Request().Header.Get(echo.HeaderAuthorization)
-				return []string{strings.TrimPrefix(auth, "Bearer ")}, nil
+				if auth := c.Request().Header.Get(echo.HeaderAuthorization); auth != "" {
+					return []string{strings.TrimPrefix(auth, "Bearer ")}, nil
+				}
+				// Browsers can't attach Authorization to <img src> or
+				// <a href target="_blank"> requests, so attachment raw
+				// downloads need a query-string fallback. The token is the
+				// same short-lived user JWT; on a single-user home NAS the
+				// leak surface is the user's own access logs.
+				if tok := c.QueryParam("token"); tok != "" {
+					return []string{tok}, nil
+				}
+				return nil, echo.ErrUnauthorized
 			},
 		},
 	}))
 
 	g := e.Group(common.V2APIPath)
+
+	// Internal endpoints: localhost-only, no JWT (e.g. wiki-summary worker)
+	internal := g.Group("/_internal", LocalhostOnly)
+	internal.POST("/chat/completions", chat.ChatCompletions)
+	internal.GET("/models", models.ListInternal)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -98,6 +118,29 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// Services status (ollama + agent)
 	g.GET("/services/status", services.Status)
 
+	// Parser proxy
+	parserProxy := &v2.ParserProxy{Client: parserClient}
+	g.GET("/parser/stats", parserProxy.Stats)
+	g.GET("/parser/jobs", parserProxy.Jobs)
+	g.GET("/parser/folders", parserProxy.Folders)
+	g.GET("/parser/state", parserProxy.State)
+	g.POST("/parser/control", parserProxy.Control)
+	g.POST("/parser/test/analyze", parserProxy.TestAnalyze)
+	g.POST("/parser/jobs/retry", parserProxy.RetryJobs)
+	g.DELETE("/parser/jobs/:id", parserProxy.DeleteJob)
+	g.POST("/parser/jobs/clear-failed", parserProxy.ClearFailedJobs)
+	g.GET("/parser/allowlist/extensions", parserProxy.GetAllowlistExtensions)
+	g.PATCH("/parser/allowlist/extensions", parserProxy.PatchAllowlistExtension)
+	g.GET("/parser/allowlist/folders", parserProxy.GetAllowlistFolders)
+	g.POST("/parser/allowlist/folders", parserProxy.PostAllowlistFolder)
+	g.DELETE("/parser/allowlist/folders/:id", parserProxy.DeleteAllowlistFolder)
+	g.GET("/parser/files", parserProxy.ListFiles)
+	g.POST("/parser/files/reindex", parserProxy.ReindexFiles)
+
+	// Search proxy → forwards /v1/ai/search/* to the Search service (/v1/search/*)
+	searchProxy := &v2.SearchProxy{Client: searchClient}
+	g.Any("/search/*", searchProxy.Proxy)
+
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
 	g.Any("/agent/*", func(c echo.Context) error {
@@ -113,6 +156,17 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/blacklist", blacklist.List)
 	g.POST("/blacklist", blacklist.Create)
 	g.DELETE("/blacklist/:id", blacklist.Delete)
+
+	// Skill management
+	skills := v2.NewSkillsHandlerFull(svc, agentURL)
+	g.GET("/skills", skills.List)
+	g.POST("/skills", skills.Create)
+	g.GET("/skills/:id", skills.Get)
+	g.PATCH("/skills/:id", skills.Update)
+	g.DELETE("/skills/:id", skills.Delete)
+	g.POST("/skills/:id/test", skills.TestStream)
+	g.GET("/skills/:id/files/*", skills.GetFile)
+	g.GET("/skills/:id/export", skills.ExportTarGz)
 
 	return e
 }

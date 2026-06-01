@@ -70,13 +70,14 @@ func NewDB(path string) (*sql.DB, error) {
 }
 
 type Model struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Source       string `json:"source"`
-	SizeBytes    int64  `json:"size_bytes"`
-	Quantization string `json:"quantization"`
-	DownloadedAt string `json:"downloaded_at"`
-	LastUsedAt   string `json:"last_used_at"`
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Source           string `json:"source"`
+	SizeBytes        int64  `json:"size_bytes"`
+	Quantization     string `json:"quantization"`
+	DownloadedAt     string `json:"downloaded_at"`
+	LastUsedAt       string `json:"last_used_at"`
+	SupportsThinking bool   `json:"supports_thinking"`
 }
 
 const (
@@ -144,16 +145,65 @@ func migrate(db *sql.DB) error {
 		UNIQUE(user_id, pattern)
 	);
 	CREATE INDEX IF NOT EXISTS idx_blacklist_user ON hard_blacklist(user_id);
+
+	CREATE TABLE IF NOT EXISTS user_skills (
+		id         TEXT NOT NULL,
+		user_id    TEXT NOT NULL,
+		last_used  TEXT NOT NULL DEFAULT '',
+		calls      INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (user_id, id)
+	);
+
+	CREATE TABLE IF NOT EXISTS skill_state (
+		user_id     TEXT NOT NULL,
+		skill_id    TEXT NOT NULL,
+		enabled     INTEGER NOT NULL DEFAULT 1,
+		uninstalled INTEGER NOT NULL DEFAULT 0,
+		last_used   TEXT NOT NULL DEFAULT '',
+		calls       INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, skill_id)
+	);
 	`)
 	if err != nil {
 		return err
 	}
+	// One-time migration from the fat user_skills schema (pre-0.4.x-alpha).
+	// If we see legacy bulk columns, the content is already on disk (or never
+	// existed): just drop and recreate the table.
+	rows, err := db.Query(`PRAGMA table_info(user_skills)`)
+	if err == nil {
+		legacy := false
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var nn, pk int
+			var dflt sql.NullString
+			rows.Scan(&cid, &name, &ctype, &nn, &dflt, &pk)
+			if name == "description" || name == "md" || name == "files_json" {
+				legacy = true
+			}
+		}
+		rows.Close()
+		if legacy {
+			_, _ = db.Exec(`DROP TABLE user_skills`)
+			_, _ = db.Exec(`CREATE TABLE user_skills (
+				id         TEXT NOT NULL,
+				user_id    TEXT NOT NULL,
+				last_used  TEXT NOT NULL DEFAULT '',
+				calls      INTEGER NOT NULL DEFAULT 0,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (user_id, id)
+			)`)
+		}
+	}
+
 	// Idempotent column additions for existing databases
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN default_model TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT ''`)
 
 	// One-time backfill: classify rows whose provider_type is still empty.
-	rows, err := db.Query(`SELECT id, base_url, protocol FROM providers WHERE provider_type=''`)
+	rows, err = db.Query(`SELECT id, base_url, protocol FROM providers WHERE provider_type=''`)
 	if err == nil {
 		type row struct {
 			id       int64

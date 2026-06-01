@@ -2,6 +2,12 @@
 
 set -e
 
+# Install runtime dependencies for attachments (ffprobe + libmagic)
+if command -v pacman >/dev/null 2>&1; then
+    echo "Installing ffmpeg and file (libmagic)..."
+    pacman -S --noconfirm --needed ffmpeg file || true
+fi
+
 ## base variables
 readonly APP_NAME="nimoos-ai"
 readonly APP_NAME_SHORT="ai"

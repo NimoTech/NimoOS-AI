@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -25,7 +26,12 @@ import skills.message_bus as mb_skills
 import skills.filesystem as fs_skills
 import skills.shell as shell_skills
 import skills.init_doc as init_doc
+import skills.wiki as wiki_skills
+import skills.skills_registry as skills_registry
+import skills.search as search_skills
 from fs.snapshots import SnapshotStore
+from wiki_client import WikiClient
+from wiki_context import WikiContextBuilder
 
 SYSTEM_PROMPT = """You are Nimo, a general-purpose AI assistant that also has the ability to manage the user's NimoOS NAS.
 
@@ -113,6 +119,179 @@ def _compose_system_prompt(conn, session_id: str, base: str,
     return base + block
 
 
+def _fetch_attachments(attachment_ids, session_id):
+    """Return rows for the given attachment_ids scoped to session_id,
+    ordered by created_at. Returns [] when attachment_ids is empty."""
+    if not attachment_ids:
+        return []
+    conn = db_module.get_connection()
+    placeholders = ",".join(["?"] * len(attachment_ids))
+    rows = conn.execute(
+        f"SELECT id, filename, mime, kind, size_bytes, rel_path "
+        f"FROM attachments WHERE id IN ({placeholders}) AND session_id = ? "
+        f"ORDER BY created_at",
+        (*attachment_ids, session_id),
+    ).fetchall()
+    return list(rows)
+
+
+def build_user_content(message: str, attachment_ids, *,
+                       session_id: str, data_root: str,
+                       model_name: str = "", provider_type: str = "other"):
+    """Compose the SDK `input` content for the user turn.
+
+    Returns a string when no attachments (backward compat). Otherwise returns
+    a list of content blocks. For image kinds: inline base64 image_url block
+    when the (provider_type, model_name) supports vision; otherwise a text
+    fallback note describing the image.
+    """
+    if not attachment_ids:
+        return message
+
+    from provider_adapters import model_supports_vision
+    has_vision = model_supports_vision(provider_type, model_name)
+
+    blocks = [{"type": "input_text", "text": message}]
+    degraded_notes = []
+    for row in _fetch_attachments(attachment_ids, session_id):
+        if row["kind"] != "image":
+            continue
+        full = os.path.join(data_root, "sessions", session_id, "attachments",
+                            row["rel_path"])
+        if has_vision:
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            blocks.append({
+                "type": "input_image",
+                "image_url": f"data:{row['mime']};base64,{b64}",
+            })
+        else:
+            kb = max(1, row["size_bytes"] // 1024)
+            degraded_notes.append(
+                f"[image attachment {row['filename']}, {kb} KB, model does not support vision]"
+            )
+    if degraded_notes:
+        blocks.append({"type": "input_text", "text": "\n".join(degraded_notes)})
+    return blocks
+
+
+def hydrate_image_blocks(history, *, session_id: str, data_root: str):
+    """Inverse of `compact_image_blocks`: replace stored compact
+    `{type:input_image, attachment_id}` blocks with real
+    `{type:input_image, image_url:"data:<mime>;base64,..."}` blocks by
+    reading the attachment file from disk.
+
+    History rows are saved in the compact shape to keep SQLite small, but
+    the OpenAI Agents SDK's chat-completions adapter only accepts
+    image_url-style blocks; feeding back the compact shape on a follow-up
+    turn raises "Only image URLs are supported for input_image".
+
+    Blocks whose attachment row or file is missing are dropped silently —
+    that's better than re-raising and breaking the whole conversation.
+    """
+    out = []
+    for item in history:
+        content = item.get("content")
+        if not isinstance(content, list):
+            out.append(item)
+            continue
+        new_content = []
+        for blk in content:
+            if (isinstance(blk, dict)
+                    and blk.get("type") == "input_image"
+                    and "attachment_id" in blk
+                    and "image_url" not in blk):
+                aid = blk["attachment_id"]
+                row = db_module.get_connection().execute(
+                    "SELECT mime, rel_path FROM attachments "
+                    "WHERE id=? AND session_id=?",
+                    (aid, session_id),
+                ).fetchone()
+                if row is None:
+                    continue
+                full = os.path.join(data_root, "sessions", session_id,
+                                    "attachments", row["rel_path"])
+                try:
+                    with open(full, "rb") as f:
+                        data = f.read()
+                except FileNotFoundError:
+                    continue
+                b64 = base64.b64encode(data).decode("ascii")
+                new_content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{row['mime']};base64,{b64}",
+                })
+            else:
+                new_content.append(blk)
+        item = {**item, "content": new_content}
+        out.append(item)
+    return out
+
+
+def compact_image_blocks(history, *, image_id_resolver):
+    """Walk the SDK history; replace any inline image data URL with a compact
+    `{type: input_image, attachment_id: <id>}` block.
+
+    `image_id_resolver(url) -> attachment_id | None` is called for each
+    image_url found. Return None to leave the block unchanged.
+    """
+    out = []
+    for item in history:
+        content = item.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for blk in content:
+                if (isinstance(blk, dict)
+                        and blk.get("type") == "input_image"
+                        and "image_url" in blk):
+                    aid = image_id_resolver(blk["image_url"])
+                    if aid:
+                        new_content.append({"type": "input_image",
+                                            "attachment_id": aid})
+                    else:
+                        new_content.append(blk)
+                else:
+                    new_content.append(blk)
+            item = {**item, "content": new_content}
+        out.append(item)
+    return out
+
+
+def select_tools_for_run(attachment_ids, *, session_id: str):
+    """Return tool list; conditionally appends `read_attachment` when at least
+    one attachment is non-image. Image-only or empty → unchanged ALL_TOOLS."""
+    rows = _fetch_attachments(attachment_ids, session_id)
+    has_non_image = any(r["kind"] != "image" for r in rows)
+    if has_non_image:
+        from skills.attachments import read_attachment
+        return list(ALL_TOOLS) + [read_attachment]
+    return list(ALL_TOOLS)
+
+
+def attachment_system_block(attachment_ids, *, session_id: str) -> str:
+    """System-prompt suffix listing non-image attachments. Empty string when
+    there are no non-image attachments."""
+    rows = _fetch_attachments(attachment_ids, session_id)
+    non_image = [r for r in rows if r["kind"] != "image"]
+    if not non_image:
+        return ""
+    lines = ["The user attached the following files to their message:"]
+    for r in non_image:
+        size_kb = max(1, r["size_bytes"] // 1024)
+        lines.append(f"- id={r['id']}, name=\"{r['filename']}\", "
+                     f"kind={r['kind']}, size={size_kb} KB")
+    lines.append("Use read_attachment(id) to inspect contents. "
+                 "Image attachments are already visible — don't call this on them. "
+                 "For kind=document, the response may include an `error` field "
+                 "(e.g., empty_scanned, encrypted, timeout) — relay it to the user "
+                 "in plain language in their own language.")
+    return "\n".join(lines)
+
+
 class AgentRunner:
     def __init__(self, conn: sqlite3.Connection, confirm_mgr=None):
         self._conn = conn
@@ -124,6 +303,14 @@ class AgentRunner:
             from confirm import ConfirmManager as _CM
             confirm_mgr = _CM(conn)
         self._confirm_mgr = confirm_mgr
+        # Session-scoped Wiki clients. Calls go through the gateway, so wiki
+        # service restarts (new random port) are transparent to us.
+        self._wiki_clients: dict[str, WikiClient] = {}
+
+    def _wiki_client_for(self, session_id: str, user_id: str) -> WikiClient:
+        if session_id not in self._wiki_clients:
+            self._wiki_clients[session_id] = WikiClient(user_id=str(user_id))
+        return self._wiki_clients[session_id]
 
     def _load_history(self, session_id: str) -> list:
         # Each _save_history row already stores the full cumulative snapshot
@@ -170,6 +357,7 @@ class AgentRunner:
         chat_username: str = "",
         user_patterns: list | None = None,
         run_id: str = "",
+        attachment_ids: list[str] = (),
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -196,6 +384,37 @@ class AgentRunner:
 
             shell_skills.SESSION_ID_VAR.set(session_id)
 
+            # --- Wiki integration ---
+            wiki_client = self._wiki_client_for(session_id, user_id)
+            if wiki_client is not None:
+                wiki_client.reset_cache()  # turn-scoped: fresh tree per turn
+            wiki_skills.WIKI_CLIENT_VAR.set(wiki_client)
+            wiki_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            wiki_skills.SESSION_ID_VAR.set(session_id)
+            wiki_skills.EVENT_QUEUE_VAR.set(sink)
+            wiki_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+
+            # Skills registry: tells list_skills() which user's runtime view to scan.
+            skills_registry.SKILLS_ROOT_VAR.set(os.environ.get(
+                "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills"))
+            skills_registry.USER_ID_VAR.set(str(user_id))
+
+            # Search tools resolve the caller's accessible Wiki Roots from this
+            # user_id (sent as X-NimoOS-User-ID). Without it, search returns
+            # no_accessible_roots → empty hits. Per-skill var, matching the
+            # established pattern (see spec 2026-05-29; unified context is a
+            # tracked follow-up).
+            search_skills.USER_ID_VAR.set(str(user_id))
+
+            # Mount the user's skill runtime view into the bwrap sandbox via
+            # ContextVar (not os.environ, which would be clobbered by concurrent
+            # async requests in the same process — Fix 1.1).
+            skills_root = os.environ.get("NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills")
+            runtime_view = os.path.join(skills_root, ".runtime", str(user_id))
+            if os.path.isdir(runtime_view):
+                shell_skills.SANDBOX_SKILLS_VAR.set(runtime_view)
+            # SANDBOX_SHELL_ROOT_VAR stays default (real persistent work dir for chat).
+
             client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             # `should_replay_reasoning_content` lets the SDK inject prior
             # `reasoning_content` back onto assistant messages when replaying
@@ -218,7 +437,45 @@ class AgentRunner:
             )
 
             base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
-            full_prompt = _compose_system_prompt(self._conn, session_id, base)
+
+            # Prepend the Wiki context block. 5s budget: if Wiki is slow we'd
+            # rather drop the block than stall the user's chat.
+            wiki_block = ""
+            if wiki_client is not None:
+                try:
+                    wiki_block = await asyncio.wait_for(
+                        WikiContextBuilder(wiki_client).build(user_patterns or []),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    wiki_block = ""
+            base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
+            full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+
+            if attachment_ids:
+                att_block = attachment_system_block(attachment_ids, session_id=session_id)
+                if att_block:
+                    full_prompt = full_prompt + "\n\n" + att_block
+
+            data_root = os.environ.get(
+                "NIMOOS_AGENT_DATA_ROOT",
+                str(db_module._DB_PATH.parent),
+            )
+
+            # Set context vars for the conditional read_attachment skill before
+            # tool selection / Agent construction so tool invocations during
+            # this run resolve the right session.
+            from skills.attachments import (
+                SESSION_ID_VAR as _ATT_S,
+                USER_ID_VAR as _ATT_U,
+                MAX_CHARS_VAR as _ATT_C,
+                DATA_ROOT_VAR as _ATT_D,
+            )
+            _ATT_S.set(session_id)
+            _ATT_U.set(user_id)
+            _ATT_C.set(int(os.environ.get(
+                "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
+            _ATT_D.set(data_root)
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
@@ -227,13 +484,24 @@ class AgentRunner:
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
-                tools=ALL_TOOLS,
+                tools=select_tools_for_run(attachment_ids, session_id=session_id),
                 model=model,
                 model_settings=model_settings,
             )
 
+            user_content = build_user_content(
+                message, attachment_ids,
+                session_id=session_id, data_root=data_root,
+                model_name=model_name, provider_type=provider_type)
             history = self._load_history(session_id)
-            input_messages = history + [{"role": "user", "content": message}]
+            # Earlier turns' image blocks were stored in compact form
+            # (attachment_id only) to keep the DB small. Re-inline the base64
+            # data URL before re-feeding to the SDK — the chat-completions
+            # adapter rejects the compact shape with "Only image URLs are
+            # supported for input_image".
+            history = hydrate_image_blocks(
+                history, session_id=session_id, data_root=data_root)
+            input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             try:
@@ -248,31 +516,91 @@ class AgentRunner:
                 #     message_output_item (it would duplicate the streamed text).
                 conv_state: dict = {"streamed_message": False}
                 message_emitted = False  # any user-visible message text reached the client
+                t_start = time.monotonic()
+                t_first_token: float | None = None
+                output_bytes = 0
+                FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
+                BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
 
                 async for event in stream.stream_events():
                     sse_event = _convert_event(event, call_names, conv_state)
                     if sse_event is None:
                         continue
-                    if sse_event["type"] == "message_delta":
+                    et = sse_event["type"]
+                    if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
+                        t_first_token = time.monotonic()
+                    if et in BYTE_COUNT_TYPES:
+                        content = sse_event.get("content")
+                        if isinstance(content, str):
+                            output_bytes += len(content.encode("utf-8"))
+                    if et == "message_delta":
                         message_emitted = True
-                    elif sse_event["type"] == "message":
-                        # End-of-turn consolidated text from message_output_item.
-                        # Drop if we already streamed the same content via deltas.
+                    elif et == "message":
                         if conv_state["streamed_message"]:
                             continue
                         message_emitted = True
                     await sink.put(sse_event)
 
-                # Reasoning-only models (e.g. deepseek-v4-flash) emit the full
-                # answer as reasoning_content with no content delta and no
-                # message_output_item — fall back to final_output so the user
-                # sees something.
+                # Reasoning-only fallback. The fallback text also counts toward
+                # output_bytes so the token count is meaningful for these models.
                 if not message_emitted:
                     final = getattr(stream, "final_output", None)
                     if final and isinstance(final, str) and final.strip():
                         await sink.put({"type": "message", "content": final})
+                        output_bytes += len(final.encode("utf-8"))
 
-                self._save_history(session_id, stream.to_input_list())
+                # stats_final — decoupled token count from timing:
+                # output_tokens needs only bytes; tok/s and ttft need first-token.
+                t_end = time.monotonic()
+                total_ms = int((t_end - t_start) * 1000)
+                output_tokens = (
+                    max(1, round(output_bytes / 3)) if output_bytes > 0 else None
+                )
+                if t_first_token is not None:
+                    ttft_ms = int((t_first_token - t_start) * 1000)
+                    generation_ms = int((t_end - t_first_token) * 1000)
+                    tokens_per_sec = (
+                        round(output_tokens * 1000 / generation_ms, 1)
+                        if output_tokens is not None and generation_ms > 0 else None
+                    )
+                else:
+                    ttft_ms = None
+                    generation_ms = None
+                    tokens_per_sec = None
+
+                await sink.put({
+                    "type": "stats_final",
+                    "ttft_ms": ttft_ms,
+                    "generation_ms": generation_ms,
+                    "total_ms": total_ms,
+                    "output_tokens": output_tokens,
+                    "tokens_per_sec": tokens_per_sec,
+                    "source": "client_estimate",
+                })
+
+                final_history = stream.to_input_list()
+                url_to_aid: dict[str, str] = {}
+                if attachment_ids:
+                    for r in _fetch_attachments(attachment_ids, session_id):
+                        if r["kind"] != "image":
+                            continue
+                        full = os.path.join(
+                            data_root, "sessions", session_id, "attachments",
+                            r["rel_path"])
+                        try:
+                            with open(full, "rb") as f:
+                                data = f.read()
+                            url = (
+                                f"data:{r['mime']};base64,"
+                                f"{base64.b64encode(data).decode('ascii')}"
+                            )
+                            url_to_aid[url] = r["id"]
+                        except FileNotFoundError:
+                            pass
+                final_history = compact_image_blocks(
+                    final_history,
+                    image_id_resolver=lambda u: url_to_aid.get(u))
+                self._save_history(session_id, final_history)
             except Exception as e:
                 await sink.put({"type": "error", "content": str(e)})
             finally:

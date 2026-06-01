@@ -2,6 +2,13 @@
 
 set -e
 
+# Install runtime dependencies for attachments (ffprobe + libmagic)
+if command -v apt-get >/dev/null 2>&1; then
+    echo "Installing ffmpeg and libmagic1..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ffmpeg libmagic1 || true
+fi
+
 ## base variables
 readonly APP_NAME="nimoos-ai"
 readonly APP_NAME_SHORT="ai"
