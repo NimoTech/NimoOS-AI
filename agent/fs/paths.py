@@ -36,15 +36,13 @@ def _is_within(child: str, parent: str) -> bool:
     return child == parent or child.startswith(parent + os.sep)
 
 
-def resolve(raw: str, session_id: str, db: sqlite3.Connection) -> str:
+def anchor(raw: str, session_id: str, db: sqlite3.Connection) -> str:
+    """Absolutize `raw` WITHOUT scope-checking. Relative paths anchor to the
+    session's single visible folder (matching resolve()). Raises
+    PermissionDenied for null bytes or un-anchorable relative paths."""
     if not isinstance(raw, str) or "\x00" in raw:
         raise PermissionDenied("path contains null byte or is not a string")
-
     visible = _load_visible(db, session_id)
-    if not visible:
-        raise PermissionDenied("no authorized resources for this session")
-
-    # 1. Absolutize. Relative path anchors to the single visible folder, if any.
     if not os.path.isabs(raw):
         folders = [v for v in visible if v.kind == "folder"]
         if len(folders) != 1:
@@ -55,7 +53,19 @@ def resolve(raw: str, session_id: str, db: sqlite3.Connection) -> str:
         anchored = os.path.join(folders[0].path, raw)
     else:
         anchored = raw
-    abs_ = os.path.abspath(anchored)
+    return os.path.abspath(anchored)
+
+
+def resolve(raw: str, session_id: str, db: sqlite3.Connection) -> str:
+    if not isinstance(raw, str) or "\x00" in raw:
+        raise PermissionDenied("path contains null byte or is not a string")
+
+    visible = _load_visible(db, session_id)
+    if not visible:
+        raise PermissionDenied("no authorized resources for this session")
+
+    # 1. Absolutize / anchor (shared with _candidate_for_request).
+    abs_ = anchor(raw, session_id, db)
 
     # 2. Realpath. We resolve symlinks even on non-existent leaves: the parent
     #    chain must already canonicalize to inside scope. os.path.realpath

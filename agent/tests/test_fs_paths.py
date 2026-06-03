@@ -1,8 +1,10 @@
 import os
 import time
+import sqlite3
 import pytest
 import db as db_module
 from fs import paths as paths_mod
+from fs import paths
 
 
 @pytest.fixture
@@ -90,3 +92,38 @@ def test_resolve_file_kind_only_self(session, tmp_path):
     # sibling within same dir is NOT allowed because the visible resource is a single file
     with pytest.raises(paths_mod.PermissionDenied):
         paths_mod.resolve(str(sib), "s1", session)
+
+
+def _conn_with_folder(tmp_path, folder):
+    conn = db_module.init_db(str(tmp_path / "a.db"),
+                             snapshots_root=str(tmp_path / "snap"))
+    now = int(time.time())
+    conn.execute("INSERT INTO sessions (id, user_id, title, created_at, updated_at) "
+                 "VALUES (?,?,?,?,?)", ("s1", "u1", None, now, now))
+    conn.execute("INSERT INTO visible_resources (session_id, path, kind, added_at) "
+                 "VALUES (?,?,?,?)", ("s1", str(folder), "folder", now))
+    conn.commit()
+    return conn
+
+
+def test_anchor_absolute_passthrough(tmp_path):
+    root = tmp_path / "root"; root.mkdir()
+    conn = _conn_with_folder(tmp_path, root)
+    assert paths.anchor("/DATA/Documents", "s1", conn) == "/DATA/Documents"
+
+
+def test_anchor_relative_uses_single_folder(tmp_path):
+    root = tmp_path / "root"; root.mkdir()
+    conn = _conn_with_folder(tmp_path, root)
+    assert paths.anchor("sub/x.txt", "s1", conn) == os.path.join(str(root), "sub/x.txt")
+
+
+def test_anchor_relative_rejected_when_no_single_folder(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "b.db"), snapshots_root=str(tmp_path / "s"))
+    now = int(time.time())
+    conn.execute("INSERT INTO sessions (id, user_id, title, created_at, updated_at) "
+                 "VALUES (?,?,?,?,?)", ("s1", "u1", None, now, now))
+    conn.commit()
+    import pytest
+    with pytest.raises(paths.PermissionDenied):
+        paths.anchor("rel.txt", "s1", conn)
