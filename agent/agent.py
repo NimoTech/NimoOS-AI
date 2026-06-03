@@ -382,6 +382,7 @@ class AgentRunner:
             fs_skills.STORE_VAR.set(_SNAPSHOT_STORE)
             fs_skills.CHAT_USERNAME_VAR.set(chat_username)
             fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+            fs_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
 
             shell_skills.SESSION_ID_VAR.set(session_id)
 

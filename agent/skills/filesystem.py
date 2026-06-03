@@ -21,6 +21,7 @@ DB_VAR: ContextVar = ContextVar("db")
 STORE_VAR: ContextVar = ContextVar("store")
 CHAT_USERNAME_VAR: ContextVar[str] = ContextVar("chat_username")
 USER_PATTERNS_VAR: ContextVar[list] = ContextVar("user_patterns")
+CONFIRM_MGR_VAR: ContextVar = ContextVar("confirm_mgr")
 
 
 def _ctx() -> dict:
@@ -32,6 +33,7 @@ def _ctx() -> dict:
         "store": STORE_VAR.get(),
         "chat_username": CHAT_USERNAME_VAR.get(""),
         "user_patterns": USER_PATTERNS_VAR.get([]),
+        "confirm_mgr": CONFIRM_MGR_VAR.get(None),
     }
 
 
