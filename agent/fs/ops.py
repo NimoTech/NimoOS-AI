@@ -67,10 +67,21 @@ async def _resolve_and_gate_or_request(ctx, raw: str, op: str) -> str:
         # ignore.gate, so blacklisted out-of-scope paths surface here as a
         # PermissionDenied; we must re-run gate explicitly before prompting.
         abs_, kind = _candidate_for_request(ctx, raw)
+        # Never grant the filesystem root itself.
+        if abs_ == os.sep:
+            raise
         visible_roots = [r["path"] for r in ctx["conn"].execute(
             "SELECT path FROM visible_resources WHERE session_id=? AND kind='folder'",
             (ctx["session_id"],))]
-        ignore.gate(abs_, visible_roots, ctx.get("user_patterns", []))  # Blocked* → no card
+        # Hard-blacklist patterns are directory-anchored (e.g. "/etc/") and
+        # match a directory's *children*, not the bare directory path. For a
+        # folder candidate, also gate a synthetic child so a request for the
+        # blacklisted directory itself is caught by the same proven matcher.
+        gate_targets = [abs_]
+        if kind == "folder":
+            gate_targets.append(os.path.join(abs_, "__nimoos_access_probe__"))
+        for target in gate_targets:
+            ignore.gate(target, visible_roots, ctx.get("user_patterns", []))  # Blocked* → no card
         if ctx.get("confirm_mgr") is None:
             raise  # no interactive channel; behave as before
         granted = await access_request.request_access(ctx, abs_, kind, op)

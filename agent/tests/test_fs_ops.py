@@ -188,3 +188,28 @@ def test_new_file_requests_nearest_existing_folder(ctx, tmp_path):
         "SELECT path, kind FROM visible_resources WHERE path=?", (str(existing),)
     ).fetchone()
     assert row is not None and row["kind"] == "folder"  # folder, not the file
+
+
+def test_blacklisted_directory_itself_never_prompts(ctx):
+    # Requesting a hard-blacklisted directory itself (not a child) must not
+    # produce a card, even though it's a real existing directory.
+    out = _run(fsops.list_dir(ctx, "/etc"))
+    assert out.startswith("Error:")
+    assert not [e for e in ctx["sink"].events if e["type"] == "access_request"]
+
+
+def test_nonexistent_top_level_never_prompts(ctx):
+    # Path whose only existing ancestor is "/" must never request "/".
+    out = _run(fsops.list_dir(ctx, "/__no_such_top__/a/b"))
+    assert out.startswith("Error:")
+    assert not [e for e in ctx["sink"].events if e["type"] == "access_request"]
+
+
+def test_no_confirm_manager_errors_immediately(ctx, tmp_path):
+    # Headless / no interactive channel: out-of-scope path errors at once,
+    # no hang, no card.
+    ctx["confirm_mgr"] = None
+    outside = tmp_path / "headless"; outside.mkdir()
+    out = _run(fsops.list_dir(ctx, str(outside)))
+    assert out.startswith("Error:")
+    assert not [e for e in ctx["sink"].events if e["type"] == "access_request"]
