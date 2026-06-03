@@ -74,7 +74,7 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
         if not fut.done():
             fut.set_result(granted)                          # 再广播给并发等待者
         return granted
-    except Exception as e:
+    except BaseException as e:
         if not fut.done():
             fut.set_exception(e)                             # 异常也广播,防死锁
         raise

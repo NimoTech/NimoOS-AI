@@ -105,3 +105,37 @@ def test_pending_map_cleared_after_resolution(ctx):
         await task
     asyncio.get_event_loop().run_until_complete(go())
     assert access_request._pending_requests == {}  # finally cleaned up
+
+
+def test_waiter_does_not_hang_when_primary_cancelled(ctx):
+    # A deduped waiter must not hang if the primary task is cancelled while
+    # blocked in mgr.wait(). Requires `except BaseException` so CancelledError
+    # propagates to the shared future instead of orphaning it.
+    class _BlockingMgr:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+        def register(self, *a):
+            return "cid"
+        async def wait(self, cid):
+            self.started.set()
+            await self.release.wait()
+            return True
+    ctx["confirm_mgr"] = _BlockingMgr()
+
+    async def go():
+        primary = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Q", "folder", "list"))
+        await ctx["confirm_mgr"].started.wait()      # primary now in mgr.wait()
+        waiter = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Q", "folder", "list"))
+        await asyncio.sleep(0)                        # let waiter suspend on shared future
+        primary.cancel()
+        # Must complete promptly; with the bug the waiter hangs and this times out.
+        await asyncio.wait_for(
+            asyncio.gather(primary, waiter, return_exceptions=True), timeout=1.0)
+        return primary.done(), waiter.done()
+
+    pdone, wdone = asyncio.get_event_loop().run_until_complete(go())
+    assert pdone and wdone
+    assert access_request._pending_requests == {}    # key cleaned up even on cancel
