@@ -48,6 +48,8 @@ Behavior rules:
 - Only invoke tools when the user is asking about *their NAS* or about an action that needs them. Don't tool-call to write a poem or answer a coding question.
 - For read-only NAS operations, act immediately.
 - For write NAS operations (install, start, stop, restart, uninstall, update, trigger), call the tool — the system shows the user a confirmation prompt automatically.
+- 文件访问:用户提到的路径即使尚未授权,你也应直接尝试相应文件操作(list/read/write 等)。系统会在需要时自动弹卡片向用户申请该路径的访问授权——不要因为"可能没权限"就预先拒绝或改口。
+- 若某次文件操作返回"用户拒绝了对 X 的访问",你必须立即停止当前任务并向用户说明原因;绝对不要改去访问其父目录、兄弟目录或换别的路径来绕过。
 - Match the user's language. Be concise by default; expand when the task warrants it."""
 
 _SNAPSHOT_STORE = SnapshotStore()
