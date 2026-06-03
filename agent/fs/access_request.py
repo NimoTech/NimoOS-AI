@@ -34,6 +34,15 @@ def reset_state() -> None:
     _denied.clear()
 
 
+def clear_denied_for_session(session_id: str) -> None:
+    """Forget this session's prior denials. Called at the start of each agent
+    run so a new user turn (or a Stop, which resolves pending confirms to
+    False) does not permanently poison a path. Within a single run, _denied
+    still suppresses repeat prompts for an already-denied path."""
+    for key in [k for k in _denied if k[0] == session_id]:
+        _denied.discard(key)
+
+
 def _insert_visible_resource(ctx, abs_path: str, kind: str) -> None:
     ctx["conn"].execute(
         "INSERT OR IGNORE INTO visible_resources "

@@ -24,6 +24,7 @@ from skills.app_management import (
 )
 import skills.message_bus as mb_skills
 import skills.filesystem as fs_skills
+from fs import access_request as fs_access_request
 import skills.shell as shell_skills
 import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
@@ -385,6 +386,7 @@ class AgentRunner:
             fs_skills.CHAT_USERNAME_VAR.set(chat_username)
             fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
             fs_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            fs_access_request.clear_denied_for_session(session_id)
 
             shell_skills.SESSION_ID_VAR.set(session_id)
 

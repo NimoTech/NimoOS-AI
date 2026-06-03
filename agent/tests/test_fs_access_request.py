@@ -36,11 +36,15 @@ def ctx(tmp_path):
     }
 
 
-async def _resolve_after_event(ctx, confirmed):
-    """Wait for the access_request event, then resolve its confirm_id."""
+async def _resolve_after_event(ctx, confirmed, *, after=0):
+    """Wait for the access_request event, then resolve its confirm_id.
+
+    `after`: only consider events past this index (supports callers that need
+    to wait for a *new* card after some events have already been emitted).
+    """
     for _ in range(200):
         evs = [e for e in ctx["sink"].events if e["type"] == "access_request"]
-        if evs:
+        if len(evs) > after:
             ctx["confirm_mgr"].resolve(evs[-1]["confirm_id"], confirmed,
                                        expected_session_id="s1")
             return
@@ -139,3 +143,22 @@ def test_waiter_does_not_hang_when_primary_cancelled(ctx):
     pdone, wdone = asyncio.get_event_loop().run_until_complete(go())
     assert pdone and wdone
     assert access_request._pending_requests == {}    # key cleaned up even on cancel
+
+
+def test_clear_denied_allows_reprompt(ctx):
+    async def go():
+        t = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Z", "folder", "list"))
+        await _resolve_after_event(ctx, False)
+        first = await t
+        # Simulate a new run/turn: clear denials for the session.
+        access_request.clear_denied_for_session(ctx["session_id"])
+        t2 = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Z", "folder", "list"))
+        await _resolve_after_event(ctx, True, after=1)
+        second = await t2
+        return first, second
+    first, second = asyncio.get_event_loop().run_until_complete(go())
+    assert first is False and second is True
+    cards = [e for e in ctx["sink"].events if e["type"] == "access_request"]
+    assert len(cards) == 2  # second prompt shown after clear
