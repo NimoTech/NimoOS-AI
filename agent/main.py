@@ -552,6 +552,7 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
         return []
 
     messages = _hydrate_messages(history, session_id_for_urls=session_id)
+    messages = _inject_access_request_cards(messages, session_id, _conn)
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
@@ -784,6 +785,58 @@ def _hydrate_messages(history: list, session_id_for_urls: str | None = None) -> 
 
     flush()
     return result
+
+
+def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
+    """Rebuild resolved file-access permission cards into the loaded history.
+
+    access_request events are UI-only (never part of the SDK history), so they'd
+    vanish on refresh. We persist each request + decision in access_requests and
+    re-attach the resolved cards here. Correlation: the k-th run that produced
+    access requests maps to the k-th assistant turn (one run ≈ one assistant
+    turn). Only granted/denied are shown; pending/cancelled are skipped.
+    """
+    rows = conn.execute(
+        "SELECT confirm_id, run_id, path, kind, reason, decision "
+        "FROM access_requests "
+        "WHERE session_id=? AND decision IN ('granted','denied') "
+        "ORDER BY created_at ASC",
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return messages
+
+    # Group rows by run_id, preserving first-seen (created_at) order.
+    groups: list[list] = []
+    seen: dict[str, int] = {}
+    for r in rows:
+        rid = r["run_id"]
+        if rid not in seen:
+            seen[rid] = len(groups)
+            groups.append([])
+        groups[seen[rid]].append(r)
+
+    assistant_turns = [m for m in messages if m.get("role") == "assistant"]
+    if not assistant_turns:
+        synthetic = {"id": "h-a-access", "role": "assistant",
+                     "blocks": [], "streaming": False}
+        messages.append(synthetic)
+        assistant_turns = [synthetic]
+
+    for gi, group in enumerate(groups):
+        turn = assistant_turns[gi] if gi < len(assistant_turns) else assistant_turns[-1]
+        turn.setdefault("blocks", [])
+        for r in group:
+            turn["blocks"].append({
+                "type": "access_request",
+                "confirmId": r["confirm_id"],
+                "path": r["path"],
+                "kind": r["kind"],
+                "reason": r["reason"],
+                "decided": True,
+                "granted": r["decision"] == "granted",
+            })
+    return messages
 
 
 class TitleUpdate(BaseModel):
