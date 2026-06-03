@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_session ON attachments(session_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_msg     ON attachments(message_id);
+
+-- Durable record of each file-access authorization request and its outcome.
+-- Unlike pending_confirmations (dropped each startup), this MUST persist so a
+-- refreshed page can rebuild the resolved card in conversation history.
+CREATE TABLE IF NOT EXISTS access_requests (
+    confirm_id  TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    decision    TEXT,
+    created_at  INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_access_req_session
+  ON access_requests(session_id, created_at);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"

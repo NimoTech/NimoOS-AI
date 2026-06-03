@@ -162,3 +162,53 @@ def test_clear_denied_allows_reprompt(ctx):
     assert first is False and second is True
     cards = [e for e in ctx["sink"].events if e["type"] == "access_request"]
     assert len(cards) == 2  # second prompt shown after clear
+
+
+def test_request_persisted_pending_then_granted(ctx):
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Persist", "folder", "list"))
+        await asyncio.sleep(0)
+        row = ctx["conn"].execute(
+            "SELECT decision, run_id, kind FROM access_requests "
+            "WHERE session_id='s1' AND path='/DATA/Persist'").fetchone()
+        assert row is not None and row["decision"] is None
+        assert row["run_id"] == "r1" and row["kind"] == "folder"
+        await _resolve_after_event(ctx, True)
+        return await task
+    granted = asyncio.get_event_loop().run_until_complete(go())
+    assert granted is True
+    row = ctx["conn"].execute(
+        "SELECT decision, resolved_at FROM access_requests WHERE path='/DATA/Persist'").fetchone()
+    assert row["decision"] == "granted" and row["resolved_at"] is not None
+
+
+def test_request_persisted_denied(ctx):
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/PersistNo", "folder", "read"))
+        await _resolve_after_event(ctx, False)
+        return await task
+    granted = asyncio.get_event_loop().run_until_complete(go())
+    assert granted is False
+    row = ctx["conn"].execute(
+        "SELECT decision FROM access_requests WHERE path='/DATA/PersistNo'").fetchone()
+    assert row["decision"] == "denied"
+
+
+def test_access_requests_table_persists_across_reinit(tmp_path):
+    import db as db_module
+    p = str(tmp_path / "persist.db")
+    conn = db_module.init_db(p, snapshots_root=str(tmp_path / "s"))
+    now = 1000
+    conn.execute("INSERT INTO sessions (id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
+                 ("s1", "u1", None, now, now))
+    conn.execute("INSERT INTO access_requests "
+                 "(confirm_id,session_id,run_id,path,kind,reason,decision,created_at) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 ("c1", "s1", "r1", "/p", "folder", "x", "granted", now))
+    conn.commit()
+    conn.close()
+    conn2 = db_module.init_db(p, snapshots_root=str(tmp_path / "s"))
+    row = conn2.execute("SELECT decision FROM access_requests WHERE confirm_id='c1'").fetchone()
+    assert row is not None and row["decision"] == "granted"

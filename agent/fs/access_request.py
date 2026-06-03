@@ -52,9 +52,32 @@ def _insert_visible_resource(ctx, abs_path: str, kind: str) -> None:
     ctx["conn"].commit()
 
 
+def _record_request(ctx, confirm_id: str, abs_path: str, kind: str, reason: str) -> None:
+    """Durably record a new (pending) access request so a refreshed page can
+    rebuild the card. decision stays NULL until resolved."""
+    ctx["conn"].execute(
+        "INSERT INTO access_requests "
+        "(confirm_id, session_id, run_id, path, kind, reason, decision, created_at) "
+        "VALUES (?,?,?,?,?,?,NULL,?)",
+        (confirm_id, ctx["session_id"], ctx.get("run_id", ""), abs_path, kind, reason,
+         int(time.time())),
+    )
+    ctx["conn"].commit()
+
+
+def _record_decision(ctx, confirm_id: str, decision: str) -> None:
+    ctx["conn"].execute(
+        "UPDATE access_requests SET decision=?, resolved_at=? WHERE confirm_id=?",
+        (decision, int(time.time()), confirm_id),
+    )
+    ctx["conn"].commit()
+
+
 async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
     """Ask the user to authorize abs_path for this session. Returns True if
-    granted (and writes visible_resources), False otherwise."""
+    granted (and writes visible_resources), False otherwise. The request and
+    its decision are recorded in access_requests so a refreshed page can
+    rebuild the (resolved) card."""
     session_id = ctx["session_id"]
     cache_key = (session_id, abs_path)
 
@@ -64,18 +87,21 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
         return await _pending_requests[cache_key]
 
     mgr = ctx["confirm_mgr"]
+    reason = _REASON.get(op, _DEFAULT_REASON)
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     _pending_requests[cache_key] = fut
     try:
         confirm_id = mgr.register(session_id, "grant_access", abs_path, "")
+        _record_request(ctx, confirm_id, abs_path, kind, reason)
         await ctx["sink"].put({
             "type": "access_request",
             "confirm_id": confirm_id,
             "path": abs_path,
             "kind": kind,
-            "reason": _REASON.get(op, _DEFAULT_REASON),
+            "reason": reason,
         })
         granted = await mgr.wait(confirm_id)
+        _record_decision(ctx, confirm_id, "granted" if granted else "denied")
         if granted:
             _insert_visible_resource(ctx, abs_path, kind)   # 先落库
         else:
