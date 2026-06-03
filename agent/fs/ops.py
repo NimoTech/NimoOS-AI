@@ -16,7 +16,7 @@ import stat
 import time
 from typing import Optional
 
-from fs import paths, ignore, ownership, staging
+from fs import paths, ignore, ownership, staging, access_request
 from fs.snapshots import SnapshotTooLarge
 
 
@@ -39,6 +39,44 @@ def _resolve_and_gate(ctx, raw: str) -> str:
     abs_ = paths.resolve(raw, ctx["session_id"], ctx["conn"])
     _gate(ctx, abs_)
     return abs_
+
+
+def _candidate_for_request(ctx, raw: str) -> tuple[str, str]:
+    """(path, kind) to request authorization for, using the SAME anchoring as
+    paths.resolve. Raises paths.PermissionDenied if un-anchorable (relative
+    path with 0 or >1 visible folders)."""
+    real = os.path.realpath(paths.anchor(raw, ctx["session_id"], ctx["conn"]))
+    if os.path.isdir(real):
+        return real, "folder"
+    if os.path.isfile(real):
+        return real, "file"
+    # Non-existent (creation/organize target): request the nearest existing
+    # ancestor directory as a folder grant.
+    parent = os.path.dirname(real)
+    while parent and not os.path.isdir(parent):
+        parent = os.path.dirname(parent)
+    return (parent or "/"), "folder"
+
+
+async def _resolve_and_gate_or_request(ctx, raw: str, op: str) -> str:
+    try:
+        return _resolve_and_gate(ctx, raw)
+    except paths.PermissionDenied:
+        # Out of scope. Decide what to request — but NEVER offer to grant a
+        # hard-blacklisted/implicitly-ignored path. paths.resolve runs BEFORE
+        # ignore.gate, so blacklisted out-of-scope paths surface here as a
+        # PermissionDenied; we must re-run gate explicitly before prompting.
+        abs_, kind = _candidate_for_request(ctx, raw)
+        visible_roots = [r["path"] for r in ctx["conn"].execute(
+            "SELECT path FROM visible_resources WHERE session_id=? AND kind='folder'",
+            (ctx["session_id"],))]
+        ignore.gate(abs_, visible_roots, ctx.get("user_patterns", []))  # Blocked* → no card
+        if ctx.get("confirm_mgr") is None:
+            raise  # no interactive channel; behave as before
+        granted = await access_request.request_access(ctx, abs_, kind, op)
+        if not granted:
+            raise paths.PermissionDenied(f"用户拒绝了对 {abs_} 的访问")
+        return _resolve_and_gate(ctx, raw)
 
 
 def _next_seq(ctx) -> int:
@@ -88,7 +126,7 @@ def _err(ex: Exception) -> str:
 
 async def list_dir(ctx, path: str) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "list")
     except (paths.PermissionDenied,
             ignore.BlockedImplicit, ignore.BlockedHardBlacklist,
             ignore.BlockedGitignore) as e:
@@ -118,7 +156,7 @@ async def list_dir(ctx, path: str) -> str:
 
 async def read_file(ctx, path: str) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "read")
     except Exception as e:
         return _err(e)
     if not os.path.isfile(abs_):
@@ -136,7 +174,7 @@ async def read_file(ctx, path: str) -> str:
 
 async def read_file_lines(ctx, path: str, start: int, end: int) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "read")
     except Exception as e:
         return _err(e)
     if end - start > 2000:
@@ -157,7 +195,7 @@ async def read_file_lines(ctx, path: str, start: int, end: int) -> str:
 
 async def write_file(ctx, path: str, content: str) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "write")
     except Exception as e:
         return _err(e)
     seq = _next_seq(ctx)
@@ -195,7 +233,7 @@ async def write_file(ctx, path: str, content: str) -> str:
 
 async def edit_file(ctx, path: str, old_string: str, new_string: str) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "write")
     except Exception as e:
         return _err(e)
     if not os.path.isfile(abs_):
@@ -214,7 +252,7 @@ async def edit_file(ctx, path: str, old_string: str, new_string: str) -> str:
 
 async def delete_path(ctx, path: str, recursive: bool = False) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "write")
     except Exception as e:
         return _err(e)
     if not os.path.exists(abs_):
@@ -273,7 +311,7 @@ async def delete_path(ctx, path: str, recursive: bool = False) -> str:
 
 async def mkdir(ctx, path: str, parents: bool = False) -> str:
     try:
-        abs_ = _resolve_and_gate(ctx, path)
+        abs_ = await _resolve_and_gate_or_request(ctx, path, "write")
     except Exception as e:
         return _err(e)
     if os.path.exists(abs_):
@@ -292,8 +330,8 @@ async def mkdir(ctx, path: str, parents: bool = False) -> str:
 
 async def rename(ctx, src: str, dst: str) -> str:
     try:
-        s = _resolve_and_gate(ctx, src)
-        d = _resolve_and_gate(ctx, dst)
+        s = await _resolve_and_gate_or_request(ctx, src, "write")
+        d = await _resolve_and_gate_or_request(ctx, dst, "write")
     except Exception as e:
         return _err(e)
     if not os.path.exists(s):
@@ -311,7 +349,7 @@ async def rename(ctx, src: str, dst: str) -> str:
 
 async def glob_files(ctx, pattern: str, root: str) -> str:
     try:
-        abs_root = _resolve_and_gate(ctx, root)
+        abs_root = await _resolve_and_gate_or_request(ctx, root, "search")
     except Exception as e:
         return _err(e)
     visible_roots = [r["path"] for r in ctx["conn"].execute(
@@ -355,7 +393,7 @@ def _is_blocked(p: str, roots, user_patterns) -> bool:
 async def search_content(ctx, query: str, root: str,
                           glob_pattern: Optional[str]) -> str:
     try:
-        abs_root = _resolve_and_gate(ctx, root)
+        abs_root = await _resolve_and_gate_or_request(ctx, root, "search")
     except Exception as e:
         return _err(e)
     visible_roots = [r["path"] for r in ctx["conn"].execute(

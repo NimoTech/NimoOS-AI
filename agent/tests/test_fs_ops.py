@@ -5,6 +5,8 @@ import pytest
 import db as db_module
 from fs import ops as fsops
 from fs.snapshots import SnapshotStore
+from confirm import ConfirmManager
+from fs import access_request
 
 
 class FakeSink:
@@ -28,10 +30,12 @@ def ctx(tmp_path):
     conn.commit()
     sink = FakeSink()
     store = SnapshotStore(root=str(tmp_path / "snap"))
+    access_request.reset_state()
     return {
         "conn": conn, "sink": sink, "store": store, "root": str(root),
         "session_id": "s1", "run_id": "r1", "user_patterns": [],
         "chat_username": "nobody-xyz",
+        "confirm_mgr": ConfirmManager(conn),
     }
 
 
@@ -114,5 +118,73 @@ def test_search_content(ctx, tmp_path):
 def test_scope_violation(ctx, tmp_path):
     other = tmp_path / "other"; other.mkdir()
     (other / "x.txt").write_text("x")
-    out = _run(fsops.read_file(ctx, str(other / "x.txt")))
+
+    async def go():
+        task = asyncio.ensure_future(fsops.read_file(ctx, str(other / "x.txt")))
+        await _resolve_event(ctx, False)
+        return await task
+    out = _run(go())
     assert "Error" in out
+
+
+def _resolve_event(ctx, confirmed):
+    async def waiter():
+        for _ in range(200):
+            evs = [e for e in ctx["sink"].events if e["type"] == "access_request"]
+            if evs:
+                ctx["confirm_mgr"].resolve(evs[-1]["confirm_id"], confirmed,
+                                           expected_session_id=ctx["session_id"])
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError("no access_request event")
+    return waiter()
+
+
+def test_unauthorized_dir_grant_then_list(ctx, tmp_path):
+    # A dir OUTSIDE the visible root.
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "f.txt").write_text("x")
+
+    async def go():
+        task = asyncio.ensure_future(fsops.list_dir(ctx, str(outside)))
+        await _resolve_event(ctx, True)
+        return await task
+    out = _run(go())
+    assert "f.txt" in out  # op continued after grant
+    assert ctx["conn"].execute(
+        "SELECT kind FROM visible_resources WHERE path=?", (str(outside),)
+    ).fetchone()["kind"] == "folder"
+
+
+def test_unauthorized_deny_returns_error(ctx, tmp_path):
+    outside = tmp_path / "nope"; outside.mkdir()
+
+    async def go():
+        task = asyncio.ensure_future(fsops.list_dir(ctx, str(outside)))
+        await _resolve_event(ctx, False)
+        return await task
+    out = _run(go())
+    assert "用户拒绝" in out
+
+
+def test_hard_blacklist_never_prompts(ctx):
+    out = _run(fsops.read_file(ctx, "/etc/passwd"))
+    assert out.startswith("Error:")
+    assert not [e for e in ctx["sink"].events if e["type"] == "access_request"]
+
+
+def test_new_file_requests_nearest_existing_folder(ctx, tmp_path):
+    # /existing exists, /existing/new.txt does not.
+    existing = tmp_path / "existing"; existing.mkdir()
+    target = existing / "new.txt"
+
+    async def go():
+        task = asyncio.ensure_future(fsops.write_file(ctx, str(target), "hi"))
+        await _resolve_event(ctx, True)
+        return await task
+    out = _run(go())
+    assert "Staged" in out
+    row = ctx["conn"].execute(
+        "SELECT path, kind FROM visible_resources WHERE path=?", (str(existing),)
+    ).fetchone()
+    assert row is not None and row["kind"] == "folder"  # folder, not the file
