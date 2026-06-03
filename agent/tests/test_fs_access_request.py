@@ -212,3 +212,31 @@ def test_access_requests_table_persists_across_reinit(tmp_path):
     conn2 = db_module.init_db(p, snapshots_root=str(tmp_path / "s"))
     row = conn2.execute("SELECT decision FROM access_requests WHERE confirm_id='c1'").fetchone()
     assert row is not None and row["decision"] == "granted"
+
+
+def test_cancelled_request_recorded_as_cancelled(ctx):
+    class _BlockingMgr:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+        def register(self, *a):
+            return "cidX"
+        async def wait(self, cid):
+            self.started.set()
+            await self.release.wait()
+            return True
+    ctx["confirm_mgr"] = _BlockingMgr()
+
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Cancel", "folder", "list"))
+        await ctx["confirm_mgr"].started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    asyncio.get_event_loop().run_until_complete(go())
+    row = ctx["conn"].execute(
+        "SELECT decision FROM access_requests WHERE confirm_id='cidX'").fetchone()
+    assert row is not None and row["decision"] == "cancelled"

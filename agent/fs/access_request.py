@@ -90,6 +90,7 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
     reason = _REASON.get(op, _DEFAULT_REASON)
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     _pending_requests[cache_key] = fut
+    confirm_id = None
     try:
         confirm_id = mgr.register(session_id, "grant_access", abs_path, "")
         _record_request(ctx, confirm_id, abs_path, kind, reason)
@@ -110,6 +111,13 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
             fut.set_result(granted)                          # 再广播给并发等待者
         return granted
     except BaseException as e:
+        # Cancelled/interrupted before a decision: mark the row so no NULL
+        # orphan lingers. Guarded — a failure here must not mask `e`.
+        if confirm_id is not None:
+            try:
+                _record_decision(ctx, confirm_id, "cancelled")
+            except Exception:
+                pass
         if not fut.done():
             fut.set_exception(e)                             # 异常也广播,防死锁
         raise
