@@ -61,6 +61,25 @@ def test_commit_emits_single_staged_batch_event(ctx, tmp_path):
     assert evs[0]["batch_id"]
 
 
+def test_commit_emits_event_even_on_midloop_failure(ctx, tmp_path):
+    root = tmp_path / "root"; (root / "a.jpg").write_text("x")
+    res = batch.preflight(ctx, [
+        {"op": "mkdir", "path": str(root / "p"), "dst": None,
+         "parents": False, "recursive": False},
+        {"op": "rename", "path": str(root / "a.jpg"),
+         "dst": str(root / "b.jpg"), "parents": False, "recursive": False}])
+    assert res.errors == []
+    (root / "b.jpg").write_text("squat")   # collide AFTER preflight
+    import pytest
+    with pytest.raises(Exception):
+        _run(batch.commit(ctx, res))
+    evs = [e for e in ctx["sink"].events if e["type"] == "staged_batch"]
+    assert len(evs) == 1                       # event still emitted
+    assert evs[0]["batch_id"]
+    assert evs[0]["summary"]["mkdir"] == 1     # the mkdir that succeeded
+    assert evs[0]["summary"]["rename"] == 0
+
+
 def test_commit_delete_file_snapshots_and_removes(ctx, tmp_path):
     root = tmp_path / "root"; f = root / "junk.txt"; f.write_text("bye")
     res = batch.preflight(ctx, [

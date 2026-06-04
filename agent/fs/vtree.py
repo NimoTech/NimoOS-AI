@@ -52,7 +52,7 @@ class VTree:
                     for entry in it:
                         if entry.name not in node.children:
                             node.children[entry.name] = _Node(
-                                is_dir=entry.is_dir(),
+                                is_dir=entry.is_dir(follow_symlinks=False),
                                 origin=os.path.join(node.origin, entry.name))
             except (FileNotFoundError, NotADirectoryError, PermissionError):
                 pass
@@ -143,6 +143,8 @@ class VTree:
 
     def delete(self, path: str, recursive: bool = False) -> None:
         abs_path = os.path.normpath(os.path.abspath(path))
+        if not self._split(abs_path):
+            raise VTreeError("cannot delete filesystem root")
         node = self._find(abs_path)
         if node is None:
             raise VTreeError(f"does not exist: {abs_path}")

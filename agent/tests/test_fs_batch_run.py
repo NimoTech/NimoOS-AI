@@ -67,6 +67,20 @@ def test_run_batch_happy_path_commits(ctx, tmp_path):
         "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 2
 
 
+def test_run_batch_rejects_symlink_target(ctx, tmp_path):
+    import os
+    root = tmp_path / "root"
+    realdir = root / "real"; realdir.mkdir(); (realdir / "f").write_text("x")
+    link = root / "link"; os.symlink(str(realdir), str(link))
+    out = _run(batch.run_batch(ctx, [
+        {"op": "delete", "path": str(link), "dst": None,
+         "parents": False, "recursive": True}]))
+    assert "符号链接" in out
+    assert os.path.islink(str(link))    # untouched
+    assert ctx["conn"].execute(
+        "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 0
+
+
 def test_run_batch_mixed_mkdir_move_delete(ctx, tmp_path):
     root = tmp_path / "root"
     (root / "a.jpg").write_text("1"); (root / "b.jpg").write_text("2")

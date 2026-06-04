@@ -92,6 +92,12 @@ def test_rename_unhydrated_dir_preserves_children(tmp_path):
         vt.delete(str(b), recursive=False)       # non-empty -> rejected
 
 
+def test_delete_root_rejected():
+    vt = VTree()
+    with pytest.raises(VTreeError):
+        vt.delete(os.sep, recursive=True)
+
+
 def test_rename_deep_subtree_preserves_grandchildren(tmp_path):
     deep = tmp_path / "A" / "sub"; deep.mkdir(parents=True)
     (deep / "deep.txt").write_text("y")

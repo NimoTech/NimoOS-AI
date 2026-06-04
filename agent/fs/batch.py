@@ -71,6 +71,12 @@ def preflight(ctx, operations: list) -> PreflightResult:
         if fatal:
             continue  # blocked op: do not apply to vtree
 
+        # ---- reject symlinks ----
+        if any(os.path.islink(rp) for rp in raw_paths):
+            res.errors.append({"index": i, "op": kind,
+                               "reason": "路径为符号链接,batch_fs 暂不支持,请单独处理"})
+            continue
+
         # ---- safety valve for recursive delete ----
         if kind == "delete" and op.get("recursive") and os.path.isdir(abs_paths[0]):
             cnt, byt = _estimate_dir(abs_paths[0])
@@ -119,69 +125,71 @@ async def commit(ctx, result) -> str:
     items = []
     summary = {"mkdir": 0, "rename": 0, "delete": 0}
 
-    for entry in result.ok:
-        kind = entry["op"]
-        abs_paths = entry["_abs"]
-        seq = _next_seq(ctx)
-        if kind == "mkdir":
-            target = abs_paths[0]
-            if os.path.exists(target):           # last-moment guard
-                continue
-            if entry.get("parents"):
-                os.makedirs(target, exist_ok=False)
-            else:
-                os.mkdir(target)
-            staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
-                           "mkdir", target, batch_id=batch_id)
-            summary["mkdir"] += 1
-            items.append({"seq": seq, "op": "mkdir", "path": target})
-        elif kind == "rename":
-            src, dst = abs_paths[0], abs_paths[1]
-            if not os.path.exists(src) or os.path.exists(dst):  # last-moment guard
-                raise RuntimeError(f"rename precondition changed: {src} -> {dst}")
-            os.rename(src, dst)
-            staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
-                           "rename", src, dst_path=dst, batch_id=batch_id)
-            summary["rename"] += 1
-            items.append({"seq": seq, "op": "rename", "path": src, "dst_path": dst})
-        elif kind == "delete":
-            target = abs_paths[0]
-            if not os.path.exists(target):       # last-moment guard
-                continue
-            st = os.stat(target)
-            if os.path.isfile(target):
-                snap = staging.maybe_take_file_snapshot(
-                    conn, ctx["store"], ctx["session_id"], ctx["run_id"],
-                    str(seq), target)
-                os.remove(target)
+    try:
+        for entry in result.ok:
+            kind = entry["op"]
+            abs_paths = entry["_abs"]
+            seq = _next_seq(ctx)
+            if kind == "mkdir":
+                target = abs_paths[0]
+                if os.path.exists(target):           # last-moment guard
+                    continue
+                if entry.get("parents"):
+                    os.makedirs(target, exist_ok=False)
+                else:
+                    os.mkdir(target)
                 staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
-                               "delete_file", target,
-                               snapshot_path=snap, snapshot_kind="file",
-                               original_uid=st.st_uid, original_gid=st.st_gid,
-                               original_mode=st.st_mode & 0o777,
-                               size_bytes=st.st_size, batch_id=batch_id)
-            else:
-                is_empty = not any(os.scandir(target))
-                snap = None
-                kindsnap = None
-                if not is_empty:
-                    snap = ctx["store"].take_tar(ctx["session_id"], ctx["run_id"],
-                                                 str(seq), target)
-                    kindsnap = "tar"
-                shutil.rmtree(target)
+                               "mkdir", target, batch_id=batch_id)
+                summary["mkdir"] += 1
+                items.append({"seq": seq, "op": "mkdir", "path": target})
+            elif kind == "rename":
+                src, dst = abs_paths[0], abs_paths[1]
+                if not os.path.exists(src) or os.path.exists(dst):  # last-moment guard
+                    raise RuntimeError(f"rename precondition changed: {src} -> {dst}")
+                os.rename(src, dst)
                 staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
-                               "delete_dir", target,
-                               snapshot_path=snap, snapshot_kind=kindsnap,
-                               original_uid=st.st_uid, original_gid=st.st_gid,
-                               original_mode=st.st_mode & 0o777,
-                               batch_id=batch_id)
-            summary["delete"] += 1
-            items.append({"seq": seq, "op": "delete", "path": target})
-
-    await ctx["sink"].put({
-        "type": "staged_batch", "run_id": ctx["run_id"], "batch_id": batch_id,
-        "summary": summary, "items": items,
-    })
+                               "rename", src, dst_path=dst, batch_id=batch_id)
+                summary["rename"] += 1
+                items.append({"seq": seq, "op": "rename", "path": src, "dst_path": dst})
+            elif kind == "delete":
+                target = abs_paths[0]
+                if not os.path.exists(target):       # last-moment guard
+                    continue
+                st = os.stat(target)
+                if os.path.isfile(target):
+                    snap = staging.maybe_take_file_snapshot(
+                        conn, ctx["store"], ctx["session_id"], ctx["run_id"],
+                        str(seq), target)
+                    os.remove(target)
+                    staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                                   "delete_file", target,
+                                   snapshot_path=snap, snapshot_kind="file",
+                                   original_uid=st.st_uid, original_gid=st.st_gid,
+                                   original_mode=st.st_mode & 0o777,
+                                   size_bytes=st.st_size, batch_id=batch_id)
+                else:
+                    is_empty = not any(os.scandir(target))
+                    snap = None
+                    kindsnap = None
+                    if not is_empty:
+                        snap = ctx["store"].take_tar(ctx["session_id"], ctx["run_id"],
+                                                     str(seq), target)
+                        kindsnap = "tar"
+                    shutil.rmtree(target)
+                    staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                                   "delete_dir", target,
+                                   snapshot_path=snap, snapshot_kind=kindsnap,
+                                   original_uid=st.st_uid, original_gid=st.st_gid,
+                                   original_mode=st.st_mode & 0o777,
+                                   batch_id=batch_id)
+                summary["delete"] += 1
+                items.append({"seq": seq, "op": "delete", "path": target})
+    finally:
+        if items:
+            await ctx["sink"].put({
+                "type": "staged_batch", "run_id": ctx["run_id"],
+                "batch_id": batch_id, "summary": summary, "items": items,
+            })
     return batch_id
 
 
@@ -195,6 +203,12 @@ def _format_rejection(res) -> str:
         for e in res.errors:
             lines.append(f"  - [#{e['index']}] {e['op']}: {e['reason']}")
     return "\n".join(lines)
+
+
+def conn_count(ctx, batch_id: str) -> int:
+    return ctx["conn"].execute(
+        "SELECT COUNT(*) AS c FROM staged_changes WHERE session_id=? AND batch_id=?",
+        (ctx["session_id"], batch_id)).fetchone()["c"]
 
 
 async def run_batch(ctx, operations: list) -> str:
@@ -219,6 +233,8 @@ async def run_batch(ctx, operations: list) -> str:
     try:
         batch_id = await commit(ctx, res)
     except Exception as e:
-        return f"批量提交中断:{e}。已暂存的改动带同一 batch,可整批撤销。"
-    return (f"已暂存 {len(res.ok)} 项结构操作(batch={batch_id})。"
+        return (f"批量提交中途失败:{e}。已暂存的部分已生成可撤销卡片"
+                f"(同一批次),可在卡片上整批或逐项撤销。")
+    count = conn_count(ctx, batch_id)
+    return (f"已暂存 {count} 项结构操作(batch={batch_id})。"
             f"等待用户在卡片上确认或撤销。")
