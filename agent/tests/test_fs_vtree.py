@@ -78,3 +78,25 @@ def test_mkdir_missing_parent_without_parents_rejected(tmp_path):
     vt = VTree()
     with pytest.raises(VTreeError):
         vt.mkdir(str(tmp_path / "x" / "y"), parents=False)
+
+
+def test_rename_unhydrated_dir_preserves_children(tmp_path):
+    # Move a real on-disk dir WITHOUT any prior query that would hydrate it.
+    a = tmp_path / "A"; a.mkdir(); (a / "child.txt").write_text("x")
+    b = tmp_path / "B"
+    vt = VTree()
+    vt.rename(str(a), str(b))
+    assert vt.exists(str(b / "child.txt"))      # moved child still visible
+    assert not vt.is_empty_dir(str(b))          # B is non-empty
+    with pytest.raises(VTreeError):
+        vt.delete(str(b), recursive=False)       # non-empty -> rejected
+
+
+def test_rename_deep_subtree_preserves_grandchildren(tmp_path):
+    deep = tmp_path / "A" / "sub"; deep.mkdir(parents=True)
+    (deep / "deep.txt").write_text("y")
+    b = tmp_path / "B"
+    vt = VTree()
+    vt.rename(str(tmp_path / "A"), str(b))
+    assert vt.exists(str(b / "sub" / "deep.txt"))   # grandchild visible at new path
+    assert not vt.is_empty_dir(str(b / "sub"))

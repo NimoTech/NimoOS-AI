@@ -4,9 +4,10 @@ Models the *post-state* of a sequence of structural ops (mkdir/rename/delete)
 on top of the real disk, so each op can be validated against the cumulative
 effect of earlier ops in the same batch — WITHOUT touching disk.
 
-Hydration is lazy and read-only: the first time a path is inspected, its
-existence/type/children are read from disk via os.scandir/os.path, then cached.
-Subsequent mutations only touch the in-memory tree.
+Hydration is lazy and read-only. Each node remembers its `origin`: the real
+disk path it maps to (None for nodes created in-batch via mkdir). Hydration
+scans `origin`, so a subtree moved by rename keeps hydrating from its true
+on-disk location at any depth.
 """
 from __future__ import annotations
 
@@ -19,19 +20,18 @@ class VTreeError(Exception):
 
 
 class _Node:
-    __slots__ = ("is_dir", "children", "loaded")
+    __slots__ = ("is_dir", "children", "loaded", "origin")
 
-    def __init__(self, is_dir: bool):
+    def __init__(self, is_dir: bool, origin: Optional[str] = None):
         self.is_dir = is_dir
         self.children: Dict[str, "_Node"] = {}
-        self.loaded = False  # whether real children were hydrated
+        self.loaded = False          # whether real children were hydrated
+        self.origin = origin         # real disk path; None if virtual-only
 
 
 class VTree:
     def __init__(self) -> None:
-        # Root is always the filesystem root "/".
-        self._root = _Node(is_dir=True)
-        self._root.loaded = False
+        self._root = _Node(is_dir=True, origin=os.sep)
 
     # ---------- internal walk / hydrate ----------
 
@@ -41,33 +41,33 @@ class VTree:
             return []
         return [p for p in norm.strip(os.sep).split(os.sep) if p]
 
-    def _hydrate_children(self, node: _Node, abs_path: str) -> None:
-        """Populate node.children from the real disk once."""
+    def _hydrate_children(self, node: _Node) -> None:
+        """Populate node.children from the real disk once, scanning node.origin."""
         if node.loaded or not node.is_dir:
             node.loaded = True
             return
-        try:
-            with os.scandir(abs_path) as it:
-                for entry in it:
-                    if entry.name not in node.children:
-                        node.children[entry.name] = _Node(is_dir=entry.is_dir())
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            pass
+        if node.origin is not None:
+            try:
+                with os.scandir(node.origin) as it:
+                    for entry in it:
+                        if entry.name not in node.children:
+                            node.children[entry.name] = _Node(
+                                is_dir=entry.is_dir(),
+                                origin=os.path.join(node.origin, entry.name))
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                pass
         node.loaded = True
 
     def _find(self, path: str) -> Optional[_Node]:
         """Return the node for path, hydrating ancestors along the way, or None
         if path does not exist in the virtual tree."""
-        parts = self._split(path)
         node = self._root
-        cur = os.sep
-        for name in parts:
-            self._hydrate_children(node, cur)
+        for name in self._split(path):
+            self._hydrate_children(node)
             child = node.children.get(name)
             if child is None:
                 return None
             node = child
-            cur = os.path.join(cur, name)
         return node
 
     def _parent_dir_node(self, path: str) -> Optional[_Node]:
@@ -90,7 +90,7 @@ class VTree:
         n = self._find(path)
         if n is None or not n.is_dir:
             return False
-        self._hydrate_children(n, os.path.normpath(os.path.abspath(path)))
+        self._hydrate_children(n)
         return len(n.children) == 0
 
     # ---------- mutations (validate + apply) ----------
@@ -103,21 +103,19 @@ class VTree:
         if not parts:
             raise VTreeError("cannot mkdir filesystem root")
         node = self._root
-        cur = os.sep
         for i, name in enumerate(parts):
-            self._hydrate_children(node, cur)
+            self._hydrate_children(node)
             child = node.children.get(name)
             last = i == len(parts) - 1
             if child is None:
                 if not last and not parents:
-                    raise VTreeError(f"parent does not exist: {cur}")
-                child = _Node(is_dir=True)
+                    raise VTreeError(f"parent does not exist: {name}")
+                child = _Node(is_dir=True, origin=None)
                 child.loaded = True  # freshly created dir is empty + fully known
                 node.children[name] = child
             elif not child.is_dir:
                 raise VTreeError(f"path component is not a dir: {name}")
             node = child
-            cur = os.path.join(cur, name)
 
     def rename(self, src: str, dst: str) -> None:
         src_abs = os.path.normpath(os.path.abspath(src))
@@ -135,11 +133,12 @@ class VTree:
         if dst_parent is None:
             raise VTreeError(f"dst parent dir does not exist: "
                              f"{os.path.dirname(dst_abs)}")
-        # detach src from its parent
+        # detach src from its parent; the node keeps its origin so its real
+        # children stay hydratable from the original disk location at any depth.
         src_parent = self._parent_dir_node(src_abs)
-        assert src_parent is not None  # src exists => parent is a dir
+        if src_parent is None:
+            raise VTreeError(f"cannot move: {src_abs}")
         src_parent.children.pop(os.path.basename(src_abs), None)
-        # attach subtree under dst
         dst_parent.children[os.path.basename(dst_abs)] = src_node
 
     def delete(self, path: str, recursive: bool = False) -> None:
