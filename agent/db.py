@@ -197,6 +197,15 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
         conn.execute("ALTER TABLE sessions ADD COLUMN thinking_enabled INTEGER")
     if "thinking_level" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN thinking_level TEXT")
+    # Idempotent ALTER for existing databases without batch_id column.
+    staged_cols = {row["name"]
+                   for row in conn.execute("PRAGMA table_info(staged_changes)")}
+    if "batch_id" not in staged_cols:
+        conn.execute("ALTER TABLE staged_changes ADD COLUMN batch_id TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_staged_batch "
+        "ON staged_changes(session_id, batch_id)")
+    conn.commit()
     conn.execute("PRAGMA foreign_keys=ON")
 
     # Any run still flagged 'running' on startup means the prior process died
