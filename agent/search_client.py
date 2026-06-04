@@ -31,7 +31,17 @@ class SearchClient:
             json={"name": name, "arguments": arguments},
             headers=headers,
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # raise_for_status()'s default message names only the status and URL,
+            # dropping the response body — which is where search puts the real
+            # cause (e.g. "parser embed 500: ..."). Re-raise the same error type
+            # (callers catch httpx.HTTPError) with the body appended.
+            body = (r.text or "").strip()
+            msg = f"{e}: {body}" if body else str(e)
+            raise httpx.HTTPStatusError(
+                msg, request=e.request, response=e.response) from e
         return r.json()
 
     async def aclose(self) -> None:
