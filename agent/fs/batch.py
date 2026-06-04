@@ -7,7 +7,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 
-from fs import staging, validators
+from fs import staging, validators, access_request
 from fs.vtree import VTree, VTreeError
 
 MAX_OPS = 500
@@ -183,3 +183,42 @@ async def commit(ctx, result) -> str:
         "summary": summary, "items": items,
     })
     return batch_id
+
+
+def _format_rejection(res) -> str:
+    lines = []
+    if res.blocked:
+        lines.append("受保护路径,已忽略(请从批次移除): " +
+                     ", ".join(b["path"] for b in res.blocked))
+    if res.errors:
+        lines.append("校验失败,未做任何改动:")
+        for e in res.errors:
+            lines.append(f"  - [#{e['index']}] {e['op']}: {e['reason']}")
+    return "\n".join(lines)
+
+
+async def run_batch(ctx, operations: list) -> str:
+    res = preflight(ctx, operations)
+
+    # blocked / errors -> atomic reject, zero disk writes
+    if res.blocked or res.errors:
+        return _format_rejection(res)
+
+    # out-of-scope paths -> ONE merged authorization card
+    if res.need_grant:
+        granted = await access_request.request_access_batch(
+            ctx, res.need_grant, "write")
+        if not granted:
+            return "用户拒绝了访问授权,未做任何改动。"
+        # TOCTOU: disk may have changed while the card was pending -> re-preflight
+        res = preflight(ctx, operations)
+        if res.need_grant or res.blocked or res.errors:
+            return ("磁盘状态在授权期间发生变化,已取消(未做任何改动)。\n"
+                    + _format_rejection(res))
+
+    try:
+        batch_id = await commit(ctx, res)
+    except Exception as e:
+        return f"批量提交中断:{e}。已暂存的改动带同一 batch,可整批撤销。"
+    return (f"已暂存 {len(res.ok)} 项结构操作(batch={batch_id})。"
+            f"等待用户在卡片上确认或撤销。")
