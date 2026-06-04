@@ -825,17 +825,21 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
 
     for gi, group in enumerate(groups):
         turn = assistant_turns[gi] if gi < len(assistant_turns) else assistant_turns[-1]
-        turn.setdefault("blocks", [])
-        for r in group:
-            turn["blocks"].append({
-                "type": "access_request",
-                "confirmId": r["confirm_id"],
-                "path": r["path"],
-                "kind": r["kind"],
-                "reason": r["reason"],
-                "decided": True,
-                "granted": r["decision"] == "granted",
-            })
+        bs = turn.setdefault("blocks", [])
+        cards = [{
+            "type": "access_request",
+            "confirmId": r["confirm_id"],
+            "path": r["path"],
+            "kind": r["kind"],
+            "reason": r["reason"],
+            "decided": True,
+            "granted": r["decision"] == "granted",
+        } for r in group]
+        # The access request happened right before the file operation it gated,
+        # so place the card(s) before the first tool block of the turn (after any
+        # leading text/thinking), not dangling at the very end of the turn.
+        insert_at = next((i for i, b in enumerate(bs) if b.get("type") == "tool"), len(bs))
+        bs[insert_at:insert_at] = cards
     return messages
 
 

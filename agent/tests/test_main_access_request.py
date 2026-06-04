@@ -84,3 +84,30 @@ def test_inject_no_assistant_turn_creates_one(tmp_path):
     cards = [b for m in out if m.get("role") == "assistant"
              for b in m.get("blocks", []) if b.get("type") == "access_request"]
     assert len(cards) == 1 and cards[0]["path"] == "/only"
+
+
+def test_inject_places_card_before_first_tool_block(tmp_path):
+    conn = _mk_conn(tmp_path, "place.db")
+    _add_req(conn, "c1", "r1", "/DATA/Docs", "granted", 1001)
+    messages = [
+        {"role": "user", "content": "整理"},
+        {"role": "assistant", "blocks": [
+            {"type": "md", "text": "好的"},
+            {"type": "tool", "name": "list_dir", "sections": []},
+            {"type": "md", "text": "整理完成"},
+        ]},
+    ]
+    out = main_module._inject_access_request_cards(messages, "s1", conn)
+    blocks = [m for m in out if m.get("role") == "assistant"][0]["blocks"]
+    types = [b["type"] for b in blocks]
+    assert types == ["md", "access_request", "tool", "md"]
+
+
+def test_inject_no_tool_block_appends_at_end(tmp_path):
+    conn = _mk_conn(tmp_path, "place2.db")
+    _add_req(conn, "c1", "r1", "/DATA/Docs", "granted", 1001)
+    messages = [{"role": "assistant", "blocks": [{"type": "md", "text": "ok"}]}]
+    out = main_module._inject_access_request_cards(messages, "s1", conn)
+    blocks = [m for m in out if m.get("role") == "assistant"][0]["blocks"]
+    types = [b["type"] for b in blocks]
+    assert types == ["md", "access_request"]
