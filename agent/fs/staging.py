@@ -15,16 +15,17 @@ def record(conn: sqlite3.Connection, session_id: str, run_id: str,
            original_uid: Optional[int] = None,
            original_gid: Optional[int] = None,
            original_mode: Optional[int] = None,
-           size_bytes: Optional[int] = None) -> int:
+           size_bytes: Optional[int] = None,
+           batch_id: Optional[str] = None) -> int:
     cur = conn.execute(
         "INSERT INTO staged_changes "
         "(session_id, run_id, seq, op, path, dst_path, snapshot_path, "
         " snapshot_kind, original_uid, original_gid, original_mode, "
-        " size_bytes, status, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " size_bytes, status, created_at, batch_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (session_id, run_id, seq, op, path, dst_path, snapshot_path,
          snapshot_kind, original_uid, original_gid, original_mode,
-         size_bytes, "pending", int(time.time())),
+         size_bytes, "pending", int(time.time()), batch_id),
     )
     conn.commit()
     return cur.lastrowid

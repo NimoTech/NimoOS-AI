@@ -127,3 +127,12 @@ def test_revert_partial_returns_207(env):
         assert res["failed"]
     finally:
         os.chmod(f1, 0o600)
+
+
+def test_record_persists_batch_id(env, tmp_path):
+    conn, store, tp = env
+    f = tp / "a.txt"; f.write_text("x")
+    staging.record(conn, "s1", "r1", 1, "mkdir", str(f), batch_id="b-123")
+    row = conn.execute(
+        "SELECT batch_id FROM staged_changes WHERE session_id='s1'").fetchone()
+    assert row["batch_id"] == "b-123"
