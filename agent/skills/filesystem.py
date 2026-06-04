@@ -6,10 +6,13 @@ ContextVars set by agent.py before every agent run.
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Optional
+from typing import Literal, Optional, Union
 
 from agents import function_tool
+from pydantic import BaseModel, Field
+from typing_extensions import Annotated
 
+from fs import batch as fsbatch
 from fs import ops as fsops
 
 
@@ -103,8 +106,49 @@ async def search_content(query: str, root: str,
     return await fsops.search_content(_ctx(), query, root, glob_pattern)
 
 
+class MkdirOp(BaseModel):
+    op: Literal["mkdir"]
+    path: str
+    parents: bool = False
+
+
+class RenameOp(BaseModel):
+    op: Literal["rename"]
+    path: str
+    dst: str
+
+
+class DeleteOp(BaseModel):
+    op: Literal["delete"]
+    path: str
+    recursive: bool = False
+
+
+FsOp = Annotated[Union[MkdirOp, RenameOp, DeleteOp], Field(discriminator="op")]
+
+
+async def _batch_fs_impl(operations: list) -> str:
+    ops = []
+    for o in operations:
+        d = o.model_dump() if isinstance(o, BaseModel) else dict(o)
+        ops.append({"op": d["op"], "path": d["path"],
+                    "dst": d.get("dst"), "parents": d.get("parents", False),
+                    "recursive": d.get("recursive", False)})
+    return await fsbatch.run_batch(_ctx(), ops)
+
+
+@function_tool
+async def batch_fs(operations: list[FsOp]) -> str:
+    """Stage many structural file operations in ONE call: mkdir / rename(move) /
+    delete. Validated as a group (all-or-nothing), then applied in the given
+    order. ALWAYS prefer this over calling mkdir/rename/delete one-by-one when you
+    have >= 2 structural operations (organizing/cleaning up files). For writing or
+    editing file *contents*, use write_file / edit_file."""
+    return await _batch_fs_impl(operations)
+
+
 ALL_TOOLS = [
     list_dir, read_file, read_file_lines,
     write_file, edit_file, delete_path, mkdir, rename,
-    glob_files, search_content,
+    glob_files, search_content, batch_fs,
 ]
