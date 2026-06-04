@@ -65,3 +65,24 @@ def test_run_batch_happy_path_commits(ctx, tmp_path):
     assert "暂存" in out or "staged" in out.lower()
     assert ctx["conn"].execute(
         "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 2
+
+
+def test_run_batch_mixed_mkdir_move_delete(ctx, tmp_path):
+    root = tmp_path / "root"
+    (root / "a.jpg").write_text("1"); (root / "b.jpg").write_text("2")
+    (root / "junk").mkdir(); (root / "junk" / "x").write_text("9")
+    ops = [{"op": "mkdir", "path": str(root / "pics"), "dst": None,
+            "parents": False, "recursive": False},
+           {"op": "rename", "path": str(root / "a.jpg"),
+            "dst": str(root / "pics" / "a.jpg"), "parents": False, "recursive": False},
+           {"op": "rename", "path": str(root / "b.jpg"),
+            "dst": str(root / "pics" / "b.jpg"), "parents": False, "recursive": False},
+           {"op": "delete", "path": str(root / "junk"), "dst": None,
+            "parents": False, "recursive": True}]
+    out = _run(batch.run_batch(ctx, ops))
+    assert (root / "pics" / "a.jpg").exists()
+    assert (root / "pics" / "b.jpg").exists()
+    assert not (root / "junk").exists()
+    rows = ctx["conn"].execute("SELECT batch_id FROM staged_changes").fetchall()
+    assert len(rows) == 4
+    assert len({r["batch_id"] for r in rows}) == 1   # all one batch
