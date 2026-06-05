@@ -1068,6 +1068,22 @@ def _read_user_thinking_defaults(conn, user_id: str):
         return ThinkingConfig(enabled=True, level=_ThinkingLevel.MEDIUM)
 
 
+def _read_max_turns_setting(conn, user_id: str) -> int:
+    """Raw user-level max_turns setting. 0 = unlimited; default 10.
+    Negative / non-integer values fall back to 10."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='max_turns_default'",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return 10
+    try:
+        v = int(row["value"])
+    except (ValueError, TypeError):
+        return 10
+    return v if v >= 0 else 10
+
+
 @app.get("/agent/user-settings/thinking")
 async def get_thinking_defaults(request: Request):
     user_id = request.headers.get("X-User-Id", "")
