@@ -105,3 +105,17 @@ def test_staged_batch_items_carry_db_id(ctx, tmp_path):
     db_id = ctx["conn"].execute(
         "SELECT id FROM staged_changes WHERE session_id='s1'").fetchone()["id"]
     assert ev["items"][0]["id"] == db_id
+
+
+def test_staged_batch_delete_items_use_precise_op(ctx, tmp_path):
+    root = tmp_path / "root"
+    f = root / "junk.txt"; f.write_text("bye")
+    d = root / "emptydir"; d.mkdir()
+    res = batch.preflight(ctx, [
+        {"op": "delete", "path": str(f), "dst": None, "parents": False, "recursive": False},
+        {"op": "delete", "path": str(d), "dst": None, "parents": False, "recursive": True}])
+    assert res.errors == []
+    _run(batch.commit(ctx, res))
+    ev = [e for e in ctx["sink"].events if e["type"] == "staged_batch"][0]
+    ops = {it["op"] for it in ev["items"]}
+    assert ops == {"delete_file", "delete_dir"}

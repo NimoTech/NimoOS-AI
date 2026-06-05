@@ -158,6 +158,7 @@ async def commit(ctx, result) -> str:
                     continue
                 st = os.stat(target)
                 if os.path.isfile(target):
+                    del_op = "delete_file"
                     snap = staging.maybe_take_file_snapshot(
                         conn, ctx["store"], ctx["session_id"], ctx["run_id"],
                         str(seq), target)
@@ -169,6 +170,7 @@ async def commit(ctx, result) -> str:
                                    original_mode=st.st_mode & 0o777,
                                    size_bytes=st.st_size, batch_id=batch_id)
                 else:
+                    del_op = "delete_dir"
                     is_empty = not any(os.scandir(target))
                     snap = None
                     kindsnap = None
@@ -184,7 +186,7 @@ async def commit(ctx, result) -> str:
                                    original_mode=st.st_mode & 0o777,
                                    batch_id=batch_id)
                 summary["delete"] += 1
-                items.append({"id": row_id, "seq": seq, "op": "delete", "path": target})
+                items.append({"id": row_id, "seq": seq, "op": del_op, "path": target})
     finally:
         if items:
             await ctx["sink"].put({
