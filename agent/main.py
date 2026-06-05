@@ -1174,6 +1174,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                attachment_ids: list[str] = (),
                user_msg_id: str = "",
                context_photo=None,
+               context_album=None,
                auth_header: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
@@ -1203,6 +1204,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 thinking=thinking,
                 attachment_ids=attachment_ids,
                 context_photo=context_photo,
+                context_album=context_album,
                 auth_header=auth_header,
             )
         except asyncio.CancelledError:
@@ -1384,6 +1386,7 @@ async def run_session(
         attachment_ids=req.attachment_ids,
         user_msg_id=user_msg_id,
         context_photo=req.context_photo,
+        context_album=req.context_album,
         auth_header=auth_header,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",

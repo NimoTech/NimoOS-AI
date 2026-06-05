@@ -304,6 +304,24 @@ def attachment_system_block(attachment_ids, *, session_id: str) -> str:
     return "\n".join(lines)
 
 
+def format_context_lines(context_photo=None, context_album=None) -> str:
+    """Render per-run UI context (viewed photo / target album) as text
+    appended to the system prompt. Returns "" when there is no context."""
+    out = ""
+    if context_photo is not None:
+        parts = [f'[Viewing photo: "{context_photo.name}"']
+        if context_photo.takenAt:
+            parts.append(f"taken {context_photo.takenAt}")
+        if context_photo.place:
+            parts.append(f"location: {context_photo.place}")
+        out += "\n\n" + ", ".join(parts) + "]"
+    if context_album is not None:
+        out += (f'\n\n[Target album: "{context_album.name}" '
+                f"(album_id: {context_album.id}) — add photos to this album; "
+                f"do NOT create a new one]")
+    return out
+
+
 class AgentRunner:
     def __init__(self, conn: sqlite3.Connection, confirm_mgr=None):
         self._conn = conn
@@ -398,6 +416,7 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
+        context_album=None,
         auth_header: str = "",
     ) -> None:
         lock = _get_lock(session_id)
@@ -540,13 +559,7 @@ class AgentRunner:
                 "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
             _ATT_D.set(data_root)
 
-            if context_photo is not None:
-                parts = [f'[Viewing photo: "{context_photo.name}"']
-                if context_photo.takenAt:
-                    parts.append(f"taken {context_photo.takenAt}")
-                if context_photo.place:
-                    parts.append(f"location: {context_photo.place}")
-                full_prompt += "\n\n" + ", ".join(parts) + "]"
+            full_prompt += format_context_lines(context_photo, context_album)
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
