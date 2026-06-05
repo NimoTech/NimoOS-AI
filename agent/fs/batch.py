@@ -138,19 +138,20 @@ async def commit(ctx, result) -> str:
                     os.makedirs(target, exist_ok=False)
                 else:
                     os.mkdir(target)
-                staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                row_id = staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
                                "mkdir", target, batch_id=batch_id)
                 summary["mkdir"] += 1
-                items.append({"seq": seq, "op": "mkdir", "path": target})
+                items.append({"id": row_id, "seq": seq, "op": "mkdir", "path": target})
             elif kind == "rename":
                 src, dst = abs_paths[0], abs_paths[1]
                 if not os.path.exists(src) or os.path.exists(dst):  # last-moment guard
                     raise RuntimeError(f"rename precondition changed: {src} -> {dst}")
                 os.rename(src, dst)
-                staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                row_id = staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
                                "rename", src, dst_path=dst, batch_id=batch_id)
                 summary["rename"] += 1
-                items.append({"seq": seq, "op": "rename", "path": src, "dst_path": dst})
+                items.append({"id": row_id, "seq": seq, "op": "rename",
+                              "path": src, "dst_path": dst})
             elif kind == "delete":
                 target = abs_paths[0]
                 if not os.path.exists(target):       # last-moment guard
@@ -161,7 +162,7 @@ async def commit(ctx, result) -> str:
                         conn, ctx["store"], ctx["session_id"], ctx["run_id"],
                         str(seq), target)
                     os.remove(target)
-                    staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                    row_id = staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
                                    "delete_file", target,
                                    snapshot_path=snap, snapshot_kind="file",
                                    original_uid=st.st_uid, original_gid=st.st_gid,
@@ -176,14 +177,14 @@ async def commit(ctx, result) -> str:
                                                      str(seq), target)
                         kindsnap = "tar"
                     shutil.rmtree(target)
-                    staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
+                    row_id = staging.record(conn, ctx["session_id"], ctx["run_id"], seq,
                                    "delete_dir", target,
                                    snapshot_path=snap, snapshot_kind=kindsnap,
                                    original_uid=st.st_uid, original_gid=st.st_gid,
                                    original_mode=st.st_mode & 0o777,
                                    batch_id=batch_id)
                 summary["delete"] += 1
-                items.append({"seq": seq, "op": "delete", "path": target})
+                items.append({"id": row_id, "seq": seq, "op": "delete", "path": target})
     finally:
         if items:
             await ctx["sink"].put({

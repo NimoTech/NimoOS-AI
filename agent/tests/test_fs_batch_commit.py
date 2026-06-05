@@ -92,3 +92,16 @@ def test_commit_delete_file_snapshots_and_removes(ctx, tmp_path):
     ).fetchone()
     assert row["op"] == "delete_file"
     assert row["snapshot_path"]   # snapshot was taken for undo
+
+
+def test_staged_batch_items_carry_db_id(ctx, tmp_path):
+    root = tmp_path / "root"; (root / "a.jpg").write_text("x")
+    res = batch.preflight(ctx, [
+        {"op": "rename", "path": str(root / "a.jpg"),
+         "dst": str(root / "b.jpg"), "parents": False, "recursive": False}])
+    _run(batch.commit(ctx, res))
+    ev = [e for e in ctx["sink"].events if e["type"] == "staged_batch"][0]
+    assert "id" in ev["items"][0]
+    db_id = ctx["conn"].execute(
+        "SELECT id FROM staged_changes WHERE session_id='s1'").fetchone()["id"]
+    assert ev["items"][0]["id"] == db_id
