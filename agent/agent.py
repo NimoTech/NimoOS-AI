@@ -9,6 +9,7 @@ import uuid
 from typing import AsyncIterator
 
 from agents import Agent, Runner
+from agents.exceptions import MaxTurnsExceeded
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.reasoning_content_replay import default_should_replay_reasoning_content
 from openai import AsyncOpenAI
@@ -416,6 +417,8 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
+        max_turns: "int | None" = 10,
+        continue_run: bool = False,
         context_album=None,
         auth_header: str = "",
     ) -> None:
@@ -587,12 +590,15 @@ class AgentRunner:
             # supported for input_image".
             history = hydrate_image_blocks(
                 history, session_id=session_id, data_root=data_root)
-            input_messages = history + [{"role": "user", "content": user_content}]
+            if continue_run:
+                input_messages = history
+            else:
+                input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None
             try:
-                stream = Runner.run_streamed(agent, input_messages)
+                stream = Runner.run_streamed(agent, input_messages, max_turns=max_turns)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).
@@ -669,6 +675,21 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+            except MaxTurnsExceeded:
+                # 触顶不是错误,是"暂停":落库 + 发可继续事件,不发红色 error。
+                try:
+                    if stream is not None:
+                        partial = self._finalize_history(
+                            stream, session_id=session_id,
+                            attachment_ids=attachment_ids, data_root=data_root)
+                        partial = _repair_dangling_tool_calls(partial)
+                        self._save_history(session_id, partial)
+                except Exception:
+                    pass
+                await sink.put({
+                    "type": "max_turns_exceeded",
+                    "max_turns": max_turns if max_turns is not None else 0,
+                })
             except Exception as e:
                 # Evidence log: if a tool_call/tool pairing 400 ever slips past
                 # the converter repair, dump the exact item list so the root

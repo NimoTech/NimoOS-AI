@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db as db_module
 from agent import AgentRunner
@@ -136,6 +136,10 @@ class ThinkingConfigPayload(BaseModel):
     level: _ThinkingLevel
 
 
+class MaxTurnsPayload(BaseModel):
+    max_turns: int = Field(ge=0)
+
+
 class ContextPhoto(BaseModel):
     id: str
     name: str = ""
@@ -153,13 +157,14 @@ class CreateSessionRequest(BaseModel):
 
 
 class RunRequest(BaseModel):
-    message: str
+    message: str = ""
     model: str = "gpt-4o-mini"
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
     attachment_ids: list[str] = []
     context_photo: ContextPhoto | None = None
+    continue_run: bool = False
     context_album: ContextAlbum | None = None
 
 
@@ -1102,6 +1107,22 @@ def _read_user_thinking_defaults(conn, user_id: str):
         return ThinkingConfig(enabled=True, level=_ThinkingLevel.MEDIUM)
 
 
+def _read_max_turns_setting(conn, user_id: str) -> int:
+    """Raw user-level max_turns setting. 0 = unlimited; default 10.
+    Negative / non-integer values fall back to 10."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='max_turns_default'",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return 10
+    try:
+        v = int(row["value"])
+    except (ValueError, TypeError):
+        return 10
+    return v if v >= 0 else 10
+
+
 @app.get("/agent/user-settings/thinking")
 async def get_thinking_defaults(request: Request):
     user_id = request.headers.get("X-User-Id", "")
@@ -1121,6 +1142,27 @@ async def put_thinking_defaults(request: Request, body: ThinkingConfigPayload):
         (user_id, json.dumps({"enabled": body.enabled,
                               "level": body.level.value}),
          int(time.time())),
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@app.get("/agent/user-settings/max-turns")
+async def get_max_turns(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    return {"max_turns": _read_max_turns_setting(_db(), user_id)}
+
+
+@app.put("/agent/user-settings/max-turns")
+async def put_max_turns(request: Request, body: MaxTurnsPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    conn = _db()
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES(?, 'max_turns_default', ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (user_id, str(body.max_turns), int(time.time())),
     )
     conn.commit()
     return {"ok": True}
@@ -1174,6 +1216,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                attachment_ids: list[str] = (),
                user_msg_id: str = "",
                context_photo=None,
+               max_turns: "int | None" = 10,
+               continue_run: bool = False,
                context_album=None,
                auth_header: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
@@ -1204,6 +1248,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                 thinking=thinking,
                 attachment_ids=attachment_ids,
                 context_photo=context_photo,
+                max_turns=max_turns,
+                continue_run=continue_run,
                 context_album=context_album,
                 auth_header=auth_header,
             )
@@ -1337,6 +1383,9 @@ async def run_session(
 
     provider_type = request.headers.get("X-Agent-Provider-Type", "other")
 
+    mt_raw = _read_max_turns_setting(_conn, x_user_id)
+    max_turns = None if mt_raw == 0 else mt_raw
+
     # Inject SKILL.md into the message when X-Skill-Id header is present.
     # Fix 1.2: validate skill_id via regex BEFORE any path operations.
     skill_id = request.headers.get("X-Skill-Id", "").strip()
@@ -1386,6 +1435,8 @@ async def run_session(
         attachment_ids=req.attachment_ids,
         user_msg_id=user_msg_id,
         context_photo=req.context_photo,
+        max_turns=max_turns,
+        continue_run=req.continue_run,
         context_album=req.context_album,
         auth_header=auth_header,
     )

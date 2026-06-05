@@ -146,6 +146,47 @@ def test_repair_dangling_tool_calls_inserts_output():
     assert out[2]["call_id"] == "c1"
     assert out[2]["output"]  # non-empty placeholder
 
+# 追加到 NimoOS-AI/agent/tests/test_agent.py
+@pytest.mark.asyncio
+async def test_max_turns_exceeded_emits_event_and_persists(runner, conn):
+    import uuid, time
+    from agents.exceptions import MaxTurnsExceeded
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    conn.commit()
+
+    async def boom():
+        raise MaxTurnsExceeded("Max turns (10) exceeded")
+        yield
+
+    mock = MagicMock()
+    mock.stream_events = boom
+    mock.final_output = None
+    mock.to_input_list.return_value = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "list_dir", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "[]"},
+    ]
+
+    q = asyncio.Queue()
+    with patch("agent.Runner.run_streamed", return_value=mock):
+        await runner.run(session_id, "u", "go", q, "k", "http://x/v1", "m", max_turns=10)
+
+    drained = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    types = [e["type"] for e in drained]
+    assert "max_turns_exceeded" in types
+    assert "error" not in types               # 不再当普通报错
+    assert types[-1] == "done"
+    mt = next(e for e in drained if e["type"] == "max_turns_exceeded")
+    assert mt["max_turns"] == 10
+    # 历史已落库(刷新后可见 + 继续可用)
+    rows = conn.execute("SELECT content FROM messages WHERE session_id=?", (session_id,)).fetchall()
+    assert len(rows) == 1
+
 
 def test_repair_dangling_tool_calls_leaves_paired_calls_untouched():
     from agent import _repair_dangling_tool_calls
@@ -448,6 +489,73 @@ def test_chatcompletions_model_uses_deepseek_reasoning_replay_hook():
             provider_data={"model": "deepseek-v4-flash"}),
     )
     assert default_should_replay_reasoning_content(ctx) is True
+
+
+# 追加到 NimoOS-AI/agent/tests/test_agent.py
+@pytest.mark.asyncio
+async def test_run_passes_max_turns_to_sdk(runner, conn):
+    import uuid, time
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    conn.commit()
+
+    captured = {}
+
+    async def empty():
+        return
+        yield
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        captured["max_turns"] = kwargs.get("max_turns")
+        captured["input"] = input_messages
+        m = MagicMock()
+        m.stream_events = empty
+        m.to_input_list.return_value = []
+        m.final_output = ""
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id, "u", "hi", asyncio.Queue(),
+                         "k", "http://x/v1", "m", max_turns=None)
+    assert captured["max_turns"] is None  # unlimited passes through
+
+
+@pytest.mark.asyncio
+async def test_continue_run_feeds_history_without_user_turn(runner, conn):
+    import uuid, time, json as _json
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    prior = [{"role": "user", "content": "earlier"},
+             {"type": "message", "role": "assistant",
+              "content": [{"type": "output_text", "text": "ok"}]}]
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), session_id, "history", _json.dumps(prior), int(time.time())))
+    conn.commit()
+
+    captured = {}
+
+    async def empty():
+        return
+        yield
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        captured["input"] = input_messages
+        m = MagicMock(); m.stream_events = empty
+        m.to_input_list.return_value = []; m.final_output = ""
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id, "u", "", asyncio.Queue(),
+                         "k", "http://x/v1", "m", continue_run=True)
+    roles = [m.get("role") for m in captured["input"] if isinstance(m, dict)]
+    # No NEW trailing user turn was appended for the continue run.
+    assert captured["input"][-1].get("role") != "user" or \
+        captured["input"][-1].get("content") != ""
 
 
 def test_repair_pairs_through_interleaved_empty_assistant_message():
