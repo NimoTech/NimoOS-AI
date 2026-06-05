@@ -6,8 +6,10 @@ import pytest
 
 @pytest.fixture
 def main_mod(tmp_path, monkeypatch):
-    # Same isolation pattern as test_main_agent_type.py: fresh DB + clean
-    # module graph so main's import-time DB init hits the temp path.
+    # Same isolation approach as test_main_agent_type.py (fresh AGENT_DB_PATH
+    # + module reload). A plain sync fixture is enough here: these tests only
+    # construct Pydantic models. Async endpoint tests need the
+    # @pytest_asyncio.fixture + AsyncClient pattern from that file instead.
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "test.db"))
     for mod in ["main", "agent", "db"]:
         sys.modules.pop(mod, None)
