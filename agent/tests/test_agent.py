@@ -224,6 +224,90 @@ def test_repair_tool_messages_fully_answered_unchanged():
     assert _repair_tool_messages(msgs) == msgs
 
 
+def test_repair_drops_orphan_tool_message():
+    """A tool message with no preceding assistant tool_calls must be dropped
+    (DeepSeek 400: 'tool must be a response to a preceding message with
+    tool_calls')."""
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "ghost", "content": "orphan"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    out = _repair_tool_messages(msgs)
+    assert all(m.get("role") != "tool" for m in out)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+
+
+def test_repair_splits_parallel_tool_calls_for_deepseek():
+    """DeepSeek can't replay a multi-tool_call assistant message; it must be
+    split into sequential single-call assistant+tool pairs, each carrying
+    reasoning_content."""
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "assistant", "content": "doing", "reasoning_content": "R",
+         "tool_calls": [
+             {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+             {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+             {"id": "c3", "type": "function", "function": {"name": "c", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+        {"role": "tool", "tool_call_id": "c3", "content": "r3"},
+    ]
+    out = _repair_tool_messages(msgs, model="deepseek-v4-flash")
+    # Expect: asst[c1],tool c1, asst[c2],tool c2, asst[c3],tool c3
+    assert [m["role"] for m in out] == [
+        "assistant", "tool", "assistant", "tool", "assistant", "tool"]
+    for k in range(0, 6, 2):
+        am = out[k]
+        assert len(am["tool_calls"]) == 1
+        assert am["reasoning_content"] == "R"  # carried onto every split msg
+        assert out[k + 1]["tool_call_id"] == am["tool_calls"][0]["id"]
+    assert out[0]["content"] == "doing"      # original content on the first only
+    assert out[2]["content"] is None
+
+
+def test_repair_keeps_parallel_tool_calls_for_non_deepseek():
+    """Non-DeepSeek providers keep the single multi-tool_call assistant message
+    (parallel execution is fine for them)."""
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ]
+    out = _repair_tool_messages(msgs, model="gpt-4o-mini")
+    assert [m["role"] for m in out] == ["assistant", "tool", "tool"]
+    assert len(out[0]["tool_calls"]) == 2
+
+
+def test_converter_patch_splits_parallel_for_deepseek_end_to_end():
+    """End-to-end through the real SDK converter: a turn with parallel tool calls
+    replayed for DeepSeek must come out as single-call assistant+tool pairs, so
+    every tool message is immediately preceded by an assistant carrying exactly
+    that one tool_call."""
+    import agent  # noqa: F401 — applies the converter patch
+    from agents.models.chatcmpl_converter import Converter
+
+    items = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "a", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call", "name": "b", "call_id": "c2", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "r1"},
+        {"type": "function_call_output", "call_id": "c2", "output": "r2"},
+    ]
+    msgs = Converter.items_to_messages(items, model="deepseek-v4-flash")
+    for k, m in enumerate(msgs):
+        if m.get("role") == "tool":
+            prev = msgs[k - 1]
+            assert prev.get("role") == "assistant"
+            tcs = prev.get("tool_calls") or []
+            assert len(tcs) == 1, "DeepSeek must see exactly one tool_call per assistant"
+            assert tcs[0]["id"] == m["tool_call_id"]
+
+
 def test_converter_patch_guarantees_paired_tool_messages():
     """End-to-end: the SDK's real items_to_messages, after the agent module's
     monkeypatch, must never emit an assistant tool_calls without a matching tool
