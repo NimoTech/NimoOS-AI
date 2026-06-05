@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db as db_module
 from agent import AgentRunner
@@ -133,6 +133,10 @@ from provider_adapters import ThinkingLevel as _ThinkingLevel
 class ThinkingConfigPayload(BaseModel):
     enabled: bool
     level: _ThinkingLevel
+
+
+class MaxTurnsPayload(BaseModel):
+    max_turns: int = Field(ge=0)
 
 
 class ContextPhoto(BaseModel):
@@ -1103,6 +1107,27 @@ async def put_thinking_defaults(request: Request, body: ThinkingConfigPayload):
         (user_id, json.dumps({"enabled": body.enabled,
                               "level": body.level.value}),
          int(time.time())),
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@app.get("/agent/user-settings/max-turns")
+async def get_max_turns(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    return {"max_turns": _read_max_turns_setting(_db(), user_id)}
+
+
+@app.put("/agent/user-settings/max-turns")
+async def put_max_turns(request: Request, body: MaxTurnsPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    conn = _db()
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES(?, 'max_turns_default', ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (user_id, str(body.max_turns), int(time.time())),
     )
     conn.commit()
     return {"ok": True}
