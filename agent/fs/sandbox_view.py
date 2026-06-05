@@ -121,9 +121,19 @@ def build_view(session_id: str, db: sqlite3.Connection,
     for real, kind in resolved:
         if kind == "file" and not any(
                 real == p or real.startswith(p + os.sep) for p in kept):
+            # Gate the file itself: if a (user) blacklist pattern matches it,
+            # do not expose it — keeps shell consistent with the file tools,
+            # which re-gate on every read.
+            if _is_masked(real, kept, user_patterns):
+                view.skipped.append(real)
+                continue
             view.ro_binds.append((real, real))
 
     for folder in kept:
+        # Gate the folder root itself (trailing sep for dir-pattern matching).
+        if _is_masked(folder + os.sep, kept, user_patterns):
+            view.skipped.append(folder)
+            continue
         view.ro_binds.append((folder, folder))
         if not _walk_dir(folder, kept, user_patterns, view, [MAX_ENTRIES]):
             # The root's OWN entry scan was truncated: its contents were not

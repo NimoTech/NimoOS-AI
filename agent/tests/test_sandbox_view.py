@@ -157,3 +157,32 @@ def test_unreadable_dir_is_safe(tmp_path, monkeypatch):
     # root still bound; no masks/crash
     assert (real, real) in view.ro_binds
     assert view.file_masks == [] and view.dir_masks == []
+
+
+def test_authorized_file_matching_user_pattern_not_bound(tmp_path):
+    f = tmp_path / "data.csv"; f.write_text("x")
+    conn = _db_with([(str(f), "file")])
+    view = sv.build_view("s1", conn, ["*.csv"])
+    real = os.path.realpath(str(f))
+    assert (real, real) not in view.ro_binds   # blacklist drift → not exposed
+    assert real in view.skipped
+
+
+def test_authorized_file_no_pattern_still_bound(tmp_path):
+    f = tmp_path / "data.csv"; f.write_text("x")
+    conn = _db_with([(str(f), "file")])
+    view = sv.build_view("s1", conn, [])
+    real = os.path.realpath(str(f))
+    assert (real, real) in view.ro_binds
+
+
+def test_authorized_folder_root_matching_user_pattern_not_bound(tmp_path):
+    secret = tmp_path / "secretdir"; secret.mkdir()
+    (secret / "f.txt").write_text("x")
+    conn = _db_with([(str(secret), "folder")])
+    view = sv.build_view("s1", conn, ["secretdir/"])
+    real = os.path.realpath(str(secret))
+    assert (real, real) not in view.ro_binds
+    assert real in view.skipped
+    # since the root isn't bound, no child masks were emitted for it either
+    assert not any(p.startswith(real + os.sep) for p in view.file_masks)
