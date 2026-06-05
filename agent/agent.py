@@ -393,6 +393,8 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
+        max_turns: "int | None" = 10,
+        continue_run: bool = False,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -546,12 +548,15 @@ class AgentRunner:
             # supported for input_image".
             history = hydrate_image_blocks(
                 history, session_id=session_id, data_root=data_root)
-            input_messages = history + [{"role": "user", "content": user_content}]
+            if continue_run:
+                input_messages = history
+            else:
+                input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None
             try:
-                stream = Runner.run_streamed(agent, input_messages)
+                stream = Runner.run_streamed(agent, input_messages, max_turns=max_turns)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).

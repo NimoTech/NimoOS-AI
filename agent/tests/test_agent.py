@@ -448,3 +448,70 @@ def test_chatcompletions_model_uses_deepseek_reasoning_replay_hook():
             provider_data={"model": "deepseek-v4-flash"}),
     )
     assert default_should_replay_reasoning_content(ctx) is True
+
+
+# 追加到 NimoOS-AI/agent/tests/test_agent.py
+@pytest.mark.asyncio
+async def test_run_passes_max_turns_to_sdk(runner, conn):
+    import uuid, time
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    conn.commit()
+
+    captured = {}
+
+    async def empty():
+        return
+        yield
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        captured["max_turns"] = kwargs.get("max_turns")
+        captured["input"] = input_messages
+        m = MagicMock()
+        m.stream_events = empty
+        m.to_input_list.return_value = []
+        m.final_output = ""
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id, "u", "hi", asyncio.Queue(),
+                         "k", "http://x/v1", "m", max_turns=None)
+    assert captured["max_turns"] is None  # unlimited passes through
+
+
+@pytest.mark.asyncio
+async def test_continue_run_feeds_history_without_user_turn(runner, conn):
+    import uuid, time, json as _json
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    prior = [{"role": "user", "content": "earlier"},
+             {"type": "message", "role": "assistant",
+              "content": [{"type": "output_text", "text": "ok"}]}]
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), session_id, "history", _json.dumps(prior), int(time.time())))
+    conn.commit()
+
+    captured = {}
+
+    async def empty():
+        return
+        yield
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        captured["input"] = input_messages
+        m = MagicMock(); m.stream_events = empty
+        m.to_input_list.return_value = []; m.final_output = ""
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id, "u", "", asyncio.Queue(),
+                         "k", "http://x/v1", "m", continue_run=True)
+    roles = [m.get("role") for m in captured["input"] if isinstance(m, dict)]
+    # No NEW trailing user turn was appended for the continue run.
+    assert captured["input"][-1].get("role") != "user" or \
+        captured["input"][-1].get("content") != ""
