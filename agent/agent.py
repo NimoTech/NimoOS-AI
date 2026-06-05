@@ -708,55 +708,87 @@ _SYNTHETIC_TOOL_RESULT = (
 )
 
 
-def _repair_tool_messages(messages: list) -> list:
-    """Ensure every assistant `tool_calls` entry is answered by a following
-    `tool` message — operating on Chat Completions *messages* (dicts with
-    `role`/`tool_calls`/`tool_call_id`), i.e. the final payload the provider
-    receives.
+def _repair_tool_messages(messages: list, *, model: str | None = None) -> list:
+    """Normalise Chat Completions *messages* (dicts with
+    `role`/`tool_calls`/`tool_call_id`) so the provider can't reject the
+    tool-call/tool-result structure. Operates on the final payload the provider
+    actually receives (the SDK's single conversion chokepoint). Three guarantees:
 
-    This is the hard guarantee against 400 "An assistant message with
-    'tool_calls' must be followed by tool messages ... (insufficient tool
-    messages following tool_calls)". The Agents SDK cancels still-running
-    sibling tool tasks when one parallel call fails; cancelled tasks raise
-    CancelledError, which the per-tool failure handler does NOT catch, so they
-    produce no tool output. Whatever the cause (failure or cancellation), any
-    unanswered tool_call gets a placeholder tool message here, inserted right
-    after that assistant message's existing tool replies.
+    1. Forward — every assistant `tool_calls[i].id` is answered by a following
+       `tool` message; missing ones get a placeholder. The Agents SDK cancels
+       sibling tool tasks when one parallel call fails; cancelled tasks raise
+       CancelledError (not caught by the per-tool failure handler) and produce
+       no output, leaving a dangling tool_call. -> avoids 400 "insufficient tool
+       messages following tool_calls".
 
-    Idempotent and parallel-safe: fully-answered turns pass through unchanged,
-    so it does not interfere with normal parallel tool execution.
+    2. Reverse — a `tool` message with no matching preceding assistant tool_call
+       is dropped. -> avoids 400 "Messages with role 'tool' must be a response
+       to a preceding message with 'tool_calls'".
+
+    3. DeepSeek only — an assistant message with MORE THAN ONE tool_call is split
+       into sequential single-tool_call assistant+tool pairs. deepseek-v4-flash
+       emits parallel tool calls even with parallel_tool_calls=False, and the
+       DeepSeek API rejects replaying a multi-tool_call assistant message (it
+       associates only the first tool result, orphaning the rest). reasoning_content
+       is carried onto every split message (DeepSeek thinking-mode requires it).
+
+    Idempotent. Well-formed turns for other providers pass through unchanged.
     """
     if not isinstance(messages, list):
         return messages
+    split_parallel = bool(model) and "deepseek" in model.lower()
     out: list = []
     i = 0
     n = len(messages)
     while i < n:
         msg = messages[i]
-        out.append(msg)
-        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
-        if isinstance(msg, dict) and msg.get("role") == "assistant" and tool_calls:
-            call_ids = [tc.get("id") for tc in tool_calls
-                        if isinstance(tc, dict) and tc.get("id")]
-            # Consume the consecutive `tool` messages that answer this turn.
-            answered: set = set()
+        tcs = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and tcs:
+            # Index the consecutive `tool` replies that follow this turn.
             j = i + 1
+            tool_by_id: dict = {}
             while (j < n and isinstance(messages[j], dict)
                    and messages[j].get("role") == "tool"):
-                out.append(messages[j])
-                tcid = messages[j].get("tool_call_id")
-                if tcid:
-                    answered.add(tcid)
+                tid = messages[j].get("tool_call_id")
+                if tid is not None and tid not in tool_by_id:
+                    tool_by_id[tid] = messages[j]
+                # duplicate / id-less tool replies are dropped as orphans
                 j += 1
-            for cid in call_ids:
-                if cid not in answered:
-                    out.append({
-                        "role": "tool",
-                        "tool_call_id": cid,
-                        "content": _SYNTHETIC_TOOL_RESULT,
-                    })
+
+            ordered = [tc for tc in tcs if isinstance(tc, dict) and tc.get("id")]
+
+            def _reply_for(cid):
+                return tool_by_id.get(cid) or {
+                    "role": "tool", "tool_call_id": cid,
+                    "content": _SYNTHETIC_TOOL_RESULT,
+                }
+
+            if split_parallel and len(ordered) > 1:
+                reasoning = msg.get("reasoning_content")
+                for k, tc in enumerate(ordered):
+                    if k == 0:
+                        am = {kk: vv for kk, vv in msg.items() if kk != "tool_calls"}
+                        am["tool_calls"] = [tc]
+                    else:
+                        am = {"role": "assistant", "content": None,
+                              "tool_calls": [tc]}
+                        if reasoning:
+                            am["reasoning_content"] = reasoning
+                    out.append(am)
+                    out.append(_reply_for(tc["id"]))
+            else:
+                out.append(msg)
+                for tc in ordered:
+                    out.append(_reply_for(tc["id"]))
             i = j
             continue
+
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            # Orphan tool message (no preceding assistant tool_calls) -> drop.
+            i += 1
+            continue
+
+        out.append(msg)
         i += 1
     return out
 
@@ -776,7 +808,13 @@ def _install_tool_message_repair_patch() -> None:
     _orig_fn = _cc.Converter.items_to_messages.__func__
 
     def _patched(cls, *args, **kwargs):
-        return _repair_tool_messages(_orig_fn(cls, *args, **kwargs))
+        # items_to_messages(cls, items, model=None, ...): model is the first
+        # kwarg, or the 2nd positional after items. Needed so DeepSeek-specific
+        # parallel-tool_call splitting only fires for DeepSeek.
+        model = kwargs.get("model")
+        if model is None and len(args) >= 2:
+            model = args[1]
+        return _repair_tool_messages(_orig_fn(cls, *args, **kwargs), model=model)
 
     _cc.Converter.items_to_messages = classmethod(_patched)
     _cc.Converter._nimoos_tool_repair_patched = True
