@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -33,6 +34,8 @@ import skills.search as search_skills
 from fs.snapshots import SnapshotStore
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
+
+_LOG = logging.getLogger("nimoos-agent")
 
 SYSTEM_PROMPT = """You are Nimo, a general-purpose AI assistant that also has the ability to manage the user's NimoOS NAS.
 
@@ -626,6 +629,22 @@ class AgentRunner:
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
             except Exception as e:
+                # Evidence log: if a tool_call/tool pairing 400 ever slips past
+                # the converter repair, dump the exact item list so the root
+                # cause can be confirmed from a real payload (until now it was
+                # inferred). Truncated to keep logs sane.
+                err_text = str(e)
+                if ("tool_calls" in err_text
+                        or "insufficient tool messages" in err_text):
+                    try:
+                        items = stream.to_input_list() if stream is not None else []
+                        _LOG.warning(
+                            "tool-pairing 400 evidence: session=%s err=%s items=%s",
+                            session_id, err_text,
+                            json.dumps(items, ensure_ascii=False)[:8000],
+                        )
+                    except Exception:
+                        pass
                 # Persist the partial turn BEFORE surfacing the error. Without
                 # this, _save_history never runs and the whole question/answer
                 # vanishes on refresh: /messages reads only the saved history, so
