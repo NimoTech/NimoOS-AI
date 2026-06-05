@@ -75,3 +75,10 @@ def test_orphan_session_sidecar_dir_pruned(tmp_path):
     (snap_root / "ghost-session" / "f.bin").write_bytes(b"x")
     db_module.init_db(db_path, snapshots_root=str(snap_root))
     assert not (snap_root / "ghost-session").exists()
+
+
+def test_staged_changes_has_batch_id_column(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "a.db"),
+                             snapshots_root=str(tmp_path / "snap"))
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(staged_changes)")}
+    assert "batch_id" in cols

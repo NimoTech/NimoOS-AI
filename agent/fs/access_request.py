@@ -9,6 +9,8 @@ exactly like the write-op confirmation flow (skills/app_management.py).
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 
 # op category -> human reason shown on the card.
@@ -123,3 +125,61 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
         raise
     finally:
         _pending_requests.pop(cache_key, None)               # 必清理
+
+
+def _infer_kind(abs_path: str) -> str:
+    """Return 'folder' for directories (and non-existent paths, treated as future dirs),
+    'file' for existing files. Matches the anchoring logic in ops._candidate_for_request."""
+    if os.path.isfile(abs_path):
+        return "file"
+    return "folder"
+
+
+async def request_access_batch(ctx, abs_paths: list[str], op: str) -> bool:
+    """Emit ONE access-request card covering all abs_paths; the user approves or
+    denies the whole set atomically. Returns True only on approval. On approval,
+    every path is persisted as a grant in visible_resources using the SAME
+    persistence logic as request_access (folder grant for dirs / nearest folder
+    for files — match whatever request_access does). Returns True immediately for
+    an empty list. Returns False if ctx['confirm_mgr'] is None (headless)."""
+    if not abs_paths:
+        return True
+
+    mgr = ctx["confirm_mgr"]
+    if mgr is None:
+        return False
+
+    session_id = ctx["session_id"]
+    reason = _REASON.get(op, _DEFAULT_REASON)
+    confirm_id = None
+    try:
+        confirm_id = mgr.register(session_id, "grant_access", abs_paths[0], "")
+        # Store one DB row for the whole batch. The `path` column holds a
+        # JSON-encoded list so a refreshed page can rebuild the multi-path card.
+        # Using INSERT OR IGNORE keeps `_record_request` safe if somehow called
+        # twice (though that cannot happen here).
+        _record_request(ctx, confirm_id, json.dumps(abs_paths), "folder", reason)
+        await ctx["sink"].put({
+            "type": "access_request",
+            "confirm_id": confirm_id,
+            "paths": abs_paths,
+            # Keep a single `path` field for backwards-compatible consumers that
+            # only look at the first path.
+            "path": abs_paths[0],
+            "kind": "folder",
+            "reason": reason,
+        })
+        granted = await mgr.wait(confirm_id)
+        _record_decision(ctx, confirm_id, "granted" if granted else "denied")
+        if granted:
+            for p in abs_paths:
+                kind = _infer_kind(p)
+                _insert_visible_resource(ctx, p, kind)
+        return granted
+    except BaseException as e:
+        if confirm_id is not None:
+            try:
+                _record_decision(ctx, confirm_id, "cancelled")
+            except Exception:
+                pass
+        raise

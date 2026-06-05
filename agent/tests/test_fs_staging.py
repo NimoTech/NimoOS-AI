@@ -127,3 +127,41 @@ def test_revert_partial_returns_207(env):
         assert res["failed"]
     finally:
         os.chmod(f1, 0o600)
+
+
+def test_record_persists_batch_id(env, tmp_path):
+    conn, store, tp = env
+    f = tp / "a.txt"; f.write_text("x")
+    staging.record(conn, "s1", "r1", 1, "mkdir", str(f), batch_id="b-123")
+    row = conn.execute(
+        "SELECT batch_id FROM staged_changes WHERE session_id='s1'").fetchone()
+    assert row["batch_id"] == "b-123"
+
+
+def test_revert_batch_undoes_all_in_reverse(env, tmp_path):
+    conn, store, tp = env
+    root = tp; (root / "p").mkdir()
+    staging.record(conn, "s1", "r1", 1, "mkdir", str(root / "p"), batch_id="b1")
+    # simulate the post-rename state on disk: a.txt moved to p/a
+    (root / "p" / "a").write_text("x")
+    staging.record(conn, "s1", "r1", 2, "rename", str(root / "a"),
+                   dst_path=str(root / "p" / "a"), batch_id="b1")
+    out = staging.revert_batch(conn, store, "s1", "b1")
+    assert out["status"] == "ok"
+    assert (root / "a").exists()        # rename reversed (p/a -> a)
+    assert not (root / "p").exists()    # mkdir reversed after (reverse seq order)
+
+
+def test_revert_items_conflict_when_dir_not_empty(env, tmp_path):
+    conn, store, tp = env
+    (tp / "p").mkdir(); (tp / "p" / "child").write_text("x")
+    sid = staging.record(conn, "s1", "r1", 1, "mkdir", str(tp / "p"),
+                         batch_id="b1")
+    out = staging.revert_items(conn, store, "s1", [sid])
+    assert out["status"] == "conflict"
+    assert (tp / "p").exists()          # not force-removed
+
+
+def test_revert_batch_nothing_when_unknown(env, tmp_path):
+    conn, store, tp = env
+    assert staging.revert_batch(conn, store, "s1", "nope")["status"] == "nothing_to_revert"

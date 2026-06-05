@@ -502,6 +502,25 @@ async def revert_run(
     return res
 
 
+class RevertRequest(BaseModel):
+    batch_id: str | None = None
+    staged_ids: list[int] | None = None
+
+
+@app.post("/agent/sessions/{session_id}/revert")
+async def revert_changes(
+    session_id: str,
+    req: RevertRequest,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    _assert_owns_session(session_id, x_user_id)
+    if req.batch_id:
+        return _fs_staging.revert_batch(_conn, _snapshot_store, session_id, req.batch_id)
+    if req.staged_ids:
+        return _fs_staging.revert_items(_conn, _snapshot_store, session_id, req.staged_ids)
+    return {"status": "nothing_to_revert"}
+
+
 @app.post("/agent/sessions")
 async def create_session(x_user_id: str = Header(..., alias="X-User-Id")):
     session_id = str(uuid.uuid4())

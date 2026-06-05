@@ -214,6 +214,78 @@ def test_access_requests_table_persists_across_reinit(tmp_path):
     assert row is not None and row["decision"] == "granted"
 
 
+def test_batch_approve_persists_all_paths(ctx, tmp_path):
+    """request_access_batch emits ONE access_request event; approving it writes
+    ALL supplied paths into visible_resources and returns True."""
+    dir_a = str(tmp_path / "dirA")
+    dir_b = str(tmp_path / "dirB")
+
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access_batch(ctx, [dir_a, dir_b], "write"))
+        await _resolve_after_event(ctx, True)
+        return await task
+
+    granted = asyncio.get_event_loop().run_until_complete(go())
+    assert granted is True
+
+    # Exactly ONE access_request card emitted for the whole batch.
+    cards = [e for e in ctx["sink"].events if e["type"] == "access_request"]
+    assert len(cards) == 1, f"expected 1 card, got {len(cards)}"
+
+    # Both directories must now be in visible_resources.
+    for path in (dir_a, dir_b):
+        row = ctx["conn"].execute(
+            "SELECT kind FROM visible_resources WHERE session_id='s1' AND path=?",
+            (path,),
+        ).fetchone()
+        assert row is not None, f"{path!r} missing from visible_resources"
+
+
+def test_batch_deny_persists_nothing(ctx, tmp_path):
+    """Denying a batch request leaves visible_resources untouched and returns False."""
+    dir_a = str(tmp_path / "dirX")
+    dir_b = str(tmp_path / "dirY")
+
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access_batch(ctx, [dir_a, dir_b], "read"))
+        await _resolve_after_event(ctx, False)
+        return await task
+
+    granted = asyncio.get_event_loop().run_until_complete(go())
+    assert granted is False
+
+    for path in (dir_a, dir_b):
+        row = ctx["conn"].execute(
+            "SELECT kind FROM visible_resources WHERE session_id='s1' AND path=?",
+            (path,),
+        ).fetchone()
+        assert row is None, f"{path!r} should NOT be in visible_resources after denial"
+
+
+def test_batch_empty_list_returns_true(ctx):
+    """An empty batch is a no-op and returns True immediately."""
+    async def go():
+        return await access_request.request_access_batch(ctx, [], "list")
+
+    result = asyncio.get_event_loop().run_until_complete(go())
+    assert result is True
+    cards = [e for e in ctx["sink"].events if e["type"] == "access_request"]
+    assert len(cards) == 0
+
+
+def test_batch_headless_returns_false(ctx):
+    """When confirm_mgr is None (headless mode), batch returns False immediately."""
+    ctx["confirm_mgr"] = None
+
+    async def go():
+        return await access_request.request_access_batch(ctx, ["/some/path"], "read")
+
+    result = asyncio.get_event_loop().run_until_complete(go())
+    assert result is False
+
+
 def test_cancelled_request_recorded_as_cancelled(ctx):
     class _BlockingMgr:
         def __init__(self):

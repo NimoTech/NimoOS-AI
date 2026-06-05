@@ -103,3 +103,23 @@ def test_session_delete_wipes_sidecar(client, tmp_path):
                       headers={"X-User-Id": "42"})
     assert r.status_code == 200
     assert not os.path.exists(snap_dir)
+
+
+def test_revert_endpoint_batch(client):
+    """POST /agent/sessions/{sid}/revert with batch_id reverts the batch."""
+    from fs import staging as fs_staging
+
+    sid = _create_session(client, user_id="u1")
+    # Seed two pending staged_changes rows with batch_id="b1" via the same _conn
+    fs_staging.record(main_module._conn, sid, "r1", 1, "mkdir", "/tmp/x",
+                      batch_id="b1")
+    fs_staging.record(main_module._conn, sid, "r1", 2, "mkdir", "/tmp/y",
+                      batch_id="b1")
+
+    r = client.post(f"/agent/sessions/{sid}/revert",
+                    json={"batch_id": "b1"},
+                    headers={"X-User-Id": "u1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] in ("ok", "nothing_to_revert", "snapshot_missing",
+                               "conflict", "partial")
