@@ -143,6 +143,11 @@ class ContextPhoto(BaseModel):
     place: str = ""
 
 
+class ContextAlbum(BaseModel):
+    id: str
+    name: str = ""
+
+
 class CreateSessionRequest(BaseModel):
     agent_type: str = "general"
 
@@ -155,6 +160,7 @@ class RunRequest(BaseModel):
     thinking: ThinkingConfigPayload | None = None
     attachment_ids: list[str] = []
     context_photo: ContextPhoto | None = None
+    context_album: ContextAlbum | None = None
 
 
 class SandboxRunRequest(BaseModel):
