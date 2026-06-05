@@ -146,6 +146,47 @@ def test_repair_dangling_tool_calls_inserts_output():
     assert out[2]["call_id"] == "c1"
     assert out[2]["output"]  # non-empty placeholder
 
+# 追加到 NimoOS-AI/agent/tests/test_agent.py
+@pytest.mark.asyncio
+async def test_max_turns_exceeded_emits_event_and_persists(runner, conn):
+    import uuid, time
+    from agents.exceptions import MaxTurnsExceeded
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())))
+    conn.commit()
+
+    async def boom():
+        raise MaxTurnsExceeded("Max turns (10) exceeded")
+        yield
+
+    mock = MagicMock()
+    mock.stream_events = boom
+    mock.final_output = None
+    mock.to_input_list.return_value = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "list_dir", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "[]"},
+    ]
+
+    q = asyncio.Queue()
+    with patch("agent.Runner.run_streamed", return_value=mock):
+        await runner.run(session_id, "u", "go", q, "k", "http://x/v1", "m", max_turns=10)
+
+    drained = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    types = [e["type"] for e in drained]
+    assert "max_turns_exceeded" in types
+    assert "error" not in types               # 不再当普通报错
+    assert types[-1] == "done"
+    mt = next(e for e in drained if e["type"] == "max_turns_exceeded")
+    assert mt["max_turns"] == 10
+    # 历史已落库(刷新后可见 + 继续可用)
+    rows = conn.execute("SELECT content FROM messages WHERE session_id=?", (session_id,)).fetchall()
+    assert len(rows) == 1
+
 
 def test_repair_dangling_tool_calls_leaves_paired_calls_untouched():
     from agent import _repair_dangling_tool_calls
