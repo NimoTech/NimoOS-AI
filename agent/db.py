@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     thinking_enabled  INTEGER,
-    thinking_level    TEXT
+    thinking_level    TEXT,
+    agent_type        TEXT NOT NULL DEFAULT 'general'
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -197,6 +198,9 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
         conn.execute("ALTER TABLE sessions ADD COLUMN thinking_enabled INTEGER")
     if "thinking_level" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN thinking_level TEXT")
+    if "agent_type" not in existing:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'general'")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}

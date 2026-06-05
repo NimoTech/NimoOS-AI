@@ -29,6 +29,7 @@ from fs import staging as _fs_staging
 from fs.snapshots import SnapshotStore
 from attachments import upload as att_upload
 from attachments.paths import build_storage_path
+from profiles import PROFILES
 
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
@@ -146,6 +147,15 @@ class ContextPhoto(BaseModel):
     place: str = ""
 
 
+class ContextAlbum(BaseModel):
+    id: str
+    name: str = ""
+
+
+class CreateSessionRequest(BaseModel):
+    agent_type: str = "general"
+
+
 class RunRequest(BaseModel):
     message: str = ""
     model: str = "gpt-4o-mini"
@@ -155,6 +165,7 @@ class RunRequest(BaseModel):
     attachment_ids: list[str] = []
     context_photo: ContextPhoto | None = None
     continue_run: bool = False
+    context_album: ContextAlbum | None = None
 
 
 class SandboxRunRequest(BaseModel):
@@ -267,6 +278,11 @@ async def add_visible_resource(
     x_user_id: str = Header(..., alias="X-User-Id"),
 ):
     _assert_owns_session(session_id, x_user_id)
+    if _session_agent_type(session_id) != "general":
+        # Restricted profiles have no filesystem layer; this endpoint is
+        # meaningless for them and stays closed as an attack surface.
+        raise HTTPException(status_code=400,
+                            detail="visible-resources not supported for this agent profile")
     if body.kind not in ("folder", "file"):
         raise HTTPException(status_code=400, detail="kind must be folder|file")
     abs_ = os.path.abspath(body.path)
@@ -527,21 +543,39 @@ async def revert_changes(
 
 
 @app.post("/agent/sessions")
-async def create_session(x_user_id: str = Header(..., alias="X-User-Id")):
+async def create_session(body: CreateSessionRequest | None = None,
+                         x_user_id: str = Header(..., alias="X-User-Id")):
+    agent_type = body.agent_type if body is not None else "general"
+    if agent_type not in PROFILES:
+        # Fixed message on purpose: echoing the input would let callers
+        # probe which agent_type values exist.
+        raise HTTPException(status_code=422, detail="invalid agent_type")
     session_id = str(uuid.uuid4())
     now = int(time.time())
     _db().execute(
-        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
-        (session_id, x_user_id, None, now, now)
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at, agent_type) "
+        "VALUES (?,?,?,?,?,?)",
+        (session_id, x_user_id, None, now, now, agent_type)
     )
     _db().commit()
-    return {"session_id": session_id}
+    return {"session_id": session_id, "agent_type": agent_type}
+
+
+def _session_agent_type(session_id: str) -> str:
+    """Resolve a session's agent_type; missing row/value = 'general'."""
+    row = _db().execute(
+        "SELECT agent_type FROM sessions WHERE id=?", (session_id,)
+    ).fetchone()
+    if not row or not row["agent_type"]:
+        return "general"
+    return row["agent_type"]
 
 
 @app.get("/agent/sessions")
 async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
     rows = _db().execute(
-        "SELECT id, title, created_at, updated_at FROM sessions WHERE user_id=? ORDER BY updated_at DESC",
+        "SELECT id, title, created_at, updated_at, agent_type "
+        "FROM sessions WHERE user_id=? ORDER BY updated_at DESC",
         (x_user_id,)
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1183,7 +1217,9 @@ def _start_run(session_id: str, user_id: str, message: str,
                user_msg_id: str = "",
                context_photo=None,
                max_turns: "int | None" = 10,
-               continue_run: bool = False) -> RunSink:
+               continue_run: bool = False,
+               context_album=None,
+               auth_header: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1214,6 +1250,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                 context_photo=context_photo,
                 max_turns=max_turns,
                 continue_run=continue_run,
+                context_album=context_album,
+                auth_header=auth_header,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1272,6 +1310,10 @@ async def run_session(
     x_agent_provider_url: str = Header(..., alias="X-Agent-Provider-Url"),
 ):
     _assert_owns_session(session_id, x_user_id)
+    if req.kind == "init" and _session_agent_type(session_id) != "general":
+        # kind=init generates agent.md for a directory — path-layer only.
+        raise HTTPException(status_code=400,
+                            detail="kind=init not supported for this agent profile")
 
     # Validate attachment_ids belong to this session and are unbound
     if req.attachment_ids:
@@ -1313,6 +1355,9 @@ async def run_session(
         raise HTTPException(status_code=409, detail="agent_busy")
 
     user_patterns = _user_patterns_from_header(request)
+    # The gateway's reverse proxy forwards the user's Authorization header
+    # verbatim; photo tools need it for the Photos service's album endpoints.
+    auth_header = request.headers.get("Authorization", "")
 
     # Resolve thinking config: request body → session row → user_settings default.
     from provider_adapters import ThinkingConfig, ThinkingLevel
@@ -1392,6 +1437,8 @@ async def run_session(
         context_photo=req.context_photo,
         max_turns=max_turns,
         continue_run=req.continue_run,
+        context_album=req.context_album,
+        auth_header=auth_header,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

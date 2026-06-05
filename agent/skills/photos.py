@@ -1,10 +1,21 @@
 import json
+from contextvars import ContextVar
 
 import httpx
 from agents import function_tool
 
 URL_FILE = "/var/run/nimoos/photos.url"
 _TIMEOUT = 30.0
+
+# Per-run user JWT, set by agent.py before each run (same pattern as the other
+# per-skill ContextVars). Album endpoints on the Photos service require a user
+# JWT; search/smart merely tolerates its absence for localhost callers.
+AUTH_HEADER_VAR: ContextVar[str] = ContextVar("photos_auth_header", default="")
+
+
+def _auth_headers() -> dict:
+    auth = AUTH_HEADER_VAR.get()
+    return {"Authorization": auth} if auth else {}
 
 
 def _photos_base_url() -> str | None:
@@ -19,7 +30,17 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
     """Search photos by semantic description using CLIP AI.
 
     Args:
-        query: Natural language description, e.g. "sunset at beach", "birthday party".
+        query: The search runs TWO channels at once:
+               1. CLIP visual semantics — matches what the photo LOOKS like.
+                  Use a short ENGLISH description ("sunset at beach").
+               2. OCR exact text — the whole query is substring-matched
+                  against text recognized INSIDE photos; hits rank on top.
+                  Use a SHORT keyword in the language actually printed on
+                  the photo (e.g. Chinese receipts → “电脑” / store name /
+                  “发票”), never a long sentence.
+               Visual subjects → one English query. Text-bearing targets
+               (receipts, documents, screenshots) → query with the words
+               likely printed on them, in their original language.
         year:  Optional year filter (e.g. 2025). 0 means no filter.
         limit: Max results to return (1-50).
     """
@@ -39,6 +60,7 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
             resp = await client.post(
                 f"{base_url}/v1/photos/search/smart",
                 json=payload,
+                headers=_auth_headers(),
             )
         if resp.status_code != 200:
             return json.dumps({"error": f"HTTP {resp.status_code}"})
@@ -76,6 +98,7 @@ async def create_album(name: str) -> str:
             resp = await client.post(
                 f"{base_url}/v1/photos/albums",
                 json={"name": name},
+                headers=_auth_headers(),
             )
         if resp.status_code not in (200, 201):
             return f"Failed to create album: HTTP {resp.status_code}"
@@ -103,6 +126,7 @@ async def add_to_album(album_id: str, asset_ids: list[str]) -> str:
                 resp = await client.post(
                     f"{base_url}/v1/photos/albums/{album_id}/assets",
                     json={"assetId": asset_id},
+                    headers=_auth_headers(),
                 )
                 if resp.status_code == 200:
                     success += 1

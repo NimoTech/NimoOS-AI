@@ -32,7 +32,9 @@ import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
 import skills.search as search_skills
+import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
+from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
@@ -269,9 +271,12 @@ def compact_image_blocks(history, *, image_id_resolver):
     return out
 
 
-def select_tools_for_run(attachment_ids, *, session_id: str):
-    """Return tool list; conditionally appends `read_attachment` when at least
-    one attachment is non-image. Image-only or empty → unchanged ALL_TOOLS."""
+def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
+    """Return tool list. Restricted profiles pin the list with no dynamic
+    additions; otherwise conditionally appends `read_attachment` when at
+    least one attachment is non-image (unchanged original behavior)."""
+    if profile is not None and profile.tools is not None:
+        return list(profile.tools)
     rows = _fetch_attachments(attachment_ids, session_id)
     has_non_image = any(r["kind"] != "image" for r in rows)
     if has_non_image:
@@ -298,6 +303,24 @@ def attachment_system_block(attachment_ids, *, session_id: str) -> str:
                  "(e.g., empty_scanned, encrypted, timeout) — relay it to the user "
                  "in plain language in their own language.")
     return "\n".join(lines)
+
+
+def format_context_lines(context_photo=None, context_album=None) -> str:
+    """Render per-run UI context (viewed photo / target album) as text
+    appended to the system prompt. Returns "" when there is no context."""
+    out = ""
+    if context_photo is not None:
+        parts = [f'[Viewing photo: "{context_photo.name}"']
+        if context_photo.takenAt:
+            parts.append(f"taken {context_photo.takenAt}")
+        if context_photo.place:
+            parts.append(f"location: {context_photo.place}")
+        out += "\n\n" + ", ".join(parts) + "]"
+    if context_album is not None:
+        out += (f'\n\n[Target album: "{context_album.name}" '
+                f"(album_id: {context_album.id}) — add photos to this album; "
+                f"do NOT create a new one]")
+    return out
 
 
 class AgentRunner:
@@ -396,6 +419,8 @@ class AgentRunner:
         context_photo=None,
         max_turns: "int | None" = 10,
         continue_run: bool = False,
+        context_album=None,
+        auth_header: str = "",
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -446,6 +471,10 @@ class AgentRunner:
             # tracked follow-up).
             search_skills.USER_ID_VAR.set(str(user_id))
 
+            # Photos service auth: album endpoints validate the user JWT, so
+            # forward the caller's Authorization header to the photo tools.
+            photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
+
             # Mount the user's skill runtime view into the bwrap sandbox via
             # ContextVar (not os.environ, which would be clobbered by concurrent
             # async requests in the same process — Fix 1.1).
@@ -476,12 +505,22 @@ class AgentRunner:
                 should_replay_reasoning_content=default_should_replay_reasoning_content,
             )
 
-            base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
+            row = self._conn.execute(
+                "SELECT agent_type FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            profile = get_profile(row["agent_type"] if row else None)
+
+            # kind=init is rejected for non-general sessions at the API layer
+            # (main.py), so INIT_SYSTEM_PROMPT only ever pairs with the general
+            # profile here.
+            base = (init_doc.INIT_SYSTEM_PROMPT if kind == "init"
+                    else (profile.prompt or SYSTEM_PROMPT))
 
             # Prepend the Wiki context block. 5s budget: if Wiki is slow we'd
-            # rather drop the block than stall the user's chat.
+            # rather drop the block than stall the user's chat. Restricted
+            # profiles skip it: no filesystem layer, no wiki tools.
             wiki_block = ""
-            if wiki_client is not None:
+            if wiki_client is not None and profile.compose_resources:
                 try:
                     wiki_block = await asyncio.wait_for(
                         WikiContextBuilder(wiki_client).build(user_patterns or []),
@@ -490,9 +529,15 @@ class AgentRunner:
                 except Exception:
                     wiki_block = ""
             base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
-            full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+            if profile.compose_resources:
+                full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+            else:
+                full_prompt = base_with_wiki
 
-            if attachment_ids:
+            if attachment_ids and profile.tools is None:
+                # Pinned-profile runs skip the attachment block: read_attachment
+                # is not in their tool list, so advertising it would make the
+                # model call a tool that does not exist.
                 att_block = attachment_system_block(attachment_ids, session_id=session_id)
                 if att_block:
                     full_prompt = full_prompt + "\n\n" + att_block
@@ -517,13 +562,7 @@ class AgentRunner:
                 "NIMOOS_MAX_ATTACHMENT_TEXT_CHARS", "32768")))
             _ATT_D.set(data_root)
 
-            if context_photo is not None:
-                parts = [f'[Viewing photo: "{context_photo.name}"']
-                if context_photo.takenAt:
-                    parts.append(f"taken {context_photo.takenAt}")
-                if context_photo.place:
-                    parts.append(f"location: {context_photo.place}")
-                full_prompt += "\n\n" + ", ".join(parts) + "]"
+            full_prompt += format_context_lines(context_photo, context_album)
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
@@ -532,7 +571,9 @@ class AgentRunner:
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
-                tools=select_tools_for_run(attachment_ids, session_id=session_id),
+                tools=select_tools_for_run(attachment_ids,
+                                           session_id=session_id,
+                                           profile=profile),
                 model=model,
                 model_settings=model_settings,
             )
@@ -729,6 +770,20 @@ _SYNTHETIC_TOOL_RESULT = (
 )
 
 
+def _is_empty_assistant(m) -> bool:
+    """An assistant message with no tool_calls and no content. DeepSeek
+    thinking-mode emits one alongside a tool call; the converter lands it
+    between the tool_calls message and its tool replies, where it breaks
+    reply adjacency (the old code then 400'd; the repair pass would orphan
+    the real reply and substitute the placeholder)."""
+    if not (isinstance(m, dict) and m.get("role") == "assistant"):
+        return False
+    if m.get("tool_calls"):
+        return False
+    content = m.get("content")
+    return content is None or (isinstance(content, str) and not content.strip())
+
+
 def _repair_tool_messages(messages: list, *, model: str | None = None) -> list:
     """Normalise Chat Completions *messages* (dicts with
     `role`/`tool_calls`/`tool_call_id`) so the provider can't reject the
@@ -769,11 +824,15 @@ def _repair_tool_messages(messages: list, *, model: str | None = None) -> list:
             j = i + 1
             tool_by_id: dict = {}
             while (j < n and isinstance(messages[j], dict)
-                   and messages[j].get("role") == "tool"):
-                tid = messages[j].get("tool_call_id")
-                if tid is not None and tid not in tool_by_id:
-                    tool_by_id[tid] = messages[j]
-                # duplicate / id-less tool replies are dropped as orphans
+                   and (messages[j].get("role") == "tool"
+                        or _is_empty_assistant(messages[j]))):
+                if messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid is not None and tid not in tool_by_id:
+                        tool_by_id[tid] = messages[j]
+                # duplicate / id-less tool replies are dropped as orphans;
+                # empty assistant interlopers are skipped and dropped too —
+                # leaving them in would orphan every reply behind them
                 j += 1
 
             ordered = [tc for tc in tcs if isinstance(tc, dict) and tc.get("id")]
