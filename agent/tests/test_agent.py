@@ -448,3 +448,47 @@ def test_chatcompletions_model_uses_deepseek_reasoning_replay_hook():
             provider_data={"model": "deepseek-v4-flash"}),
     )
     assert default_should_replay_reasoning_content(ctx) is True
+
+
+def test_repair_pairs_through_interleaved_empty_assistant_message():
+    """DeepSeek thinking-mode emits an empty assistant message alongside a
+    tool call; the converter lands it BETWEEN the tool_calls message and the
+    real tool reply. The pairing scan must skip (and drop) it instead of
+    treating the real reply as an orphan: that substituted the placeholder
+    for the model (it kept seeing "no result") while the UI showed the real
+    results from the SSE event."""
+    from agent import _repair_tool_messages, _SYNTHETIC_TOOL_RESULT
+    msgs = [
+        {"role": "user", "content": "find beach photos"},
+        {"role": "assistant", "content": None, "reasoning_content": "R",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "search_photos", "arguments": "{}"}}]},
+        {"role": "assistant", "content": ""},          # empty interloper
+        {"role": "tool", "tool_call_id": "c1", "content": '{"count": 15}'},
+        {"role": "assistant", "content": "done"},
+    ]
+    out = _repair_tool_messages(msgs, model="deepseek-v4-flash")
+    tools = [m for m in out if m.get("role") == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["content"] == '{"count": 15}'      # real result preserved
+    assert all(m.get("content") != _SYNTHETIC_TOOL_RESULT for m in out)
+    # the empty interloper is gone
+    assert not any(m.get("role") == "assistant" and not m.get("tool_calls")
+                   and not (m.get("content") or "") for m in out)
+
+
+def test_repair_empty_assistant_skip_applies_to_all_providers():
+    """The adjacency break is not DeepSeek-specific — the forward-pairing
+    guarantee must survive the interloper for every provider."""
+    from agent import _repair_tool_messages, _SYNTHETIC_TOOL_RESULT
+    msgs = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "assistant", "content": ""},
+        {"role": "tool", "tool_call_id": "c1", "content": "REAL"},
+    ]
+    out = _repair_tool_messages(msgs)   # no model kwarg
+    tools = [m for m in out if m.get("role") == "tool"]
+    assert len(tools) == 1 and tools[0]["content"] == "REAL"
+    assert all(m.get("content") != _SYNTHETIC_TOOL_RESULT for m in out)

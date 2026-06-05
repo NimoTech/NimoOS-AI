@@ -736,6 +736,20 @@ _SYNTHETIC_TOOL_RESULT = (
 )
 
 
+def _is_empty_assistant(m) -> bool:
+    """An assistant message with no tool_calls and no content. DeepSeek
+    thinking-mode emits one alongside a tool call; the converter lands it
+    between the tool_calls message and its tool replies, where it breaks
+    reply adjacency (the old code then 400'd; the repair pass would orphan
+    the real reply and substitute the placeholder)."""
+    if not (isinstance(m, dict) and m.get("role") == "assistant"):
+        return False
+    if m.get("tool_calls"):
+        return False
+    content = m.get("content")
+    return content is None or (isinstance(content, str) and not content.strip())
+
+
 def _repair_tool_messages(messages: list, *, model: str | None = None) -> list:
     """Normalise Chat Completions *messages* (dicts with
     `role`/`tool_calls`/`tool_call_id`) so the provider can't reject the
@@ -776,11 +790,15 @@ def _repair_tool_messages(messages: list, *, model: str | None = None) -> list:
             j = i + 1
             tool_by_id: dict = {}
             while (j < n and isinstance(messages[j], dict)
-                   and messages[j].get("role") == "tool"):
-                tid = messages[j].get("tool_call_id")
-                if tid is not None and tid not in tool_by_id:
-                    tool_by_id[tid] = messages[j]
-                # duplicate / id-less tool replies are dropped as orphans
+                   and (messages[j].get("role") == "tool"
+                        or _is_empty_assistant(messages[j]))):
+                if messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid is not None and tid not in tool_by_id:
+                        tool_by_id[tid] = messages[j]
+                # duplicate / id-less tool replies are dropped as orphans;
+                # empty assistant interlopers are skipped and dropped too —
+                # leaving them in would orphan every reply behind them
                 j += 1
 
             ordered = [tc for tc in tcs if isinstance(tc, dict) and tc.get("id")]
