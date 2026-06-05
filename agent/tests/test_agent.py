@@ -306,6 +306,40 @@ async def test_error_path_persists_repaired_history(runner, conn):
     assert "error" in types and types[-1] == "done"
 
 
+@pytest.mark.asyncio
+async def test_tool_pairing_400_logs_evidence(runner, conn, caplog):
+    """A tool_call/tool pairing 400 must dump the exact item list to the
+    nimoos-agent logger so the root cause can be confirmed from a real payload."""
+    import logging, uuid, time
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())),
+    )
+    conn.commit()
+
+    async def boom():
+        raise RuntimeError("insufficient tool messages following tool_calls message")
+        yield
+
+    mock_stream = MagicMock()
+    mock_stream.stream_events = boom
+    mock_stream.final_output = None
+    mock_stream.to_input_list.return_value = [
+        {"type": "function_call", "name": "edit_file", "call_id": "c1", "arguments": "{}"},
+    ]
+
+    queue = asyncio.Queue()
+    with patch("agent.Runner.run_streamed", return_value=mock_stream):
+        with caplog.at_level(logging.WARNING, logger="nimoos-agent"):
+            await runner.run(session_id, "u", "go", queue,
+                             "k", "http://localhost/v1", "m")
+
+    evidence = [r for r in caplog.records if "tool-pairing 400 evidence" in r.getMessage()]
+    assert evidence, "expected an evidence log line for the tool-pairing 400"
+    assert "c1" in evidence[0].getMessage(), "evidence must include the offending items"
+
+
 def test_inject_synthetic_reasoning_no_op_when_no_assistant_messages():
     from agent import _inject_synthetic_reasoning
     items = [{"role": "user", "content": "u"}, {"role": "user", "content": "v"}]
