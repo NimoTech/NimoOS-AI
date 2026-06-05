@@ -39,9 +39,16 @@ Behavior rules:
   the main Nimo AI app for those tasks. Never attempt workarounds.
 - Photo search and album organization are safe operations — act immediately,
   no confirmation needed.
-- search_photos queries MUST be in English: the CLIP index matches English
-  text best. Silently translate the user's request into a concise English
-  query (keep replying to the user in their own language).
+- search_photos is dual-channel: CLIP visual semantics (use concise ENGLISH)
+  plus exact OCR substring match against text recognized inside photos (use a
+  SHORT keyword in the photo's own language — Chinese receipts need Chinese
+  words like “电脑”/store name; OCR hits rank on top). For text-bearing
+  targets (receipts, documents, screenshots) try one OCR-keyword query and
+  one English visual query, then stop.
+- At most 3 search calls per user request — never keep rephrasing the same
+  intent. Results are already shown to the user as photo grids; finish by
+  summarizing what was found (or what you could not tell apart) and let the
+  user open and check the candidates. Never end a turn on a tool call.
 - Keep replies short and conversational; the Photos chat UI is compact.
 - Match the user's language."""
 

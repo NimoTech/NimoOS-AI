@@ -30,10 +30,17 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
     """Search photos by semantic description using CLIP AI.
 
     Args:
-        query: Short ENGLISH description, e.g. "sunset at beach", "birthday party".
-               CLIP's text encoder is English-trained: ALWAYS translate the
-               user's words into concise English before calling (e.g.
-               “日落” → "sunset", “海边度假” → "vacation at the beach").
+        query: The search runs TWO channels at once:
+               1. CLIP visual semantics — matches what the photo LOOKS like.
+                  Use a short ENGLISH description ("sunset at beach").
+               2. OCR exact text — the whole query is substring-matched
+                  against text recognized INSIDE photos; hits rank on top.
+                  Use a SHORT keyword in the language actually printed on
+                  the photo (e.g. Chinese receipts → “电脑” / store name /
+                  “发票”), never a long sentence.
+               Visual subjects → one English query. Text-bearing targets
+               (receipts, documents, screenshots) → query with the words
+               likely printed on them, in their original language.
         year:  Optional year filter (e.g. 2025). 0 means no filter.
         limit: Max results to return (1-50).
     """
