@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at        INTEGER NOT NULL,
     thinking_enabled  INTEGER,
     thinking_level    TEXT,
-    agent_type        TEXT NOT NULL DEFAULT 'general'
+    agent_type        TEXT NOT NULL DEFAULT 'general',
+    network_granted   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -201,6 +202,9 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "agent_type" not in existing:
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'general'")
+    if "network_granted" not in existing:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN network_granted INTEGER NOT NULL DEFAULT 0")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}
@@ -284,3 +288,16 @@ def get_connection() -> sqlite3.Connection:
     if _conn is None:
         _conn = init_db()
     return _conn
+
+
+def is_network_granted(conn, session_id: str) -> bool:
+    row = conn.execute(
+        "SELECT network_granted FROM sessions WHERE id=?", (session_id,)
+    ).fetchone()
+    return bool(row and row["network_granted"])
+
+
+def grant_network(conn, session_id: str) -> None:
+    conn.execute(
+        "UPDATE sessions SET network_granted=1 WHERE id=?", (session_id,))
+    conn.commit()
