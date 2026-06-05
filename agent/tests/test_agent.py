@@ -131,6 +131,181 @@ def test_inject_synthetic_reasoning_fills_gaps():
     assert synth["summary"][0]["text"]
 
 
+def test_repair_dangling_tool_calls_inserts_output():
+    """A function_call with no following output must get a synthetic output so
+    the provider doesn't 400 with 'insufficient tool messages'."""
+    from agent import _repair_dangling_tool_calls
+    items = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "edit_file", "call_id": "c1", "arguments": "{}"},
+        # no function_call_output for c1
+    ]
+    out = _repair_dangling_tool_calls(items)
+    assert out[1]["type"] == "function_call"
+    assert out[2]["type"] == "function_call_output"
+    assert out[2]["call_id"] == "c1"
+    assert out[2]["output"]  # non-empty placeholder
+
+
+def test_repair_dangling_tool_calls_leaves_paired_calls_untouched():
+    from agent import _repair_dangling_tool_calls
+    items = [
+        {"type": "function_call", "name": "t", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+    ]
+    assert _repair_dangling_tool_calls(items) == items
+    # Idempotent: repairing twice changes nothing.
+    once = _repair_dangling_tool_calls(items)
+    assert _repair_dangling_tool_calls(once) == once
+
+
+def test_repair_dangling_tool_calls_mixed_parallel_calls():
+    """Two parallel calls where only the first got an output: only the second
+    is back-filled, and the existing pairing is preserved."""
+    from agent import _repair_dangling_tool_calls
+    items = [
+        {"type": "function_call", "name": "a", "call_id": "c1", "arguments": "{}"},
+        {"type": "function_call", "name": "b", "call_id": "c2", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        # c2 never produced an output (sibling cancelled)
+    ]
+    out = _repair_dangling_tool_calls(items)
+    outputs = [x for x in out if x.get("type") == "function_call_output"]
+    answered = {x["call_id"] for x in outputs}
+    assert answered == {"c1", "c2"}
+
+
+def test_repair_tool_messages_inserts_missing_tool_reply():
+    """An assistant tool_calls turn with no following tool message must get a
+    placeholder tool message (the failure-or-cancel fallback)."""
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "edit_file", "arguments": "{}"}}]},
+        # no tool message for c1
+    ]
+    out = _repair_tool_messages(msgs)
+    assert out[2] == {"role": "tool", "tool_call_id": "c1",
+                      "content": out[2]["content"]}
+    assert out[2]["content"]  # non-empty placeholder
+
+
+def test_repair_tool_messages_partial_parallel_keeps_order():
+    """Two parallel calls, only the first answered → the second (cancelled
+    sibling) gets a placeholder, inserted after the existing tool reply, and a
+    following assistant turn is preserved."""
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        # c2's reply is missing (sibling cancelled)
+        {"role": "assistant", "content": "done"},
+    ]
+    out = _repair_tool_messages(msgs)
+    roles = [m["role"] for m in out]
+    assert roles == ["assistant", "tool", "tool", "assistant"]
+    assert out[1]["tool_call_id"] == "c1"
+    assert out[2]["tool_call_id"] == "c2"
+    assert out[3] == {"role": "assistant", "content": "done"}
+
+
+def test_repair_tool_messages_fully_answered_unchanged():
+    from agent import _repair_tool_messages
+    msgs = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    assert _repair_tool_messages(msgs) == msgs
+
+
+def test_converter_patch_guarantees_paired_tool_messages():
+    """End-to-end: the SDK's real items_to_messages, after the agent module's
+    monkeypatch, must never emit an assistant tool_calls without a matching tool
+    message — even when the input item list has a dangling function_call (e.g. a
+    mid-run turn where a parallel sibling was cancelled)."""
+    import agent  # noqa: F401 — importing applies the converter patch
+    from agents.models.chatcmpl_converter import Converter
+
+    items = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "edit_file",
+         "call_id": "c1", "arguments": "{}"},
+        # NO function_call_output for c1 — the dangling case
+    ]
+    msgs = Converter.items_to_messages(items, model="gpt-4o-mini")
+    # Collect tool_call ids and the tool_call_ids that answer them.
+    call_ids, answered = set(), set()
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in (m.get("tool_calls") or []):
+                call_ids.add(tc["id"])
+        if m.get("role") == "tool":
+            answered.add(m.get("tool_call_id"))
+    assert call_ids == {"c1"}
+    assert call_ids <= answered, "every tool_call must be answered by a tool message"
+
+
+@pytest.mark.asyncio
+async def test_error_path_persists_repaired_history(runner, conn):
+    """When the run blows up mid-stream (e.g. a provider 400), the turn must
+    still be saved so it survives a page refresh (the /messages endpoint reads
+    only the saved history), with any dangling tool_call repaired so the saved
+    history can't re-trigger the same 400 on the next turn."""
+    import uuid, time
+    session_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (session_id, "u", "t", int(time.time()), int(time.time())),
+    )
+    conn.commit()
+
+    async def boom_stream_events():
+        raise RuntimeError(
+            "400 An assistant message with 'tool_calls' must be followed by "
+            "tool messages (insufficient tool messages following tool_calls message)"
+        )
+        yield  # unreachable; makes this an async generator
+
+    mock_stream = MagicMock()
+    mock_stream.stream_events = boom_stream_events
+    mock_stream.final_output = None
+    # Cumulative items at the point of failure: a tool call with NO output.
+    mock_stream.to_input_list.return_value = [
+        {"role": "user", "content": "go"},
+        {"type": "function_call", "name": "edit_file", "call_id": "c1", "arguments": "{}"},
+    ]
+
+    queue = asyncio.Queue()
+    with patch("agent.Runner.run_streamed", return_value=mock_stream):
+        # run() swallows the exception and surfaces it as an SSE error event;
+        # it must not propagate (main.py owns run-status bookkeeping).
+        await runner.run(session_id, "u", "go", queue,
+                         "k", "http://localhost/v1", "m")
+
+    rows = conn.execute(
+        "SELECT content FROM messages WHERE session_id=?", (session_id,)
+    ).fetchall()
+    assert len(rows) == 1, "errored turn must still be persisted"
+    saved = json.loads(rows[0]["content"])
+    calls = [x for x in saved if isinstance(x, dict) and x.get("type") == "function_call"]
+    answered = {x.get("call_id") for x in saved
+                if isinstance(x, dict) and x.get("type") == "function_call_output"}
+    assert calls, "saved history should contain the tool call"
+    assert all(c["call_id"] in answered for c in calls), "dangling call must be repaired"
+
+    drained = []
+    while not queue.empty():
+        drained.append(queue.get_nowait())
+    types = [e["type"] for e in drained]
+    assert "error" in types and types[-1] == "done"
+
+
 def test_inject_synthetic_reasoning_no_op_when_no_assistant_messages():
     from agent import _inject_synthetic_reasoning
     items = [{"role": "user", "content": "u"}, {"role": "user", "content": "v"}]

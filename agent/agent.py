@@ -344,6 +344,33 @@ class AgentRunner:
         )
         self._conn.commit()
 
+    def _finalize_history(self, stream, *, session_id: str,
+                          attachment_ids, data_root: str) -> list:
+        """Snapshot the SDK's cumulative item list and compact inline image
+        data URLs back to `attachment_id` references (to keep the row small).
+        Used by both the success path and the error path."""
+        final_history = stream.to_input_list()
+        url_to_aid: dict[str, str] = {}
+        if attachment_ids:
+            for r in _fetch_attachments(attachment_ids, session_id):
+                if r["kind"] != "image":
+                    continue
+                full = os.path.join(
+                    data_root, "sessions", session_id, "attachments",
+                    r["rel_path"])
+                try:
+                    with open(full, "rb") as f:
+                        data = f.read()
+                    url = (
+                        f"data:{r['mime']};base64,"
+                        f"{base64.b64encode(data).decode('ascii')}"
+                    )
+                    url_to_aid[url] = r["id"]
+                except FileNotFoundError:
+                    pass
+        return compact_image_blocks(
+            final_history, image_id_resolver=lambda u: url_to_aid.get(u))
+
     async def run(
         self,
         session_id: str,
@@ -518,6 +545,7 @@ class AgentRunner:
             input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
+            stream = None
             try:
                 stream = Runner.run_streamed(agent, input_messages)
                 # Maps tool call_id -> tool name so tool_result events can
@@ -592,33 +620,149 @@ class AgentRunner:
                     "source": "client_estimate",
                 })
 
-                final_history = stream.to_input_list()
-                url_to_aid: dict[str, str] = {}
-                if attachment_ids:
-                    for r in _fetch_attachments(attachment_ids, session_id):
-                        if r["kind"] != "image":
-                            continue
-                        full = os.path.join(
-                            data_root, "sessions", session_id, "attachments",
-                            r["rel_path"])
-                        try:
-                            with open(full, "rb") as f:
-                                data = f.read()
-                            url = (
-                                f"data:{r['mime']};base64,"
-                                f"{base64.b64encode(data).decode('ascii')}"
-                            )
-                            url_to_aid[url] = r["id"]
-                        except FileNotFoundError:
-                            pass
-                final_history = compact_image_blocks(
-                    final_history,
-                    image_id_resolver=lambda u: url_to_aid.get(u))
+                final_history = self._finalize_history(
+                    stream, session_id=session_id,
+                    attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
             except Exception as e:
+                # Persist the partial turn BEFORE surfacing the error. Without
+                # this, _save_history never runs and the whole question/answer
+                # vanishes on refresh: /messages reads only the saved history, so
+                # an errored turn that was never saved is gone for good. Repair
+                # any dangling tool_call first, or the saved (and later replayed)
+                # history would itself re-trigger the same 400 on every later turn.
+                try:
+                    if stream is not None:
+                        partial = self._finalize_history(
+                            stream, session_id=session_id,
+                            attachment_ids=attachment_ids, data_root=data_root)
+                        partial = _repair_dangling_tool_calls(partial)
+                        self._save_history(session_id, partial)
+                except Exception:
+                    pass
                 await sink.put({"type": "error", "content": str(e)})
             finally:
                 await sink.put({"type": "done"})
+
+
+def _repair_dangling_tool_calls(items: list) -> list:
+    """Ensure every `function_call` item has a following `function_call_output`.
+
+    Works on the SDK *item* shape (`type: function_call` / `function_call_output`).
+    Used before persisting a partial (errored) turn so the stored history can't
+    re-trigger a 400 when it's replayed on a later turn. The request the model
+    actually receives is guarded separately by `_repair_tool_messages` (see the
+    converter patch below), which covers mid-run turns we never see here.
+
+    For each unsatisfied call_id we insert a synthetic output right after the
+    call. Idempotent: already-paired calls are left untouched.
+    """
+    if not isinstance(items, list):
+        return items
+    satisfied: set = set()
+    for it in items:
+        if isinstance(it, dict) and it.get("type") == "function_call_output":
+            cid = it.get("call_id") or it.get("id")
+            if cid:
+                satisfied.add(cid)
+    out: list = []
+    for it in items:
+        out.append(it)
+        if isinstance(it, dict) and it.get("type") == "function_call":
+            cid = it.get("call_id") or it.get("id")
+            if cid and cid not in satisfied:
+                out.append({
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": "(tool did not complete; no result was produced)",
+                })
+                satisfied.add(cid)  # guard against a duplicated call_id
+    return out
+
+
+# Content used for a tool result we had to synthesize because the real tool
+# never returned one (it errored past the failure handler, or was cancelled as
+# a sibling of another parallel call that failed).
+_SYNTHETIC_TOOL_RESULT = (
+    "(no result: the tool failed or was cancelled before returning)"
+)
+
+
+def _repair_tool_messages(messages: list) -> list:
+    """Ensure every assistant `tool_calls` entry is answered by a following
+    `tool` message — operating on Chat Completions *messages* (dicts with
+    `role`/`tool_calls`/`tool_call_id`), i.e. the final payload the provider
+    receives.
+
+    This is the hard guarantee against 400 "An assistant message with
+    'tool_calls' must be followed by tool messages ... (insufficient tool
+    messages following tool_calls)". The Agents SDK cancels still-running
+    sibling tool tasks when one parallel call fails; cancelled tasks raise
+    CancelledError, which the per-tool failure handler does NOT catch, so they
+    produce no tool output. Whatever the cause (failure or cancellation), any
+    unanswered tool_call gets a placeholder tool message here, inserted right
+    after that assistant message's existing tool replies.
+
+    Idempotent and parallel-safe: fully-answered turns pass through unchanged,
+    so it does not interfere with normal parallel tool execution.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out: list = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        out.append(msg)
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and tool_calls:
+            call_ids = [tc.get("id") for tc in tool_calls
+                        if isinstance(tc, dict) and tc.get("id")]
+            # Consume the consecutive `tool` messages that answer this turn.
+            answered: set = set()
+            j = i + 1
+            while (j < n and isinstance(messages[j], dict)
+                   and messages[j].get("role") == "tool"):
+                out.append(messages[j])
+                tcid = messages[j].get("tool_call_id")
+                if tcid:
+                    answered.add(tcid)
+                j += 1
+            for cid in call_ids:
+                if cid not in answered:
+                    out.append({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "content": _SYNTHETIC_TOOL_RESULT,
+                    })
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def _install_tool_message_repair_patch() -> None:
+    """Wrap the SDK's single items->messages conversion chokepoint so EVERY
+    outbound Chat Completions request (the first turn and every mid-run turn we
+    never otherwise see) is passed through `_repair_tool_messages`.
+
+    The SDK is already vendored/patched in this repo (see
+    reasoning_content_replay); this patch is in the same spirit. Applied once
+    and idempotent.
+    """
+    from agents.models import chatcmpl_converter as _cc
+    if getattr(_cc.Converter, "_nimoos_tool_repair_patched", False):
+        return
+    _orig_fn = _cc.Converter.items_to_messages.__func__
+
+    def _patched(cls, *args, **kwargs):
+        return _repair_tool_messages(_orig_fn(cls, *args, **kwargs))
+
+    _cc.Converter.items_to_messages = classmethod(_patched)
+    _cc.Converter._nimoos_tool_repair_patched = True
+
+
+_install_tool_message_repair_patch()
 
 
 def _inject_synthetic_reasoning(items: list) -> list:
