@@ -147,13 +147,14 @@ class ContextPhoto(BaseModel):
 
 
 class RunRequest(BaseModel):
-    message: str
+    message: str = ""
     model: str = "gpt-4o-mini"
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
     attachment_ids: list[str] = []
     context_photo: ContextPhoto | None = None
+    continue_run: bool = False
 
 
 class SandboxRunRequest(BaseModel):
@@ -1180,7 +1181,9 @@ def _start_run(session_id: str, user_id: str, message: str,
                thinking=None, provider_type: str = "other",
                attachment_ids: list[str] = (),
                user_msg_id: str = "",
-               context_photo=None) -> RunSink:
+               context_photo=None,
+               max_turns: "int | None" = 10,
+               continue_run: bool = False) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1209,6 +1212,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                 thinking=thinking,
                 attachment_ids=attachment_ids,
                 context_photo=context_photo,
+                max_turns=max_turns,
+                continue_run=continue_run,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1333,6 +1338,9 @@ async def run_session(
 
     provider_type = request.headers.get("X-Agent-Provider-Type", "other")
 
+    mt_raw = _read_max_turns_setting(_conn, x_user_id)
+    max_turns = None if mt_raw == 0 else mt_raw
+
     # Inject SKILL.md into the message when X-Skill-Id header is present.
     # Fix 1.2: validate skill_id via regex BEFORE any path operations.
     skill_id = request.headers.get("X-Skill-Id", "").strip()
@@ -1382,6 +1390,8 @@ async def run_session(
         attachment_ids=req.attachment_ids,
         user_msg_id=user_msg_id,
         context_photo=req.context_photo,
+        max_turns=max_turns,
+        continue_run=req.continue_run,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
