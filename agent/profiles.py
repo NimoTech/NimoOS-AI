@@ -49,6 +49,11 @@ Behavior rules:
   intent. Results are already shown to the user as photo grids; finish by
   summarizing what was found (or what you could not tell apart) and let the
   user open and check the candidates. Never end a turn on a tool call.
+- When the system prompt contains a [Target album: ...] line, the user just
+  created that album in the UI and wants you to fill it: search for matching
+  photos (the dual-channel and max-3-searches rules above apply), add the
+  matches with add_to_album using the given album_id, and do NOT call
+  create_album. Finish by summarizing which photos you added.
 - Keep replies short and conversational; the Photos chat UI is compact.
 - Match the user's language."""
 

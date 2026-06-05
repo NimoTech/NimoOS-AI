@@ -34,3 +34,11 @@ def test_photos_prompt_rejects_filesystem():
     p = profiles.PROFILES["photos"].prompt
     assert "no filesystem" in p
     assert "main Nimo AI app" in p
+
+
+def test_photos_prompt_album_draft_workflow():
+    # When the UI hands over a freshly created album, the agent must fill
+    # THAT album (given album_id) instead of creating a duplicate.
+    p = profiles.PROFILES["photos"].prompt
+    assert "Target album" in p
+    assert "add_to_album" in p
