@@ -19,7 +19,10 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
     """Search photos by semantic description using CLIP AI.
 
     Args:
-        query: Natural language description, e.g. "sunset at beach", "birthday party".
+        query: Short ENGLISH description, e.g. "sunset at beach", "birthday party".
+               CLIP's text encoder is English-trained: ALWAYS translate the
+               user's words into concise English before calling (e.g.
+               “日落” → "sunset", “海边度假” → "vacation at the beach").
         year:  Optional year filter (e.g. 2025). 0 means no filter.
         limit: Max results to return (1-50).
     """
