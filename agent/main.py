@@ -1167,7 +1167,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                thinking=None, provider_type: str = "other",
                attachment_ids: list[str] = (),
                user_msg_id: str = "",
-               context_photo=None) -> RunSink:
+               context_photo=None,
+               auth_header: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1196,6 +1197,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 thinking=thinking,
                 attachment_ids=attachment_ids,
                 context_photo=context_photo,
+                auth_header=auth_header,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1299,6 +1301,9 @@ async def run_session(
         raise HTTPException(status_code=409, detail="agent_busy")
 
     user_patterns = _user_patterns_from_header(request)
+    # The gateway's reverse proxy forwards the user's Authorization header
+    # verbatim; photo tools need it for the Photos service's album endpoints.
+    auth_header = request.headers.get("Authorization", "")
 
     # Resolve thinking config: request body → session row → user_settings default.
     from provider_adapters import ThinkingConfig, ThinkingLevel
@@ -1373,6 +1378,7 @@ async def run_session(
         attachment_ids=req.attachment_ids,
         user_msg_id=user_msg_id,
         context_photo=req.context_photo,
+        auth_header=auth_header,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

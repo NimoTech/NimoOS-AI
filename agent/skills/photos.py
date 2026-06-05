@@ -1,10 +1,21 @@
 import json
+from contextvars import ContextVar
 
 import httpx
 from agents import function_tool
 
 URL_FILE = "/var/run/nimoos/photos.url"
 _TIMEOUT = 30.0
+
+# Per-run user JWT, set by agent.py before each run (same pattern as the other
+# per-skill ContextVars). Album endpoints on the Photos service require a user
+# JWT; search/smart merely tolerates its absence for localhost callers.
+AUTH_HEADER_VAR: ContextVar[str] = ContextVar("photos_auth_header", default="")
+
+
+def _auth_headers() -> dict:
+    auth = AUTH_HEADER_VAR.get()
+    return {"Authorization": auth} if auth else {}
 
 
 def _photos_base_url() -> str | None:
@@ -42,6 +53,7 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
             resp = await client.post(
                 f"{base_url}/v1/photos/search/smart",
                 json=payload,
+                headers=_auth_headers(),
             )
         if resp.status_code != 200:
             return json.dumps({"error": f"HTTP {resp.status_code}"})
@@ -79,6 +91,7 @@ async def create_album(name: str) -> str:
             resp = await client.post(
                 f"{base_url}/v1/photos/albums",
                 json={"name": name},
+                headers=_auth_headers(),
             )
         if resp.status_code not in (200, 201):
             return f"Failed to create album: HTTP {resp.status_code}"
@@ -106,6 +119,7 @@ async def add_to_album(album_id: str, asset_ids: list[str]) -> str:
                 resp = await client.post(
                     f"{base_url}/v1/photos/albums/{album_id}/assets",
                     json={"assetId": asset_id},
+                    headers=_auth_headers(),
                 )
                 if resp.status_code == 200:
                     success += 1

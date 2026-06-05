@@ -31,6 +31,7 @@ import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
 import skills.search as search_skills
+import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 from profiles import get_profile
 from wiki_client import WikiClient
@@ -397,6 +398,7 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
+        auth_header: str = "",
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -446,6 +448,10 @@ class AgentRunner:
             # established pattern (see spec 2026-05-29; unified context is a
             # tracked follow-up).
             search_skills.USER_ID_VAR.set(str(user_id))
+
+            # Photos service auth: album endpoints validate the user JWT, so
+            # forward the caller's Authorization header to the photo tools.
+            photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
 
             # Mount the user's skill runtime view into the bwrap sandbox via
             # ContextVar (not os.environ, which would be clobbered by concurrent
