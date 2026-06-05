@@ -197,7 +197,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
         more = "" if len(view.skipped) <= 5 else f" 等 {len(view.skipped)} 项"
         result += (f"\n(System Hint: 以下路径过大已折叠,未在命令行可见: {shown}{more}。"
                    f"请改用 glob_files / search 工具访问。)")
-    if not use_net and not result.startswith("[exit 0]"):
+    if not use_net and result.startswith("[exit ") and not result.startswith("[exit 0]"):
         result += _NETWORK_HINT
     return result
 
