@@ -32,6 +32,7 @@ import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
 import skills.search as search_skills
 from fs.snapshots import SnapshotStore
+from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
@@ -268,9 +269,12 @@ def compact_image_blocks(history, *, image_id_resolver):
     return out
 
 
-def select_tools_for_run(attachment_ids, *, session_id: str):
-    """Return tool list; conditionally appends `read_attachment` when at least
-    one attachment is non-image. Image-only or empty → unchanged ALL_TOOLS."""
+def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
+    """Return tool list. Restricted profiles pin the list with no dynamic
+    additions; otherwise conditionally appends `read_attachment` when at
+    least one attachment is non-image (unchanged original behavior)."""
+    if profile is not None and profile.tools is not None:
+        return list(profile.tools)
     rows = _fetch_attachments(attachment_ids, session_id)
     has_non_image = any(r["kind"] != "image" for r in rows)
     if has_non_image:
@@ -473,12 +477,22 @@ class AgentRunner:
                 should_replay_reasoning_content=default_should_replay_reasoning_content,
             )
 
-            base = init_doc.INIT_SYSTEM_PROMPT if kind == "init" else SYSTEM_PROMPT
+            row = self._conn.execute(
+                "SELECT agent_type FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            profile = get_profile(row["agent_type"] if row else None)
+
+            # kind=init is rejected for non-general sessions at the API layer
+            # (main.py), so INIT_SYSTEM_PROMPT only ever pairs with the general
+            # profile here.
+            base = (init_doc.INIT_SYSTEM_PROMPT if kind == "init"
+                    else (profile.prompt or SYSTEM_PROMPT))
 
             # Prepend the Wiki context block. 5s budget: if Wiki is slow we'd
-            # rather drop the block than stall the user's chat.
+            # rather drop the block than stall the user's chat. Restricted
+            # profiles skip it: no filesystem layer, no wiki tools.
             wiki_block = ""
-            if wiki_client is not None:
+            if wiki_client is not None and profile.compose_resources:
                 try:
                     wiki_block = await asyncio.wait_for(
                         WikiContextBuilder(wiki_client).build(user_patterns or []),
@@ -487,9 +501,15 @@ class AgentRunner:
                 except Exception:
                     wiki_block = ""
             base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
-            full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+            if profile.compose_resources:
+                full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+            else:
+                full_prompt = base_with_wiki
 
-            if attachment_ids:
+            if attachment_ids and profile.tools is None:
+                # Pinned-profile runs skip the attachment block: read_attachment
+                # is not in their tool list, so advertising it would make the
+                # model call a tool that does not exist.
                 att_block = attachment_system_block(attachment_ids, session_id=session_id)
                 if att_block:
                     full_prompt = full_prompt + "\n\n" + att_block
@@ -529,7 +549,9 @@ class AgentRunner:
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
-                tools=select_tools_for_run(attachment_ids, session_id=session_id),
+                tools=select_tools_for_run(attachment_ids,
+                                           session_id=session_id,
+                                           profile=profile),
                 model=model,
                 model_settings=model_settings,
             )
