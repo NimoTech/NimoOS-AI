@@ -135,4 +135,94 @@ async def add_to_album(album_id: str, asset_ids: list[str]) -> str:
         return f"Photos service error: {e}"
 
 
-ALL_TOOLS = [search_photos, create_album, add_to_album]
+@function_tool
+async def list_albums() -> str:
+    """List the user's photo albums.
+
+    Returns JSON: {count, albums: [{id, name, assetCount, dateStart,
+    dateEnd}]} (dates are YYYY-MM-DD or empty). Use it to find albums
+    that need renaming or organizing.
+    """
+    base_url = _photos_base_url()
+    if not base_url:
+        return json.dumps({"error": "Photos service is unavailable."})
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{base_url}/v1/photos/albums", headers=_auth_headers())
+        if resp.status_code != 200:
+            return json.dumps({"error": f"HTTP {resp.status_code}"})
+        raw = resp.json() or []
+        albums = [
+            {
+                "id": a.get("id", ""),
+                "name": a.get("name", ""),
+                "assetCount": a.get("assetCount", 0),
+                "dateStart": (a.get("dateStart") or "")[:10],
+                "dateEnd": (a.get("dateEnd") or "")[:10],
+            }
+            for a in raw[:100]
+        ]
+        return json.dumps({"count": len(albums), "albums": albums})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@function_tool
+async def get_album_summary(album_id: str) -> str:
+    """Get the naming signals of one album: photo/video counts, taken-at
+    date range, top places, top named persons, OCR text samples, filename
+    samples and coverCandidates (time-spread photo IDs for look_at_photos).
+
+    Args:
+        album_id: The album ID (from list_albums).
+    """
+    base_url = _photos_base_url()
+    if not base_url:
+        return json.dumps({"error": "Photos service is unavailable."})
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{base_url}/v1/photos/albums/{album_id}/summary",
+                headers=_auth_headers())
+        if resp.status_code == 404:
+            return json.dumps({"error": "album not found"})
+        if resp.status_code != 200:
+            return json.dumps({"error": f"HTTP {resp.status_code}"})
+        return json.dumps(resp.json())
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@function_tool
+async def rename_album(album_id: str, new_name: str) -> str:
+    """Rename an existing album. Albums are database records; renaming
+    never touches the underlying files.
+
+    Args:
+        album_id: The album ID (from list_albums).
+        new_name: The new album name.
+    """
+    base_url = _photos_base_url()
+    if not base_url:
+        return "Photos service is unavailable."
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.patch(
+                f"{base_url}/v1/photos/albums/{album_id}",
+                json={"name": new_name},
+                headers=_auth_headers())
+        if resp.status_code == 409:
+            return (f"Failed: an album named '{new_name}' already exists. "
+                    "Pick a different name.")
+        if resp.status_code == 404:
+            return "Failed: album not found."
+        if resp.status_code != 200:
+            return f"Failed to rename album: HTTP {resp.status_code}"
+        return f"Album {album_id} renamed to '{new_name}'"
+    except Exception as e:
+        return f"Photos service error: {e}"
+
+
+ALL_TOOLS = [search_photos, create_album, add_to_album,
+             list_albums, get_album_summary, rename_album]
