@@ -243,7 +243,7 @@ async def look_at_photos(asset_ids: list[str]) -> str:
 
     Expensive fallback — use ONLY when get_album_summary returns no usable
     signal (no places, no named persons, no OCR text). Pass the summary's
-    coverCandidates IDs.
+    coverCandidates IDs. Call at most once per album.
 
     Args:
         asset_ids: 1-3 photo asset IDs (extra IDs are ignored).
@@ -274,6 +274,9 @@ async def look_at_photos(asset_ids: list[str]) -> str:
                     failed += 1
                     continue
                 mime = resp.headers.get("content-type", "image/jpeg")
+                if not mime.startswith("image/"):
+                    failed += 1
+                    continue
                 b64 = base64.b64encode(resp.content).decode("ascii")
                 blocks.append({
                     "type": "image_url",

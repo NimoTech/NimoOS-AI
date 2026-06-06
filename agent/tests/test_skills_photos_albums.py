@@ -135,6 +135,7 @@ async def test_look_at_photos_describes(tmp_path):
     assert parts[0]["type"] == "text"
     assert len([p for p in parts if p["type"] == "image_url"]) == 3
     assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert oai.chat.completions.create.call_args[1]["model"] == "qwen-vl"
 
 
 async def test_look_at_photos_all_thumbs_fail(tmp_path):
@@ -148,3 +149,17 @@ async def test_look_at_photos_all_thumbs_fail(tmp_path):
         out = await m.look_at_photos.on_invoke_tool(
             MagicMock(), '{"asset_ids": ["p1"]}')
     assert "Could not load" in out
+
+
+async def test_photos_profile_has_seven_tools():
+    from profiles import PROFILES
+    assert len(PROFILES["photos"].tools) == 7
+
+
+async def test_photos_prompt_mentions_album_workflow():
+    from profiles import PHOTOS_SYSTEM_PROMPT as p
+    assert "list_albums" in p
+    assert "get_album_summary" in p
+    assert "rename_album" in p
+    assert "look_at_photos" in p
+    assert "old name → new name" in p  # final report requirement
