@@ -23,9 +23,19 @@ _client = SearchClient()
 USER_ID_VAR: ContextVar[str] = ContextVar("search_user_id", default="")
 
 
-async def _nimoos_search_impl(query: str, modality: str = "auto",
+async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
                               filters: Optional[str] = None, top_k: int = 5) -> str:
-    args: dict = {"query": query, "modality": modality, "top_k": top_k}
+    args: dict = {"query": query, "top_k": top_k}
+    if sources is not None:
+        # accept "images" / "images,filenames" / JSON '["images"]'
+        s = sources.strip()
+        if s.startswith("["):
+            try:
+                args["sources"] = json.loads(s)
+            except json.JSONDecodeError as e:
+                return json.dumps({"error": f"invalid sources JSON: {e}"}, ensure_ascii=False)
+        else:
+            args["sources"] = [p.strip() for p in s.split(",") if p.strip()]
     if filters is not None:
         try:
             args["filters"] = json.loads(filters)
@@ -56,23 +66,21 @@ async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
 
 
 @function_tool
-async def nimoos_search(query: str, modality: str = "auto",
+async def nimoos_search(query: str, sources: Optional[str] = None,
                         filters: Optional[str] = None, top_k: int = 5) -> str:
-    """Search the user's personal NAS for relevant content. Use this when the
-    user asks about files, documents, or any past content stored on their NAS.
-    Returns up to top_k hits with previews and file paths.
+    """Unified search over the user's NAS: by content (semantic), by filename,
+    and photos. Returns grouped candidates {semantic, filenames, images} for the
+    user to choose from.
 
     Args:
         query: The search query string.
-        modality: Search modality — "auto" (default) or "text". MVP is text-only.
-        filters: Optional JSON-encoded filter object. Supported fields:
-            root_ids (string[]), mime_prefix (string[], e.g. ["text/markdown"]),
-            kind_in (string[]: body|ocr|caption|transcript|summary; MVP: body),
-            lang_in (string[], e.g. ["zh","en"]), mtime_after_ms (int, unix ms).
-            Example: '{"mime_prefix":["text/markdown"],"mtime_after_ms":1714500000000}'.
-        top_k: Maximum number of hits to return (default 5, max 20).
+        sources: Optional comma-separated subset of "semantic", "filenames",
+            "images" (e.g. "images" to search photos only). Omit to search all.
+        filters: Optional JSON-encoded filter object (applies to the semantic
+            source only): root_ids, mime_prefix, kind_in, lang_in, mtime_after_ms.
+        top_k: Max hits per source (default 5, max 20).
     """
-    return await _nimoos_search_impl(query, modality, filters, top_k)
+    return await _nimoos_search_impl(query, sources, filters, top_k)
 
 
 @function_tool

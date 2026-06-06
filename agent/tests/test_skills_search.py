@@ -37,7 +37,8 @@ async def test_nimoos_search_propagates_user_id(monkeypatch):
     assert calls["name"] == "nimoos_search"
     assert calls["arguments"]["query"] == "hello"
     assert calls["arguments"]["top_k"] == 3
-    assert calls["arguments"]["modality"] == "auto"
+    assert "modality" not in calls["arguments"], "modality removed in favor of sources"
+    assert "sources" not in calls["arguments"], "sources absent when not specified"
     assert json.loads(out) == {"hits": []}
 
 
