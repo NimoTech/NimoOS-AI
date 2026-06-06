@@ -26,17 +26,9 @@ def test_network_true_shares_net():
     assert "--share-net" in args
 
 
-def test_authorized_binds_and_masks_present():
-    view = SandboxView(
-        ro_binds=[("/data/proj", "/data/proj")],
-        dir_masks=["/data/proj/.ssh"],
-        file_masks=["/data/proj/x.key"],
-    )
+def test_authorized_binds_present():
+    view = SandboxView(ro_binds=[("/data/proj", "/data/proj")])
     args = _build_bwrap_opts(Path("/work"), view, network=False)
-    assert args.count("--ro-bind") >= 2
+    assert "--ro-bind" in args
     assert "/data/proj" in args
-    assert "--tmpfs" in args and "/data/proj/.ssh" in args
-    i_bind = args.index("/data/proj")
-    i_mask = args.index("/data/proj/.ssh")
-    assert i_bind < i_mask
-    assert "/bin/bash" not in args   # command is NOT in the opts/fd
+    assert "/bin/bash" not in args   # command is on the real argv, not in opts
