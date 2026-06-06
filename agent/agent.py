@@ -978,14 +978,19 @@ def _convert_event(event, call_names: dict[str, str] | None = None,
                 return None
 
             # Responses API streaming format. The event class name discriminates
-            # between reasoning-summary deltas and output-text deltas; fall back
-            # to tagging as message when ambiguous (better than mis-classifying
-            # the response as reasoning, which is what the prior code did).
+            # reasoning-summary deltas, output-text deltas and tool-call
+            # argument deltas (ResponseFunctionCallArgumentsDeltaEvent — the
+            # chat-completions adapter streams those too). Argument fragments
+            # are NOT user-facing text: leaking them used to append raw
+            # {"album_id": ...} JSON to the chat message. The tool call itself
+            # is surfaced later via the RunItemStreamEvent branch below.
             delta = getattr(data, "delta", None)
             if isinstance(delta, str) and delta:
                 cls_name = type(data).__name__.lower()
                 if "reasoning" in cls_name:
                     return {"type": "thinking", "content": delta}
+                if "text" not in cls_name:
+                    return None
                 state["streamed_message"] = True
                 return {"type": "message_delta", "content": delta}
 
