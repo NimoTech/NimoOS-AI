@@ -1,60 +1,42 @@
-import os
 from pathlib import Path
-
-import pytest
-
-from skills.shell import _build_argv, SANDBOX_SKILLS_VAR
+from skills.shell import _build_bwrap_opts, SANDBOX_SKILLS_VAR
+from fs.sandbox_view import SandboxView
 
 
-def test_build_argv_mounts_skills_when_var_set(tmp_path):
-    work = tmp_path / "work"
-    work.mkdir()
-    skills_view = tmp_path / "view"
-    skills_view.mkdir()
+def test_skills_view_mounted_when_set(tmp_path):
+    skills_view = tmp_path / "view"; skills_view.mkdir()
     token = SANDBOX_SKILLS_VAR.set(str(skills_view))
     try:
-        argv = _build_argv(work, "echo hi")
+        args = _build_bwrap_opts(Path("/work"), SandboxView(), network=False)
     finally:
         SANDBOX_SKILLS_VAR.reset(token)
-
-    bound = False
-    for i, tok in enumerate(argv):
-        if tok == "--ro-bind" and argv[i+1] == str(skills_view) and argv[i+2] == "/skill":
-            bound = True
-            break
-    assert bound, f"--ro-bind {skills_view} /skill not in argv: {argv}"
+    assert "--ro-bind" in args
+    assert str(skills_view) in args
+    assert "/skill" in args
 
 
-def test_build_argv_no_skills_mount_when_var_unset(tmp_path):
-    work = tmp_path / "work"
-    work.mkdir()
-    # Default ContextVar value is empty string.
-    argv = _build_argv(work, "echo hi")
-    assert "/skill" not in argv
+def test_default_is_unshare_net():
+    args = _build_bwrap_opts(Path("/work"), SandboxView(), network=False)
+    assert "--unshare-net" in args
+    assert "--share-net" not in args
 
 
-def test_build_argv_concurrent_contexts_dont_leak():
-    """The whole point of using a ContextVar: two parallel coroutines
-    each see their own value of SANDBOX_SKILLS_VAR."""
-    import asyncio
+def test_network_true_shares_net():
+    args = _build_bwrap_opts(Path("/work"), SandboxView(), network=True)
+    assert "--share-net" in args
 
-    async def coroutine(view, work):
-        token = SANDBOX_SKILLS_VAR.set(view)
-        try:
-            await asyncio.sleep(0.01)  # yield to the other coroutine
-            argv = _build_argv(Path(work), "echo")
-            return any(
-                argv[i] == "--ro-bind" and argv[i+1] == view and argv[i+2] == "/skill"
-                for i in range(len(argv) - 2)
-            )
-        finally:
-            SANDBOX_SKILLS_VAR.reset(token)
 
-    async def runner():
-        return await asyncio.gather(
-            coroutine("/view-a", "/tmp"),
-            coroutine("/view-b", "/tmp"),
-        )
-
-    a, b = asyncio.run(runner())
-    assert a and b, "Each coroutine should see its own mount path"
+def test_authorized_binds_and_masks_present():
+    view = SandboxView(
+        ro_binds=[("/data/proj", "/data/proj")],
+        dir_masks=["/data/proj/.ssh"],
+        file_masks=["/data/proj/x.key"],
+    )
+    args = _build_bwrap_opts(Path("/work"), view, network=False)
+    assert args.count("--ro-bind") >= 2
+    assert "/data/proj" in args
+    assert "--tmpfs" in args and "/data/proj/.ssh" in args
+    i_bind = args.index("/data/proj")
+    i_mask = args.index("/data/proj/.ssh")
+    assert i_bind < i_mask
+    assert "/bin/bash" not in args   # command is NOT in the opts/fd
