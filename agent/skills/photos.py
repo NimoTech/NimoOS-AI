@@ -1,8 +1,10 @@
+import base64
 import json
 from contextvars import ContextVar
 
 import httpx
 from agents import function_tool
+from openai import AsyncOpenAI
 
 URL_FILE = "/var/run/nimoos/photos.url"
 _TIMEOUT = 30.0
@@ -11,6 +13,13 @@ _TIMEOUT = 30.0
 # per-skill ContextVars). Album endpoints on the Photos service require a user
 # JWT; search/smart merely tolerates its absence for localhost callers.
 AUTH_HEADER_VAR: ContextVar[str] = ContextVar("photos_auth_header", default="")
+
+# Per-run vision sub-call config, set by agent.py before each run:
+# {"ok": bool, "base_url": str, "api_key": str, "model": str}. look_at_photos
+# issues a one-shot vision request with these credentials — tool-output
+# images are dropped by the chat-completions adapter, so vision happens
+# out-of-band and only TEXT descriptions enter the conversation.
+VISION_CFG_VAR: ContextVar[dict] = ContextVar("photos_vision_cfg", default={})
 
 
 def _auth_headers() -> dict:
@@ -174,6 +183,10 @@ async def get_album_summary(album_id: str) -> str:
     date range, top places, top named persons, OCR text samples, filename
     samples and coverCandidates (time-spread photo IDs for look_at_photos).
 
+    Returns JSON with keys: assetCount, photoCount, videoCount, dateStart,
+    dateEnd, topPlaces, topPersons, ocrSamples, sampleFilenames,
+    coverCandidates.
+
     Args:
         album_id: The album ID (from list_albums).
     """
@@ -224,5 +237,65 @@ async def rename_album(album_id: str, new_name: str) -> str:
         return f"Photos service error: {e}"
 
 
+@function_tool
+async def look_at_photos(asset_ids: list[str]) -> str:
+    """Look at up to 3 photos and return one-line visual descriptions.
+
+    Expensive fallback — use ONLY when get_album_summary returns no usable
+    signal (no places, no named persons, no OCR text). Pass the summary's
+    coverCandidates IDs.
+
+    Args:
+        asset_ids: 1-3 photo asset IDs (extra IDs are ignored).
+    """
+    cfg = VISION_CFG_VAR.get()
+    if not cfg.get("ok"):
+        return ("The current model does not support vision. "
+                "Name the album from metadata instead.")
+    base_url = _photos_base_url()
+    if not base_url:
+        return "Photos service is unavailable."
+
+    ids = list(asset_ids)[:3]
+    blocks = [{
+        "type": "text",
+        "text": ("Briefly describe each photo in one line (subject, scene, "
+                 "activity), to help name the photo album they belong to."),
+    }]
+    failed = 0
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            for aid in ids:
+                resp = await client.get(
+                    f"{base_url}/v1/photos/assets/{aid}/thumbnail",
+                    params={"size": "small"},
+                    headers=_auth_headers())
+                if resp.status_code != 200:
+                    failed += 1
+                    continue
+                mime = resp.headers.get("content-type", "image/jpeg")
+                b64 = base64.b64encode(resp.content).decode("ascii")
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
+    except Exception as e:
+        return f"Photos service error: {e}"
+    if failed == len(ids):
+        return f"Could not load any of the {len(ids)} thumbnails."
+
+    try:
+        oai = AsyncOpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
+        completion = await oai.chat.completions.create(
+            model=cfg["model"],
+            messages=[{"role": "user", "content": blocks}],
+        )
+        desc = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Vision call failed ({e}); name the album from metadata instead."
+    note = f" ({failed} of {len(ids)} thumbnails unavailable)" if failed else ""
+    return f"Photo descriptions{note}:\n{desc}"
+
+
 ALL_TOOLS = [search_photos, create_album, add_to_album,
-             list_albums, get_album_summary, rename_album]
+             list_albums, get_album_summary, rename_album, look_at_photos]

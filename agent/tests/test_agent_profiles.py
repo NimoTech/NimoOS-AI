@@ -7,7 +7,7 @@ def test_select_tools_photos_profile_pinned():
     tools = agent_module.select_tools_for_run(
         [], session_id="s1", profile=PROFILES["photos"])
     names = sorted(t.name for t in tools)
-    assert names == ["add_to_album", "create_album", "get_album_summary", "list_albums", "rename_album", "search_photos"]
+    assert names == ["add_to_album", "create_album", "get_album_summary", "list_albums", "look_at_photos", "rename_album", "search_photos"]
 
 
 def test_select_tools_photos_ignores_attachments():
@@ -17,7 +17,7 @@ def test_select_tools_photos_ignores_attachments():
     tools = agent_module.select_tools_for_run(
         ["att-1"], session_id="s1", profile=PROFILES["photos"])
     names = sorted(t.name for t in tools)
-    assert names == ["add_to_album", "create_album", "get_album_summary", "list_albums", "rename_album", "search_photos"]
+    assert names == ["add_to_album", "create_album", "get_album_summary", "list_albums", "look_at_photos", "rename_album", "search_photos"]
 
 
 def test_select_tools_general_unchanged(monkeypatch):

@@ -93,3 +93,58 @@ async def test_rename_album_conflict(tmp_path):
         out = await m.rename_album.on_invoke_tool(
             MagicMock(), '{"album_id": "al1", "new_name": "Dup"}')
         assert "already exists" in out
+
+
+async def test_look_at_photos_vision_unsupported(tmp_path):
+    import skills.photos as m
+    m.VISION_CFG_VAR.set({"ok": False})
+    with patch("httpx.AsyncClient") as cls:
+        out = await m.look_at_photos.on_invoke_tool(
+            MagicMock(), '{"asset_ids": ["p1"]}')
+    assert "does not support vision" in out
+    cls.assert_not_called()  # zero requests
+
+
+async def test_look_at_photos_describes(tmp_path):
+    thumb = MagicMock()
+    thumb.status_code = 200
+    thumb.content = b"\xff\xd8fakejpeg"
+    thumb.headers = {"content-type": "image/jpeg"}
+
+    completion = MagicMock()
+    completion.choices = [MagicMock()]
+    completion.choices[0].message.content = "1. A sunset over the sea."
+
+    oai = MagicMock()
+    oai.chat.completions.create = AsyncMock(return_value=completion)
+
+    import skills.photos as m
+    m.VISION_CFG_VAR.set({"ok": True, "base_url": "http://llm",
+                          "api_key": "k", "model": "qwen-vl"})
+    with patch("skills.photos.URL_FILE", _url_file(tmp_path)), \
+         patch("httpx.AsyncClient", return_value=_mock_async_client(thumb)), \
+         patch("skills.photos.AsyncOpenAI", return_value=oai) as oai_cls:
+        out = await m.look_at_photos.on_invoke_tool(
+            MagicMock(), '{"asset_ids": ["p1", "p2", "p3", "p4"]}')
+
+    assert "sunset" in out
+    oai_cls.assert_called_once_with(base_url="http://llm", api_key="k")
+    msgs = oai.chat.completions.create.call_args[1]["messages"]
+    parts = msgs[0]["content"]
+    # 1 text instruction + up to 3 images (4th asset id is truncated)
+    assert parts[0]["type"] == "text"
+    assert len([p for p in parts if p["type"] == "image_url"]) == 3
+    assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+async def test_look_at_photos_all_thumbs_fail(tmp_path):
+    thumb = MagicMock()
+    thumb.status_code = 404
+    import skills.photos as m
+    m.VISION_CFG_VAR.set({"ok": True, "base_url": "http://llm",
+                          "api_key": "k", "model": "qwen-vl"})
+    with patch("skills.photos.URL_FILE", _url_file(tmp_path)), \
+         patch("httpx.AsyncClient", return_value=_mock_async_client(thumb)):
+        out = await m.look_at_photos.on_invoke_tool(
+            MagicMock(), '{"asset_ids": ["p1"]}')
+    assert "Could not load" in out

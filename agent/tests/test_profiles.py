@@ -5,7 +5,7 @@ def test_photos_profile_tools_exact():
     p = profiles.PROFILES["photos"]
     names = sorted(t.name for t in p.tools)
     assert names == ["add_to_album", "create_album", "get_album_summary",
-                     "list_albums", "rename_album", "search_photos"]
+                     "list_albums", "look_at_photos", "rename_album", "search_photos"]
     assert p.compose_resources is False
 
 

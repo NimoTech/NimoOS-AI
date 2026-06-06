@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 
 import db as db_module
 from provider_adapters import (
-    ProviderType, ThinkingConfig, build_model_settings,
+    ProviderType, ThinkingConfig, build_model_settings, model_supports_vision,
 )
 from skills import ALL_TOOLS
 from skills.app_management import (
@@ -471,6 +471,17 @@ class AgentRunner:
             # Photos service auth: album endpoints validate the user JWT, so
             # forward the caller's Authorization header to the photo tools.
             photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
+
+            # Vision sub-call config for look_at_photos: the tool issues a
+            # one-shot vision request with the caller's provider credentials
+            # (tool-output images are dropped by the chat-completions
+            # adapter, so vision happens out-of-band).
+            photos_skills.VISION_CFG_VAR.set({
+                "ok": model_supports_vision(provider_type, model_name),
+                "base_url": provider_url,
+                "api_key": provider_key,
+                "model": model_name,
+            })
 
             # Mount the user's skill runtime view into the bwrap sandbox via
             # ContextVar (not os.environ, which would be clobbered by concurrent
