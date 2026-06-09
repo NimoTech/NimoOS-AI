@@ -1,10 +1,12 @@
 package v2
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-AI/service"
@@ -79,5 +81,49 @@ func TestSearchProxy_PreservesQueryString(t *testing.T) {
 	defer mu.Unlock()
 	if len(*captured) != 1 || (*captured)[0].Path != "/v1/search/file" {
 		t.Fatalf("captured path = %+v", *captured)
+	}
+}
+
+// The browser path injects X-NimoOS-User-ID (AI JWT middleware) before the proxy.
+// The proxy must forward it to the Search service, or agent/tool returns 400.
+func TestSearchProxy_ForwardsUserIDHeader(t *testing.T) {
+	var mu sync.Mutex
+	gotUID := ""
+	gotName := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotUID = r.Header.Get("X-NimoOS-User-ID")
+		gotName = r.Header.Get("X-NimoOS-User-Name")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"groups":{},"stats":{},"warnings":[]}`))
+	}))
+	defer upstream.Close()
+	p := newSearchProxy(t, upstream.URL)
+
+	e := echo.New()
+	req := httptest.NewRequest("POST", "/v1/ai/search/agent/tool",
+		strings.NewReader(`{"name":"nimoos_search","arguments":{"query":"x"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NimoOS-User-ID", "42")
+	req.Header.Set("X-NimoOS-User-Name", "alice")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("*")
+	c.SetParamValues("agent/tool")
+
+	if err := p.Proxy(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotUID != "42" {
+		t.Fatalf("upstream X-NimoOS-User-ID = %q, want 42", gotUID)
+	}
+	if gotName != "alice" {
+		t.Fatalf("upstream X-NimoOS-User-Name = %q, want alice", gotName)
 	}
 }

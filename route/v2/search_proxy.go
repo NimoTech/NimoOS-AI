@@ -9,7 +9,7 @@ import (
 
 // SearchClientIface is the subset of *service.SearchClient the proxy needs.
 type SearchClientIface interface {
-	Forward(method, path, contentType string, body []byte) ([]byte, int, error)
+	Forward(method, path, contentType string, body []byte, headers map[string]string) ([]byte, int, error)
 }
 
 // SearchProxy transparently forwards /v1/ai/search/* to the Search service's
@@ -37,7 +37,17 @@ func (p *SearchProxy) Proxy(c echo.Context) error {
 		body = b
 	}
 	ct := c.Request().Header.Get("Content-Type")
-	resp, code, err := p.Client.Forward(c.Request().Method, path, ct, body)
+	// /v1/ai/search/* is JWT-protected (route/v2.go); the middleware injects
+	// X-NimoOS-User-ID/-Name on the inbound request. Forward them so the Search
+	// service can scope results per user (agent/tool 400s without the user id).
+	headers := map[string]string{}
+	if uid := c.Request().Header.Get("X-NimoOS-User-ID"); uid != "" {
+		headers["X-NimoOS-User-ID"] = uid
+	}
+	if uname := c.Request().Header.Get("X-NimoOS-User-Name"); uname != "" {
+		headers["X-NimoOS-User-Name"] = uname
+	}
+	resp, code, err := p.Client.Forward(c.Request().Method, path, ct, body, headers)
 	if err != nil {
 		return c.JSON(http.StatusBadGateway, echo.Map{"error": err.Error()})
 	}
