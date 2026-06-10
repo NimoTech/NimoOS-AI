@@ -9,6 +9,7 @@ import uuid
 from typing import AsyncIterator
 
 from agents import Agent, Runner
+from agents.exceptions import MaxTurnsExceeded
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.reasoning_content_replay import default_should_replay_reasoning_content
 from openai import AsyncOpenAI
@@ -57,6 +58,7 @@ Behavior rules:
 - 文件访问:用户提到的路径即使尚未授权,你也应直接尝试相应文件操作(list/read/write 等)。系统会在需要时自动弹卡片向用户申请该路径的访问授权——不要因为"可能没权限"就预先拒绝或改口。
 - 若某次文件操作返回"用户拒绝了对 X 的访问",你必须立即停止当前任务并向用户说明原因;绝对不要改去访问其父目录、兄弟目录或换别的路径来绕过。
 - 批量文件结构操作:需要同时执行 2 个或以上的新建文件夹、移动/重命名、删除操作时,必须使用 `batch_fs` 工具一次性完成,而不是多次单独调用。`write_file`/`edit_file` 仅用于修改文件内容。
+- 命令行(run_command)沙箱:对用户授权目录是**只读**的——可 `ls`/`cat`/`grep` 浏览搜索,但不能修改或删除;改删请用 write_file/edit_file/delete_path/batch_fs。沙箱**默认无网络**,需要 curl/git/pip/apt 时传 `network=true`(系统会请用户确认,本会话内确认一次即可)。需要跑会写盘的构建/测试命令时,先把代码拷到 /work。某些过大的目录可能未挂入命令行,届时改用 glob_files/search。
 - Match the user's language. Be concise by default; expand when the task warrants it."""
 
 _SNAPSHOT_STORE = SnapshotStore()
@@ -416,6 +418,8 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
+        max_turns: "int | None" = 10,
+        continue_run: bool = False,
         context_album=None,
         auth_header: str = "",
         user_lang: str = "",
@@ -446,6 +450,10 @@ class AgentRunner:
             fs_access_request.clear_denied_for_session(session_id)
 
             shell_skills.SESSION_ID_VAR.set(session_id)
+            shell_skills.DB_VAR.set(self._conn)
+            shell_skills.USER_PATTERNS_VAR.set(user_patterns or [])
+            shell_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            shell_skills.EVENT_QUEUE_VAR.set(sink)
 
             # --- Wiki integration ---
             wiki_client = self._wiki_client_for(session_id, user_id)
@@ -608,12 +616,15 @@ class AgentRunner:
             # supported for input_image".
             history = hydrate_image_blocks(
                 history, session_id=session_id, data_root=data_root)
-            input_messages = history + [{"role": "user", "content": user_content}]
+            if continue_run:
+                input_messages = history
+            else:
+                input_messages = history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None
             try:
-                stream = Runner.run_streamed(agent, input_messages)
+                stream = Runner.run_streamed(agent, input_messages, max_turns=max_turns)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).
@@ -690,6 +701,21 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+            except MaxTurnsExceeded:
+                # 触顶不是错误,是"暂停":落库 + 发可继续事件,不发红色 error。
+                try:
+                    if stream is not None:
+                        partial = self._finalize_history(
+                            stream, session_id=session_id,
+                            attachment_ids=attachment_ids, data_root=data_root)
+                        partial = _repair_dangling_tool_calls(partial)
+                        self._save_history(session_id, partial)
+                except Exception:
+                    pass
+                await sink.put({
+                    "type": "max_turns_exceeded",
+                    "max_turns": max_turns if max_turns is not None else 0,
+                })
             except Exception as e:
                 # Evidence log: if a tool_call/tool pairing 400 ever slips past
                 # the converter repair, dump the exact item list so the root

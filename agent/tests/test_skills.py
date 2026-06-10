@@ -92,18 +92,17 @@ import skills.shell as sh
 
 
 def test_shell_argv_shape(tmp_path):
+    from fs.sandbox_view import SandboxView
     work = tmp_path / "work"
     work.mkdir()
-    argv = sh._build_argv(work, "echo hi")
-    assert argv[0] == sh.PRLIMIT_BIN
-    assert sh.BWRAP_BIN in argv
-    # work dir bound at /work, cwd /work, network shared, all unshared
-    assert "--bind" in argv and str(work) in argv
-    assert "--share-net" in argv
-    assert "--unshare-all" in argv
-    assert "--die-with-parent" in argv
-    # the user's command is the trailing argument to bash -lc
-    assert argv[-3:] == ["/bin/bash", "-lc", "echo hi"]
+    opts = sh._build_bwrap_opts(work, SandboxView(), network=False)
+    # opts are bwrap OPTIONS only (no prlimit, no bwrap bin, no command tail)
+    assert "--bind" in opts and str(work) in opts and "/work" in opts
+    assert "--unshare-all" in opts
+    assert "--unshare-net" in opts        # offline by default now
+    assert "--share-net" not in opts
+    assert "--die-with-parent" in opts
+    assert "/bin/bash" not in opts        # command lives on the real argv
 
 
 def test_shell_truncate():
