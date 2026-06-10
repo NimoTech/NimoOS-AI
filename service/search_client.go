@@ -114,14 +114,14 @@ func (c *SearchClient) GetWithContext(ctx context.Context, path string) ([]byte,
 }
 
 // Forward proxies an arbitrary method/path to the Search service using the
-// long-timeout client, preserving the caller's Content-Type. Mirrors
-// ParserClient.Forward: tries once, reloads discovery, retries once.
-func (c *SearchClient) Forward(method, path, contentType string, body []byte) ([]byte, int, error) {
+// long-timeout client, preserving the caller's Content-Type and forwarding the
+// given headers (e.g. X-NimoOS-User-ID). Tries once, reloads discovery, retries once.
+func (c *SearchClient) Forward(method, path, contentType string, body []byte, headers map[string]string) ([]byte, int, error) {
 	base, err := c.baseURL()
 	if err != nil {
 		return nil, 0, err
 	}
-	resp, err := c.tryOnceCT(method, base+path, contentType, body)
+	resp, err := c.tryOnceCT(method, base+path, contentType, body, headers)
 	if err == nil {
 		return c.readBody(resp)
 	}
@@ -129,14 +129,14 @@ func (c *SearchClient) Forward(method, path, contentType string, body []byte) ([
 		return nil, 0, err
 	}
 	base, _ = c.baseURL()
-	resp, err = c.tryOnceCT(method, base+path, contentType, body)
+	resp, err = c.tryOnceCT(method, base+path, contentType, body, headers)
 	if err != nil {
 		return nil, 0, err
 	}
 	return c.readBody(resp)
 }
 
-func (c *SearchClient) tryOnceCT(method, url, contentType string, body []byte) (*http.Response, error) {
+func (c *SearchClient) tryOnceCT(method, url, contentType string, body []byte, headers map[string]string) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -147,6 +147,9 @@ func (c *SearchClient) tryOnceCT(method, url, contentType string, body []byte) (
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	return c.httpLong.Do(req)
 }
