@@ -418,6 +418,7 @@ class AgentRunner:
         context_photo=None,
         context_album=None,
         auth_header: str = "",
+        user_lang: str = "",
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -571,6 +572,15 @@ class AgentRunner:
             _ATT_D.set(data_root)
 
             full_prompt += format_context_lines(context_photo, context_album)
+
+            if user_lang:
+                # Explicit locale beats "match the user's language": short or
+                # mixed-language queries give the model too weak a signal.
+                full_prompt += (
+                    f"\n\n[The user's interface language is \"{user_lang}\". "
+                    "Always reply in that language unless the user explicitly "
+                    "asks for another one.]"
+                )
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,

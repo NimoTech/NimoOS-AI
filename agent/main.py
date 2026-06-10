@@ -1175,7 +1175,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                user_msg_id: str = "",
                context_photo=None,
                context_album=None,
-               auth_header: str = "") -> RunSink:
+               auth_header: str = "",
+               user_lang: str = "") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1206,6 +1207,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 context_photo=context_photo,
                 context_album=context_album,
                 auth_header=auth_header,
+                user_lang=user_lang,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1312,6 +1314,9 @@ async def run_session(
     # The gateway's reverse proxy forwards the user's Authorization header
     # verbatim; photo tools need it for the Photos service's album endpoints.
     auth_header = request.headers.get("Authorization", "")
+    # UI locale (e.g. "zh_cn") sent by the frontend; threaded into the system
+    # prompt so the model replies in the user's language instead of guessing.
+    user_lang = request.headers.get("Language", "").strip()
 
     # Resolve thinking config: request body → session row → user_settings default.
     from provider_adapters import ThinkingConfig, ThinkingLevel
@@ -1388,6 +1393,7 @@ async def run_session(
         context_photo=req.context_photo,
         context_album=req.context_album,
         auth_header=auth_header,
+        user_lang=user_lang,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
