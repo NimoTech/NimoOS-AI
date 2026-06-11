@@ -33,30 +33,41 @@ func (h *ChatHandler) ChatCompletions(c echo.Context) error {
 
 	forceCloud := c.Request().Header.Get("X-NimoOS-Force-Cloud") == "true"
 
-	decision, err := h.svc.Router().Decide(userID, forceCloud)
-	if err != nil {
-		if errors.Is(err, service.ErrRemoteNotAllowed) {
-			return echo.NewHTTPError(http.StatusForbidden, "remote access not allowed by privacy policy")
-		}
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
 	body, err := io.ReadAll(c.Request().Body)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "failed to read request body")
 	}
 
-	body = stripProviderPrefix(body)
+	target, body := parseModelTarget(body)
 	body = stripInternalFields(body)
 	stream := isStreamRequest(body)
 
-	switch decision.Backend {
+	// Explicit model selection drives routing; privacy policy only vetoes.
+	switch target.backend {
 	case service.BackendLocal:
 		return h.forwardToLocal(c, bytes.NewReader(body), stream)
 	case service.BackendCloud:
-		return h.forwardToCloud(c, userID, bytes.NewReader(body), stream)
+		// Reuse Decide(forceCloud=true) purely for the AllowRemote veto.
+		if _, derr := h.svc.Router().Decide(userID, true); derr != nil {
+			if errors.Is(derr, service.ErrRemoteNotAllowed) {
+				return echo.NewHTTPError(http.StatusForbidden, "remote access not allowed by privacy policy")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, derr.Error())
+		}
+		return h.forwardToCloud(c, userID, target.providerID, bytes.NewReader(body), stream)
 	default:
-		return echo.NewHTTPError(http.StatusInternalServerError, "unknown backend")
+		// No explicit prefix → legacy behaviour via Router.Decide.
+		decision, derr := h.svc.Router().Decide(userID, forceCloud)
+		if derr != nil {
+			if errors.Is(derr, service.ErrRemoteNotAllowed) {
+				return echo.NewHTTPError(http.StatusForbidden, "remote access not allowed by privacy policy")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, derr.Error())
+		}
+		if decision.Backend == service.BackendLocal {
+			return h.forwardToLocal(c, bytes.NewReader(body), stream)
+		}
+		return h.forwardToCloud(c, userID, 0, bytes.NewReader(body), stream)
 	}
 }
 
@@ -78,24 +89,34 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 	return proxyResponse(c, resp)
 }
 
-func (h *ChatHandler) forwardToCloud(c echo.Context, userID string, body io.Reader, stream bool) error {
-	providers, err := h.svc.Providers().ListProviders(userID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list providers")
-	}
-	if len(providers) == 0 {
-		return echo.NewHTTPError(http.StatusBadRequest, "no cloud provider configured")
-	}
-
+func (h *ChatHandler) forwardToCloud(c echo.Context, userID string, providerID int64, body io.Reader, stream bool) error {
 	var provider *service.Provider
-	for _, p := range providers {
-		if p.Enabled {
-			provider = p
-			break
+	if providerID != 0 {
+		p, err := h.svc.Providers().GetProvider(providerID, userID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "selected provider not found")
 		}
-	}
-	if provider == nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "no enabled cloud provider")
+		if !p.Enabled {
+			return echo.NewHTTPError(http.StatusBadRequest, "selected provider is disabled")
+		}
+		provider = p
+	} else {
+		providers, err := h.svc.Providers().ListProviders(userID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to list providers")
+		}
+		if len(providers) == 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "no cloud provider configured")
+		}
+		for _, p := range providers {
+			if p.Enabled {
+				provider = p
+				break
+			}
+		}
+		if provider == nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "no enabled cloud provider")
+		}
 	}
 
 	apiKey, err := h.svc.MasterKey().Decrypt(provider.APIKey)
@@ -235,36 +256,74 @@ func mapEffortToLevel(s string) string {
 	return "medium"
 }
 
-// stripProviderPrefix removes the "{providerID}:" prefix from the model field.
-// The frontend encodes the provider ID into the model string (e.g. "6:deepseek-chat")
-// so the backend can resolve the provider, but cloud APIs only accept the bare model name.
-func stripProviderPrefix(body []byte) []byte {
+// modelTarget is the routing intent parsed from the request's model field.
+// backend == "" means no explicit prefix → caller falls back to Router.Decide.
+type modelTarget struct {
+	backend    service.Backend
+	providerID int64
+	bareModel  string
+}
+
+// parseModelTarget reads the model field, classifies the routing target, and
+// returns the body rewritten with the bare model name. Recognised forms:
+//
+//	"local:<name>"             → local
+//	"cloud:<id>:<name>"        → cloud, provider <id>
+//	"<id>:<name>" (numeric id) → cloud, provider <id>  (legacy)
+//	anything else              → backend "" (no explicit target)
+func parseModelTarget(body []byte) (modelTarget, []byte) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body
+		return modelTarget{}, body
 	}
 	modelRaw, ok := req["model"]
 	if !ok {
-		return body
+		return modelTarget{}, body
 	}
 	var model string
 	if err := json.Unmarshal(modelRaw, &model); err != nil {
-		return body
+		return modelTarget{}, body
 	}
-	if idx := strings.Index(model, ":"); idx >= 0 && isNumeric(model[:idx]) {
-		model = model[idx+1:]
-		encoded, err := json.Marshal(model)
-		if err != nil {
-			return body
+
+	tgt := modelTarget{bareModel: model}
+	switch {
+	case strings.HasPrefix(model, "local:"):
+		tgt.backend = service.BackendLocal
+		tgt.bareModel = model[len("local:"):]
+	case strings.HasPrefix(model, "cloud:"):
+		rest := model[len("cloud:"):]
+		if idx := strings.Index(rest, ":"); idx > 0 && isNumeric(rest[:idx]) {
+			tgt.backend = service.BackendCloud
+			tgt.providerID = parseInt64(rest[:idx])
+			tgt.bareModel = rest[idx+1:]
 		}
-		req["model"] = encoded
-		out, err := json.Marshal(req)
-		if err != nil {
-			return body
+	default:
+		if idx := strings.Index(model, ":"); idx > 0 && isNumeric(model[:idx]) {
+			tgt.backend = service.BackendCloud
+			tgt.providerID = parseInt64(model[:idx])
+			tgt.bareModel = model[idx+1:]
 		}
-		return out
 	}
-	return body
+
+	// Rewrite body with the bare model name.
+	if tgt.bareModel != model {
+		if encoded, err := json.Marshal(tgt.bareModel); err == nil {
+			req["model"] = encoded
+			if out, err := json.Marshal(req); err == nil {
+				return tgt, out
+			}
+		}
+	}
+	return tgt, body
+}
+
+// parseInt64 returns the int64 value of an all-digit string, 0 on failure.
+func parseInt64(s string) int64 {
+	var n int64
+	for _, c := range s {
+		n = n*10 + int64(c-'0')
+	}
+	return n
 }
 
 // stripInternalFields removes NimoOS-internal fields (e.g. _backend) before forwarding
