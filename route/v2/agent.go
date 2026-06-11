@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -115,7 +116,18 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
 		c.Request().Header.Set("X-Agent-Provider-Url", "http://127.0.0.1:11434/v1")
 	} else if h.svc != nil {
-		if key, provURL, ok := h.resolveProvider(userID); ok {
+		// Prefer the explicitly selected provider; fall back to first-enabled.
+		var key, provURL string
+		var ok bool
+		if pid := c.Request().Header.Get("X-Agent-Provider-Id"); pid != "" {
+			if id, perr := strconv.ParseInt(pid, 10, 64); perr == nil {
+				key, provURL, ok = h.resolveProviderByID(userID, id)
+			}
+		}
+		if !ok {
+			key, provURL, ok = h.resolveProvider(userID)
+		}
+		if ok {
 			c.Request().Header.Set("X-Agent-Provider-Key", key)
 			c.Request().Header.Set("X-Agent-Provider-Url", provURL)
 		}
@@ -156,6 +168,20 @@ func (h *AgentHandler) resolveProvider(userID string) (key, provURL string, ok b
 		}
 	}
 	return "", "", false
+}
+
+// resolveProviderByID resolves a specific provider's decrypted key + base URL.
+// Returns ok=false if missing, not owned by userID, disabled, or undecryptable.
+func (h *AgentHandler) resolveProviderByID(userID string, id int64) (key, provURL string, ok bool) {
+	p, err := h.svc.Providers().GetProvider(id, userID)
+	if err != nil || !p.Enabled {
+		return "", "", false
+	}
+	decrypted, err := h.svc.MasterKey().Decrypt(p.APIKey)
+	if err != nil {
+		return "", "", false
+	}
+	return decrypted, p.BaseURL, true
 }
 
 func isRunEndpoint(r *http.Request) bool {
