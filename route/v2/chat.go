@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/NimoTech/NimoOS-AI/service"
@@ -292,16 +293,26 @@ func parseModelTarget(body []byte) (modelTarget, []byte) {
 		tgt.bareModel = model[len("local:"):]
 	case strings.HasPrefix(model, "cloud:"):
 		rest := model[len("cloud:"):]
-		if idx := strings.Index(rest, ":"); idx > 0 && isNumeric(rest[:idx]) {
-			tgt.backend = service.BackendCloud
-			tgt.providerID = parseInt64(rest[:idx])
-			tgt.bareModel = rest[idx+1:]
+		if idx := strings.Index(rest, ":"); idx > 0 {
+			if id, perr := strconv.ParseInt(rest[:idx], 10, 64); perr == nil {
+				tgt.backend = service.BackendCloud
+				tgt.providerID = id
+				tgt.bareModel = rest[idx+1:]
+			} else {
+				// "cloud:" prefix but unparseable id → strip prefix, route via default.
+				tgt.bareModel = rest
+			}
+		} else {
+			// "cloud:" prefix with no id segment → strip prefix, route via default.
+			tgt.bareModel = rest
 		}
 	default:
-		if idx := strings.Index(model, ":"); idx > 0 && isNumeric(model[:idx]) {
-			tgt.backend = service.BackendCloud
-			tgt.providerID = parseInt64(model[:idx])
-			tgt.bareModel = model[idx+1:]
+		if idx := strings.Index(model, ":"); idx > 0 {
+			if id, perr := strconv.ParseInt(model[:idx], 10, 64); perr == nil {
+				tgt.backend = service.BackendCloud
+				tgt.providerID = id
+				tgt.bareModel = model[idx+1:]
+			}
 		}
 	}
 
@@ -317,15 +328,6 @@ func parseModelTarget(body []byte) (modelTarget, []byte) {
 	return tgt, body
 }
 
-// parseInt64 returns the int64 value of an all-digit string, 0 on failure.
-func parseInt64(s string) int64 {
-	var n int64
-	for _, c := range s {
-		n = n*10 + int64(c-'0')
-	}
-	return n
-}
-
 // stripInternalFields removes NimoOS-internal fields (e.g. _backend) before forwarding
 // to upstream APIs that don't understand them.
 func stripInternalFields(body []byte) []byte {
@@ -339,19 +341,6 @@ func stripInternalFields(body []byte) []byte {
 		return body
 	}
 	return out
-}
-
-// isNumeric returns true if s consists entirely of ASCII digits.
-func isNumeric(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // isStreamRequest parses the body bytes to check if stream:true was requested.

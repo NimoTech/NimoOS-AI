@@ -42,6 +42,7 @@ func TestParseModelTarget(t *testing.T) {
 		{"cloud_scheme", `{"model":"cloud:6:deepseek-chat"}`, service.BackendCloud, 6, "deepseek-chat"},
 		{"legacy_numeric", `{"model":"6:deepseek-chat"}`, service.BackendCloud, 6, "deepseek-chat"},
 		{"bare_no_prefix", `{"model":"gpt-4o"}`, service.Backend(""), 0, "gpt-4o"},
+		{"cloud_no_id", `{"model":"cloud:deepseek-chat"}`, service.Backend(""), 0, "deepseek-chat"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
