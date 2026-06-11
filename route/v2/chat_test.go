@@ -32,11 +32,11 @@ func TestChatHandler_MissingUserID_Returns401(t *testing.T) {
 
 func TestParseModelTarget(t *testing.T) {
 	cases := []struct {
-		name       string
-		in         string
-		wantBack   service.Backend
-		wantPID    int64
-		wantModel  string
+		name      string
+		in        string
+		wantBack  service.Backend
+		wantPID   int64
+		wantModel string
 	}{
 		{"local", `{"model":"local:llama3"}`, service.BackendLocal, 0, "llama3"},
 		{"cloud_scheme", `{"model":"cloud:6:deepseek-chat"}`, service.BackendCloud, 6, "deepseek-chat"},
@@ -49,7 +49,9 @@ func TestParseModelTarget(t *testing.T) {
 			require.Equal(t, tc.wantBack, target.backend)
 			require.Equal(t, tc.wantPID, target.providerID)
 			// body should carry the bare model name.
-			var got struct{ Model string `json:"model"` }
+			var got struct {
+				Model string `json:"model"`
+			}
 			require.NoError(t, json.Unmarshal(body, &got))
 			require.Equal(t, tc.wantModel, got.Model)
 		})
