@@ -92,6 +92,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.POST("/providers", providers.Create)
 	g.PUT("/providers/:id", providers.Update)
 	g.DELETE("/providers/:id", providers.Delete)
+	g.GET("/providers/:id/models", providers.ListModels)
+	g.POST("/providers/:id/models/refresh", providers.RefreshModels)
+	g.PUT("/providers/:id/models", providers.UpdateModels)
 
 	// Privacy policy
 	g.GET("/policy", policy.Get)

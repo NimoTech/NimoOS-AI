@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-AI/pkg/config"
@@ -98,4 +100,88 @@ func TestProvidersResponseIncludesThinkingFlags(t *testing.T) {
 	require.Len(t, body, 1)
 	require.Equal(t, "deepseek", body[0]["provider_type"])
 	require.Equal(t, true, body[0]["supports_thinking"])
+}
+
+func TestProvidersHandler_RefreshAndListModels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"gpt-4o"},{"id":"o3"}]}`))
+	}))
+	defer upstream.Close()
+
+	svc := newTestServices(t)
+	p := &service.Provider{UserID: "10", Name: "OAI", BaseURL: upstream.URL, Protocol: service.ProtocolOpenAI, Enabled: true}
+	require.NoError(t, svc.Providers().CreateProvider(p))
+
+	h := NewProvidersHandler(svc)
+	e := echo.New()
+
+	// Refresh.
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "10")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues(strconv.FormatInt(p.ID, 10))
+	require.NoError(t, h.RefreshModels(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// ListModels returns the fetched models.
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Header.Set("X-NimoOS-User-ID", "10")
+	rec2 := httptest.NewRecorder()
+	c2 := e.NewContext(req2, rec2)
+	c2.SetParamNames("id")
+	c2.SetParamValues(strconv.FormatInt(p.ID, 10))
+	require.NoError(t, h.ListModels(c2))
+	var list []providerModelDTO
+	require.NoError(t, json.Unmarshal(rec2.Body.Bytes(), &list))
+	require.Len(t, list, 2)
+}
+
+func TestProvidersHandler_UpdateModels_FavoritesAndList(t *testing.T) {
+	svc := newTestServices(t)
+	p := &service.Provider{UserID: "10", Name: "DS", BaseURL: "https://api.deepseek.com/v1", Protocol: service.ProtocolOpenAI, Enabled: true}
+	require.NoError(t, svc.Providers().CreateProvider(p))
+	require.NoError(t, svc.Providers().UpsertFetchedModels(p.ID, []string{"deepseek-chat", "deepseek-reasoner"}))
+
+	h := NewProvidersHandler(svc)
+	e := echo.New()
+	body := `{"models":[{"name":"deepseek-chat","favorite":true}]}`
+	req := httptest.NewRequest(http.MethodPut, "/", strings.NewReader(body))
+	req.Header.Set("X-NimoOS-User-ID", "10")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues(strconv.FormatInt(p.ID, 10))
+	require.NoError(t, h.UpdateModels(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	favs, err := svc.Providers().ListFavoriteModels(p.ID)
+	require.NoError(t, err)
+	require.Len(t, favs, 1)
+	require.Equal(t, "deepseek-chat", favs[0].ModelName)
+}
+
+func TestProvidersHandler_List_EmbedsFavoritesOnly(t *testing.T) {
+	svc := newTestServices(t)
+	p := &service.Provider{UserID: "10", Name: "DS", BaseURL: "https://api.deepseek.com/v1", Protocol: service.ProtocolOpenAI, Enabled: true}
+	require.NoError(t, svc.Providers().CreateProvider(p))
+	require.NoError(t, svc.Providers().UpsertFetchedModels(p.ID, []string{"a", "b"}))
+	_, err := svc.Providers().ReconcileModels(p.ID, []service.ProviderModelInput{{Name: "a", Favorite: true}})
+	require.NoError(t, err)
+
+	h := NewProvidersHandler(svc)
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "10")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	require.NoError(t, h.List(c))
+
+	var list []providerDTO
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+	require.Len(t, list, 1)
+	require.Len(t, list[0].Models, 1, "only favorite models embedded")
+	require.Equal(t, "a", list[0].Models[0].Name)
 }
