@@ -36,7 +36,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 			echo.HeaderAuthorization, echo.HeaderContentType,
 			"X-NimoOS-Force-Cloud", "X-User-Id", "X-User-Name",
 			"X-Agent-Provider-Key", "X-Agent-Provider-Url",
-			"X-Agent-Provider-Type",
+			"X-Agent-Provider-Type", "X-Agent-Provider-Id",
 		},
 	}))
 
