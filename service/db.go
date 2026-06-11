@@ -137,6 +137,18 @@ func migrate(db *sql.DB) error {
 		last_used_at  TEXT NOT NULL DEFAULT ''
 	);
 
+	CREATE TABLE IF NOT EXISTS provider_models (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		provider_id INTEGER NOT NULL,
+		model_name  TEXT NOT NULL,
+		source      TEXT NOT NULL DEFAULT 'fetched',
+		favorite    INTEGER NOT NULL DEFAULT 0,
+		created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(provider_id, model_name),
+		FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_provider_models_pid ON provider_models(provider_id);
+
 	CREATE TABLE IF NOT EXISTS hard_blacklist (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id    TEXT NOT NULL,
@@ -223,5 +235,11 @@ func migrate(db *sql.DB) error {
 			_, _ = db.Exec(`UPDATE providers SET provider_type=? WHERE id=?`, pt, r.id)
 		}
 	}
+	// One-time backfill: surface each provider's existing default_model as a
+	// favorite manual model so upgraded installs see it immediately. Idempotent
+	// via the UNIQUE(provider_id, model_name) constraint.
+	_, _ = db.Exec(
+		`INSERT OR IGNORE INTO provider_models (provider_id, model_name, source, favorite)
+		 SELECT id, default_model, 'manual', 1 FROM providers WHERE default_model <> ''`)
 	return nil
 }
