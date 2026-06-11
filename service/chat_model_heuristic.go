@@ -24,7 +24,7 @@ func LooksLikeChatModel(providerType, name string) bool {
 
 var (
 	// Obvious non-conversational families across providers.
-	nonChatRe      = regexp.MustCompile(`(?i)embed|whisper|tts|audio|dall-?e|image|moderation|rerank|vision-encoder`)
-	openaiChatRe   = regexp.MustCompile(`(?i)^(gpt-|o1|o3|o4|chatgpt)`)
+	nonChatRe       = regexp.MustCompile(`(?i)embed|whisper|tts|audio|dall-?e|image|moderation|rerank|vision-encoder`)
+	openaiChatRe    = regexp.MustCompile(`(?i)^(gpt-|o1|o3|o4|chatgpt)`)
 	anthropicChatRe = regexp.MustCompile(`(?i)^claude`)
 )

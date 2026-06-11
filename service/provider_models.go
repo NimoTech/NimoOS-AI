@@ -86,6 +86,7 @@ func (s *providerService) UpsertFetchedModels(providerID int64, names []string) 
 //   - fetched rows: only favorite may change; never deleted (omission ignored).
 //   - manual rows: added/deleted/favorited per the desired list.
 //   - a desired name absent from DB is inserted as a manual row.
+//
 // Returns the full reconciled list.
 func (s *providerService) ReconcileModels(providerID int64, desired []ProviderModelInput) ([]*ProviderModel, error) {
 	existing, err := s.ListModels(providerID)
