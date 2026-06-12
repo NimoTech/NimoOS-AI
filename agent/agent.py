@@ -582,12 +582,15 @@ class AgentRunner:
             full_prompt += format_context_lines(context_photo, context_album)
 
             if user_lang:
-                # Explicit locale beats "match the user's language": short or
-                # mixed-language queries give the model too weak a signal.
+                # The interface locale is only a fallback for short or
+                # mixed-language queries; a message written clearly in one
+                # language always wins (e.g. Chinese input on an English UI
+                # must get a Chinese reply).
                 full_prompt += (
                     f"\n\n[The user's interface language is \"{user_lang}\". "
-                    "Always reply in that language unless the user explicitly "
-                    "asks for another one.]"
+                    "Reply in the language the user's message is written in; "
+                    "when the message is too short or mixed to tell, fall "
+                    "back to the interface language.]"
                 )
 
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
