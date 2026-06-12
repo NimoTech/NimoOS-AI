@@ -39,17 +39,11 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
     """Search photos by semantic description using CLIP AI.
 
     Args:
-        query: The search runs TWO channels at once:
-               1. CLIP visual semantics — matches what the photo LOOKS like.
-                  Use a short ENGLISH description ("sunset at beach").
-               2. OCR exact text — the whole query is substring-matched
-                  against text recognized INSIDE photos; hits rank on top.
-                  Use a SHORT keyword in the language actually printed on
-                  the photo (e.g. Chinese receipts → “电脑” / store name /
-                  “发票”), never a long sentence.
-               Visual subjects → one English query. Text-bearing targets
-               (receipts, documents, screenshots) → query with the words
-               likely printed on them, in their original language.
+        query: MUST be ENGLISH ONLY — never pass Chinese or any other
+               language; non-English queries are rejected by this tool.
+               Translate the user's request into ONE short English
+               description of what the photo looks like ("sunset at
+               beach", "computer store receipt") before calling.
         year:  Optional year filter (e.g. 2025). 0 means no filter.
         limit: Max results to return (1-50).
     """
@@ -59,6 +53,13 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
 
     if limit < 1 or limit > 50:
         limit = 20
+
+    # Hard guard: the caller (LLM) must translate to English first.
+    if any(ord(ch) > 127 for ch in query):
+        return json.dumps({
+            "error": "query must be English only. Translate the request "
+                     "into a short English description and call again.",
+        })
 
     payload: dict = {"query": query, "limit": limit}
     if year > 0:
