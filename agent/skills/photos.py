@@ -35,7 +35,8 @@ def _photos_base_url() -> str | None:
 
 
 @function_tool
-async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
+async def search_photos(query: str, year: int = 0, limit: int = 20,
+                        ocr_text: str = "") -> str:
     """Search photos by semantic description using CLIP AI.
 
     Args:
@@ -46,6 +47,12 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
                beach", "computer store receipt") before calling.
         year:  Optional year filter (e.g. 2025). 0 means no filter.
         limit: Max results to return (1-50).
+        ocr_text: OPTIONAL, for text-bearing targets only (receipts,
+               documents, screenshots): a SHORT keyword expected to be
+               printed INSIDE the photo, in the photo's own language
+               (e.g. Chinese receipts → "发票" / store name). Exact-text
+               matches are merged on top of the visual results. Leave
+               empty for purely visual searches.
     """
     base_url = _photos_base_url()
     if not base_url:
@@ -66,17 +73,44 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
         payload["filters"] = {"year": year}
 
     try:
+        ocr_hits = []
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(
                 f"{base_url}/v1/photos/search/smart",
                 json=payload,
                 headers=_auth_headers(),
             )
+            # OCR channel: a separate request in the photo's own language.
+            # Only exact text matches (matchedBy == "ocr") are kept — the
+            # CLIP tail of a non-English query is noise.
+            if ocr_text.strip():
+                ocr_payload: dict = {"query": ocr_text.strip(), "limit": limit}
+                if year > 0:
+                    ocr_payload["filters"] = {"year": year}
+                ocr_resp = await client.post(
+                    f"{base_url}/v1/photos/search/smart",
+                    json=ocr_payload,
+                    headers=_auth_headers(),
+                )
+                if ocr_resp.status_code == 200:
+                    ocr_hits = [
+                        item for item in (ocr_resp.json() or [])
+                        if item.get("matchedBy") == "ocr"
+                    ]
         if resp.status_code != 200:
             return json.dumps({"error": f"HTTP {resp.status_code}"})
 
-        raw = resp.json()
-        if not raw:
+        raw = resp.json() or []
+        seen = set()
+        merged = []
+        for item in ocr_hits + list(raw):
+            item_id = item.get("id", "")
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            merged.append(item)
+        merged = merged[:limit]
+        if not merged:
             return json.dumps({"query": query, "count": 0, "results": []})
 
         results = [
@@ -84,8 +118,9 @@ async def search_photos(query: str, year: int = 0, limit: int = 20) -> str:
                 "id": item.get("id", ""),
                 "name": item.get("originalName", item.get("id", "unknown")),
                 "takenAt": (item.get("takenAt") or "")[:10],
+                **({"matchedBy": "ocr"} if item.get("matchedBy") == "ocr" else {}),
             }
-            for item in raw
+            for item in merged
         ]
         return json.dumps({"query": query, "count": len(results), "results": results})
 
