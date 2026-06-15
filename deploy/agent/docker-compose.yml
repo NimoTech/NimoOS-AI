@@ -1,0 +1,29 @@
+name: nimoos-agent
+
+# NimoOS Agent — 离线镜像部署(image 由 script/package-agent.sh 打的 tar 经
+# docker load 注入,pull_policy: never)。AppManagement 经 labels 识别为系统 app。
+services:
+  agent:
+    image: localhost/nimoos-agent:bundled
+    pull_policy: never
+    network_mode: host          # 绑 127.0.0.1:8282,nimoos-ai 反代不变
+    # Task 0 spike 已确认:不需要 SYS_ADMIN(bwrap 用无特权 userns);三个 security-opt 缺一不可
+    security_opt:
+      - seccomp=unconfined       # 放行 unshare/clone/mount
+      - apparmor=unconfined      # 否则 "Failed to make / slave"
+      - systempaths=unconfined   # 否则 "Can't mount proc"(Docker 掩盖 /proc)
+    volumes:
+      # rslave:容器能看到容器启动后宿主新挂载(USB→/media、阵列→/DATA);单向、不反向泄漏。
+      - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }
+      - { type: bind, source: /media, target: /media, bind: { propagation: rslave } }
+      - { type: bind, source: /mnt,   target: /mnt,   bind: { propagation: rslave } }
+      - { type: bind, source: /var/run/nimoos, target: /var/run/nimoos, read_only: true }
+      - { type: bind, source: /var/lib/nimoos/ai/agent, target: /var/lib/nimoos/ai/agent }
+      - { type: bind, source: /etc/nimoos, target: /etc/nimoos, read_only: true }
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "3" }
+    labels:
+      nimoos.system: "true"
+      nimoos.display_name: "NimoOS Agent"
