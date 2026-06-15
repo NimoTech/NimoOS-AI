@@ -108,8 +108,9 @@ MAX_DOC_UNCOMPRESSED_BYTES  = _env_int("NIMOOS_MAX_DOC_UNCOMPRESSED_BYTES",  209
 app = FastAPI(title="nimoos-agent")
 
 
+# container-local liveness probe — intentionally minimal (no auth/DB)
 @app.get("/healthz")
-def healthz():
+async def healthz():
     return {"status": "ok"}
 
 

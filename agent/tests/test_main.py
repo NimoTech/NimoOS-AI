@@ -23,6 +23,12 @@ async def test_health_returns_ok(client):
     assert resp.json()["status"] == "ok"
 
 @pytest.mark.asyncio
+async def test_healthz_ok(client):
+    resp = await client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+@pytest.mark.asyncio
 async def test_create_session(client):
     resp = await client.post("/agent/sessions", headers={"X-User-Id": "1"})
     assert resp.status_code == 200
