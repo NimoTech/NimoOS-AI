@@ -108,6 +108,11 @@ MAX_DOC_UNCOMPRESSED_BYTES  = _env_int("NIMOOS_MAX_DOC_UNCOMPRESSED_BYTES",  209
 app = FastAPI(title="nimoos-agent")
 
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
 @app.on_event("startup")
 async def _attachments_startup():
     """Run attachment GC at agent startup.
