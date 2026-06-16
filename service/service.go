@@ -129,3 +129,13 @@ func NewServiceFromParts(db *sql.DB, store *SkillsStore) Services {
 		skills: &skillsService{db: db, store: store},
 	}
 }
+
+// NewServicesForTest wires only the pieces handler tests need.
+func NewServicesForTest(db *sql.DB, mk *crypto.MasterKey) Services {
+	return &services{
+		db:        db,
+		masterKey: mk,
+		providers: &providerService{db: db},
+		mcp:       &mcpService{db: db},
+	}
+}
