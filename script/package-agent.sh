@@ -13,7 +13,20 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
 
 echo "==> 构建镜像 ${IMAGE_REF} ..."
-docker build -t "${IMAGE_REF}" -f "${ROOT}/deploy/agent/Dockerfile" "${ROOT}"
+# 基础镜像存在性守卫:离线/国内网无法访问 docker.io,缺基础镜像时给出可操作提示,
+# 而不是抛一个看不懂的 "TLS handshake timeout"。
+BASE_IMAGE="$(awk '/^FROM /{print $2; exit}' "${ROOT}/deploy/agent/Dockerfile")"
+if ! docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
+  echo "!! 本地缺少基础镜像 ${BASE_IMAGE}。" >&2
+  echo "   离线环境请先在能联网的机器获取后导入本机:" >&2
+  echo "     docker pull ${BASE_IMAGE}" >&2
+  echo "     docker save ${BASE_IMAGE} -o base.tar   # 拷到本机后:  docker load -i base.tar" >&2
+  echo "   或给本机 docker 配 registry-mirrors(/etc/docker/daemon.json)再重试。" >&2
+  exit 1
+fi
+# DOCKER_BUILDKIT=0:用经典构建器,基础镜像在本地即直接复用、不去 registry 重新解析元数据
+# (BuildKit 即便本地有也会 HEAD docker.io,离线会超时)。
+DOCKER_BUILDKIT=0 docker build -t "${IMAGE_REF}" -f "${ROOT}/deploy/agent/Dockerfile" "${ROOT}"
 
 echo "==> 导出镜像 -> agent-image.tar ..."
 docker save "${IMAGE_REF}" -o "${STAGE}/agent-image.tar"
