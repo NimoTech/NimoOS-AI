@@ -624,7 +624,14 @@ class AgentRunner:
             # the SDK constructor only takes (model, openai_client,
             # should_replay_reasoning_content). The Runner pulls model_settings
             # off Agent and threads it into each call.
-            mcp_tools, mcp_conns = await _build_mcp_for_run(mcp_servers)
+            # §7.3: MCP tools are additive and must only extend the general
+            # profile.  Pinned-whitelist profiles (e.g. photos) have a fixed
+            # tool set for isolation; appending MCP tools would break that
+            # contract.  `_build_mcp_for_run(None)` short-circuits to ([], [])
+            # without opening any connections, so pinned profiles incur zero
+            # MCP connection cost.
+            _mcp_allowed = profile is None or profile.tools is None
+            mcp_tools, mcp_conns = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
