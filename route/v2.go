@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NimoTech/NimoOS-AI/common"
 	"github.com/NimoTech/NimoOS-AI/pkg/config"
@@ -22,7 +23,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	policy := v2.NewPolicyHandler(svc)
 	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
 	sessions := v2.NewSessionsHandler(svc)
-	agent := v2.NewAgentHandler(svc, agentURL, 60)
+	mcpTickets := v2.NewTicketStore(30 * time.Second)
+	mcp := v2.NewMCPHandler(svc, mcpTickets)
+	agent := v2.NewAgentHandler(svc, agentURL, 60, mcpTickets)
 	agent.StartHealthMonitor()
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
 	searchClient := service.NewSearchClient(runtimePath + "/search.url")
@@ -37,6 +40,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 			"X-NimoOS-Force-Cloud", "X-User-Id", "X-User-Name",
 			"X-Agent-Provider-Key", "X-Agent-Provider-Url",
 			"X-Agent-Provider-Type", "X-Agent-Provider-Id",
+			"X-Agent-MCP-Ticket",
 		},
 	}))
 
@@ -82,6 +86,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal := g.Group("/_internal", LocalhostOnly)
 	internal.POST("/chat/completions", chat.ChatCompletions)
 	internal.GET("/models", models.ListInternal)
+	internal.GET("/mcp/runtime", mcp.Runtime)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -95,6 +100,12 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.GET("/providers/:id/models", providers.ListModels)
 	g.POST("/providers/:id/models/refresh", providers.RefreshModels)
 	g.PUT("/providers/:id/models", providers.UpdateModels)
+
+	// MCP server management
+	g.GET("/mcp/servers", mcp.List)
+	g.POST("/mcp/servers", mcp.Create)
+	g.PUT("/mcp/servers/:id", mcp.Update)
+	g.DELETE("/mcp/servers/:id", mcp.Delete)
 
 	// Privacy policy
 	g.GET("/policy", policy.Get)
