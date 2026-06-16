@@ -182,6 +182,7 @@ class SandboxRunRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     confirmed: bool = True
+    remember: bool = False
 
     model_config = {"extra": "ignore"}
 
@@ -1530,6 +1531,7 @@ async def confirm_session(
     x_user_id: str = Header(..., alias="X-User-Id"),
 ):
     confirmed = True
+    remember = False
     confirm_id = ""
     body = await request.body()
     if body:
@@ -1537,13 +1539,15 @@ async def confirm_session(
             import json as _json
             data = _json.loads(body)
             confirmed = bool(data.get("confirmed", True))
+            remember = bool(data.get("remember", False))
             confirm_id = str(data.get("confirm_id") or "")
         except Exception:
             pass
     if not confirm_id:
         raise HTTPException(status_code=400, detail="confirm_id_required")
     try:
-        _confirm_mgr.resolve(confirm_id, confirmed, expected_session_id=session_id)
+        _confirm_mgr.resolve(confirm_id, confirmed, remember=remember,
+                             expected_session_id=session_id)
     except KeyError as e:
         # confirm_expired (id unknown / already resolved / agent restarted) or
         # confirm_session_mismatch (id belongs to another session). Both are 409.
