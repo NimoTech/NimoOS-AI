@@ -100,3 +100,30 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 		t.Fatalf("reused ticket should 401, got %d", rec2.Code)
 	}
 }
+
+func TestMcpHandler_UpdateRejectsStdioTransport(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute))
+	e := echo.New()
+
+	// create a valid http server directly
+	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+		UserID: "u1", Name: "x", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/", strings.NewReader(`{"transport":"stdio"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("1")
+	err := h.Update(c)
+	if err == nil {
+		t.Fatal("expected error for stdio transport on update")
+	}
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 HTTPError, got %v", err)
+	}
+}

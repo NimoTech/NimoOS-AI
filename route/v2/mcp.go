@@ -137,6 +137,9 @@ func (h *MCPHandler) Update(c echo.Context) error {
 	if err := h.applyReq(existing, &req); err != nil {
 		return err
 	}
+	if existing.Transport != "http" && existing.Transport != "sse" {
+		return echo.NewHTTPError(http.StatusBadRequest, "transport must be 'http' or 'sse' in phase 1")
+	}
 	if err := h.svc.MCP().UpdateMcpServer(existing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return echo.NewHTTPError(http.StatusNotFound, "mcp server not found")
