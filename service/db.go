@@ -100,6 +100,22 @@ func migrate(db *sql.DB) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_providers_user_id ON providers(user_id);
 
+	CREATE TABLE IF NOT EXISTS mcp_servers (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id     TEXT NOT NULL,
+		name        TEXT NOT NULL,
+		transport   TEXT NOT NULL,
+		url         TEXT NOT NULL DEFAULT '',
+		command     TEXT NOT NULL DEFAULT '',
+		args        TEXT NOT NULL DEFAULT '[]',
+		env         TEXT NOT NULL DEFAULT '{}',
+		headers     TEXT NOT NULL DEFAULT '',
+		enabled     INTEGER NOT NULL DEFAULT 1,
+		created_at  INTEGER NOT NULL,
+		updated_at  INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_id ON mcp_servers(user_id);
+
 	CREATE TABLE IF NOT EXISTS privacy_policies (
 		id                INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id           TEXT NOT NULL UNIQUE,
