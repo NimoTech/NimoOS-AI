@@ -1,9 +1,12 @@
 """Wrap MCP tools as confirm-gated, blacklist-gated FunctionTools."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextvars import ContextVar
+
+MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start path
 
 from agents import FunctionTool
 
@@ -15,6 +18,8 @@ EVENT_QUEUE_VAR: ContextVar = ContextVar("mcp_event_queue", default=None)
 CONFIRM_MGR_VAR: ContextVar = ContextVar("mcp_confirm_mgr", default=None)
 USER_PATTERNS_VAR: ContextVar = ContextVar("mcp_user_patterns", default=[])
 # session-scoped set of "serverid::toolname" the user chose to remember.
+# CONTRACT: agent.py MUST call _CONFIRMED_TOOLS_VAR.set(set()) at the start of
+# each run (see Task 13) to prevent cross-run/session bleed of approvals.
 _CONFIRMED_TOOLS_VAR: ContextVar = ContextVar("mcp_confirmed_tools", default=set())
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -94,3 +99,78 @@ def _wrap_tool(server: dict, conn, mcp_tool) -> FunctionTool:
         on_invoke_tool=_on_invoke,
         strict_json_schema=False,
     )
+
+
+class McpConn:
+    """Holds a live agents.mcp server. `srv` exposes connect/list_tools/
+    call_tool/cleanup (the agents.mcp server interface)."""
+    __slots__ = ("server", "srv")
+
+    def __init__(self, server: dict, srv):
+        self.server = server
+        self.srv = srv
+
+    async def call_tool(self, name: str, args: dict):
+        return await self.srv.call_tool(name, args)
+
+    async def aclose(self):
+        try:
+            await self.srv.cleanup()
+        except Exception:
+            pass
+
+
+async def _emit_warning(server_name: str, err) -> None:
+    queue = EVENT_QUEUE_VAR.get()
+    if queue is None:
+        return
+    await queue.put({"type": "mcp_warning", "server": server_name, "error": str(err)})
+
+
+async def _connect(server: dict) -> "McpConn":
+    transport = server.get("transport", "http")
+    if transport in ("http", "sse"):
+        from agents.mcp import MCPServerStreamableHttp, MCPServerSse
+        cls = MCPServerStreamableHttp if transport == "http" else MCPServerSse
+        srv = cls(
+            params={"url": server["url"], "headers": server.get("headers", {})},
+            client_session_timeout_seconds=MCP_CONNECT_TIMEOUT,
+            name=server.get("name", "mcp"),
+        )
+    else:  # stdio reserved for phase 2
+        raise ValueError(f"unsupported transport: {transport}")
+    await asyncio.wait_for(srv.connect(), timeout=MCP_CONNECT_TIMEOUT)
+    return McpConn(server=server, srv=srv)
+
+
+async def build_mcp_tools(servers: list[dict]):
+    """Connect all servers concurrently; a failing server is skipped (its tools
+    are simply absent this run). Returns (tools, conns_to_close)."""
+    results = await asyncio.gather(*[_connect(s) for s in servers],
+                                   return_exceptions=True)
+    tools, conns = [], []
+    seen_names: set[str] = set()
+    for s, conn in zip(servers, results):
+        if isinstance(conn, Exception):
+            await _emit_warning(s.get("name", "mcp"), conn)
+            continue
+        try:
+            mcp_tools = await asyncio.wait_for(conn.srv.list_tools(),
+                                               timeout=MCP_CONNECT_TIMEOUT)
+        except Exception as e:
+            await _emit_warning(s.get("name", "mcp"), e)
+            await conn.aclose()
+            continue
+        conns.append(conn)
+        for t in mcp_tools:
+            tool = _wrap_tool(s, conn, t)
+            # Disambiguate name collisions across servers (e.g. two servers whose
+            # slug+toolname coincide) so neither silently shadows the other.
+            if tool.name in seen_names:
+                suffix = 2
+                while f"{tool.name}_{suffix}" in seen_names:
+                    suffix += 1
+                tool.name = f"{tool.name}_{suffix}"
+            seen_names.add(tool.name)
+            tools.append(tool)
+    return tools, conns
