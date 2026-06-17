@@ -33,7 +33,7 @@ def _stdio_env(user_env: dict) -> dict:
     env.update(user_env or {})
     core = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("NIMOOS_MCP_HOME", "/tmp"),
+        "HOME": os.environ.get("NIMOOS_MCP_HOME") or os.environ.get("HOME") or "/tmp",
         "npm_config_cache": os.environ.get("npm_config_cache", ""),
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", ""),
     }
@@ -323,8 +323,14 @@ async def _metas_for_server(server: dict):
         if time.monotonic() - entry.fetched_at > SCHEMA_TTL:
             _schedule_revalidate(server)        # stale-while-revalidate
         return entry.metas
+    # 冷 / fingerprint 变:
+    if server.get("transport") == "stdio":
+        _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
+        await _emit_warning(server.get("name", "mcp"),
+                            "stdio 工具首次使用正在后台下载初始化,稍后重试")
+        return []
     try:
-        return await _cold_fetch(server)        # cold or fingerprint changed
+        return await _cold_fetch(server)        # http/sse:内联快取
     except Exception as e:
         await _emit_warning(server.get("name", "mcp"), e)
         return []
@@ -355,11 +361,13 @@ async def build_mcp_tools(servers: list[dict]) -> list:
 
 
 TEST_TIMEOUT = 9  # 秒;须 < Go 调用方超时(10s),Go 放弃后 Python 主动取消释放
+STDIO_TEST_TIMEOUT = 90  # 秒;stdio 首次下包慢;Go /test client 超时须 > 此值
 
 
 async def test_server(server: dict) -> dict:
+    timeout = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
     try:
-        return await asyncio.wait_for(_test_server_inner(server), timeout=TEST_TIMEOUT)
+        return await asyncio.wait_for(_test_server_inner(server), timeout=timeout)
     except asyncio.TimeoutError:
         return {"ok": False, "error": "探测超时"}
 
@@ -370,7 +378,7 @@ async def _test_server_inner(server: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"连接失败: {e}"}
     try:
-        tools = await conn.srv.list_tools()
+        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
     except Exception as e:
         await conn.aclose()
         return {"ok": False, "error": f"列工具失败: {e}"}
