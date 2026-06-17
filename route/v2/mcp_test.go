@@ -31,7 +31,7 @@ func mcpTestSvc(t *testing.T) service.Services {
 func TestMcpHandler_CreateListDTOHidesSecrets(t *testing.T) {
 	svc := mcpTestSvc(t)
 	ts := NewTicketStore(time.Minute)
-	h := NewMCPHandler(svc, ts)
+	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
 	e := echo.New()
 
 	body := `{"name":"github","transport":"http","url":"https://x","headers":{"Authorization":"Bearer SECRET"}}`
@@ -63,7 +63,7 @@ func TestMcpHandler_CreateListDTOHidesSecrets(t *testing.T) {
 func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	svc := mcpTestSvc(t)
 	ts := NewTicketStore(time.Minute)
-	h := NewMCPHandler(svc, ts)
+	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
 	e := echo.New()
 
 	enc, _ := svc.MasterKey().Encrypt(`{"Authorization":"Bearer SECRET"}`)
@@ -103,7 +103,7 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 
 func TestMcpHandler_UpdateRejectsStdioTransport(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute))
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 
 	// create a valid http server directly
@@ -125,5 +125,59 @@ func TestMcpHandler_UpdateRejectsStdioTransport(t *testing.T) {
 	he, ok := err.(*echo.HTTPError)
 	if !ok || he.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 HTTPError, got %v", err)
+	}
+}
+
+func TestMcpHandler_TestProxiesToAgent(t *testing.T) {
+	svc := mcpTestSvc(t)
+	enc, _ := svc.MasterKey().Encrypt(`{"Authorization":"Bearer S"}`)
+	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Headers: enc, Enabled: true,
+	})
+	var gotAuth string
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if h, ok := body["headers"].(map[string]any); ok {
+			gotAuth, _ = h["Authorization"].(string)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"tool_count":2,"tools":["a","b"]}`))
+	}))
+	defer agent.Close()
+
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), agent.URL)
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("1")
+	if err := h.Test(c); err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"tool_count":2`) {
+		t.Fatalf("unexpected resp %d %s", rec.Code, rec.Body.String())
+	}
+	if gotAuth != "Bearer S" {
+		t.Fatalf("agent did not receive decrypted header, got %q", gotAuth)
+	}
+}
+
+func TestMcpHandler_TestNotFound(t *testing.T) {
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("999")
+	err := h.Test(c)
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %v", err)
 	}
 }

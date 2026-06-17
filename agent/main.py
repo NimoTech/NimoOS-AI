@@ -1643,6 +1643,13 @@ async def cancel_session(
     return {"ok": True, "confirms_cancelled": confirms_cancelled, "task_cancelled": task_cancelled}
 
 
+@app.post("/agent/mcp/test")
+async def mcp_test(request: Request):
+    import mcp_client.client as mcp_client
+    cfg = await request.json()
+    return await mcp_client.test_server(cfg)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8282)

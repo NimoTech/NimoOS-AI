@@ -1,23 +1,27 @@
 package v2
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
 
 type MCPHandler struct {
-	svc     service.Services
-	tickets *TicketStore
+	svc      service.Services
+	tickets  *TicketStore
+	agentURL string
 }
 
-func NewMCPHandler(svc service.Services, tickets *TicketStore) *MCPHandler {
-	return &MCPHandler{svc: svc, tickets: tickets}
+func NewMCPHandler(svc service.Services, tickets *TicketStore, agentURL string) *MCPHandler {
+	return &MCPHandler{svc: svc, tickets: tickets, agentURL: agentURL}
 }
 
 type mcpRequest struct {
@@ -234,6 +238,43 @@ func (h *MCPHandler) decryptMap(enc string) map[string]string {
 	}
 	_ = json.Unmarshal([]byte(plain), &out)
 	return out
+}
+
+// Test handles POST /v1/ai/mcp/servers/:id/test — connectivity probe. Go can't
+// speak MCP, so it decrypts the saved config and forwards to the Python agent's
+// /agent/mcp/test, returning the agent's {ok,tool_count,tools,error} verbatim.
+func (h *MCPHandler) Test(c echo.Context) error {
+	uid, err := h.userID(c)
+	if err != nil {
+		return err
+	}
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid id")
+	}
+	m, err := h.svc.MCP().GetMcpServer(id, uid)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return echo.NewHTTPError(http.StatusNotFound, "mcp server not found")
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	var args []string
+	_ = json.Unmarshal([]byte(m.Args), &args)
+	payload, _ := json.Marshal(map[string]any{
+		"id": m.ID, "name": m.Name, "transport": m.Transport, "url": m.URL,
+		"command": m.Command, "args": args,
+		"env":     h.decryptMap(m.Env),
+		"headers": h.decryptMap(m.Headers),
+	})
+	client := &http.Client{Timeout: 12 * time.Second} // > Python TEST_TIMEOUT(9s)
+	resp, err := client.Post(h.agentURL+"/agent/mcp/test", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return c.JSON(http.StatusBadGateway, map[string]any{"ok": false, "error": "agent unreachable"})
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return c.JSONBlob(http.StatusOK, body)
 }
 
 // Runtime serves GET /v1/ai/_internal/mcp/runtime. Auth is the one-time ticket
