@@ -107,3 +107,26 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
     monkeypatch.setattr(mc, "MCP_CONNECT_TIMEOUT", 0.05)   # http path inner timeout tiny
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
     assert out["ok"] is False and "超时" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_conn_cleanup_called_on_close(monkeypatch):
+    """Our run path must trigger the SDK's cleanup() for stdio conns (which is
+    where the SDK does the process-group kill). Full no-orphan check is manual."""
+    cleaned = {"n": 0}
+
+    class FakeStdioSrv:
+        async def connect(self): pass
+        async def cleanup(self): cleaned["n"] += 1   # SDK group-kill happens here
+
+    async def fake_connect(server):
+        return mc.McpConn(server=server, srv=FakeStdioSrv())
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+
+    mc._RUN_CONNS_VAR.set({})
+    mc._RUN_CONN_LOCKS_VAR.set({})
+    conn = await mc._get_run_conn({"id": 1, "name": "fs", "transport": "stdio", "command": "npx"})
+    assert conn is not None
+    await mc.close_run_conns()
+    assert cleaned["n"] == 1                          # cleanup invoked exactly once
+    assert mc._RUN_CONNS_VAR.get() == {}             # run conns cleared
