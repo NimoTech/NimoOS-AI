@@ -51,3 +51,10 @@ async def test_close_run_conns_closes_and_clears(monkeypatch):
     await mc.close_run_conns()
     assert c.closed is True
     assert mc._RUN_CONNS_VAR.get() == {}
+
+
+@pytest.mark.asyncio
+async def test_get_run_conn_uninitialised_raises():
+    mc._RUN_CONNS_VAR.set(None)
+    with pytest.raises(RuntimeError):
+        await mc._get_run_conn({"id": 1, "name": "x"})

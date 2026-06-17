@@ -203,6 +203,8 @@ async def _get_run_conn(server: dict) -> "McpConn":
     """Lazily connect on first use within a run; reuse for the rest of the run.
     A per-server lock makes concurrent tool calls share one connection."""
     conns = _RUN_CONNS_VAR.get()
+    if conns is None:
+        raise RuntimeError("_RUN_CONNS_VAR not initialised; agent.py must call .set({}) at run start")
     sid = server["id"]
     if sid in conns:
         return conns[sid]
