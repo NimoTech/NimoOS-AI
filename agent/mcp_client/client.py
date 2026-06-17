@@ -9,6 +9,10 @@ import time
 from collections import OrderedDict
 from contextvars import ContextVar
 
+from agents import FunctionTool
+
+from mcp_client.schema import sanitize_schema, flatten_result
+
 MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start path
 
 SCHEMA_TTL = 600        # 秒;超过则 stale(仍可用,触发后台 revalidate)
@@ -60,9 +64,6 @@ def _fingerprint(server: dict) -> str:
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(basis.encode()).hexdigest()
 
-from agents import FunctionTool
-
-from mcp_client.schema import sanitize_schema, flatten_result
 
 # Set per-run by agent.py (mirrors how skills/* receive context).
 SESSION_ID_VAR: ContextVar = ContextVar("mcp_session_id", default="")
@@ -267,7 +268,10 @@ async def _cold_fetch(server: dict):
     try:
         tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
     finally:
-        await conn.aclose()
+        try:
+            await conn.aclose()
+        except Exception:
+            pass
     metas = [_extract_meta(t) for t in tools]
     _cache_put(server["id"], metas, _fingerprint(server))
     return metas

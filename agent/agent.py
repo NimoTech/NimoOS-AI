@@ -620,7 +620,7 @@ class AgentRunner:
             # §7.3: MCP tools are additive and must only extend the general
             # profile.  Pinned-whitelist profiles (e.g. photos) have a fixed
             # tool set for isolation; appending MCP tools would break that
-            # contract.  `_build_mcp_for_run(None)` short-circuits to ([], [])
+            # contract.  `_build_mcp_for_run(None)` short-circuits to []
             # without opening any connections, so pinned profiles incur zero
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
