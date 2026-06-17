@@ -102,8 +102,8 @@ def _gate_args(args: dict, patterns: list[str]) -> None:
                 raise ValueError(f"参数 {k} 命中黑名单({pat})")
 
 
-async def _ensure_confirmed(server: dict, mcp_tool, args: dict) -> bool:
-    key = f"{server['id']}::{mcp_tool.name}"
+async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
+    key = f"{server['id']}::{tool_name}"
     if key in _CONFIRMED_TOOLS_VAR.get(set()):
         return True
     mgr = CONFIRM_MGR_VAR.get()
@@ -111,11 +111,11 @@ async def _ensure_confirmed(server: dict, mcp_tool, args: dict) -> bool:
     session_id = SESSION_ID_VAR.get()
     confirm_id = mgr.register(
         session_id, f"mcp_call:{key}",
-        f"调用 MCP server「{server['name']}」的工具 {mcp_tool.name}",
+        f"调用 MCP server「{server['name']}」的工具 {tool_name}",
         json.dumps(args, ensure_ascii=False)[:500])
     await queue.put({
         "type": "confirmation_required", "confirm_id": confirm_id,
-        "kind": "mcp_tool", "server": server["name"], "tool": mcp_tool.name,
+        "kind": "mcp_tool", "server": server["name"], "tool": tool_name,
         "remember_scope": "tool",
     })
     confirmed = await mgr.wait(confirm_id)
@@ -126,10 +126,11 @@ async def _ensure_confirmed(server: dict, mcp_tool, args: dict) -> bool:
     return confirmed
 
 
-def _wrap_tool(server: dict, conn, mcp_tool) -> FunctionTool:
+def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
     slug = _slug(server["name"])
-    fq_name = f"mcp__{slug}__{mcp_tool.name}"
-    schema = sanitize_schema(getattr(mcp_tool, "inputSchema", None))
+    tool_name = meta["name"]
+    fq_name = f"mcp__{slug}__{tool_name}"
+    schema = sanitize_schema(meta.get("input_schema"))
 
     async def _on_invoke(ctx, input_json: str) -> str:
         try:
@@ -140,17 +141,23 @@ def _wrap_tool(server: dict, conn, mcp_tool) -> FunctionTool:
             _gate_args(args, USER_PATTERNS_VAR.get([]))
         except ValueError as e:
             return f"已被黑名单拦截: {e}"
-        if not await _ensure_confirmed(server, mcp_tool, args):
+        if not await _ensure_confirmed(server, tool_name, args):
             return "用户拒绝了该 MCP 工具调用"
         try:
-            result = await conn.call_tool(mcp_tool.name, args)
+            conn = await _get_run_conn(server)          # lazy connect (connection layer)
         except Exception as e:
-            return f"MCP 工具 {mcp_tool.name} 调用失败: {e}"
+            return (f"系统错误:无法连接到 MCP 服务方「{server['name']}」({e})。"
+                    f"这是连接/服务端故障,与调用参数无关——请勿改参数重试,"
+                    f"告知用户检查该 MCP 服务状态。")
+        try:
+            result = await conn.call_tool(tool_name, args)   # tool execution layer
+        except Exception as e:
+            return f"MCP 工具 {tool_name} 执行出错: {e}"
         return flatten_result(result)
 
     return FunctionTool(
         name=fq_name,
-        description=getattr(mcp_tool, "description", "") or "",
+        description=meta.get("description", "") or "",
         params_json_schema=schema,
         on_invoke_tool=_on_invoke,
         strict_json_schema=False,
@@ -228,34 +235,80 @@ async def close_run_conns() -> None:
     conns.clear()
 
 
-async def build_mcp_tools(servers: list[dict]):
-    """Connect all servers concurrently; a failing server is skipped (its tools
-    are simply absent this run). Returns (tools, conns_to_close)."""
-    results = await asyncio.gather(*[_connect(s) for s in servers],
-                                   return_exceptions=True)
-    tools, conns = [], []
-    seen_names: set[str] = set()
-    for s, conn in zip(servers, results):
-        if isinstance(conn, Exception):
-            await _emit_warning(s.get("name", "mcp"), conn)
-            continue
+def _schedule_revalidate(server: dict) -> None:
+    sid = server["id"]
+    if sid in _REVALIDATING:           # single-flight per server
+        return
+    _REVALIDATING.add(sid)
+    task = asyncio.create_task(_revalidate(server))
+    _BACKGROUND_TASKS.add(task)        # strong ref so the task isn't GC'd mid-await
+    def _done(t):
+        _BACKGROUND_TASKS.discard(t)
+        _REVALIDATING.discard(sid)
+    task.add_done_callback(_done)
+
+
+async def _revalidate(server: dict) -> None:
+    try:
+        conn = await _connect(server)
         try:
-            mcp_tools = await asyncio.wait_for(conn.srv.list_tools(),
-                                               timeout=MCP_CONNECT_TIMEOUT)
-        except Exception as e:
-            await _emit_warning(s.get("name", "mcp"), e)
+            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+            _cache_put(server["id"], [_extract_meta(t) for t in tools], _fingerprint(server))
+        finally:
             await conn.aclose()
+    except Exception:
+        pass   # keep stale cache; background task must never raise
+
+
+async def _cold_fetch(server: dict):
+    """Connect once just to read schemas; cache + return metas. Connection is
+    closed immediately (real calls use the per-run lazy connection)."""
+    conn = await _connect(server)
+    try:
+        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+    finally:
+        await conn.aclose()
+    metas = [_extract_meta(t) for t in tools]
+    _cache_put(server["id"], metas, _fingerprint(server))
+    return metas
+
+
+async def _metas_for_server(server: dict):
+    """Return tool metas for a server, preferring cache. Cold/changed -> fetch
+    inline; stale -> serve cached + background revalidate. Returns [] on failure
+    (and emits a warning)."""
+    fp = _fingerprint(server)
+    entry = _cache_get(server["id"])
+    if entry is not None and entry.fingerprint == fp:
+        if time.monotonic() - entry.fetched_at > SCHEMA_TTL:
+            _schedule_revalidate(server)        # stale-while-revalidate
+        return entry.metas
+    try:
+        return await _cold_fetch(server)        # cold or fingerprint changed
+    except Exception as e:
+        await _emit_warning(server.get("name", "mcp"), e)
+        return []
+
+
+async def build_mcp_tools(servers: list[dict]) -> list:
+    """Build confirm/blacklist-gated FunctionTools for this run from the schema
+    cache (zero connection when warm). Connections are established lazily per
+    tool call (see _get_run_conn). Returns a flat list of FunctionTools."""
+    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in servers],
+                                     return_exceptions=True)
+    tools = []
+    seen_names: set = set()
+    for s, metas in zip(servers, metas_per):
+        if isinstance(metas, Exception):
+            await _emit_warning(s.get("name", "mcp"), metas)
             continue
-        conns.append(conn)
-        for t in mcp_tools:
-            tool = _wrap_tool(s, conn, t)
-            # Disambiguate name collisions across servers (e.g. two servers whose
-            # slug+toolname coincide) so neither silently shadows the other.
-            if tool.name in seen_names:
+        for meta in metas:
+            tool = _wrap_tool(s, meta)
+            if tool.name in seen_names:          # disambiguate cross-server collisions
                 suffix = 2
                 while f"{tool.name}_{suffix}" in seen_names:
                     suffix += 1
                 tool.name = f"{tool.name}_{suffix}"
             seen_names.add(tool.name)
             tools.append(tool)
-    return tools, conns
+    return tools

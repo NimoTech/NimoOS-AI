@@ -326,22 +326,14 @@ def format_context_lines(context_photo=None, context_album=None) -> str:
 
 
 async def _build_mcp_for_run(mcp_servers):
-    """Build confirm-gated MCP tools for this run. Never raises — MCP is
-    additive. Returns (tools, conns_to_close)."""
+    """Build cache-backed, confirm-gated MCP tools for this run. Never raises —
+    MCP is additive. Returns a flat list of FunctionTools."""
     if not mcp_servers:
-        return [], []
+        return []
     try:
         return await mcp_client.build_mcp_tools(mcp_servers)
     except Exception:
-        return [], []
-
-
-async def _close_mcp_conns(conns):
-    for c in conns or []:
-        try:
-            await c.aclose()
-        except Exception:
-            pass
+        return []
 
 
 class AgentRunner:
@@ -450,7 +442,6 @@ class AgentRunner:
             raise RuntimeError("agent_busy")
 
         async with lock:
-            mcp_conns = []  # safe default; replaced by _build_mcp_for_run below
             # `sink` is anything with an async `put(event)`. Today that's a
             # RunSink (persists+pubsubs); skills don't care about the type.
             APP_SESSION_VAR.set(session_id)
@@ -461,6 +452,8 @@ class AgentRunner:
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
             mcp_client._CONFIRMED_TOOLS_VAR.set(set())
+            mcp_client._RUN_CONNS_VAR.set({})
+            mcp_client._RUN_CONN_LOCKS_VAR.set({})
             mb_skills.SESSION_ID_VAR.set(session_id)
             mb_skills.EVENT_QUEUE_VAR.set(sink)
             mb_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
@@ -631,7 +624,7 @@ class AgentRunner:
             # without opening any connections, so pinned profiles incur zero
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
-            mcp_tools, mcp_conns = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            mcp_tools = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
@@ -788,7 +781,7 @@ class AgentRunner:
                     pass
                 await sink.put({"type": "error", "content": str(e)})
             finally:
-                await _close_mcp_conns(mcp_conns)
+                await mcp_client.close_run_conns()
                 await sink.put({"type": "done"})
 
 
