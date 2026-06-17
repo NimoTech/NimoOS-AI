@@ -2,11 +2,63 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import time
+from collections import OrderedDict
 from contextvars import ContextVar
 
 MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start path
+
+SCHEMA_TTL = 600        # 秒;超过则 stale(仍可用,触发后台 revalidate)
+SCHEMA_CACHE_MAX = 256  # LRU 容量上限,兜住内存
+
+
+class _CacheEntry:
+    __slots__ = ("metas", "fetched_at", "fingerprint")
+
+    def __init__(self, metas, fetched_at, fingerprint):
+        self.metas = metas              # list[dict]: {"name","description","input_schema"}
+        self.fetched_at = fetched_at    # time.monotonic()
+        self.fingerprint = fingerprint
+
+
+_SCHEMA_CACHE: "OrderedDict[int, _CacheEntry]" = OrderedDict()  # key = server["id"], LRU
+_REVALIDATING: set = set()             # 防重入:同一 server 同时只有一个后台刷新
+_BACKGROUND_TASKS: set = set()         # 强引用,防 asyncio.create_task 被 GC
+
+
+def _extract_meta(mcp_tool) -> dict:
+    return {"name": mcp_tool.name,
+            "description": getattr(mcp_tool, "description", "") or "",
+            "input_schema": getattr(mcp_tool, "inputSchema", None)}
+
+
+def _cache_put(server_id: int, metas, fingerprint) -> None:
+    _SCHEMA_CACHE[server_id] = _CacheEntry(metas, time.monotonic(), fingerprint)
+    _SCHEMA_CACHE.move_to_end(server_id)
+    while len(_SCHEMA_CACHE) > SCHEMA_CACHE_MAX:
+        _SCHEMA_CACHE.popitem(last=False)   # 淘汰最久未用
+
+
+def _cache_get(server_id: int):
+    entry = _SCHEMA_CACHE.get(server_id)
+    if entry is not None:
+        _SCHEMA_CACHE.move_to_end(server_id)
+    return entry
+
+
+def _fingerprint(server: dict) -> str:
+    basis = json.dumps({
+        "transport": server.get("transport", "http"),
+        "url": server.get("url", ""),
+        "headers": server.get("headers", {}),
+        "command": server.get("command", ""),
+        "args": server.get("args", []),
+        "env": server.get("env", {}),
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(basis.encode()).hexdigest()
 
 from agents import FunctionTool
 
