@@ -379,6 +379,9 @@ async def _test_server_inner(server: dict) -> dict:
         return {"ok": False, "error": f"连接失败: {e}"}
     try:
         tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
+    except asyncio.TimeoutError:
+        await conn.aclose()
+        return {"ok": False, "error": "列工具超时"}
     except Exception as e:
         await conn.aclose()
         return {"ok": False, "error": f"列工具失败: {e}"}

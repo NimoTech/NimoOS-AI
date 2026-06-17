@@ -93,3 +93,17 @@ async def test_test_server_uses_stdio_timeout(monkeypatch, _clear_cache):
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)
     out2 = await mc.test_server({"id": 2, "name": "h", "transport": "http", "url": "https://x"})
     assert out2["ok"] is False and "超时" in out2["error"]
+
+
+@pytest.mark.asyncio
+async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache):
+    class SlowSrv:
+        async def list_tools(self):
+            import asyncio
+            await asyncio.sleep(10)
+        async def cleanup(self): pass
+    async def fake_connect(s): return mc.McpConn(server=s, srv=SlowSrv())
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+    monkeypatch.setattr(mc, "MCP_CONNECT_TIMEOUT", 0.05)   # http path inner timeout tiny
+    out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
+    assert out["ok"] is False and "超时" in out["error"]
