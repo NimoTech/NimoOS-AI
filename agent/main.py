@@ -31,6 +31,16 @@ from attachments import upload as att_upload
 from attachments.paths import build_storage_path
 from profiles import PROFILES
 
+# Ensure MCP cache dirs exist on the persistent volume at startup.
+# The `if _d:` guard makes this a no-op when the env vars are unset (e.g. in tests).
+for _d in (
+    os.environ.get("NIMOOS_MCP_HOME"),
+    os.environ.get("npm_config_cache"),
+    os.environ.get("UV_CACHE_DIR"),
+):
+    if _d:
+        os.makedirs(_d, exist_ok=True)
+
 _DB_PATH = os.environ.get("AGENT_DB_PATH", str(db_module._DB_PATH))
 _conn = db_module.init_db(_DB_PATH)
 _confirm_mgr = ConfirmManager(_conn)

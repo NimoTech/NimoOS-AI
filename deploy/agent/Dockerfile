@@ -19,6 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       file \
  && rm -rf /var/lib/apt/lists/*
 
+# Node(npm/npx)+ uv(uvx):stdio MCP server 运行时(用户填 `npx -y ...` / `uvx ...` 用到时自下载)
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir uv
+
+# stdio server 的 HOME / 包缓存指向持久卷,容器重启不重下(目录由 main.py 启动时 mkdir)
+ENV NIMOOS_MCP_HOME=/var/lib/nimoos/ai/agent/mcp-home
+ENV npm_config_cache=/var/lib/nimoos/ai/agent/mcp-home/.npm
+ENV UV_CACHE_DIR=/var/lib/nimoos/ai/agent/mcp-home/.uv
+
 # 静态 ffmpeg(避免 apt 拉入 ~200MB X11/wayland 依赖)
 ARG FFMPEG_ARCH=amd64
 RUN set -eux; cd /tmp; \
