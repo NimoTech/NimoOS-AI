@@ -34,6 +34,7 @@ import skills.skills_registry as skills_registry
 import skills.search as search_skills
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
+import mcp_client.client as mcp_client
 from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
@@ -324,6 +325,25 @@ def format_context_lines(context_photo=None, context_album=None) -> str:
     return out
 
 
+async def _build_mcp_for_run(mcp_servers):
+    """Build confirm-gated MCP tools for this run. Never raises — MCP is
+    additive. Returns (tools, conns_to_close)."""
+    if not mcp_servers:
+        return [], []
+    try:
+        return await mcp_client.build_mcp_tools(mcp_servers)
+    except Exception:
+        return [], []
+
+
+async def _close_mcp_conns(conns):
+    for c in conns or []:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+
+
 class AgentRunner:
     def __init__(self, conn: sqlite3.Connection, confirm_mgr=None):
         self._conn = conn
@@ -423,17 +443,24 @@ class AgentRunner:
         context_album=None,
         auth_header: str = "",
         user_lang: str = "",
+        mcp_servers: list | None = None,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
             raise RuntimeError("agent_busy")
 
         async with lock:
+            mcp_conns = []  # safe default; replaced by _build_mcp_for_run below
             # `sink` is anything with an async `put(event)`. Today that's a
             # RunSink (persists+pubsubs); skills don't care about the type.
             APP_SESSION_VAR.set(session_id)
             APP_EVENT_VAR.set(sink)
             APP_CONFIRM_VAR.set(self._confirm_mgr)
+            mcp_client.SESSION_ID_VAR.set(session_id)
+            mcp_client.EVENT_QUEUE_VAR.set(sink)
+            mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
+            mcp_client._CONFIRMED_TOOLS_VAR.set(set())
             mb_skills.SESSION_ID_VAR.set(session_id)
             mb_skills.EVENT_QUEUE_VAR.set(sink)
             mb_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
@@ -597,12 +624,20 @@ class AgentRunner:
             # the SDK constructor only takes (model, openai_client,
             # should_replay_reasoning_content). The Runner pulls model_settings
             # off Agent and threads it into each call.
+            # §7.3: MCP tools are additive and must only extend the general
+            # profile.  Pinned-whitelist profiles (e.g. photos) have a fixed
+            # tool set for isolation; appending MCP tools would break that
+            # contract.  `_build_mcp_for_run(None)` short-circuits to ([], [])
+            # without opening any connections, so pinned profiles incur zero
+            # MCP connection cost.
+            _mcp_allowed = profile is None or profile.tools is None
+            mcp_tools, mcp_conns = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
                 tools=select_tools_for_run(attachment_ids,
                                            session_id=session_id,
-                                           profile=profile),
+                                           profile=profile) + mcp_tools,
                 model=model,
                 model_settings=model_settings,
             )
@@ -753,6 +788,7 @@ class AgentRunner:
                     pass
                 await sink.put({"type": "error", "content": str(e)})
             finally:
+                await _close_mcp_conns(mcp_conns)
                 await sink.put({"type": "done"})
 
 

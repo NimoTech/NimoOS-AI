@@ -12,7 +12,7 @@ import (
 
 func TestAgentHealth_PythonDown(t *testing.T) {
 	e := echo.New()
-	h := v2.NewAgentHandler(nil, "http://127.0.0.1:19999", 10) // unreachable port
+	h := v2.NewAgentHandler(nil, "http://127.0.0.1:19999", 10, nil) // unreachable port
 	req := httptest.NewRequest(http.MethodGet, "/agent/health", nil)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
@@ -24,7 +24,7 @@ func TestAgentHealth_PythonDown(t *testing.T) {
 
 func TestAgentProxy_MissingUserID(t *testing.T) {
 	e := echo.New()
-	h := v2.NewAgentHandler(nil, "http://127.0.0.1:19999", 10)
+	h := v2.NewAgentHandler(nil, "http://127.0.0.1:19999", 10, nil)
 	req := httptest.NewRequest(http.MethodPost, "/agent/sessions", strings.NewReader("{}"))
 	req.Header.Set("Content-Type", "application/json")
 	// No X-NimoOS-User-ID header set

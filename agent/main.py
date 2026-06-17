@@ -182,6 +182,7 @@ class SandboxRunRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     confirmed: bool = True
+    remember: bool = False
 
     model_config = {"extra": "ignore"}
 
@@ -1226,7 +1227,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                continue_run: bool = False,
                context_album=None,
                auth_header: str = "",
-               user_lang: str = "") -> RunSink:
+               user_lang: str = "",
+               mcp_servers: list | None = None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1260,6 +1262,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 context_album=context_album,
                 auth_header=auth_header,
                 user_lang=user_lang,
+                mcp_servers=mcp_servers,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -1436,6 +1439,9 @@ async def run_session(
         )
         _conn.commit()
 
+    from mcp_client.runtime import fetch_mcp_servers
+    mcp_servers = await fetch_mcp_servers(request.headers.get("X-Agent-MCP-Ticket", ""))
+
     sink = _start_run(
         session_id, x_user_id, req.message,
         x_agent_provider_key, x_agent_provider_url, req.model,
@@ -1451,6 +1457,7 @@ async def run_session(
         context_album=req.context_album,
         auth_header=auth_header,
         user_lang=user_lang,
+        mcp_servers=mcp_servers,
     )
     return StreamingResponse(_stream_from_sink(sink), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -1530,6 +1537,7 @@ async def confirm_session(
     x_user_id: str = Header(..., alias="X-User-Id"),
 ):
     confirmed = True
+    remember = False
     confirm_id = ""
     body = await request.body()
     if body:
@@ -1537,13 +1545,15 @@ async def confirm_session(
             import json as _json
             data = _json.loads(body)
             confirmed = bool(data.get("confirmed", True))
+            remember = bool(data.get("remember", False))
             confirm_id = str(data.get("confirm_id") or "")
         except Exception:
             pass
     if not confirm_id:
         raise HTTPException(status_code=400, detail="confirm_id_required")
     try:
-        _confirm_mgr.resolve(confirm_id, confirmed, expected_session_id=session_id)
+        _confirm_mgr.resolve(confirm_id, confirmed, remember=remember,
+                             expected_session_id=session_id)
     except KeyError as e:
         # confirm_expired (id unknown / already resolved / agent restarted) or
         # confirm_session_mismatch (id belongs to another session). Both are 409.

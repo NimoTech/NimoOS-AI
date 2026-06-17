@@ -1,6 +1,7 @@
 package service
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -145,4 +146,23 @@ func TestModelTable_CreateAndQuery(t *testing.T) {
 	require.NoError(t, row.Scan(&name, &source, &sizeBytes, &quantization))
 	require.Equal(t, "ollama", source)
 	require.Equal(t, int64(4*1024*1024*1024), sizeBytes)
+}
+
+func TestDB_CreatesMcpServersTable(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "ai.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+
+	var name string
+	err = db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='mcp_servers'`,
+	).Scan(&name)
+	if err != nil {
+		t.Fatalf("mcp_servers table missing: %v", err)
+	}
+	if name != "mcp_servers" {
+		t.Fatalf("got %q", name)
+	}
 }

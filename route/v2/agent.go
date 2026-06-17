@@ -21,9 +21,10 @@ type AgentHandler struct {
 	timeout   int
 	available atomic.Bool
 	proxy     *httputil.ReverseProxy
+	tickets   *TicketStore
 }
 
-func NewAgentHandler(svc service.Services, agentURL string, timeout int) *AgentHandler {
+func NewAgentHandler(svc service.Services, agentURL string, timeout int, tickets *TicketStore) *AgentHandler {
 	target, _ := url.Parse(agentURL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.FlushInterval = 100 * time.Millisecond
@@ -43,6 +44,7 @@ func NewAgentHandler(svc service.Services, agentURL string, timeout int) *AgentH
 		agentURL: agentURL,
 		timeout:  timeout,
 		proxy:    proxy,
+		tickets:  tickets,
 	}
 	h.available.Store(false)
 	return h
@@ -142,6 +144,12 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 				c.Request().Header.Set("X-Agent-User-Blacklist", enc)
 			}
 		}
+	}
+
+	// MCP: mint a one-time ticket so the agent can pull this user's decrypted
+	// MCP config from the loopback /_internal/mcp/runtime endpoint without a JWT.
+	if h.tickets != nil && isRunEndpoint(c.Request()) {
+		c.Request().Header.Set("X-Agent-MCP-Ticket", h.tickets.Mint(userID))
 	}
 
 	if isRunEndpoint(c.Request()) {

@@ -111,3 +111,22 @@ async def test_pending_written_to_db(db):
         (confirm_id,),
     ).fetchone()
     assert row is None
+
+
+@pytest.mark.asyncio
+async def test_consume_remember_default_false(db):
+    mgr = ConfirmManager(db)
+    cid = mgr.register("s1", "act", "desc", "cmd")
+    mgr.resolve(cid, confirmed=True)  # no remember kwarg
+    await mgr.wait(cid)
+    assert mgr.consume_remember(cid) is False
+
+
+@pytest.mark.asyncio
+async def test_consume_remember_true_then_cleared(db):
+    mgr = ConfirmManager(db)
+    cid = mgr.register("s1", "act", "desc", "cmd")
+    mgr.resolve(cid, confirmed=True, remember=True)
+    await mgr.wait(cid)
+    assert mgr.consume_remember(cid) is True
+    assert mgr.consume_remember(cid) is False  # read-once

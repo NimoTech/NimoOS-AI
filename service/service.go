@@ -22,6 +22,7 @@ type Services interface {
 	Sessions() *sessionService
 	Blacklist() *blacklistService
 	Skills() *skillsService
+	MCP() *mcpService
 }
 
 type services struct {
@@ -35,18 +36,20 @@ type services struct {
 	sessions      *sessionService
 	blacklist     *blacklistService
 	skills        *skillsService
+	mcp           *mcpService
 }
 
-func (s *services) DB() *sql.DB                      { return s.db }
-func (s *services) MasterKey() *crypto.MasterKey      { return s.masterKey }
-func (s *services) OllamaChecker() *OllamaChecker     { return s.ollamaChecker }
-func (s *services) LocalAdapter() *LocalAdapter       { return s.localAdapter }
-func (s *services) Router() *Router                   { return s.router }
-func (s *services) Providers() *providerService       { return s.providers }
-func (s *services) ModelManager() *ModelManager       { return s.modelManager }
-func (s *services) Sessions() *sessionService         { return s.sessions }
-func (s *services) Blacklist() *blacklistService      { return s.blacklist }
-func (s *services) Skills() *skillsService            { return s.skills }
+func (s *services) DB() *sql.DB                   { return s.db }
+func (s *services) MasterKey() *crypto.MasterKey  { return s.masterKey }
+func (s *services) OllamaChecker() *OllamaChecker { return s.ollamaChecker }
+func (s *services) LocalAdapter() *LocalAdapter   { return s.localAdapter }
+func (s *services) Router() *Router               { return s.router }
+func (s *services) Providers() *providerService   { return s.providers }
+func (s *services) ModelManager() *ModelManager   { return s.modelManager }
+func (s *services) Sessions() *sessionService     { return s.sessions }
+func (s *services) Blacklist() *blacklistService  { return s.blacklist }
+func (s *services) Skills() *skillsService        { return s.skills }
+func (s *services) MCP() *mcpService              { return s.mcp }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -72,6 +75,7 @@ func NewService(cfg *config.Config) Services {
 	_ = os.MkdirAll(skillsRoot, 0o755)
 	store := &SkillsStore{Root: skillsRoot}
 	skillsSvc := &skillsService{db: db, store: store}
+	mcpSvc := &mcpService{db: db}
 
 	// Rebuild .runtime/<uid>/ for every user we know about. The skill_state
 	// table lists users; if a user has no row, the agent layer rebuilds on
@@ -114,6 +118,7 @@ func NewService(cfg *config.Config) Services {
 		sessions:      sessionSvc,
 		blacklist:     blacklistSvc,
 		skills:        skillsSvc,
+		mcp:           mcpSvc,
 	}
 }
 
@@ -122,5 +127,15 @@ func NewServiceFromParts(db *sql.DB, store *SkillsStore) Services {
 	return &services{
 		db:     db,
 		skills: &skillsService{db: db, store: store},
+	}
+}
+
+// NewServicesForTest wires only the pieces handler tests need.
+func NewServicesForTest(db *sql.DB, mk *crypto.MasterKey) Services {
+	return &services{
+		db:        db,
+		masterKey: mk,
+		providers: &providerService{db: db},
+		mcp:       &mcpService{db: db},
 	}
 }

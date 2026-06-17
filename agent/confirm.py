@@ -35,6 +35,7 @@ class ConfirmManager:
         self._timeout = timeout
         self._pending: dict[str, _Pending] = {}
         self._results: dict[str, bool] = {}
+        self._remember: dict[str, bool] = {}
 
     def register(self, session_id: str, action: str, description: str, command: str) -> str:
         """Allocate a confirm_id and an Event so a /confirm POST that arrives
@@ -67,7 +68,8 @@ class ConfirmManager:
 
         return self._results.pop(confirm_id, False)
 
-    def resolve(self, confirm_id: str, confirmed: bool, expected_session_id: str | None = None) -> None:
+    def resolve(self, confirm_id: str, confirmed: bool, remember: bool = False,
+                expected_session_id: str | None = None) -> None:
         """Unblock the wait() corresponding to confirm_id.
 
         expected_session_id, if provided, must match the registered session;
@@ -79,6 +81,8 @@ class ConfirmManager:
         if expected_session_id is not None and pending.session_id != expected_session_id:
             raise KeyError("confirm_session_mismatch")
         self._results[confirm_id] = confirmed
+        if remember:
+            self._remember[confirm_id] = True
         pending.event.set()
 
     def cancel_session(self, session_id: str) -> int:
@@ -89,6 +93,11 @@ class ConfirmManager:
             self._results[cid] = False
             self._pending[cid].event.set()
         return len(ids)
+
+    def consume_remember(self, confirm_id: str) -> bool:
+        """Read-once: whether the user ticked 'remember' for this confirm.
+        Safe to call after wait() (wait's _cleanup does not touch _remember)."""
+        return self._remember.pop(confirm_id, False)
 
     def _cleanup(self, confirm_id: str) -> None:
         self._pending.pop(confirm_id, None)
