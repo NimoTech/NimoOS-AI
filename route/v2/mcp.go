@@ -106,11 +106,8 @@ func (h *MCPHandler) Create(c echo.Context) error {
 	if err := h.applyReq(m, &req); err != nil {
 		return err
 	}
-	if m.Transport != "http" && m.Transport != "sse" {
-		return echo.NewHTTPError(http.StatusBadRequest, "transport must be 'http' or 'sse' in phase 1")
-	}
-	if m.URL == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "url required")
+	if err := validateAndClean(m); err != nil {
+		return err
 	}
 	if err := h.svc.MCP().CreateMcpServer(m); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -141,8 +138,8 @@ func (h *MCPHandler) Update(c echo.Context) error {
 	if err := h.applyReq(existing, &req); err != nil {
 		return err
 	}
-	if existing.Transport != "http" && existing.Transport != "sse" {
-		return echo.NewHTTPError(http.StatusBadRequest, "transport must be 'http' or 'sse' in phase 1")
+	if err := validateAndClean(existing); err != nil {
+		return err
 	}
 	if err := h.svc.MCP().UpdateMcpServer(existing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -214,6 +211,26 @@ func (h *MCPHandler) applyReq(m *service.McpServer, req *mcpRequest) error {
 	return nil
 }
 
+// validateAndClean enforces per-transport required fields and clears the fields
+// that don't belong to the chosen transport (no dirty url+command rows).
+func validateAndClean(m *service.McpServer) error {
+	switch m.Transport {
+	case "http", "sse":
+		if m.URL == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "url required for http/sse")
+		}
+		m.Command, m.Args, m.Env = "", "[]", "{}"
+	case "stdio":
+		if m.Command == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "command required for stdio")
+		}
+		m.URL, m.Headers = "", ""
+	default:
+		return echo.NewHTTPError(http.StatusBadRequest, "transport must be 'http', 'sse' or 'stdio'")
+	}
+	return nil
+}
+
 // --- internal loopback runtime endpoint ---
 
 type runtimeServer struct {
@@ -267,7 +284,11 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		"env":     h.decryptMap(m.Env),
 		"headers": h.decryptMap(m.Headers),
 	})
-	client := &http.Client{Timeout: 12 * time.Second} // > Python TEST_TIMEOUT(9s)
+	timeout := 12 * time.Second
+	if m.Transport == "stdio" {
+		timeout = 100 * time.Second // stdio first npx/uvx download is slow; > Python STDIO_TEST_TIMEOUT(90s)
+	}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Post(h.agentURL+"/agent/mcp/test", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return c.JSON(http.StatusBadGateway, map[string]any{"ok": false, "error": "agent unreachable"})
