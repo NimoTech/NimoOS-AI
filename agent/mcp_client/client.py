@@ -316,3 +316,30 @@ async def build_mcp_tools(servers: list[dict]) -> list:
             seen_names.add(tool.name)
             tools.append(tool)
     return tools
+
+
+TEST_TIMEOUT = 9  # 秒;须 < Go 调用方超时(10s),Go 放弃后 Python 主动取消释放
+
+
+async def test_server(server: dict) -> dict:
+    try:
+        return await asyncio.wait_for(_test_server_inner(server), timeout=TEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "探测超时"}
+
+
+async def _test_server_inner(server: dict) -> dict:
+    try:
+        conn = await _connect(server)
+    except Exception as e:
+        return {"ok": False, "error": f"连接失败: {e}"}
+    try:
+        tools = await conn.srv.list_tools()
+    except Exception as e:
+        await conn.aclose()
+        return {"ok": False, "error": f"列工具失败: {e}"}
+    await conn.aclose()
+    metas = [_extract_meta(t) for t in tools]
+    if "id" in server:
+        _cache_put(server["id"], metas, _fingerprint(server))
+    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas]}
