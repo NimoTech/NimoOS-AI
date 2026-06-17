@@ -24,7 +24,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
 	sessions := v2.NewSessionsHandler(svc)
 	mcpTickets := v2.NewTicketStore(30 * time.Second)
-	mcp := v2.NewMCPHandler(svc, mcpTickets)
+	mcp := v2.NewMCPHandler(svc, mcpTickets, agentURL)
 	agent := v2.NewAgentHandler(svc, agentURL, 60, mcpTickets)
 	agent.StartHealthMonitor()
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
@@ -106,6 +106,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.POST("/mcp/servers", mcp.Create)
 	g.PUT("/mcp/servers/:id", mcp.Update)
 	g.DELETE("/mcp/servers/:id", mcp.Delete)
+	g.POST("/mcp/servers/:id/test", mcp.Test)
 
 	// Privacy policy
 	g.GET("/policy", policy.Get)
