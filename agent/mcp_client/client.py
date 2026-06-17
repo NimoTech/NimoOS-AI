@@ -74,6 +74,10 @@ USER_PATTERNS_VAR: ContextVar = ContextVar("mcp_user_patterns", default=[])
 # each run (see Task 13) to prevent cross-run/session bleed of approvals.
 _CONFIRMED_TOOLS_VAR: ContextVar = ContextVar("mcp_confirmed_tools", default=set())
 
+# Per-run lazy MCP connections. agent.py MUST set both to fresh {} at run start.
+_RUN_CONNS_VAR: ContextVar = ContextVar("mcp_run_conns", default=None)
+_RUN_CONN_LOCKS_VAR: ContextVar = ContextVar("mcp_run_conn_locks", default=None)
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PATH_KEY_RE = re.compile(r"(path|file|dir|directory)", re.IGNORECASE)
 
@@ -193,6 +197,33 @@ async def _connect(server: dict) -> "McpConn":
         raise ValueError(f"unsupported transport: {transport}")
     await asyncio.wait_for(srv.connect(), timeout=MCP_CONNECT_TIMEOUT)
     return McpConn(server=server, srv=srv)
+
+
+async def _get_run_conn(server: dict) -> "McpConn":
+    """Lazily connect on first use within a run; reuse for the rest of the run.
+    A per-server lock makes concurrent tool calls share one connection."""
+    conns = _RUN_CONNS_VAR.get()
+    sid = server["id"]
+    if sid in conns:
+        return conns[sid]
+    locks = _RUN_CONN_LOCKS_VAR.get()
+    lock = locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        if sid in conns:                 # double-check after acquiring
+            return conns[sid]
+        conn = await _connect(server)
+        conns[sid] = conn
+        return conn
+
+
+async def close_run_conns() -> None:
+    conns = _RUN_CONNS_VAR.get() or {}
+    for c in list(conns.values()):
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+    conns.clear()
 
 
 async def build_mcp_tools(servers: list[dict]):
