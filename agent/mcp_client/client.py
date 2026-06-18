@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from collections import OrderedDict
@@ -14,6 +15,31 @@ from agents import FunctionTool
 from mcp_client.schema import sanitize_schema, flatten_result
 
 MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start path
+
+STDIO_CONNECT_TIMEOUT = 90  # 秒;stdio 首次 npx/uvx 下包可能很慢(下完本地缓存,后续快)
+
+# 透传给 stdio 子进程的运行时变量(缺了会乱码/时区/临时目录出错)
+_ENV_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
+
+
+def _connect_timeout(server: dict) -> int:
+    return STDIO_CONNECT_TIMEOUT if server.get("transport") == "stdio" else MCP_CONNECT_TIMEOUT
+
+
+def _stdio_env(user_env: dict) -> dict:
+    """子进程环境 = 白名单透传 ⊕ 用户 env ⊕ 受保护核心变量(核心最后应用,用户不可覆盖)。
+    不整体继承 os.environ,避免泄漏 agent 的敏感变量。"""
+    env = {k: os.environ[k] for k in _ENV_PASSTHROUGH if k in os.environ}
+    env.update(user_env or {})
+    core = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("NIMOOS_MCP_HOME") or os.environ.get("HOME") or "/tmp",
+        "npm_config_cache": os.environ.get("npm_config_cache", ""),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", ""),
+    }
+    env.update({k: v for k, v in core.items() if v})
+    return env
+
 
 SCHEMA_TTL = 600        # 秒;超过则 stale(仍可用,触发后台 revalidate)
 SCHEMA_CACHE_MAX = 256  # LRU 容量上限,兜住内存
@@ -193,17 +219,27 @@ async def _emit_warning(server_name: str, err) -> None:
 
 async def _connect(server: dict) -> "McpConn":
     transport = server.get("transport", "http")
+    timeout = _connect_timeout(server)
     if transport in ("http", "sse"):
         from agents.mcp import MCPServerStreamableHttp, MCPServerSse
         cls = MCPServerStreamableHttp if transport == "http" else MCPServerSse
         srv = cls(
             params={"url": server["url"], "headers": server.get("headers", {})},
-            client_session_timeout_seconds=MCP_CONNECT_TIMEOUT,
+            client_session_timeout_seconds=timeout,
             name=server.get("name", "mcp"),
         )
-    else:  # stdio reserved for phase 2
+    elif transport == "stdio":
+        from agents.mcp import MCPServerStdio
+        srv = MCPServerStdio(
+            params={"command": server["command"],
+                    "args": server.get("args", []),
+                    "env": _stdio_env(server.get("env", {}))},
+            client_session_timeout_seconds=timeout,
+            name=server.get("name", "mcp"),
+        )
+    else:
         raise ValueError(f"unsupported transport: {transport}")
-    await asyncio.wait_for(srv.connect(), timeout=MCP_CONNECT_TIMEOUT)
+    await asyncio.wait_for(srv.connect(), timeout=timeout)
     return McpConn(server=server, srv=srv)
 
 
@@ -253,7 +289,7 @@ async def _revalidate(server: dict) -> None:
     try:
         conn = await _connect(server)
         try:
-            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
             _cache_put(server["id"], [_extract_meta(t) for t in tools], _fingerprint(server))
         finally:
             await conn.aclose()
@@ -266,7 +302,7 @@ async def _cold_fetch(server: dict):
     closed immediately (real calls use the per-run lazy connection)."""
     conn = await _connect(server)
     try:
-        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=MCP_CONNECT_TIMEOUT)
+        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
     finally:
         try:
             await conn.aclose()
@@ -287,8 +323,14 @@ async def _metas_for_server(server: dict):
         if time.monotonic() - entry.fetched_at > SCHEMA_TTL:
             _schedule_revalidate(server)        # stale-while-revalidate
         return entry.metas
+    # 冷 / fingerprint 变:
+    if server.get("transport") == "stdio":
+        _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
+        await _emit_warning(server.get("name", "mcp"),
+                            "stdio 工具首次使用正在后台下载初始化,稍后重试")
+        return []
     try:
-        return await _cold_fetch(server)        # cold or fingerprint changed
+        return await _cold_fetch(server)        # http/sse:内联快取
     except Exception as e:
         await _emit_warning(server.get("name", "mcp"), e)
         return []
@@ -319,11 +361,13 @@ async def build_mcp_tools(servers: list[dict]) -> list:
 
 
 TEST_TIMEOUT = 9  # 秒;须 < Go 调用方超时(10s),Go 放弃后 Python 主动取消释放
+STDIO_TEST_TIMEOUT = 90  # 秒;stdio 首次下包慢;Go /test client 超时须 > 此值
 
 
 async def test_server(server: dict) -> dict:
+    timeout = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
     try:
-        return await asyncio.wait_for(_test_server_inner(server), timeout=TEST_TIMEOUT)
+        return await asyncio.wait_for(_test_server_inner(server), timeout=timeout)
     except asyncio.TimeoutError:
         return {"ok": False, "error": "探测超时"}
 
@@ -334,7 +378,10 @@ async def _test_server_inner(server: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"连接失败: {e}"}
     try:
-        tools = await conn.srv.list_tools()
+        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
+    except asyncio.TimeoutError:
+        await conn.aclose()
+        return {"ok": False, "error": "列工具超时"}
     except Exception as e:
         await conn.aclose()
         return {"ok": False, "error": f"列工具失败: {e}"}

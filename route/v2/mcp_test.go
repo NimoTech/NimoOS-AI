@@ -101,30 +101,72 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	}
 }
 
-func TestMcpHandler_UpdateRejectsStdioTransport(t *testing.T) {
+func TestMcpHandler_CreateStdioAcceptedAndCleansURL(t *testing.T) {
 	svc := mcpTestSvc(t)
 	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
-
-	// create a valid http server directly
-	_ = svc.MCP().CreateMcpServer(&service.McpServer{
-		UserID: "u1", Name: "x", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true,
-	})
-
-	req := httptest.NewRequest(http.MethodPut, "/", strings.NewReader(`{"transport":"stdio"}`))
+	body := `{"name":"fs","transport":"stdio","command":"npx","args":["-y","x"],"url":"https://stray"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	req.Header.Set("X-NimoOS-User-ID", "u1")
 	rec := httptest.NewRecorder()
-	c := e.NewContext(req, rec)
-	c.SetParamNames("id")
-	c.SetParamValues("1")
-	err := h.Update(c)
-	if err == nil {
-		t.Fatal("expected error for stdio transport on update")
+	if err := h.Create(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("create: %v", err)
 	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("code %d body %s", rec.Code, rec.Body.String())
+	}
+	rows, _ := svc.MCP().ListMcpServers("u1")
+	if len(rows) != 1 || rows[0].Transport != "stdio" || rows[0].Command != "npx" {
+		t.Fatalf("stored wrong: %+v", rows[0])
+	}
+	if rows[0].URL != "" {
+		t.Fatalf("stray url not cleared: %q", rows[0].URL)
+	}
+}
+
+func TestMcpHandler_CreateStdioRequiresCommand(t *testing.T) {
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+	body := `{"name":"x","transport":"stdio"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	err := h.Create(e.NewContext(req, rec))
 	he, ok := err.(*echo.HTTPError)
 	if !ok || he.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 HTTPError, got %v", err)
+		t.Fatalf("expected 400, got %v", err)
+	}
+}
+
+func TestMcpHandler_CreateUnknownTransport(t *testing.T) {
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+	body := `{"name":"x","transport":"ws","url":"https://x"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	err := h.Create(e.NewContext(req, rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %v", err)
+	}
+}
+
+func TestMcpHandler_CreateHTTPRequiresURL(t *testing.T) {
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+	body := `{"name":"x","transport":"http"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	err := h.Create(e.NewContext(req, rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %v", err)
 	}
 }
 
