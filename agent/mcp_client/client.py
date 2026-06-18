@@ -14,7 +14,14 @@ from agents import FunctionTool
 
 from mcp_client.schema import sanitize_schema, flatten_result
 
-MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start path
+MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start CONNECT path (keeps startup non-blocking)
+
+# ClientSession read timeout — bounds each JSON-RPC request (list_tools AND call_tool),
+# NOT just the connect. Must be generous: remote tool calls (e.g. MS Learn semantic
+# search) routinely take several seconds, far past the 5s connect cap. call_tool has no
+# outer wait_for, so it is bounded ONLY by this value — too small here silently cancels
+# every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
+MCP_SESSION_TIMEOUT = 60  # seconds
 
 STDIO_CONNECT_TIMEOUT = 90  # 秒;stdio 首次 npx/uvx 下包可能很慢(下完本地缓存,后续快)
 
@@ -24,6 +31,12 @@ _ENV_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 
 def _connect_timeout(server: dict) -> int:
     return STDIO_CONNECT_TIMEOUT if server.get("transport") == "stdio" else MCP_CONNECT_TIMEOUT
+
+
+def _session_timeout(server: dict) -> int:
+    # Per-request (list/call) read timeout. stdio reuses its generous connect budget
+    # (local subprocess); http/sse must be generous for slow remote tool calls.
+    return STDIO_CONNECT_TIMEOUT if server.get("transport") == "stdio" else MCP_SESSION_TIMEOUT
 
 
 def _stdio_env(user_env: dict) -> dict:
@@ -217,15 +230,22 @@ async def _emit_warning(server_name: str, err) -> None:
     await queue.put({"type": "mcp_warning", "server": server_name, "error": str(err)})
 
 
-async def _connect(server: dict) -> "McpConn":
+async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     transport = server.get("transport", "http")
-    timeout = _connect_timeout(server)
+    # connect_timeout caps the TCP+TLS+initialize handshake. The run-start cold path
+    # uses the short default (_connect_timeout) to stay non-blocking; call-time /
+    # background / test callers pass a generous value because a COLD connect to a
+    # remote server can take several seconds (measured ~5.6s to learn.microsoft.com)
+    # — well past the 5s run-start cap. session timeout bounds each request after
+    # connect (list/call); see MCP_SESSION_TIMEOUT.
+    connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
+    session_to = _session_timeout(server)
     if transport in ("http", "sse"):
         from agents.mcp import MCPServerStreamableHttp, MCPServerSse
         cls = MCPServerStreamableHttp if transport == "http" else MCPServerSse
         srv = cls(
             params={"url": server["url"], "headers": server.get("headers", {})},
-            client_session_timeout_seconds=timeout,
+            client_session_timeout_seconds=session_to,
             name=server.get("name", "mcp"),
         )
     elif transport == "stdio":
@@ -234,12 +254,12 @@ async def _connect(server: dict) -> "McpConn":
             params={"command": server["command"],
                     "args": server.get("args", []),
                     "env": _stdio_env(server.get("env", {}))},
-            client_session_timeout_seconds=timeout,
+            client_session_timeout_seconds=session_to,
             name=server.get("name", "mcp"),
         )
     else:
         raise ValueError(f"unsupported transport: {transport}")
-    await asyncio.wait_for(srv.connect(), timeout=timeout)
+    await asyncio.wait_for(srv.connect(), timeout=connect_to)
     return McpConn(server=server, srv=srv)
 
 
@@ -257,7 +277,9 @@ async def _get_run_conn(server: dict) -> "McpConn":
     async with lock:
         if sid in conns:                 # double-check after acquiring
             return conns[sid]
-        conn = await _connect(server)
+        # call-time: the user is actively invoking the tool — tolerate a cold/slow
+        # connect (generous cap) instead of failing the call at the 5s run-start cap.
+        conn = await _connect(server, connect_timeout=_session_timeout(server))
         conns[sid] = conn
         return conn
 
@@ -287,9 +309,12 @@ def _schedule_revalidate(server: dict) -> None:
 
 async def _revalidate(server: dict) -> None:
     try:
-        conn = await _connect(server)
+        # background: not blocking any run, so use the generous session budget for
+        # both connect and list (tolerates a cold remote connect that the 5s
+        # run-start cap would reject). This is what self-heals a slow server.
+        conn = await _connect(server, connect_timeout=_session_timeout(server))
         try:
-            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
+            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_session_timeout(server))
             _cache_put(server["id"], [_extract_meta(t) for t in tools], _fingerprint(server))
         finally:
             await conn.aclose()
@@ -330,8 +355,10 @@ async def _metas_for_server(server: dict):
                             "stdio 工具首次使用正在后台下载初始化,稍后重试")
         return []
     try:
-        return await _cold_fetch(server)        # http/sse:内联快取
+        return await _cold_fetch(server)        # http/sse:内联快取(短超时,不阻塞 run 启动)
     except Exception as e:
+        # 冷取超时多半是慢链路下的冷连接(>5s)。后台用宽松超时预热缓存,下次 run 即有工具。
+        _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
         return []
 
@@ -373,12 +400,16 @@ async def test_server(server: dict) -> dict:
 
 
 async def _test_server_inner(server: dict) -> dict:
+    # The probe's overall bound is the outer test_server wait_for(budget). Use that
+    # same budget for the inner connect + list so a cold remote connect (~5.6s) isn't
+    # rejected by the short 5s run-start cap; the outer wait_for is the real ceiling.
+    budget = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
     try:
-        conn = await _connect(server)
+        conn = await _connect(server, connect_timeout=budget)
     except Exception as e:
         return {"ok": False, "error": f"连接失败: {e}"}
     try:
-        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
+        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=budget)
     except asyncio.TimeoutError:
         await conn.aclose()
         return {"ok": False, "error": "列工具超时"}

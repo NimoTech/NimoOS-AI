@@ -19,7 +19,7 @@ def _clear():
 
 @pytest.mark.asyncio
 async def test_test_server_ok_and_warms_cache(monkeypatch):
-    async def fake_connect(s): return mc.McpConn(server=s, srv=GoodSrv())
+    async def fake_connect(s, connect_timeout=None): return mc.McpConn(server=s, srv=GoodSrv())
     monkeypatch.setattr(mc, "_connect", fake_connect)
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["ok"] is True and out["tool_count"] == 1 and out["tools"] == ["search"]
@@ -28,7 +28,7 @@ async def test_test_server_ok_and_warms_cache(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_test_server_connect_failure(monkeypatch):
-    async def boom(s): raise RuntimeError("refused")
+    async def boom(s, connect_timeout=None): raise RuntimeError("refused")
     monkeypatch.setattr(mc, "_connect", boom)
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["ok"] is False and "连接失败" in out["error"]
@@ -37,7 +37,7 @@ async def test_test_server_connect_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_test_server_overall_timeout(monkeypatch):
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)
-    async def slow_connect(s):
+    async def slow_connect(s, connect_timeout=None):
         import asyncio
         await asyncio.sleep(1)
     monkeypatch.setattr(mc, "_connect", slow_connect)
