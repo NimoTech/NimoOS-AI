@@ -355,6 +355,96 @@ func (h *MCPHandler) Test(c echo.Context) error {
 	return c.JSONBlob(http.StatusOK, body)
 }
 
+// --- internal loopback CRUD-lite (no JWT; localhost-only via _internal group) ---
+// user_id comes from the request body/query (caller is a local, trusted process:
+// the CLI or the agent), NOT from JWT claims.
+
+// ParseInternal handles POST /v1/ai/_internal/mcp/parse — same as public Parse,
+// for non-JWT local callers (the agent, building its confirm card).
+func (h *MCPHandler) ParseInternal(c echo.Context) error {
+	return h.Parse(c)
+}
+
+// RegisterInternal handles POST /v1/ai/_internal/mcp/register — parse a command
+// line and create a server for the given user_id. Used by the CLI and the agent.
+func (h *MCPHandler) RegisterInternal(c echo.Context) error {
+	var body struct {
+		UserID      string `json:"user_id"`
+		CommandLine string `json:"command_line"`
+		Name        string `json:"name"`
+	}
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if strings.TrimSpace(body.UserID) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	if strings.TrimSpace(body.CommandLine) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "command_line required")
+	}
+	req := mcpRequest{CommandLine: &body.CommandLine}
+	if strings.TrimSpace(body.Name) != "" {
+		req.Name = &body.Name
+	}
+	if err := applyCommandLine(&req); err != nil {
+		return err
+	}
+	m := &service.McpServer{UserID: body.UserID, Transport: "http", Args: "[]", Env: "{}", Enabled: true}
+	if err := h.applyReq(m, &req); err != nil {
+		return err
+	}
+	if err := validateAndClean(m); err != nil {
+		return err
+	}
+	if err := h.svc.MCP().CreateMcpServer(m); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusCreated, toMcpDTO(m))
+}
+
+// ListInternal handles GET /v1/ai/_internal/mcp/list?user_id=<id> — DTOs (no
+// secrets) for the given user. Used by the CLI `list`.
+func (h *MCPHandler) ListInternal(c echo.Context) error {
+	uid := c.QueryParam("user_id")
+	if strings.TrimSpace(uid) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	rows, err := h.svc.MCP().ListMcpServers(uid)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	out := make([]mcpDTO, len(rows))
+	for i, m := range rows {
+		out[i] = toMcpDTO(m)
+	}
+	return c.JSON(http.StatusOK, out)
+}
+
+// RemoveInternal handles POST /v1/ai/_internal/mcp/remove — delete (id,user_id).
+// Used by the CLI `remove`. Reuses DeleteMcpServer.
+func (h *MCPHandler) RemoveInternal(c echo.Context) error {
+	var body struct {
+		UserID string `json:"user_id"`
+		ID     int64  `json:"id"`
+	}
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if strings.TrimSpace(body.UserID) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	if body.ID == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "id required")
+	}
+	if err := h.svc.MCP().DeleteMcpServer(body.ID, body.UserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return echo.NewHTTPError(http.StatusNotFound, "mcp server not found")
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
 // Runtime serves GET /v1/ai/_internal/mcp/runtime. Auth is the one-time ticket
 // (minted by the agent Proxy), NOT X-NimoOS-User-ID. Localhost-only is enforced
 // by the _internal group's LocalhostOnly middleware.

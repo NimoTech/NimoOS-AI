@@ -87,6 +87,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.POST("/chat/completions", chat.ChatCompletions)
 	internal.GET("/models", models.ListInternal)
 	internal.GET("/mcp/runtime", mcp.Runtime)
+	internal.POST("/mcp/parse", mcp.ParseInternal)
+	internal.POST("/mcp/register", mcp.RegisterInternal)
+	internal.GET("/mcp/list", mcp.ListInternal)
+	internal.POST("/mcp/remove", mcp.RemoveInternal)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
