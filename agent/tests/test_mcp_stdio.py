@@ -46,6 +46,40 @@ def test_connect_timeout_per_transport():
     assert mc._connect_timeout({}) == mc.MCP_CONNECT_TIMEOUT
 
 
+def test_session_timeout_per_transport():
+    # The per-request (list/call) read timeout is decoupled from the connect cap:
+    # remote tool calls (e.g. MS Learn semantic search) routinely exceed the 5s
+    # connect cap, so the session timeout must be generous.
+    assert mc._session_timeout({"transport": "http"}) == mc.MCP_SESSION_TIMEOUT
+    assert mc._session_timeout({"transport": "sse"}) == mc.MCP_SESSION_TIMEOUT
+    assert mc._session_timeout({"transport": "stdio"}) == mc.STDIO_CONNECT_TIMEOUT
+    assert mc._session_timeout({}) == mc.MCP_SESSION_TIMEOUT
+    assert mc.MCP_SESSION_TIMEOUT >= 30                       # room for real tool calls
+    assert mc.MCP_SESSION_TIMEOUT > mc.MCP_CONNECT_TIMEOUT    # decoupled from connect cap
+
+
+@pytest.mark.asyncio
+async def test_connect_http_uses_session_timeout_not_connect_cap(monkeypatch):
+    """http session timeout (client_session_timeout_seconds) must be the generous
+    MCP_SESSION_TIMEOUT, not the 5s connect cap — otherwise slow remote tool calls
+    get cancelled mid-call (the MS Learn 'can't call' bug)."""
+    captured = {}
+
+    class FakeHttpSrv:
+        def __init__(self, params=None, client_session_timeout_seconds=None, name=None):
+            captured["timeout"] = client_session_timeout_seconds
+        async def connect(self): captured["connected"] = True
+
+    import agents.mcp as am
+    monkeypatch.setattr(am, "MCPServerStreamableHttp", FakeHttpSrv, raising=False)
+
+    server = {"id": 2, "name": "ms-learn", "transport": "http",
+              "url": "https://learn.microsoft.com/api/mcp", "headers": {}}
+    await mc._connect(server)
+    assert captured["connected"] is True
+    assert captured["timeout"] == mc.MCP_SESSION_TIMEOUT
+
+
 @pytest.fixture
 def _clear_cache():
     mc._SCHEMA_CACHE.clear(); mc._REVALIDATING.clear(); mc._BACKGROUND_TASKS.clear()
@@ -82,6 +116,23 @@ async def test_cold_http_still_inline(monkeypatch, _clear_cache):
 
 
 @pytest.mark.asyncio
+async def test_cold_http_failure_schedules_self_heal(monkeypatch, _clear_cache):
+    # A slow remote whose inline cold-fetch times out must NOT just give up: it
+    # schedules a background revalidate (generous timeouts) so the next run gets tools.
+    scheduled = {"n": 0}
+    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.__setitem__("n", scheduled["n"] + 1))
+    warns = []
+    async def fake_emit(name, err): warns.append((name, str(err)))
+    monkeypatch.setattr(mc, "_emit_warning", fake_emit)
+    async def boom_cold(s): raise TimeoutError()
+    monkeypatch.setattr(mc, "_cold_fetch", boom_cold)
+    metas = await mc._metas_for_server({"id": 7, "name": "h", "transport": "http", "url": "https://x"})
+    assert metas == []
+    assert scheduled["n"] == 1          # background self-heal scheduled
+    assert warns                        # user warned
+
+
+@pytest.mark.asyncio
 async def test_test_server_uses_stdio_timeout(monkeypatch, _clear_cache):
     async def fake_inner(server):
         import asyncio
@@ -102,9 +153,9 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
             import asyncio
             await asyncio.sleep(10)
         async def cleanup(self): pass
-    async def fake_connect(s): return mc.McpConn(server=s, srv=SlowSrv())
+    async def fake_connect(s, connect_timeout=None): return mc.McpConn(server=s, srv=SlowSrv())
     monkeypatch.setattr(mc, "_connect", fake_connect)
-    monkeypatch.setattr(mc, "MCP_CONNECT_TIMEOUT", 0.05)   # http path inner timeout tiny
+    monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)   # http probe budget tiny -> list times out fast
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
     assert out["ok"] is False and "超时" in out["error"]
 
@@ -119,7 +170,7 @@ async def test_stdio_conn_cleanup_called_on_close(monkeypatch):
         async def connect(self): pass
         async def cleanup(self): cleaned["n"] += 1   # SDK group-kill happens here
 
-    async def fake_connect(server):
+    async def fake_connect(server, connect_timeout=None):
         return mc.McpConn(server=server, srv=FakeStdioSrv())
     monkeypatch.setattr(mc, "_connect", fake_connect)
 

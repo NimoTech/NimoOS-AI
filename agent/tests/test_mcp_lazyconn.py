@@ -17,7 +17,7 @@ def _reset():
 async def test_get_run_conn_connects_once_then_reuses(monkeypatch):
     _reset()
     calls = {"n": 0}
-    async def fake_connect(s):
+    async def fake_connect(s, connect_timeout=None):
         calls["n"] += 1
         return FakeConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
@@ -33,7 +33,7 @@ async def test_get_run_conn_connects_once_then_reuses(monkeypatch):
 async def test_get_run_conn_concurrent_single_flight(monkeypatch):
     _reset()
     calls = {"n": 0}
-    async def fake_connect(s):
+    async def fake_connect(s, connect_timeout=None):
         calls["n"] += 1
         await asyncio.sleep(0.02)
         return FakeConn()
@@ -45,7 +45,7 @@ async def test_get_run_conn_concurrent_single_flight(monkeypatch):
 @pytest.mark.asyncio
 async def test_close_run_conns_closes_and_clears(monkeypatch):
     _reset()
-    async def fake_connect(s): return FakeConn()
+    async def fake_connect(s, connect_timeout=None): return FakeConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     c = await mc._get_run_conn({"id": 1, "name": "x"})
     await mc.close_run_conns()
