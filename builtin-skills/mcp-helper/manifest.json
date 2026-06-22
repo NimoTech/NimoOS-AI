@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "mcp-helper",
+  "name": "mcp-helper",
+  "title": "MCP helper",
+  "description": "Help the user connect external MCP servers (in Settings) and use the tools they expose; troubleshoot when an MCP server won't work.",
+  "color": "green",
+  "icon": "layers",
+  "trigger": "auto",
+  "examples": [
+    "How do I add the Microsoft Learn MCP server?",
+    "My MCP server isn't working — it says 405",
+    "What is this mcp__ tool?"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}
