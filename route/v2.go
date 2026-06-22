@@ -104,6 +104,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// MCP server management
 	g.GET("/mcp/servers", mcp.List)
 	g.POST("/mcp/servers", mcp.Create)
+	g.POST("/mcp/servers/parse", mcp.Parse)
 	g.PUT("/mcp/servers/:id", mcp.Update)
 	g.DELETE("/mcp/servers/:id", mcp.Delete)
 	g.POST("/mcp/servers/:id/test", mcp.Test)

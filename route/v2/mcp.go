@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/NimoTech/NimoOS-AI/pkg/mcpparse"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
@@ -25,14 +27,15 @@ func NewMCPHandler(svc service.Services, tickets *TicketStore, agentURL string) 
 }
 
 type mcpRequest struct {
-	Name      *string            `json:"name"`
-	Transport *string            `json:"transport"`
-	URL       *string            `json:"url"`
-	Command   *string            `json:"command"`
-	Args      *[]string          `json:"args"`
-	Env       *map[string]string `json:"env"`     // plaintext in; handler encrypts
-	Headers   *map[string]string `json:"headers"` // plaintext in; handler encrypts
-	Enabled   *bool              `json:"enabled"`
+	Name        *string            `json:"name"`
+	Transport   *string            `json:"transport"`
+	URL         *string            `json:"url"`
+	Command     *string            `json:"command"`
+	Args        *[]string          `json:"args"`
+	Env         *map[string]string `json:"env"`     // plaintext in; handler encrypts
+	Headers     *map[string]string `json:"headers"` // plaintext in; handler encrypts
+	Enabled     *bool              `json:"enabled"`
+	CommandLine *string            `json:"command_line"` // optional: parsed to fill transport/command/args/url/env
 }
 
 type mcpDTO struct {
@@ -102,6 +105,9 @@ func (h *MCPHandler) Create(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
+	if err := applyCommandLine(&req); err != nil {
+		return err
+	}
 	m := &service.McpServer{UserID: uid, Transport: "http", Args: "[]", Env: "{}", Enabled: true}
 	if err := h.applyReq(m, &req); err != nil {
 		return err
@@ -113,6 +119,22 @@ func (h *MCPHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusCreated, map[string]int64{"id": m.ID})
+}
+
+// Parse handles POST /v1/ai/mcp/servers/parse — parse a command line into a
+// server config WITHOUT persisting. Used by the UI to prefill the add form.
+func (h *MCPHandler) Parse(c echo.Context) error {
+	var body struct {
+		CommandLine string `json:"command_line"`
+	}
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	p, err := mcpparse.Parse(body.CommandLine)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	return c.JSON(http.StatusOK, p)
 }
 
 func (h *MCPHandler) Update(c echo.Context) error {
@@ -166,6 +188,41 @@ func (h *MCPHandler) Delete(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.NoContent(http.StatusNoContent)
+}
+
+// applyCommandLine parses req.CommandLine (if present) into req's transport/
+// command/args/url/env BEFORE applyReq runs, so explicit fields still override.
+// SuggestedName only fills req.Name when the caller gave no name.
+func applyCommandLine(req *mcpRequest) error {
+	if req.CommandLine == nil || strings.TrimSpace(*req.CommandLine) == "" {
+		return nil
+	}
+	p, err := mcpparse.Parse(*req.CommandLine)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if req.Transport == nil {
+		req.Transport = &p.Transport
+	}
+	if req.URL == nil && p.URL != "" {
+		req.URL = &p.URL
+	}
+	if req.Command == nil && p.Command != "" {
+		req.Command = &p.Command
+	}
+	if req.Args == nil && p.Transport == "stdio" {
+		args := p.Args
+		req.Args = &args
+	}
+	if req.Env == nil && len(p.Env) > 0 {
+		env := p.Env
+		req.Env = &env
+	}
+	if req.Name == nil && p.SuggestedName != "" {
+		name := p.SuggestedName
+		req.Name = &name
+	}
+	return nil
 }
 
 // applyReq merges request fields into m, encrypting headers/env. Only fields
