@@ -10,6 +10,7 @@ from skills.wiki import (
     wiki_append_user_notes, wiki_replace_user_notes, wiki_register_root,
 )
 from skills.skills_registry import ALL_TOOLS as SKILLS_REGISTRY_TOOLS
+from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
 from skills.search import SEARCH_TOOLS
 
 # Wiki tools — write tools added in Task 7.
@@ -20,4 +21,4 @@ WIKI_TOOLS = [
 
 ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
              + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
-             + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS + SEARCH_TOOLS)
+             + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS + SEARCH_TOOLS + MCP_ADMIN_TOOLS)
