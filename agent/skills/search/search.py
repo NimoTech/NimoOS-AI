@@ -18,6 +18,7 @@ from agents import function_tool
 from search_client import SearchClient
 from parser_client import ParserClient
 from skills import filesystem as _fsskill
+from skills import photos as _photos
 from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
 
 _client = SearchClient()
@@ -186,4 +187,58 @@ async def read_document(file_id: Optional[str] = None,
     return await _read_document_impl(file_id, path, ocr, offset, max_chars)
 
 
-SEARCH_TOOLS = [nimoos_search, read_file_chunk, read_document]
+async def _view_document_page_impl(path: str, page: int = 1,
+                                   question: str = "") -> str:
+    cfg = _photos.VISION_CFG_VAR.get()
+    if not cfg.get("ok"):
+        return json.dumps(
+            {"error": "current model has no vision; use "
+                      "read_document(path, ocr=true) for scanned text instead"},
+            ensure_ascii=False)
+    try:
+        ctx = {
+            "session_id": _fsskill.SESSION_ID_VAR.get(),
+            "conn": _fsskill.DB_VAR.get(),
+            "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
+        }
+        abs_path = _fsops._resolve_and_gate(ctx, path)
+    except _FS_GATE_ERRORS as e:
+        return json.dumps(
+            {"error": f"not authorized to read that path: {e}"},
+            ensure_ascii=False)
+    uid = USER_ID_VAR.get() or None
+    try:
+        rendered = await _parser_client.render_pages(
+            abs_path, page, page, user_id=uid)
+    except Exception as e:
+        return json.dumps({"error": f"page render failed: {e}"},
+                          ensure_ascii=False)
+    pages = rendered.get("pages") or []
+    if not pages:
+        return json.dumps({"error": f"page {page} not found"}, ensure_ascii=False)
+    prompt = question or (
+        f"Describe page {page} of this document — its text, tables, figures, "
+        f"and layout.")
+    desc, err = await _photos.describe_image(pages[0]["png_b64"], prompt)
+    if err:
+        return json.dumps({"error": f"vision failed: {err}"}, ensure_ascii=False)
+    return json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+
+
+@function_tool
+async def view_document_page(path: str, page: int = 1, question: str = "") -> str:
+    """Render a document PAGE to an image and look at it with the vision model.
+    Use when read_document's text is not enough — scanned/image PDFs, complex
+    tables, charts/diagrams, or "what does this page look like" questions.
+    Requires a vision-capable model (otherwise use read_document(path, ocr=true)).
+    PDF only. You may only view paths within your authorized scope.
+
+    Args:
+        path: Absolute path to the PDF.
+        page: 1-based page number to render.
+        question: Optional specific question about the page.
+    """
+    return await _view_document_page_impl(path, page, question)
+
+
+SEARCH_TOOLS = [nimoos_search, read_file_chunk, read_document, view_document_page]

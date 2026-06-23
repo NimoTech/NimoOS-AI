@@ -259,3 +259,66 @@ async def test_read_document_path_no_run_context_errors(monkeypatch):
 
     assert "error" in json.loads(result_holder["out"])
     assert called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_renders_and_describes(monkeypatch, tmp_path):
+    from skills import photos as photos_skill
+    conn, root = _fs_authorized_conn(tmp_path)
+    f = root / "doc.pdf"
+    f.write_bytes(b"%PDF-1.4 fake")
+    fsskill.SESSION_ID_VAR.set("s1")
+    fsskill.DB_VAR.set(conn)
+    fsskill.USER_PATTERNS_VAR.set([])
+    search_skill.USER_ID_VAR.set("u1")
+    photos_skill.VISION_CFG_VAR.set({"ok": True, "base_url": "x", "api_key": "k", "model": "m"})
+
+    captured = {}
+    async def fake_render(path, page_start, page_end, scale=2.0, user_id=None):
+        captured.update(path=path, page=page_start, user_id=user_id)
+        return {"path": path, "pages": [{"page": page_start, "png_b64": "IMG"}]}
+    monkeypatch.setattr(search_skill._parser_client, "render_pages", fake_render)
+
+    async def fake_describe(png_b64, prompt, mime="image/png"):
+        captured["png"] = png_b64
+        return "a bar chart of Q1 sales", None
+    monkeypatch.setattr(search_skill._photos, "describe_image", fake_describe)
+
+    out = await search_skill._view_document_page_impl(path=str(f), page=3)
+    data = json.loads(out)
+    assert data["description"] == "a bar chart of Q1 sales"
+    assert captured["path"] == os.path.realpath(str(f))
+    assert captured["page"] == 3
+    assert captured["png"] == "IMG"
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_no_vision_errors(monkeypatch, tmp_path):
+    from skills import photos as photos_skill
+    photos_skill.VISION_CFG_VAR.set({"ok": False})
+    called = {"n": 0}
+    async def fake_render(*a, **k):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(search_skill._parser_client, "render_pages", fake_render)
+    out = await search_skill._view_document_page_impl(path="/DATA/x.pdf", page=1)
+    assert "error" in json.loads(out)
+    assert called["n"] == 0  # never rendered when model has no vision
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_unauthorized_path(monkeypatch, tmp_path):
+    from skills import photos as photos_skill
+    conn, _root = _fs_authorized_conn(tmp_path)
+    fsskill.SESSION_ID_VAR.set("s1")
+    fsskill.DB_VAR.set(conn)
+    fsskill.USER_PATTERNS_VAR.set([])
+    photos_skill.VISION_CFG_VAR.set({"ok": True, "base_url": "x", "api_key": "k", "model": "m"})
+    called = {"n": 0}
+    async def fake_render(*a, **k):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(search_skill._parser_client, "render_pages", fake_render)
+    out = await search_skill._view_document_page_impl(path="/etc/passwd", page=1)
+    assert "error" in json.loads(out)
+    assert called["n"] == 0  # never rendered for an unauthorized path
