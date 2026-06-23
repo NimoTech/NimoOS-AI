@@ -16,8 +16,20 @@ from agents import function_tool
 
 # search_client.py is a top-level module in agent/; agent/ is on sys.path
 from search_client import SearchClient
+from parser_client import ParserClient
+from skills import filesystem as _fsskill
+from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
 
 _client = SearchClient()
+_parser_client = ParserClient()
+
+_FS_GATE_ERRORS = (
+    _fspaths.PermissionDenied,
+    _fsignore.BlockedImplicit,
+    _fsignore.BlockedHardBlacklist,
+    _fsignore.BlockedGitignore,
+    LookupError,  # fs ContextVars unset (no active run context)
+)
 
 # Set per-run by AgentRunner.run; read at tool-call time.
 USER_ID_VAR: ContextVar[str] = ContextVar("search_user_id", default="")
@@ -65,15 +77,46 @@ async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
     return json.dumps(result, ensure_ascii=False)
 
 
-async def _read_document_impl(file_id: str, offset: int = 0,
+async def _read_document_impl(file_id: Optional[str] = None,
+                              path: Optional[str] = None,
+                              ocr: bool = False,
+                              offset: int = 0,
                               max_chars: int = 24000) -> str:
+    # file_id + not ocr → indexed fast path (M1, via Search).
+    if file_id and not ocr:
+        uid = USER_ID_VAR.get() or None
+        try:
+            result = await _client.invoke_tool("read_document", {
+                "file_id": file_id, "offset": offset, "max_chars": max_chars,
+            }, user_id=uid)
+        except httpx.HTTPError as e:
+            return json.dumps({"error": f"read_document failed: {e}"},
+                              ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+
+    # path (or forced ocr) → on-demand extraction via Parser, gated by the
+    # same per-session filesystem authorization read_file uses.
+    if not path:
+        return json.dumps(
+            {"error": "provide file_id (indexed) or path (any file)"},
+            ensure_ascii=False)
+    ctx = {
+        "session_id": _fsskill.SESSION_ID_VAR.get(),
+        "conn": _fsskill.DB_VAR.get(),
+        "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
+    }
+    try:
+        abs_path = _fsops._resolve_and_gate(ctx, path)
+    except _FS_GATE_ERRORS as e:
+        return json.dumps(
+            {"error": f"not authorized to read that path: {e}"},
+            ensure_ascii=False)
     uid = USER_ID_VAR.get() or None
     try:
-        result = await _client.invoke_tool("read_document", {
-            "file_id": file_id, "offset": offset, "max_chars": max_chars,
-        }, user_id=uid)
-    except httpx.HTTPError as e:
-        return json.dumps({"error": f"read_document failed: {e}"},
+        result = await _parser_client.extract(
+            abs_path, ocr=ocr, max_chars=max_chars, user_id=uid)
+    except Exception as e:
+        return json.dumps({"error": f"document extraction failed: {e}"},
                           ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False)
 
@@ -114,23 +157,30 @@ async def read_file_chunk(file_id: str, kind: str, chunk_no: int,
 
 
 @function_tool
-async def read_document(file_id: str, offset: int = 0,
+async def read_document(file_id: Optional[str] = None,
+                        path: Optional[str] = None,
+                        ocr: bool = False,
+                        offset: int = 0,
                         max_chars: int = 24000) -> str:
-    """Read a document's full extracted text by file_id, reconstructed from the
-    search index with [Page N] markers. Call this after nimoos_search returns a
-    file_id when you need the whole document rather than a short preview.
+    """Read a document's full text — PDF, Word, PowerPoint, Excel, HTML,
+    Markdown, or plain text.
 
-    If the result has "truncated": true the document is long — page with
-    "offset" set to the returned "next_offset", or (better for finding one
-    specific fact) use nimoos_search to locate the relevant passage instead of
-    reading the whole document.
+    Two ways to call it:
+    - file_id (from nimoos_search) — fast, reads the already-indexed text with
+      [Page N] markers; supports offset paging for long docs.
+    - path — read any file by absolute path, including files NOT yet indexed
+      (e.g. just uploaded). The text is extracted on demand. Set ocr=true for
+      scanned/image PDFs. You may only read paths within your authorized scope
+      (the same scope read_file uses).
 
     Args:
-        file_id: File identifier returned by nimoos_search.
-        offset: Character offset to start from (default 0; for paging).
-        max_chars: Maximum characters to return (default 24000).
+        file_id: Indexed file id from nimoos_search (preferred when available).
+        path: Absolute path to read on demand (for unindexed files).
+        ocr: Force OCR extraction (scanned PDFs); implies the path route.
+        offset: Character offset for paging the indexed (file_id) route.
+        max_chars: Maximum characters to return.
     """
-    return await _read_document_impl(file_id, offset, max_chars)
+    return await _read_document_impl(file_id, path, ocr, offset, max_chars)
 
 
 SEARCH_TOOLS = [nimoos_search, read_file_chunk, read_document]

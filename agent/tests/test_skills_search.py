@@ -155,3 +155,71 @@ async def test_read_document_handles_http_error(monkeypatch):
     monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
     out = await search_skill._read_document_impl("f1")
     assert "error" in json.loads(out)
+
+
+import os
+import time
+import db as db_module
+from skills import filesystem as fsskill
+
+
+def _fs_authorized_conn(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "fs.db"),
+                             snapshots_root=str(tmp_path / "snap"))
+    now = int(time.time())
+    conn.execute("INSERT INTO sessions (id, user_id, title, created_at, updated_at) "
+                 "VALUES (?,?,?,?,?)", ("s1", "u1", None, now, now))
+    root = tmp_path / "root"
+    root.mkdir()
+    conn.execute("INSERT INTO visible_resources (session_id, path, kind, added_at) "
+                 "VALUES (?,?,?,?)", ("s1", str(root), "folder", now))
+    conn.commit()
+    return conn, root
+
+
+@pytest.mark.asyncio
+async def test_read_document_path_authorized_calls_parser(monkeypatch, tmp_path):
+    conn, root = _fs_authorized_conn(tmp_path)
+    f = root / "doc.pdf"
+    f.write_bytes(b"%PDF-1.4 fake")
+    fsskill.SESSION_ID_VAR.set("s1")
+    fsskill.DB_VAR.set(conn)
+    fsskill.USER_PATTERNS_VAR.set([])
+    search_skill.USER_ID_VAR.set("u1")
+
+    captured = {}
+    async def fake_extract(path, ocr=False, max_chars=24000, user_id=None):
+        captured.update(path=path, ocr=ocr, user_id=user_id)
+        return {"path": path, "markdown": "hello pdf", "truncated": False, "ocr": ocr}
+
+    monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
+    out = await search_skill._read_document_impl(path=str(f))
+    data = json.loads(out)
+    assert data["markdown"] == "hello pdf"
+    assert captured["path"] == os.path.realpath(str(f))
+    assert captured["user_id"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_read_document_path_unauthorized_is_blocked(monkeypatch, tmp_path):
+    conn, _root = _fs_authorized_conn(tmp_path)
+    fsskill.SESSION_ID_VAR.set("s1")
+    fsskill.DB_VAR.set(conn)
+    fsskill.USER_PATTERNS_VAR.set([])
+    search_skill.USER_ID_VAR.set("u1")
+
+    called = {"n": 0}
+    async def fake_extract(*a, **k):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
+
+    out = await search_skill._read_document_impl(path="/etc/passwd")
+    assert "error" in json.loads(out)
+    assert called["n"] == 0  # parser never called for an unauthorized path
+
+
+@pytest.mark.asyncio
+async def test_read_document_no_args_errors():
+    out = await search_skill._read_document_impl()
+    assert "error" in json.loads(out)
