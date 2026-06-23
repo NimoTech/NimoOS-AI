@@ -223,3 +223,39 @@ async def test_read_document_path_unauthorized_is_blocked(monkeypatch, tmp_path)
 async def test_read_document_no_args_errors():
     out = await search_skill._read_document_impl()
     assert "error" in json.loads(out)
+
+
+@pytest.mark.asyncio
+async def test_read_document_path_no_run_context_errors(monkeypatch):
+    # Run inside a fresh copy_context so SESSION_ID_VAR / DB_VAR are guaranteed
+    # unset (no default) — their .get() raises LookupError, which must be caught
+    # inside the try block and returned as error JSON rather than escaping.
+    import asyncio
+    import contextvars
+
+    called = {"n": 0}
+    async def fake_extract(*a, **k):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
+
+    result_holder = {}
+    async def _run():
+        # Fresh context: SESSION_ID_VAR / DB_VAR are unset → .get() raises LookupError
+        out = await search_skill._read_document_impl(path="/DATA/x.pdf")
+        result_holder["out"] = out
+
+    ctx = contextvars.copy_context()
+    # Run _run in a context where the fs vars were never set.
+    # We use loop.run_in_executor with the context, or simply run directly since
+    # copy_context() inherits current values — instead create a truly empty
+    # context by resetting any set tokens first.
+    session_tok = search_skill._fsskill.SESSION_ID_VAR.set("_sentinel_to_reset")
+    db_tok = search_skill._fsskill.DB_VAR.set("_sentinel_to_reset")
+    search_skill._fsskill.SESSION_ID_VAR.reset(session_tok)
+    search_skill._fsskill.DB_VAR.reset(db_tok)
+
+    await _run()
+
+    assert "error" in json.loads(result_holder["out"])
+    assert called["n"] == 0

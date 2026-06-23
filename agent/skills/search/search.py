@@ -100,12 +100,15 @@ async def _read_document_impl(file_id: Optional[str] = None,
         return json.dumps(
             {"error": "provide file_id (indexed) or path (any file)"},
             ensure_ascii=False)
-    ctx = {
-        "session_id": _fsskill.SESSION_ID_VAR.get(),
-        "conn": _fsskill.DB_VAR.get(),
-        "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
-    }
     try:
+        # Build ctx INSIDE the try: SESSION_ID_VAR/DB_VAR have no default, so an
+        # unset run context raises LookupError here — which _FS_GATE_ERRORS
+        # catches -> error JSON (never reaches Parser).
+        ctx = {
+            "session_id": _fsskill.SESSION_ID_VAR.get(),
+            "conn": _fsskill.DB_VAR.get(),
+            "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
+        }
         abs_path = _fsops._resolve_and_gate(ctx, path)
     except _FS_GATE_ERRORS as e:
         return json.dumps(
