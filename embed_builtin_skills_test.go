@@ -22,5 +22,5 @@ func TestFileReaderSkillEmbedded(t *testing.T) {
 }
 
 func TestBuiltinSeedVersionBumped(t *testing.T) {
-	require.Equal(t, "6", service.BuiltinSeedVersion)
+	require.Equal(t, "7", service.BuiltinSeedVersion)
 }

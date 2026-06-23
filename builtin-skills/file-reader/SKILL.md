@@ -38,6 +38,17 @@ that folder.
 3. Synthesize an answer grounded in what you read; cite each source file
    (and page) you used.
 
+### When the text isn't enough (scanned pages, tables, figures, layout)
+Sometimes `read_document` returns little or garbled text (scanned/image PDFs),
+or the question is about a figure, a complex table, or how a page looks.
+- If your model is vision-capable: call
+  `view_document_page(path="/abs/file.pdf", page=N, question="...")` — it
+  renders that PDF page to an image and looks at it. Use the page number from
+  the `[Page N]` markers in `read_document` output.
+- If your model is NOT vision-capable: call
+  `read_document(path="/abs/file.pdf", ocr=true)` to OCR the scanned text
+  instead. (view_document_page will tell you to do this if vision is off.)
+
 ### Long documents
 - If `read_document` returns `"truncated": true`, the document is long. Do NOT
   loop dozens of times through `next_offset` to read it all — you will lose the
