@@ -18,10 +18,19 @@ and for questions that span many documents.
   `truncated` and `next_offset` for long documents.
 
 ### How to read ONE specific document
-1. If you don't already have its `file_id`, call `nimoos_search` with
-   `sources="filenames"` and the file name to get it.
-2. Call `read_document(file_id)`.
-3. Answer from the returned text. Cite the file name and `[Page N]` when useful.
+1. If the user gave a path (or you found one with list_dir/nimoos_search),
+   call `read_document(path="/abs/path")` — this reads any file by path,
+   including files NOT yet indexed (e.g. just uploaded). For scanned/image
+   PDFs add `ocr=true`.
+2. Otherwise, if you have the file's `file_id` from nimoos_search, call
+   `read_document(file_id=...)` — faster, and supports `offset` paging with
+   `[Page N]` markers for long indexed documents.
+3. Answer from the returned text. Cite the file name (and `[Page N]` when
+   present).
+
+You may only read paths within your authorized scope (same as read_file). If
+read_document reports it is not authorized, ask the user to grant access to
+that folder.
 
 ### How to answer a question ACROSS documents
 1. `nimoos_search(query, sources="semantic")` to find the most relevant files.
