@@ -61,5 +61,26 @@ class ParserClient:
             raise httpx.HTTPStatusError(msg, request=e.request, response=e.response) from e
         return r.json()
 
+    async def render_pages(self, path: str, page_start: int, page_end: int,
+                           scale: float = 2.0,
+                           user_id: Optional[str] = None) -> dict[str, Any]:
+        base = self._resolve_base_url()
+        headers: dict[str, str] = {}
+        if user_id:
+            headers["X-NimoOS-User-ID"] = user_id
+        r = await self._client.post(
+            f"{base}/v1/parser/render/pages",
+            json={"path": path, "page_start": page_start,
+                  "page_end": page_end, "scale": scale},
+            headers=headers,
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = (r.text or "").strip()
+            msg = f"{e}: {body}" if body else str(e)
+            raise httpx.HTTPStatusError(msg, request=e.request, response=e.response) from e
+        return r.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()

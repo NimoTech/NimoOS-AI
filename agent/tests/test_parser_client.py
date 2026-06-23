@@ -53,3 +53,27 @@ async def test_missing_discovery_file_raises(tmp_path):
     with pytest.raises(RuntimeError):
         await client.extract("/DATA/x.pdf")
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_render_pages_posts_correct_shape(tmp_path):
+    url_file = tmp_path / "parser.url"
+    url_file.write_text("http://127.0.0.1:8283\n")
+
+    async def fake_post(url, json=None, headers=None):
+        class R:
+            status_code = 200
+            def json(self): return {"path": json["path"],
+                                    "pages": [{"page": 1, "png_b64": "AAA"}]}
+            def raise_for_status(self): pass
+        assert url == "http://127.0.0.1:8283/v1/parser/render/pages"
+        assert json == {"path": "/DATA/x.pdf", "page_start": 2,
+                        "page_end": 2, "scale": 2.0}
+        assert headers == {"X-NimoOS-User-ID": "u1"}
+        return R()
+
+    client = ParserClient(discovery_path=str(url_file))
+    with patch.object(client._client, "post", side_effect=fake_post):
+        out = await client.render_pages("/DATA/x.pdf", 2, 2, user_id="u1")
+    assert out["pages"][0]["png_b64"] == "AAA"
+    await client.aclose()
