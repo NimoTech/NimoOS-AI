@@ -19,6 +19,9 @@ services:
       - { type: bind, source: /mnt,   target: /mnt,   bind: { propagation: rslave } }
       - { type: bind, source: /var/run/nimoos, target: /var/run/nimoos, read_only: true }
       - { type: bind, source: /var/lib/nimoos/ai/agent, target: /var/lib/nimoos/ai/agent }
+      # skills 根目录:Go(host)在此播种 builtin/ 并建 .runtime/<user>/ symlink 视图;
+      # 容器内 Python list_skills/read_skill_file 只读扫描,故 read_only。
+      - { type: bind, source: /var/lib/nimoos/ai/skills, target: /var/lib/nimoos/ai/skills, read_only: true }
       - { type: bind, source: /etc/nimoos, target: /etc/nimoos, read_only: true }
     restart: unless-stopped
     logging:
