@@ -118,3 +118,40 @@ def test_agent_imports_search_skills_module():
     import agent as agent_module
     from skills.search import search as search_skill
     assert agent_module.search_skills.USER_ID_VAR is search_skill.USER_ID_VAR
+
+
+def test_read_document_in_all_tools():
+    from skills import ALL_TOOLS
+    assert "read_document" in {t.name for t in ALL_TOOLS}
+
+
+@pytest.mark.asyncio
+async def test_read_document_propagates_user_id_and_args(monkeypatch):
+    calls = {}
+
+    async def fake_invoke(name, arguments, user_id=None):
+        calls["name"] = name
+        calls["arguments"] = arguments
+        calls["user_id"] = user_id
+        return {"file_id": "f1", "text": "hello [Page 1]", "truncated": False,
+                "total_chars": 14, "next_offset": 0}
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    search_skill.USER_ID_VAR.set("u1")
+    out = await search_skill._read_document_impl("f1", offset=0, max_chars=24000)
+    assert calls["name"] == "read_document"
+    assert calls["user_id"] == "u1"
+    assert calls["arguments"] == {"file_id": "f1", "offset": 0, "max_chars": 24000}
+    data = json.loads(out)
+    assert data["text"] == "hello [Page 1]"
+    assert data["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_document_handles_http_error(monkeypatch):
+    async def fake_invoke(name, arguments, user_id=None):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    out = await search_skill._read_document_impl("f1")
+    assert "error" in json.loads(out)

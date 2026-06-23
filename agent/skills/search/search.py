@@ -65,6 +65,19 @@ async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
     return json.dumps(result, ensure_ascii=False)
 
 
+async def _read_document_impl(file_id: str, offset: int = 0,
+                              max_chars: int = 24000) -> str:
+    uid = USER_ID_VAR.get() or None
+    try:
+        result = await _client.invoke_tool("read_document", {
+            "file_id": file_id, "offset": offset, "max_chars": max_chars,
+        }, user_id=uid)
+    except httpx.HTTPError as e:
+        return json.dumps({"error": f"read_document failed: {e}"},
+                          ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False)
+
+
 @function_tool
 async def nimoos_search(query: str, sources: Optional[str] = None,
                         filters: Optional[str] = None, top_k: int = 5) -> str:
@@ -100,4 +113,24 @@ async def read_file_chunk(file_id: str, kind: str, chunk_no: int,
     return await _read_file_chunk_impl(file_id, kind, chunk_no, window)
 
 
-SEARCH_TOOLS = [nimoos_search, read_file_chunk]
+@function_tool
+async def read_document(file_id: str, offset: int = 0,
+                        max_chars: int = 24000) -> str:
+    """Read a document's full extracted text by file_id, reconstructed from the
+    search index with [Page N] markers. Call this after nimoos_search returns a
+    file_id when you need the whole document rather than a short preview.
+
+    If the result has "truncated": true the document is long — page with
+    "offset" set to the returned "next_offset", or (better for finding one
+    specific fact) use nimoos_search to locate the relevant passage instead of
+    reading the whole document.
+
+    Args:
+        file_id: File identifier returned by nimoos_search.
+        offset: Character offset to start from (default 0; for paging).
+        max_chars: Maximum characters to return (default 24000).
+    """
+    return await _read_document_impl(file_id, offset, max_chars)
+
+
+SEARCH_TOOLS = [nimoos_search, read_file_chunk, read_document]
