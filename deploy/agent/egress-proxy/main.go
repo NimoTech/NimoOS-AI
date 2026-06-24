@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 var internalV4 = []*net.IPNet{
@@ -149,6 +150,10 @@ func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop fun
 					log.Printf("dns udp write upstream: %v", err)
 					return
 				}
+				if err := upConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					log.Printf("dns udp set deadline: %v", err)
+					return
+				}
 				resp := make([]byte, 4096)
 				rn, err := upConn.Read(resp)
 				if err != nil {
@@ -181,6 +186,10 @@ func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop fun
 				}
 				defer upConn.Close()
 				// Read 2-byte length prefix + message from client.
+				if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					log.Printf("dns tcp set client deadline: %v", err)
+					return
+				}
 				var msgLen uint16
 				if err := binary.Read(c, binary.BigEndian, &msgLen); err != nil {
 					return
@@ -197,6 +206,10 @@ func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop fun
 					return
 				}
 				// Read upstream response and relay back to client.
+				if err := upConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					log.Printf("dns tcp set upstream deadline: %v", err)
+					return
+				}
 				var respLen uint16
 				if err := binary.Read(upConn, binary.BigEndian, &respLen); err != nil {
 					log.Printf("dns tcp read upstream len: %v", err)
