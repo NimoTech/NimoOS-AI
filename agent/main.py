@@ -1,12 +1,18 @@
 import asyncio
+import atexit
 import base64
 import json
+import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 from typing import AsyncGenerator
+
+_LOG = logging.getLogger("nimoos-agent")
 
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_MD_BYTES = 50 * 1024
@@ -105,6 +111,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env var. Truthy values: '1', 'true', 'yes' (case-insensitive)."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes")
+
+
+def _env_str(name: str, default: str) -> str:
+    """Read a string env var with a default."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val
+
+
 MAX_ATTACHMENT_SIZE         = _env_int("NIMOOS_MAX_ATTACHMENT_SIZE",         524_288_000)
 MAX_IMAGE_ATTACHMENT_SIZE   = _env_int("NIMOOS_MAX_IMAGE_ATTACHMENT_SIZE",   20_971_520)
 MAX_ATTACHMENTS_PER_SESSION = _env_int("NIMOOS_MAX_ATTACHMENTS_PER_SESSION", 50)
@@ -114,6 +136,21 @@ ATTACHMENT_GC_AGE           = _env_int("NIMOOS_ATTACHMENT_GC_AGE",           86_
 MAX_DOC_CHARS               = _env_int("NIMOOS_MAX_DOC_CHARS",               262_144)
 MAX_DOC_EXTRACT_SECONDS     = _env_int("NIMOOS_MAX_DOC_EXTRACT_SECONDS",     8)
 MAX_DOC_UNCOMPRESSED_BYTES  = _env_int("NIMOOS_MAX_DOC_UNCOMPRESSED_BYTES",  209_715_200)
+
+# Egress DLP / sandbox execution mode
+# NIMOOS_AGENT_EXEC_MODE: "netns" (default) or "none" (disable sandbox)
+EXEC_MODE           = _env_str("NIMOOS_AGENT_EXEC_MODE",    "netns")
+# Path to the egress-proxy binary
+EGRESS_PROXY_BIN    = _env_str("NIMOOS_EGRESS_PROXY_BIN",   "/usr/local/bin/egress-proxy")
+# TOFU: trust-on-first-use — proxy allows first connection per host by default
+EGRESS_TOFU         = _env_bool("NIMOOS_EGRESS_TOFU",       True)
+# Upload byte threshold above which egress is flagged for confirmation
+EGRESS_UPLOAD_BYTES = _env_int("NIMOOS_EGRESS_UPLOAD_BYTES", 65_536)
+
+# Subprocess handles for orchestrated children (executor + proxy).
+# Populated by the startup handler; used by the shutdown handler.
+_executor_proc: "subprocess.Popen | None" = None
+_proxy_proc: "subprocess.Popen | None" = None
 
 app = FastAPI(title="nimoos-agent")
 
@@ -139,9 +176,213 @@ async def _attachments_startup():
         run_startup_gc(_db(), _data_root(),
                        age_seconds=ATTACHMENT_GC_AGE)
     except Exception as e:
-        import logging
-        logging.getLogger("nimoos-agent").warning(
-            "attachment GC failed: %s", e)
+        _LOG.warning("attachment GC failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Startup orchestration helpers (netns + egress-proxy + executor)
+# ---------------------------------------------------------------------------
+
+def _build_proxy_argv(
+    proxy_bin: str,
+    listen: str = "169.254.7.1:8888",
+    dns: str = "169.254.7.1:53",
+    confirm_url: str = "http://127.0.0.1:8282/internal/egress-confirm",
+    grant_listen: str = "127.0.0.1:8889",
+) -> list[str]:
+    """Return the argv list for starting the egress-proxy.
+
+    Extracted as a pure function so tests can verify argv construction without
+    actually spawning a process.
+
+    NOTE (P0 design): The grant_listen address exists for A-path (content-
+    inspection allow-listing) but main.py does not call it in this phase — there
+    is no content judge, so the grant channel has no caller.  Proxy grant support
+    is wired at the process level; P1 will add the judge that calls it.
+    """
+    return [
+        proxy_bin,
+        "-listen", listen,
+        "-dns", dns,
+        "-confirm-url", confirm_url,
+        "-grant-listen", grant_listen,
+    ]
+
+
+def _wait_for_pid_file(pid_file: str, timeout: float = 5.0, interval: float = 0.1) -> int:
+    """Poll *pid_file* until it appears and contains a valid PID, or timeout.
+
+    Returns the PID (int) on success; raises TimeoutError on timeout.
+    Extracted as a pure function for unit-testing without subprocess.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(pid_file) as fh:
+                content = fh.read().strip()
+            if content:
+                return int(content)
+        except (FileNotFoundError, ValueError):
+            pass
+        time.sleep(interval)
+    raise TimeoutError(f"executor pid file {pid_file!r} not ready after {timeout}s")
+
+
+def _teardown_children() -> None:
+    """Terminate executor and proxy subprocesses. Safe to call multiple times."""
+    global _executor_proc, _proxy_proc
+    for name, proc in (("executor", _executor_proc), ("proxy", _proxy_proc)):
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception as exc:
+                _LOG.warning("teardown %s: %s", name, exc)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    # Attempt netns teardown (requires CAP_NET_ADMIN; silently ignored otherwise)
+    try:
+        from netns import bootstrap
+        bootstrap.teardown()
+    except Exception as exc:
+        _LOG.debug("netns teardown: %s", exc)
+    _executor_proc = None
+    _proxy_proc = None
+
+
+@app.on_event("startup")
+async def _egress_startup():
+    """Fork executor, wire network namespace, and start egress-proxy.
+
+    Only runs when EXEC_MODE == "netns".  All errors are caught and logged;
+    the agent continues to start even if orchestration fails — this prevents a
+    missing `ip` binary or non-root environment (e.g. CI) from hard-crashing
+    the service.  In that case the executor sandbox is simply unavailable and
+    shell/MCP tools will fail gracefully at runtime.
+    """
+    global _executor_proc, _proxy_proc
+
+    if EXEC_MODE != "netns":
+        _LOG.info("egress startup: EXEC_MODE=%r — skipping netns orchestration", EXEC_MODE)
+        return
+
+    pid_file = _env_str("NIMOOS_EXEC_PID_FILE", "/var/run/nimoos/agent-exec.pid")
+
+    try:
+        # 1. Fork executor (python -m netns.executor) from the agent root dir
+        #    so that `import netns` resolves correctly.
+        agent_root = os.path.dirname(os.path.abspath(__file__))
+        _executor_proc = subprocess.Popen(
+            [sys.executable, "-m", "netns.executor"],
+            cwd=agent_root,
+        )
+        _LOG.info("egress startup: executor spawned pid=%d", _executor_proc.pid)
+
+        # 2. Wait for executor to write its PID file (it runs unshare then writes)
+        exec_pid = _wait_for_pid_file(pid_file, timeout=5.0)
+        _LOG.info("egress startup: executor netns pid=%d", exec_pid)
+
+        # 3. Create veth pair and configure the host side (requires CAP_NET_ADMIN)
+        from netns import bootstrap
+        bootstrap.create_netns(exec_pid)
+        _LOG.info("egress startup: netns veth configured")
+
+        # 4. Start egress-proxy
+        proxy_argv = _build_proxy_argv(EGRESS_PROXY_BIN)
+        _proxy_proc = subprocess.Popen(proxy_argv)
+        _LOG.info("egress startup: proxy spawned pid=%d argv=%s",
+                  _proxy_proc.pid, proxy_argv)
+
+        # Register atexit teardown (also covered by the shutdown event below)
+        atexit.register(_teardown_children)
+
+    except Exception as exc:
+        _LOG.error(
+            "egress startup failed (%s) — sandbox unavailable, "
+            "agent will still start without netns isolation",
+            exc,
+        )
+        # Best-effort cleanup of any partially-started children
+        try:
+            _teardown_children()
+        except Exception:
+            pass
+
+
+@app.on_event("shutdown")
+async def _egress_shutdown():
+    """Tear down executor and proxy on graceful shutdown."""
+    try:
+        _teardown_children()
+    except Exception as exc:
+        _LOG.warning("egress shutdown: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Internal egress-confirm callback (called by egress-proxy, not by users)
+# ---------------------------------------------------------------------------
+
+class _EgressConfirmRequest(BaseModel):
+    host: str
+    bytes: int = 0
+    reason: str = ""
+
+
+@app.post("/internal/egress-confirm")
+async def egress_confirm(req: _EgressConfirmRequest):
+    """Receive an egress-confirmation request from the egress-proxy.
+
+    The proxy calls this endpoint (bound to 127.0.0.1) when an outbound
+    connection exceeds the upload-bytes threshold or matches a policy rule.
+    We route the confirmation to the most-recently-active agent session.
+
+    Routing policy (P0): take the last-active session sink. When multiple
+    sessions are running concurrently, attribution is ambiguous; P1 will add
+    per-connection session tagging in the proxy protocol.
+
+    Fail-closed: any condition that prevents us from finding an active session
+    or registering a confirmation returns {"allow": false}.
+    """
+    # Find an active session — P0 uses last-active heuristic
+    session_id: str | None = _runner._last_active_session
+    if session_id is not None and session_id not in _runner._active_sinks:
+        # last-active session has since finished; check if any remain
+        if _runner._active_sinks:
+            session_id = next(iter(_runner._active_sinks))
+        else:
+            session_id = None
+
+    if session_id is None:
+        _LOG.debug("egress-confirm: no active session — fail-closed (host=%s)", req.host)
+        return {"allow": False}
+
+    sink = _runner._active_sinks.get(session_id)
+    if sink is None:
+        _LOG.debug("egress-confirm: sink gone for session %s — fail-closed", session_id)
+        return {"allow": False}
+
+    description = (
+        f"Outbound connection to {req.host!r} — "
+        f"bytes={req.bytes}, reason={req.reason or 'policy'}"
+    )
+    try:
+        cid = _confirm_mgr.register(session_id, "egress", description, req.host)
+        await sink.put({
+            "type": "confirmation_required",
+            "confirm_id": cid,
+            "action": "egress_confirm",
+            "host": req.host,
+            "bytes": req.bytes,
+            "reason": req.reason,
+            "description": description,
+        })
+        granted = await _confirm_mgr.wait(cid)
+        return {"allow": bool(granted)}
+    except Exception as exc:
+        _LOG.error("egress-confirm error for session %s: %s — fail-closed", session_id, exc)
+        return {"allow": False}
 
 
 from provider_adapters import ThinkingLevel as _ThinkingLevel

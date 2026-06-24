@@ -351,6 +351,15 @@ class AgentRunner:
         # service restarts (new random port) are transparent to us.
         self._wiki_clients: dict[str, WikiClient] = {}
 
+        # Active-sink registry for egress-confirm callback routing.
+        # Maps session_id → sink for all currently-running agent turns.
+        # /internal/egress-confirm is an independent HTTP request (not inside
+        # any run's contextvar scope), so it uses this registry to find a sink.
+        # P0: last-active session is the fallback when routing is ambiguous
+        # (concurrent multi-session case); a proper per-connection routing is P1.
+        self._active_sinks: dict[str, object] = {}
+        self._last_active_session: str | None = None
+
     def _wiki_client_for(self, session_id: str, user_id: str) -> WikiClient:
         if session_id not in self._wiki_clients:
             self._wiki_clients[session_id] = WikiClient(user_id=str(user_id))
@@ -444,6 +453,12 @@ class AgentRunner:
         async with lock:
             # `sink` is anything with an async `put(event)`. Today that's a
             # RunSink (persists+pubsubs); skills don't care about the type.
+
+            # Register sink for egress-confirm callback routing. Removed in
+            # the finally block below regardless of success or failure.
+            self._active_sinks[session_id] = sink
+            self._last_active_session = session_id
+
             APP_SESSION_VAR.set(session_id)
             APP_EVENT_VAR.set(sink)
             APP_CONFIRM_VAR.set(self._confirm_mgr)
@@ -781,6 +796,10 @@ class AgentRunner:
                     pass
                 await sink.put({"type": "error", "content": str(e)})
             finally:
+                # Deregister sink. The sink remains accessible via _active_runs
+                # in main.py for replay; we just remove it from the hot-path
+                # egress routing table.
+                self._active_sinks.pop(session_id, None)
                 await mcp_client.close_run_conns()
                 await sink.put({"type": "done"})
 
