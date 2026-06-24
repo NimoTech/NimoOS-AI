@@ -94,7 +94,7 @@ def test_client_echo(executor_sock, monkeypatch):
     client = _import_client()
     monkeypatch.setenv("NIMOOS_EXEC_SOCK", executor_sock)
 
-    exit_code, output = asyncio.get_event_loop().run_until_complete(
+    exit_code, output = asyncio.run(
         client.run_command("echo hi", timeout_sec=5, env={}, cwd="/tmp")
     )
     assert exit_code == 0
@@ -107,7 +107,7 @@ def test_client_exit_code(executor_sock, monkeypatch):
     client = _import_client()
     monkeypatch.setenv("NIMOOS_EXEC_SOCK", executor_sock)
 
-    exit_code, output = asyncio.get_event_loop().run_until_complete(
+    exit_code, output = asyncio.run(
         client.run_command("exit 5", timeout_sec=5, env={}, cwd="/tmp")
     )
     assert exit_code == 5
@@ -125,9 +125,10 @@ def test_client_timeout(executor_sock, monkeypatch):
             timeout=10.0,
         )
 
-    exit_code, output = asyncio.get_event_loop().run_until_complete(_run())
-    # Either the exit code is non-zero or output mentions killed/timeout
-    assert exit_code != 0 or "timeout" in output.lower() or "killed" in output.lower()
+    exit_code, output = asyncio.run(_run())
+    # Executor must return exit=124 and the "[killed: timeout ...]" marker.
+    assert exit_code == 124
+    assert "killed" in output
 
 
 @pytest.mark.skipif(_prlimit_missing, reason="prlimit binary not found")
@@ -136,7 +137,7 @@ def test_client_env(executor_sock, monkeypatch):
     client = _import_client()
     monkeypatch.setenv("NIMOOS_EXEC_SOCK", executor_sock)
 
-    exit_code, output = asyncio.get_event_loop().run_until_complete(
+    exit_code, output = asyncio.run(
         client.run_command(
             "echo $TESTVAR",
             timeout_sec=5,

@@ -42,7 +42,7 @@ Constants:
   MAX_TIMEOUT_SEC   = 300 s
   DEFAULT_TIMEOUT_SEC = 30 s
   MAX_OUTPUT_BYTES  = 16 KiB
-  NPROC             = 64
+  NPROC             = 1024
 
 Environment overrides (for testing / deployment):
   NIMOOS_EXEC_SOCK      — Unix socket path (default /var/run/nimoos/agent-exec.sock)
@@ -129,19 +129,23 @@ def _execute(req: dict) -> dict:
     extra_env = req.get("env") or {}
     cwd = req.get("cwd") or "/work"
 
-    # Build execution environment
+    # Build execution environment.
+    # Start with defaults, merge caller-supplied extras, then force-override
+    # proxy variables so a malicious caller cannot bypass the egress choke-point
+    # by passing env={"HTTP_PROXY": "http://evil"}.
     base_env = {
-        "HTTP_PROXY": PROXY_BASE_URL,
-        "HTTPS_PROXY": PROXY_BASE_URL,
-        "http_proxy": PROXY_BASE_URL,
-        "https_proxy": PROXY_BASE_URL,
-        "NO_PROXY": "",
-        "no_proxy": "",
         "HOME": "/work",
         "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
         "TERM": "dumb",
     }
     base_env.update(extra_env)
+    # Proxy vars MUST come last — always override anything the caller supplied.
+    base_env["HTTP_PROXY"] = PROXY_BASE_URL
+    base_env["HTTPS_PROXY"] = PROXY_BASE_URL
+    base_env["http_proxy"] = PROXY_BASE_URL
+    base_env["https_proxy"] = PROXY_BASE_URL
+    base_env["NO_PROXY"] = ""
+    base_env["no_proxy"] = ""
 
     # Build prlimit-wrapped command
     argv = [

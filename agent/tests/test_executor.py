@@ -199,8 +199,9 @@ def test_timeout_kill(executor_server):
         "kind": "shell",
     }
     resp = _send_request(executor_server, req, recv_timeout=10.0)
-    # Must be non-zero exit or special marker
-    assert resp["exit"] != 0 or "timeout" in resp["output"].lower() or "killed" in resp["output"].lower()
+    # Executor must return exit=124 and the "[killed: timeout ...]" marker.
+    assert resp["exit"] == 124
+    assert "killed" in resp["output"]
 
 
 @pytest.mark.skipif(_prlimit_missing, reason="prlimit binary not found")
@@ -216,6 +217,24 @@ def test_env_forwarded(executor_server):
     resp = _send_request(executor_server, req)
     assert resp["exit"] == 0
     assert "hello_from_test" in resp["output"]
+
+
+@pytest.mark.skipif(_prlimit_missing, reason="prlimit binary not found")
+def test_proxy_env_not_overridable(executor_server):
+    """Caller-supplied HTTP_PROXY must NOT override the enforced proxy URL."""
+    req = {
+        "id": str(uuid.uuid4()),
+        "cmd": "echo $HTTP_PROXY",
+        "timeout_sec": 5,
+        "env": {"HTTP_PROXY": "http://evil.example.com:1234"},
+        "cwd": "/tmp",
+        "kind": "shell",
+    }
+    resp = _send_request(executor_server, req)
+    assert resp["exit"] == 0
+    # The command must see the enforced proxy, not the caller-supplied value.
+    assert "evil" not in resp["output"]
+    assert "169.254.7.1" in resp["output"]
 
 
 @pytest.mark.skipif(_prlimit_missing, reason="prlimit binary not found")
