@@ -16,8 +16,21 @@ from agents import function_tool
 
 # search_client.py is a top-level module in agent/; agent/ is on sys.path
 from search_client import SearchClient
+from parser_client import ParserClient
+from skills import filesystem as _fsskill
+from skills import photos as _photos
+from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
 
 _client = SearchClient()
+_parser_client = ParserClient()
+
+_FS_GATE_ERRORS = (
+    _fspaths.PermissionDenied,
+    _fsignore.BlockedImplicit,
+    _fsignore.BlockedHardBlacklist,
+    _fsignore.BlockedGitignore,
+    LookupError,  # fs ContextVars unset (no active run context)
+)
 
 # Set per-run by AgentRunner.run; read at tool-call time.
 USER_ID_VAR: ContextVar[str] = ContextVar("search_user_id", default="")
@@ -65,6 +78,50 @@ async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
     return json.dumps(result, ensure_ascii=False)
 
 
+async def _read_document_impl(file_id: Optional[str] = None,
+                              path: Optional[str] = None,
+                              ocr: bool = False,
+                              offset: int = 0,
+                              max_chars: int = 24000) -> str:
+    # file_id + not ocr → indexed fast path (M1, via Search).
+    if file_id and not ocr:
+        uid = USER_ID_VAR.get() or None
+        try:
+            result = await _client.invoke_tool("read_document", {
+                "file_id": file_id, "offset": offset, "max_chars": max_chars,
+            }, user_id=uid)
+        except httpx.HTTPError as e:
+            return json.dumps({"error": f"read_document failed: {e}"},
+                              ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+
+    # path (or forced ocr) → on-demand extraction via Parser, gated by the
+    # same per-session filesystem authorization read_file uses.
+    if not path:
+        return json.dumps(
+            {"error": "provide file_id (indexed) or path (any file)"},
+            ensure_ascii=False)
+    try:
+        # Use the FULL fs ctx (like read_file): it carries confirm_mgr + the
+        # event sink, so an out-of-scope path pops the SAME access-request card
+        # read_file uses and waits for the user's grant. _ctx() reads ContextVars
+        # with no default → an unset run context raises LookupError, caught below.
+        ctx = _fsskill._ctx()
+        abs_path = await _fsops._resolve_and_gate_or_request(ctx, path, "read")
+    except _FS_GATE_ERRORS as e:
+        return json.dumps(
+            {"error": f"not authorized to read that path: {e}"},
+            ensure_ascii=False)
+    uid = USER_ID_VAR.get() or None
+    try:
+        result = await _parser_client.extract(
+            abs_path, ocr=ocr, max_chars=max_chars, user_id=uid)
+    except Exception as e:
+        return json.dumps({"error": f"document extraction failed: {e}"},
+                          ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False)
+
+
 @function_tool
 async def nimoos_search(query: str, sources: Optional[str] = None,
                         filters: Optional[str] = None, top_k: int = 5) -> str:
@@ -100,4 +157,83 @@ async def read_file_chunk(file_id: str, kind: str, chunk_no: int,
     return await _read_file_chunk_impl(file_id, kind, chunk_no, window)
 
 
-SEARCH_TOOLS = [nimoos_search, read_file_chunk]
+@function_tool
+async def read_document(file_id: Optional[str] = None,
+                        path: Optional[str] = None,
+                        ocr: bool = False,
+                        offset: int = 0,
+                        max_chars: int = 24000) -> str:
+    """Read a document's full text — PDF, Word, PowerPoint, Excel, HTML,
+    Markdown, or plain text.
+
+    Two ways to call it:
+    - file_id (from nimoos_search) — fast, reads the already-indexed text with
+      [Page N] markers; supports offset paging for long docs.
+    - path — read any file by absolute path, including files NOT yet indexed
+      (e.g. just uploaded). The text is extracted on demand. Set ocr=true for
+      scanned/image PDFs. You may only read paths within your authorized scope
+      (the same scope read_file uses).
+
+    Args:
+        file_id: Indexed file id from nimoos_search (preferred when available).
+        path: Absolute path to read on demand (for unindexed files).
+        ocr: Force OCR extraction (scanned PDFs); implies the path route.
+        offset: Character offset for paging the indexed (file_id) route.
+        max_chars: Maximum characters to return.
+    """
+    return await _read_document_impl(file_id, path, ocr, offset, max_chars)
+
+
+async def _view_document_page_impl(path: str, page: int = 1,
+                                   question: str = "") -> str:
+    cfg = _photos.VISION_CFG_VAR.get()
+    if not cfg.get("ok"):
+        return json.dumps(
+            {"error": "current model has no vision; use "
+                      "read_document(path, ocr=true) for scanned text instead"},
+            ensure_ascii=False)
+    try:
+        # Full fs ctx so an out-of-scope path pops the access-request card and
+        # waits for the user's grant (same flow as read_file / read_document).
+        ctx = _fsskill._ctx()
+        abs_path = await _fsops._resolve_and_gate_or_request(ctx, path, "read")
+    except _FS_GATE_ERRORS as e:
+        return json.dumps(
+            {"error": f"not authorized to read that path: {e}"},
+            ensure_ascii=False)
+    uid = USER_ID_VAR.get() or None
+    try:
+        rendered = await _parser_client.render_pages(
+            abs_path, page, page, user_id=uid)
+    except Exception as e:
+        return json.dumps({"error": f"page render failed: {e}"},
+                          ensure_ascii=False)
+    pages = rendered.get("pages") or []
+    if not pages:
+        return json.dumps({"error": f"page {page} not found"}, ensure_ascii=False)
+    prompt = question or (
+        f"Describe page {page} of this document — its text, tables, figures, "
+        f"and layout.")
+    desc, err = await _photos.describe_image(pages[0]["png_b64"], prompt)
+    if err:
+        return json.dumps({"error": f"vision failed: {err}"}, ensure_ascii=False)
+    return json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+
+
+@function_tool
+async def view_document_page(path: str, page: int = 1, question: str = "") -> str:
+    """Render a document PAGE to an image and look at it with the vision model.
+    Use when read_document's text is not enough — scanned/image PDFs, complex
+    tables, charts/diagrams, or "what does this page look like" questions.
+    Requires a vision-capable model (otherwise use read_document(path, ocr=true)).
+    PDF only. You may only view paths within your authorized scope.
+
+    Args:
+        path: Absolute path to the PDF.
+        page: 1-based page number to render.
+        question: Optional specific question about the page.
+    """
+    return await _view_document_page_impl(path, page, question)
+
+
+SEARCH_TOOLS = [nimoos_search, read_file_chunk, read_document, view_document_page]

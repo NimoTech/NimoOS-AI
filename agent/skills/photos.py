@@ -1,6 +1,7 @@
 import base64
 import json
 from contextvars import ContextVar
+from typing import Optional
 
 import httpx
 from agents import function_tool
@@ -271,6 +272,30 @@ async def rename_album(album_id: str, new_name: str) -> str:
         return f"Album {album_id} renamed to '{new_name}'"
     except Exception as e:
         return f"Photos service error: {e}"
+
+
+async def describe_image(png_b64: str, prompt: str,
+                         mime: str = "image/png") -> tuple[str, Optional[str]]:
+    """One-shot vision description of a single base64 image. Returns
+    (description, error). error is non-None when the model lacks vision or the
+    call fails. Shares VISION_CFG_VAR + AsyncOpenAI with look_at_photos."""
+    cfg = VISION_CFG_VAR.get()
+    if not cfg.get("ok"):
+        return "", "current model does not support vision"
+    blocks = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url",
+         "image_url": {"url": f"data:{mime};base64,{png_b64}"}},
+    ]
+    try:
+        oai = AsyncOpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"])
+        completion = await oai.chat.completions.create(
+            model=cfg["model"],
+            messages=[{"role": "user", "content": blocks}],
+        )
+        return (completion.choices[0].message.content or "").strip(), None
+    except Exception as e:  # network / model error
+        return "", str(e)
 
 
 @function_tool

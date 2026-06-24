@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "file-reader",
+  "name": "file-reader",
+  "title": "File reader",
+  "description": "Read the contents of a document (PDF, Word, PowerPoint, Excel, HTML, Markdown, text) and answer questions about it — single-document full text or across many documents.",
+  "color": "teal",
+  "icon": "file",
+  "trigger": "auto",
+  "examples": [
+    "What does this contract say about termination?",
+    "Summarize report.pdf",
+    "What do my docs say about the 2025 budget?"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}
