@@ -47,6 +47,8 @@ func (h *ChatHandler) ChatCompletions(c echo.Context) error {
 	switch target.backend {
 	case service.BackendLocal:
 		return h.forwardToLocal(c, bytes.NewReader(body), stream)
+	case service.BackendOpenVINO:
+		return h.forwardToOpenVINO(c, target, body, stream)
 	case service.BackendCloud:
 		// Reuse Decide(forceCloud=true) purely for the AllowRemote veto.
 		if _, derr := h.svc.Router().Decide(userID, true); derr != nil {
@@ -80,6 +82,48 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 				"code":    "local_model_failed",
 				"type":    "escalation_required",
 				"message": "Local model failed. Set X-NimoOS-Force-Cloud: true to retry with cloud.",
+			},
+		})
+	}
+	defer resp.Body.Close()
+	if stream {
+		return proxySSEResponse(c, resp)
+	}
+	return proxyResponse(c, resp)
+}
+
+// forwardToOpenVINO routes a request to the local OVMS backend on the requested
+// device. OpenVINO is a local backend, so it is not subject to the AllowRemote
+// privacy policy (same as Ollama).
+func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body []byte, stream bool) error {
+	adapter := h.svc.OpenVINOAdapter()
+
+	device := target.device
+	if device == "" {
+		device = adapter.DefaultDevice()
+	}
+	if !adapter.HasDevice(device) {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":      "unknown_device",
+				"type":      "invalid_request_error",
+				"message":   "device not resident on OpenVINO backend",
+				"available": adapter.Devices(),
+			},
+		})
+	}
+
+	// Rewrite the model field to the OVMS internal servable name.
+	internal := service.OVMSModelName(target.bareModel, device)
+	rewritten := setModelField(body, internal)
+
+	resp, err := adapter.ChatCompletions(bytes.NewReader(rewritten))
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]string{
+				"code":    "backend_unavailable",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 服务未就绪",
 			},
 		})
 	}
