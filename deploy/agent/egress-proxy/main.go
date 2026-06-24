@@ -165,19 +165,28 @@ type confirmResp struct {
 	Allow bool `json:"allow"`
 }
 
+// confirmClient is the HTTP client used for egress-confirm callbacks.
+// A 5-second timeout ensures fail-closed behaviour on slow/hung control planes.
+var confirmClient = &http.Client{Timeout: 5 * time.Second}
+
 // callConfirm calls the confirm URL and returns whether the request is allowed.
-// Returns false on any error (fail-closed).
+// Returns false on any error (fail-closed): network errors, timeouts, non-200,
+// or JSON decode failures all result in deny.
 func callConfirm(host string, bytesCount int64, reason string) bool {
 	if confirmURL == "" {
 		return false
 	}
 	body, _ := json.Marshal(confirmReq{Host: host, Bytes: bytesCount, Reason: reason})
-	resp, err := http.Post(confirmURL, "application/json", bytes.NewReader(body)) //nolint:noctx
+	resp, err := confirmClient.Post(confirmURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("egress-confirm: POST error: %v", err)
 		return false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("egress-confirm: non-200 status: %d", resp.StatusCode)
+		return false
+	}
 	var cr confirmResp
 	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
 		log.Printf("egress-confirm: decode error: %v", err)
@@ -400,7 +409,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// For external targets: count upload bytes and enforce threshold.
-	cw := &countingWriter{w: dst}
+	// uploadAuthorized is a per-connection latch: once this connection has been
+	// authorized (via grant or confirm), subsequent chunks are forwarded without
+	// calling confirm again.
+	uploadAuthorized := false
+	var uploadTotal int64
 	uploadDone := make(chan struct{})
 
 	go func() {
@@ -409,22 +422,23 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		for {
 			n, rerr := cli.Read(buf)
 			if n > 0 {
-				_, werr := cw.Write(buf[:n])
-				if werr != nil {
-					break
-				}
-				total := cw.Total()
-				if total > T_UPLOAD {
-					// Check grant first.
+				chunk := int64(n)
+
+				// Pre-write gate: if this chunk would push us over the threshold
+				// and the connection is not yet authorized, we must authorize
+				// BEFORE writing any data to dst.
+				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
 					if hasGrant(host) {
-						if !consumeGrant(host, int64(n), cli) {
-							// Budget exhausted; consumeGrant already closed/RST.
+						// Grant covers it; deduct and latch.
+						if !consumeGrant(host, chunk, cli) {
+							// Budget exhausted; consumeGrant already RST the conn.
 							break
 						}
+						uploadAuthorized = true
 					} else {
-						// Ask confirm.
-						if !callConfirm(host, total, "upload_over_threshold") {
-							// Deny: RST the client side.
+						// No grant — ask confirm BEFORE writing the chunk.
+						if !callConfirm(host, uploadTotal+chunk, "upload_over_threshold") {
+							// Deny: RST; the over-limit chunk is never written.
 							if tc, ok := cli.(*net.TCPConn); ok {
 								tc.SetLinger(0)
 							}
@@ -432,8 +446,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 							dst.Close()
 							break
 						}
-						// Allow: register a synthetic infinite grant so we don't
-						// spam confirm on every subsequent chunk.
+						// Allowed: latch for this connection and register a
+						// synthetic large grant to silence future calls.
+						uploadAuthorized = true
 						grantStore.Lock()
 						grantStore.m[host] = &ticket{
 							MaxBytes: 1<<62 - 1,
@@ -442,6 +457,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 						grantStore.Unlock()
 					}
 				}
+
+				// Write chunk — only reached if authorized or still under threshold.
+				_, werr := dst.Write(buf[:n])
+				if werr != nil {
+					break
+				}
+				uploadTotal += chunk
 			}
 			if rerr != nil {
 				break

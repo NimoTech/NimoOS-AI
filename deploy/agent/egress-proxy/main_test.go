@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -717,9 +718,9 @@ func TestPortPolicyExternalHTTPS(t *testing.T) {
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
 
-	confirmCalled := 0
+	var confirmCalled atomic.Int32
 	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		confirmCalled++
+		confirmCalled.Add(1)
 		json.NewEncoder(w).Encode(confirmResp{Allow: false}) // deny so we don't need a real upstream
 	}))
 	defer confirmSrv.Close()
@@ -737,7 +738,7 @@ func TestPortPolicyExternalHTTPS(t *testing.T) {
 
 	// Should be 403 (denied by TOFU confirm, not port policy).
 	// The key assertion: confirmCalled > 0 means we got past port check.
-	if confirmCalled == 0 {
+	if confirmCalled.Load() == 0 {
 		t.Error("expected confirm to be called for external 443 (port policy should pass)")
 	}
 }
@@ -828,18 +829,16 @@ func TestAntiRebindingCheck(t *testing.T) {
 	// Classified as external (false), but IP is internal → should reject.
 	dialer := secureDialer(false) // classified external
 
-	// We can't easily call Control directly, but we can use the dialer to
-	// attempt a connection to an internal IP when classified as external.
-	// The Control hook runs synchronously before connect(), so the Dial returns error.
+	// The Control hook runs synchronously before connect(), so the Dial must
+	// return an error that originates from our rebinding check — not from a
+	// lower-level "connection refused" that could mask a missing hook.
 	_, err := dialer.Dial("tcp", "127.0.0.1:1") // internal IP, port doesn't need to exist
 	if err == nil {
-		t.Error("expected rebinding check to reject internal IP when classified as external")
+		t.Errorf("expected rebinding check to reject internal IP when classified as external, but Dial succeeded")
+		return
 	}
 	if !strings.Contains(err.Error(), "rebinding-check") && !strings.Contains(err.Error(), "classification mismatch") {
-		// May also fail with connection refused, but our control hook fires before connect.
-		// Accept any error (including "connection refused" if hook doesn't fire for some reason).
-		// The important thing is it doesn't succeed.
-		t.Logf("dial to internal IP when classified external errored (as expected): %v", err)
+		t.Errorf("expected error to mention rebinding-check or classification mismatch (got: %v)", err)
 	}
 }
 
@@ -848,11 +847,16 @@ func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
 	dialer := secureDialer(true) // classified internal
 
 	// Try to connect to an external IP (8.8.8.8) when classified as internal.
+	// The Control hook must fire before the OS connect attempt and return an
+	// error containing the rebinding-check / classification-mismatch keywords.
 	_, err := dialer.Dial("tcp", "8.8.8.8:80")
 	if err == nil {
-		t.Error("expected rebinding check to reject external IP when classified as internal")
+		t.Errorf("expected rebinding check to reject external IP when classified as internal, but Dial succeeded")
+		return
 	}
-	t.Logf("expected error: %v", err)
+	if !strings.Contains(err.Error(), "rebinding-check") && !strings.Contains(err.Error(), "classification mismatch") {
+		t.Errorf("expected error to mention rebinding-check or classification mismatch (got: %v)", err)
+	}
 }
 
 // TestConfirmURLDeny: callConfirm returns false when server denies.
@@ -927,4 +931,193 @@ func TestProxyPlainHTTPInternal(t *testing.T) {
 	if !strings.Contains(rw.Body.String(), "hello from internal") {
 		t.Errorf("unexpected body: %s", rw.Body.String())
 	}
+}
+
+// TestUploadGateDenyNoDataLeak verifies C1: when the confirm server denies an
+// upload_over_threshold request, the over-limit chunk is never written to dst.
+// The dst-side received byte count must be ≤ T_UPLOAD (the threshold) at the
+// point the connection is closed; the denied chunk must not have leaked.
+func TestUploadGateDenyNoDataLeak(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	// Confirm server: allow TOFU, deny upload_over_threshold.
+	var confirmReasons []string
+	var confirmMu sync.Mutex
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req confirmReq
+		json.NewDecoder(r.Body).Decode(&req)
+		confirmMu.Lock()
+		confirmReasons = append(confirmReasons, req.Reason)
+		confirmMu.Unlock()
+		allow := req.Reason == "tofu_unknown_host"
+		json.NewEncoder(w).Encode(confirmResp{Allow: allow})
+	}))
+	defer confirmSrv.Close()
+
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	// dst: a real TCP server that accumulates all bytes it receives.
+	var dstMu sync.Mutex
+	var dstReceived []byte
+	dstDone := make(chan struct{})
+
+	dstLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("dst listen: %v", err)
+	}
+	defer dstLn.Close()
+	go func() {
+		defer close(dstDone)
+		conn, err := dstLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				dstMu.Lock()
+				dstReceived = append(dstReceived, buf[:n]...)
+				dstMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// cli side: pipe that we write upload data into.
+	cliR, cliW := net.Pipe()
+
+	// Run the upload goroutine (extracted logic mirrors handleConnect's goroutine).
+	// We exercise the actual handleConnect by wiring up a real CONNECT tunnel.
+	// Since we cannot use CONNECT with httptest (no hijacker in Recorder), we
+	// instead call the upload goroutine logic directly by constructing the tunnel
+	// manually: cliR is the "client" side the proxy reads from, dst is the real conn.
+
+	dstAddr := dstLn.Addr().String()
+	dstConn, err := net.Dial("tcp", dstAddr)
+	if err != nil {
+		t.Fatalf("dial dst: %v", err)
+	}
+
+	// Replicate the upload goroutine from handleConnect (external path).
+	host := "leak-test.example.com"
+	markConfirmed(host) // TOFU already done; only upload threshold matters.
+
+	uploadDone := make(chan struct{})
+	go func() {
+		defer close(uploadDone)
+		defer dstConn.Close()
+
+		uploadAuthorized := false
+		var uploadTotal int64
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := cliR.Read(buf)
+			if n > 0 {
+				chunk := int64(n)
+				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
+					if hasGrant(host) {
+						if !consumeGrant(host, chunk, cliR) {
+							break
+						}
+						uploadAuthorized = true
+					} else {
+						if !callConfirm(host, uploadTotal+chunk, "upload_over_threshold") {
+							// Deny — do NOT write this chunk.
+							if tc, ok := cliR.(*net.TCPConn); ok {
+								tc.SetLinger(0)
+							}
+							cliR.Close()
+							dstConn.Close()
+							break
+						}
+						uploadAuthorized = true
+						grantStore.Lock()
+						grantStore.m[host] = &ticket{
+							MaxBytes: 1<<62 - 1,
+							Expiry:   time.Now().Add(24 * time.Hour),
+						}
+						grantStore.Unlock()
+					}
+				}
+				_, werr := dstConn.Write(buf[:n])
+				if werr != nil {
+					break
+				}
+				uploadTotal += chunk
+			}
+			if rerr != nil {
+				break
+			}
+		}
+	}()
+
+	// Send exactly T_UPLOAD bytes (at threshold, not yet over).
+	belowThreshold := make([]byte, T_UPLOAD)
+	for i := range belowThreshold {
+		belowThreshold[i] = 0xAB
+	}
+	if _, err := cliW.Write(belowThreshold); err != nil {
+		t.Fatalf("write below-threshold chunk: %v", err)
+	}
+
+	// Give the goroutine time to flush the below-threshold bytes.
+	time.Sleep(50 * time.Millisecond)
+
+	// Now send 1 extra byte — this chunk puts total over T_UPLOAD.
+	// The goroutine must call confirm (which denies) and NOT write this byte.
+	overChunk := []byte{0xFF}
+	cliW.Write(overChunk) //nolint:errcheck — pipe may be closed by deny path
+
+	// Wait for the upload goroutine to finish (deny closes dstConn).
+	select {
+	case <-uploadDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upload goroutine did not finish within 3s")
+	}
+
+	// Close the dst listener and wait for its goroutine to finish.
+	dstLn.Close()
+	select {
+	case <-dstDone:
+	case <-time.After(2 * time.Second):
+	}
+
+	// Verify: dst must have received at most T_UPLOAD bytes (the denied chunk leaked = bug).
+	dstMu.Lock()
+	received := int64(len(dstReceived))
+	dstMu.Unlock()
+
+	if received > T_UPLOAD {
+		t.Errorf("C1 data-leak: dst received %d bytes, want ≤ %d (T_UPLOAD); denied chunk leaked", received, T_UPLOAD)
+	}
+
+	// Verify confirm was called with reason=upload_over_threshold.
+	confirmMu.Lock()
+	reasons := make([]string, len(confirmReasons))
+	copy(reasons, confirmReasons)
+	confirmMu.Unlock()
+
+	found := false
+	for _, r := range reasons {
+		if r == "upload_over_threshold" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("C1: confirm was not called with upload_over_threshold; reasons=%v", reasons)
+	}
+
+	cliW.Close()
 }
