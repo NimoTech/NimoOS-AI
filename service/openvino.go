@@ -25,6 +25,9 @@ func OVMSModelName(model, device string) string {
 // ovmsDisplayName reverses OVMSModelName for the model list: it finds a trailing
 // "-gpuN" / "-npuN" / "-cpu" segment and renders it as "@GPU.N" etc.
 // If no known device suffix is found, the internal name is returned unchanged.
+//
+// 前提:OVMS servable 名必须以 OVMSModelName 生成的格式结尾(即 -gpuN / -npuN / -cpu);
+// 若 OVMS 配置了其它命名格式,此函数无法正确还原设备部分,模型列表将显示裸内部名。
 func ovmsDisplayName(internal string) string {
 	idx := strings.LastIndex(internal, "-")
 	if idx < 0 || idx == len(internal)-1 {
