@@ -6,11 +6,19 @@
 #   docker pull python:3.11-slim
 #   docker inspect --format '{{index .RepoDigests 0}}' python:3.11-slim
 # 然后把下一行替换为:  FROM python:3.11-slim@sha256:<digest>
+
+# ── Stage 1: build egress-proxy ──────────────────────────────────────────────
+FROM golang:1.21 AS egressbuild
+COPY deploy/agent/egress-proxy /src
+RUN cd /src && CGO_ENABLED=0 go build -o /egress-proxy .
+
+# ── Stage 2: runtime image ───────────────────────────────────────────────────
 FROM python:3.11-slim
 
 # 沙箱运行时 + LLM 命令工具链(bwrap --ro-bind /usr 后命令用容器的 /usr)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bubblewrap util-linux tini \
+      iproute2 \
       libmagic1 ca-certificates \
       bash coreutils findutils grep sed gawk \
       git curl wget \
@@ -47,5 +55,9 @@ COPY agent/ /usr/share/nimoos/agent/
 WORKDIR /usr/share/nimoos/agent
 ENV AGENT_DB_PATH=/var/lib/nimoos/ai/agent/agent.db
 EXPOSE 8282
+
+# egress-proxy: compiled in stage 1 (golang:1.21), copied here as static binary
+COPY --from=egressbuild /egress-proxy /usr/local/bin/egress-proxy
+
 # tini 作 PID 1 回收 bwrap 产生的孤儿/僵尸进程
 ENTRYPOINT ["/usr/bin/tini", "--", "python", "main.py"]
