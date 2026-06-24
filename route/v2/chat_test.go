@@ -85,6 +85,8 @@ func TestForwardToOpenVINODisabled(t *testing.T) {
 	h := &ChatHandler{svc: svc}
 
 	e := echo.New()
+	// body 直接作为参数传给 forwardToOpenVINO;disabled 守卫在消费 body 之前就返回,
+	// 故 request 自身的 body 刻意置 nil。
 	body := []byte(`{"model":"openvino:qwen3-vl-int4@GPU.1","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	rec := httptest.NewRecorder()
