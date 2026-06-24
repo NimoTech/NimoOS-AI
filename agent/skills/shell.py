@@ -1,14 +1,22 @@
 """Sandboxed shell tool surface for the agent.
 
-Each ``run_command`` spawns a fresh ``bwrap`` (bubblewrap) subprocess. The
-container has read-only system dirs, a session-persistent ``/work``, ``/tmp``
-as tmpfs, and — when the user has authorized resources — those folders/files
-mounted READ-ONLY at their real paths (with blacklisted subpaths masked).
+Execution mode is controlled by the ``NIMOOS_AGENT_EXEC_MODE`` environment
+variable (default ``netns``):
 
-Network is OFF by default (``--unshare-net``); ``network=True`` asks the user
-to confirm, and once granted stays on for the session. bwrap args are passed
-via ``--args <fd>`` (an in-memory memfd) to bypass ARG_MAX and avoid pipe
-deadlocks.
+* **netns** (default): Commands are forwarded to the netns executor daemon via
+  ``netns.client.run_command``.  The daemon runs commands inside an isolated
+  network namespace with a transparent egress proxy; network is available but
+  outbound traffic to unknown destinations requires confirmation (DLP managed
+  by the proxy layer).  No bwrap is involved.
+
+* **bwrap**: Legacy bubblewrap sandbox.  Each ``run_command`` spawns a fresh
+  ``bwrap`` subprocess.  The container has read-only system dirs, a
+  session-persistent ``/work``, ``/tmp`` as tmpfs, and — when the user has
+  authorized resources — those folders/files mounted READ-ONLY at their real
+  paths (with blacklisted subpaths masked).  Network is OFF by default
+  (``--unshare-net``); ``network=True`` asks the user to confirm, and once
+  granted stays on for the session.  bwrap args are passed via ``--args <fd>``
+  (an in-memory memfd) to bypass ARG_MAX and avoid pipe deadlocks.
 """
 from __future__ import annotations
 
@@ -22,6 +30,7 @@ from agents import function_tool
 
 import db as dbmod
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
+from netns import client as netns_client
 
 
 SESSION_ID_VAR: ContextVar[str] = ContextVar("shell_session_id", default="_default")
@@ -32,6 +41,8 @@ DB_VAR: ContextVar = ContextVar("shell_db", default=None)
 USER_PATTERNS_VAR: ContextVar[list] = ContextVar("shell_user_patterns", default=[])
 CONFIRM_MGR_VAR: ContextVar = ContextVar("shell_confirm_mgr", default=None)
 EVENT_QUEUE_VAR: ContextVar = ContextVar("shell_event_queue", default=None)
+
+EXEC_MODE = os.environ.get("NIMOOS_AGENT_EXEC_MODE", "netns")
 
 BWRAP_BIN = os.environ.get("BWRAP_PATH", "/usr/bin/bwrap")
 PRLIMIT_BIN = os.environ.get("PRLIMIT_PATH", "/usr/bin/prlimit")
@@ -107,6 +118,18 @@ async def _run(command: str, timeout_sec: int, network: bool,
     timeout_sec = max(1, min(int(timeout_sec), MAX_TIMEOUT_SEC))
     session_id = SESSION_ID_VAR.get()
     work = _work_dir(session_id)
+
+    if EXEC_MODE != "bwrap":
+        # netns mode: delegate to the executor daemon running inside the
+        # isolated network namespace.  Truncation, timeout enforcement, and
+        # proxy injection are handled by the executor; we just format the
+        # result to match the established [exit N]\n<body> contract.
+        exit_code, output = await netns_client.run_command(
+            command, timeout_sec, env={}, cwd=str(work)
+        )
+        return f"[exit {exit_code}]\n{output}"
+
+    # bwrap mode (fallback): original bubblewrap sandbox — do not modify.
     opts = _build_bwrap_opts(work, view, network)
 
     # Options go through an in-memory fd to bypass ARG_MAX (spec §4.3.1); the
@@ -186,6 +209,13 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
     user_patterns = USER_PATTERNS_VAR.get([])
     view = build_view(session_id, db, user_patterns) if db is not None else SandboxView()
 
+    if EXEC_MODE != "bwrap":
+        # netns mode: network is always available (managed by egress proxy/DLP).
+        # Skip the _maybe_grant_network confirmation flow entirely.
+        # The `network` parameter is accepted for API compatibility but ignored.
+        return await _run(command, timeout_sec, False, view)
+
+    # bwrap mode: original network-grant + offline-hint logic — do not modify.
     use_net = await _maybe_grant_network(session_id, command) if network else False
     if network and not use_net:
         return "联网请求被拒绝(用户拒绝或当前会话无法确认)。可去掉 network 离线执行。"
@@ -200,25 +230,29 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
 @function_tool
 async def run_command(command: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC,
                       network: bool = False) -> str:
-    """Run a bash command inside an isolated sandbox (bubblewrap).
+    """Run a bash command inside an isolated execution environment.
 
-    The sandbox provides:
-      - read-only /usr,/etc,/lib (no host $HOME, no other services' data)
-      - the user's AUTHORIZED folders/files mounted READ-ONLY at their real
-        paths — you can `ls`/`cat`/`grep` them, but NOT modify or delete. To
-        change or delete files use write_file/edit_file/delete_path/batch_fs.
-        Build/test commands that write caches (pytest -> __pycache__, npm ->
-        node_modules) fail with EROFS; copy code into /work to run them.
-      - a writable /work directory (cwd; HOME=/work) that persists across calls
-      - /tmp as tmpfs
-      - NO network by default. Pass network=true to request internet (curl/git/
-        apt/pip); the user is asked to confirm once per session.
+    The environment provides:
+      - Commands run as root inside an isolated network namespace (netns mode,
+        default) or inside a bubblewrap sandbox (bwrap mode, legacy fallback,
+        set NIMOOS_AGENT_EXEC_MODE=bwrap).
+      - The user's AUTHORIZED folders/files are accessible at their real paths
+        (read-only for browsing; use write_file/edit_file/delete_path/batch_fs
+        to modify).  Unauthorized paths are not present.
+      - A writable /work directory (cwd) that persists across calls within the
+        same session.
+      - Network is AVAILABLE.  Outbound connections to the public internet are
+        subject to egress DLP controls: connections to previously unseen
+        domains require one-time confirmation from the user, and large uploads
+        may be blocked.  Internal LAN/loopback traffic is unrestricted.
 
-    Paths the user hasn't authorized are not present (ls -> No such file). If a
-    large folder was too big to mount, use glob_files/search instead.
+    ``network`` parameter: compatibility reserved.  In netns mode network is
+    always available and this flag has no effect.  In bwrap (fallback) mode it
+    controls whether internet access is enabled (requires user confirmation once
+    per session).
 
     Result is combined stdout+stderr, truncated to ~16 KiB; first line is
-    `[exit N]` or `[killed: timeout Ns]`. Default timeout 30s, max 300s.
+    ``[exit N]`` or ``[killed: timeout Ns]``.  Default timeout 30 s, max 300 s.
     """
     return await _run_command_impl(command, timeout_sec, network)
 
