@@ -208,10 +208,12 @@ def test_startup_orchestration_popen_failure_does_not_raise(tmp_path, monkeypatc
 
     monkeypatch.setattr(m.subprocess, "Popen", failing_popen)
 
-    # lifespan startup should NOT raise even when Popen fails
+    # lifespan startup should NOT raise even when Popen fails.
+    # Use asyncio.run() (not get_event_loop()) so this works regardless of
+    # whether a previous test already closed the default event loop.
     import asyncio
     try:
-        asyncio.get_event_loop().run_until_complete(m._egress_startup())
+        asyncio.run(m._egress_startup())
     except Exception as exc:
         pytest.fail(f"_egress_startup raised unexpectedly: {exc}")
 

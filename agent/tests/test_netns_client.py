@@ -55,6 +55,8 @@ def executor_sock(tmp_path, monkeypatch):
     pid_path = str(tmp_path / "exec_client.pid")
 
     monkeypatch.setattr(executor, "_do_unshare", lambda: None)
+    # Patch: _wait_for_iface → no-op (veth-e not present in non-root test)
+    monkeypatch.setattr(executor, "_wait_for_iface", lambda name, timeout=10.0: None)
     import netns.bootstrap as bootstrap
     monkeypatch.setattr(bootstrap, "config_child_iface", lambda: None)
     monkeypatch.setenv("NIMOOS_EXEC_SOCK", sock_path)
