@@ -111,6 +111,9 @@ func (m *ModelManager) openvinoModels() []*Model {
 		return nil
 	}
 	internalNames := m.openvino.ListServedModels()
+	if len(internalNames) == 0 {
+		return nil // OVMS 不可达或无模型时遵守"返回 nil"约定
+	}
 	out := make([]*Model, 0, len(internalNames))
 	for _, in := range internalNames {
 		display := ovmsDisplayName(in)
