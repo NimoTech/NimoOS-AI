@@ -102,15 +102,12 @@ async def _read_document_impl(file_id: Optional[str] = None,
             {"error": "provide file_id (indexed) or path (any file)"},
             ensure_ascii=False)
     try:
-        # Build ctx INSIDE the try: SESSION_ID_VAR/DB_VAR have no default, so an
-        # unset run context raises LookupError here — which _FS_GATE_ERRORS
-        # catches -> error JSON (never reaches Parser).
-        ctx = {
-            "session_id": _fsskill.SESSION_ID_VAR.get(),
-            "conn": _fsskill.DB_VAR.get(),
-            "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
-        }
-        abs_path = _fsops._resolve_and_gate(ctx, path)
+        # Use the FULL fs ctx (like read_file): it carries confirm_mgr + the
+        # event sink, so an out-of-scope path pops the SAME access-request card
+        # read_file uses and waits for the user's grant. _ctx() reads ContextVars
+        # with no default → an unset run context raises LookupError, caught below.
+        ctx = _fsskill._ctx()
+        abs_path = await _fsops._resolve_and_gate_or_request(ctx, path, "read")
     except _FS_GATE_ERRORS as e:
         return json.dumps(
             {"error": f"not authorized to read that path: {e}"},
@@ -196,12 +193,10 @@ async def _view_document_page_impl(path: str, page: int = 1,
                       "read_document(path, ocr=true) for scanned text instead"},
             ensure_ascii=False)
     try:
-        ctx = {
-            "session_id": _fsskill.SESSION_ID_VAR.get(),
-            "conn": _fsskill.DB_VAR.get(),
-            "user_patterns": _fsskill.USER_PATTERNS_VAR.get([]),
-        }
-        abs_path = _fsops._resolve_and_gate(ctx, path)
+        # Full fs ctx so an out-of-scope path pops the access-request card and
+        # waits for the user's grant (same flow as read_file / read_document).
+        ctx = _fsskill._ctx()
+        abs_path = await _fsops._resolve_and_gate_or_request(ctx, path, "read")
     except _FS_GATE_ERRORS as e:
         return json.dumps(
             {"error": f"not authorized to read that path: {e}"},

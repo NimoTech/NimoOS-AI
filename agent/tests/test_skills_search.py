@@ -177,14 +177,34 @@ def _fs_authorized_conn(tmp_path):
     return conn, root
 
 
+class _FakeSink:
+    def __init__(self):
+        self.events = []
+
+    async def put(self, e):
+        self.events.append(e)
+
+
+def _set_full_fs_ctx(conn, *, confirm_mgr=None, sink=None):
+    """Set ALL filesystem ContextVars read_document/view_document_page rely on
+    via fsskill._ctx(). RUN_ID/EVENT_QUEUE/STORE have no default, so they must
+    be set or _ctx() raises LookupError. confirm_mgr=None means no interactive
+    channel (out-of-scope paths are rejected without a card)."""
+    fsskill.SESSION_ID_VAR.set("s1")
+    fsskill.RUN_ID_VAR.set("r1")
+    fsskill.DB_VAR.set(conn)
+    fsskill.USER_PATTERNS_VAR.set([])
+    fsskill.EVENT_QUEUE_VAR.set(sink if sink is not None else _FakeSink())
+    fsskill.STORE_VAR.set(None)
+    fsskill.CONFIRM_MGR_VAR.set(confirm_mgr)
+
+
 @pytest.mark.asyncio
 async def test_read_document_path_authorized_calls_parser(monkeypatch, tmp_path):
     conn, root = _fs_authorized_conn(tmp_path)
     f = root / "doc.pdf"
     f.write_bytes(b"%PDF-1.4 fake")
-    fsskill.SESSION_ID_VAR.set("s1")
-    fsskill.DB_VAR.set(conn)
-    fsskill.USER_PATTERNS_VAR.set([])
+    _set_full_fs_ctx(conn)
     search_skill.USER_ID_VAR.set("u1")
 
     captured = {}
@@ -203,9 +223,7 @@ async def test_read_document_path_authorized_calls_parser(monkeypatch, tmp_path)
 @pytest.mark.asyncio
 async def test_read_document_path_unauthorized_is_blocked(monkeypatch, tmp_path):
     conn, _root = _fs_authorized_conn(tmp_path)
-    fsskill.SESSION_ID_VAR.set("s1")
-    fsskill.DB_VAR.set(conn)
-    fsskill.USER_PATTERNS_VAR.set([])
+    _set_full_fs_ctx(conn)
     search_skill.USER_ID_VAR.set("u1")
 
     called = {"n": 0}
@@ -220,6 +238,45 @@ async def test_read_document_path_unauthorized_is_blocked(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_read_document_path_out_of_scope_requests_access(monkeypatch, tmp_path):
+    # An out-of-scope (but not blacklisted) path, WITH an interactive channel,
+    # must pop the access-request card (request_access) and — once granted —
+    # proceed to extract. This is the behavior that was missing.
+    from fs import access_request as ar_mod
+    conn, _root = _fs_authorized_conn(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    f = outside / "resume.pdf"
+    f.write_bytes(b"%PDF-1.4 fake")
+    _set_full_fs_ctx(conn, confirm_mgr=object())  # non-None → interactive
+    search_skill.USER_ID_VAR.set("u1")
+
+    recorded = {}
+    async def fake_request_access(ctx, abs_path, kind, op):
+        recorded.update(abs_path=abs_path, op=op)
+        # simulate the user granting: persist so the retry resolve() succeeds
+        conn.execute(
+            "INSERT INTO visible_resources (session_id, path, kind, added_at) "
+            "VALUES (?,?,?,?)", ("s1", abs_path, kind, 0))
+        conn.commit()
+        return True
+    monkeypatch.setattr(ar_mod, "request_access", fake_request_access)
+
+    captured = {}
+    async def fake_extract(path, ocr=False, max_chars=24000, user_id=None):
+        captured["path"] = path
+        return {"path": path, "markdown": "resume text", "truncated": False, "ocr": ocr}
+    monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
+
+    out = await search_skill._read_document_impl(path=str(f))
+    data = json.loads(out)
+    assert data["markdown"] == "resume text"            # proceeded after grant
+    assert recorded["abs_path"] == os.path.realpath(str(f))  # card was requested
+    assert recorded["op"] == "read"
+    assert captured["path"] == os.path.realpath(str(f))
+
+
+@pytest.mark.asyncio
 async def test_read_document_no_args_errors():
     out = await search_skill._read_document_impl()
     assert "error" in json.loads(out)
@@ -227,11 +284,12 @@ async def test_read_document_no_args_errors():
 
 @pytest.mark.asyncio
 async def test_read_document_path_no_run_context_errors(monkeypatch):
-    # Run inside a fresh copy_context so SESSION_ID_VAR / DB_VAR are guaranteed
-    # unset (no default) — their .get() raises LookupError, which must be caught
-    # inside the try block and returned as error JSON rather than escaping.
-    import asyncio
-    import contextvars
+    # When there is no active run context, fsskill._ctx() raises LookupError
+    # (SESSION_ID/RUN_ID/etc. have no default). That must be caught inside the
+    # try and returned as error JSON — never escape, never reach Parser.
+    def _boom():
+        raise LookupError("no active run context")
+    monkeypatch.setattr(search_skill._fsskill, "_ctx", _boom)
 
     called = {"n": 0}
     async def fake_extract(*a, **k):
@@ -239,25 +297,8 @@ async def test_read_document_path_no_run_context_errors(monkeypatch):
         return {}
     monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
 
-    result_holder = {}
-    async def _run():
-        # Fresh context: SESSION_ID_VAR / DB_VAR are unset → .get() raises LookupError
-        out = await search_skill._read_document_impl(path="/DATA/x.pdf")
-        result_holder["out"] = out
-
-    ctx = contextvars.copy_context()
-    # Run _run in a context where the fs vars were never set.
-    # We use loop.run_in_executor with the context, or simply run directly since
-    # copy_context() inherits current values — instead create a truly empty
-    # context by resetting any set tokens first.
-    session_tok = search_skill._fsskill.SESSION_ID_VAR.set("_sentinel_to_reset")
-    db_tok = search_skill._fsskill.DB_VAR.set("_sentinel_to_reset")
-    search_skill._fsskill.SESSION_ID_VAR.reset(session_tok)
-    search_skill._fsskill.DB_VAR.reset(db_tok)
-
-    await _run()
-
-    assert "error" in json.loads(result_holder["out"])
+    out = await search_skill._read_document_impl(path="/DATA/x.pdf")
+    assert "error" in json.loads(out)
     assert called["n"] == 0
 
 
@@ -267,9 +308,7 @@ async def test_view_document_page_renders_and_describes(monkeypatch, tmp_path):
     conn, root = _fs_authorized_conn(tmp_path)
     f = root / "doc.pdf"
     f.write_bytes(b"%PDF-1.4 fake")
-    fsskill.SESSION_ID_VAR.set("s1")
-    fsskill.DB_VAR.set(conn)
-    fsskill.USER_PATTERNS_VAR.set([])
+    _set_full_fs_ctx(conn)
     search_skill.USER_ID_VAR.set("u1")
     photos_skill.VISION_CFG_VAR.set({"ok": True, "base_url": "x", "api_key": "k", "model": "m"})
 
@@ -310,9 +349,7 @@ async def test_view_document_page_no_vision_errors(monkeypatch, tmp_path):
 async def test_view_document_page_unauthorized_path(monkeypatch, tmp_path):
     from skills import photos as photos_skill
     conn, _root = _fs_authorized_conn(tmp_path)
-    fsskill.SESSION_ID_VAR.set("s1")
-    fsskill.DB_VAR.set(conn)
-    fsskill.USER_PATTERNS_VAR.set([])
+    _set_full_fs_ctx(conn)
     photos_skill.VISION_CFG_VAR.set({"ok": True, "base_url": "x", "api_key": "k", "model": "m"})
     called = {"n": 0}
     async def fake_render(*a, **k):
