@@ -217,3 +217,71 @@ async def test_bwrap_mode_impl_still_uses_network_grant(monkeypatch):
     result = await shell._run_command_impl("curl x", 30, True)
     assert grant_called, "_maybe_grant_network must be called in bwrap mode"
     assert "拒绝" in result
+
+
+# ---------------------------------------------------------------------------
+# m-1: netns mode must NOT call build_view (saves a DB round-trip)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_netns_mode_impl_skips_build_view(monkeypatch):
+    """In netns mode, _run_command_impl must not call build_view.
+
+    build_view queries the DB to assemble the sandbox mount list; it is only
+    needed in bwrap mode.  In netns mode we short-circuit before the bwrap
+    block, so build_view must never be called — verifying m-1.
+    """
+    build_view_called = []
+
+    def _counting_build_view(session_id, db, user_patterns):
+        build_view_called.append((session_id, db, user_patterns))
+        from fs.sandbox_view import SandboxView
+        return SandboxView()
+
+    async def _fake_run(cmd, t, net, view):
+        # In netns mode view should be None (not passed from build_view)
+        assert view is None, f"netns _run received a non-None view: {view!r}"
+        return "[exit 0]\nok"
+
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    monkeypatch.setattr(shell, "build_view", _counting_build_view)
+    monkeypatch.setattr(shell, "_run", _fake_run)
+
+    conn = _mem_db()
+    shell.SESSION_ID_VAR.set("s1")
+    shell.DB_VAR.set(conn)
+
+    result = await shell._run_command_impl("echo hi", 30, False)
+    assert not build_view_called, (
+        f"build_view must NOT be called in netns mode; was called {len(build_view_called)} time(s)"
+    )
+    assert result == "[exit 0]\nok"
+
+
+@pytest.mark.asyncio
+async def test_bwrap_mode_impl_still_calls_build_view(monkeypatch):
+    """In bwrap mode, _run_command_impl must still call build_view (regression guard)."""
+    build_view_called = []
+
+    def _counting_build_view(session_id, db, user_patterns):
+        build_view_called.append(session_id)
+        from fs.sandbox_view import SandboxView
+        return SandboxView()
+
+    async def _fake_run(cmd, t, net, view):
+        return "[exit 0]\n"
+
+    async def _fake_grant(session_id, command):
+        return False
+
+    monkeypatch.setattr(shell, "EXEC_MODE", "bwrap")
+    monkeypatch.setattr(shell, "build_view", _counting_build_view)
+    monkeypatch.setattr(shell, "_run", _fake_run)
+    monkeypatch.setattr(shell, "_maybe_grant_network", _fake_grant)
+
+    conn = _mem_db()
+    shell.SESSION_ID_VAR.set("s1")
+    shell.DB_VAR.set(conn)
+
+    await shell._run_command_impl("echo hi", 30, False)
+    assert build_view_called, "build_view must be called in bwrap mode"

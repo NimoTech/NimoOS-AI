@@ -30,7 +30,10 @@ from agents import function_tool
 
 import db as dbmod
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
-from netns import client as netns_client
+
+# netns_client is imported lazily inside _run() to allow bwrap fallback to load
+# and operate even when the netns package is unavailable (e.g. during tests or
+# on systems without the executor installed).  Do NOT import it here.
 
 
 SESSION_ID_VAR: ContextVar[str] = ContextVar("shell_session_id", default="_default")
@@ -114,7 +117,7 @@ def _truncate(data: bytes, limit: int) -> str:
 
 
 async def _run(command: str, timeout_sec: int, network: bool,
-               view: SandboxView) -> str:
+               view: SandboxView | None) -> str:
     timeout_sec = max(1, min(int(timeout_sec), MAX_TIMEOUT_SEC))
     session_id = SESSION_ID_VAR.get()
     work = _work_dir(session_id)
@@ -124,6 +127,8 @@ async def _run(command: str, timeout_sec: int, network: bool,
         # isolated network namespace.  Truncation, timeout enforcement, and
         # proxy injection are handled by the executor; we just format the
         # result to match the established [exit N]\n<body> contract.
+        # Lazy import: keeps bwrap mode loadable even if netns package is absent.
+        from netns import client as netns_client  # noqa: PLC0415
         exit_code, output = await netns_client.run_command(
             command, timeout_sec, env={}, cwd=str(work)
         )
@@ -205,15 +210,17 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
 
 async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> str:
     session_id = SESSION_ID_VAR.get()
-    db = DB_VAR.get()
-    user_patterns = USER_PATTERNS_VAR.get([])
-    view = build_view(session_id, db, user_patterns) if db is not None else SandboxView()
 
     if EXEC_MODE != "bwrap":
         # netns mode: network is always available (managed by egress proxy/DLP).
-        # Skip the _maybe_grant_network confirmation flow entirely.
+        # Skip the _maybe_grant_network confirmation flow and build_view entirely
+        # (view is only used by bwrap to mount authorized paths; netns ignores it).
         # The `network` parameter is accepted for API compatibility but ignored.
-        return await _run(command, timeout_sec, False, view)
+        return await _run(command, timeout_sec, False, None)
+
+    db = DB_VAR.get()
+    user_patterns = USER_PATTERNS_VAR.get([])
+    view = build_view(session_id, db, user_patterns) if db is not None else SandboxView()
 
     # bwrap mode: original network-grant + offline-hint logic — do not modify.
     use_net = await _maybe_grant_network(session_id, command) if network else False
