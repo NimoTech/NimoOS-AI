@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"encoding/binary"
 	"flag"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 )
 
 var internalV4 = []*net.IPNet{
@@ -71,9 +75,176 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	cli.Close()
 }
 
+// firstNonLinkLocalNameserver reads /etc/resolv.conf and returns the first
+// nameserver that is not in the 169.254.0.0/16 range, with port 53 appended.
+// Returns "" if none found.
+func firstNonLinkLocalNameserver() string {
+	f, err := os.Open("/etc/resolv.conf")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	linkLocal := cidr("169.254.0.0/16")
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "nameserver") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		ip := net.ParseIP(fields[1])
+		if ip != nil && !linkLocal.Contains(ip) {
+			return net.JoinHostPort(fields[1], "53")
+		}
+	}
+	return ""
+}
+
+// startDNSForwarder starts a minimal UDP+TCP DNS forwarder listening on listenAddr
+// and forwarding all queries verbatim to upstream. It returns the actual listen
+// address (useful when listenAddr has port 0), a stop function, and any error.
+func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop func(), err error) {
+	// UDP listener
+	udpConn, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		return "", nil, err
+	}
+	// TCP listener on same address/port
+	tcpLn, err := net.Listen("tcp", udpConn.LocalAddr().String())
+	if err != nil {
+		udpConn.Close()
+		return "", nil, err
+	}
+
+	actualAddr = udpConn.LocalAddr().String()
+
+	stopCh := make(chan struct{})
+
+	// UDP handler: for each incoming packet, dial upstream, forward, read response.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			n, src, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			query := make([]byte, n)
+			copy(query, buf[:n])
+			go func(pkt []byte, clientAddr net.Addr) {
+				upConn, err := net.Dial("udp", upstream)
+				if err != nil {
+					log.Printf("dns udp dial upstream: %v", err)
+					return
+				}
+				defer upConn.Close()
+				if _, err := upConn.Write(pkt); err != nil {
+					log.Printf("dns udp write upstream: %v", err)
+					return
+				}
+				resp := make([]byte, 4096)
+				rn, err := upConn.Read(resp)
+				if err != nil {
+					log.Printf("dns udp read upstream: %v", err)
+					return
+				}
+				_, _ = udpConn.WriteTo(resp[:rn], clientAddr)
+			}(query, src)
+		}
+	}()
+
+	// TCP handler: each connection is length-prefixed DNS over TCP.
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			conn, err := tcpLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				upConn, err := net.Dial("tcp", upstream)
+				if err != nil {
+					log.Printf("dns tcp dial upstream: %v", err)
+					return
+				}
+				defer upConn.Close()
+				// Read 2-byte length prefix + message from client.
+				var msgLen uint16
+				if err := binary.Read(c, binary.BigEndian, &msgLen); err != nil {
+					return
+				}
+				msg := make([]byte, msgLen)
+				if _, err := io.ReadFull(c, msg); err != nil {
+					return
+				}
+				// Forward to upstream with length prefix.
+				prefix := make([]byte, 2)
+				binary.BigEndian.PutUint16(prefix, msgLen)
+				if _, err := upConn.Write(append(prefix, msg...)); err != nil {
+					log.Printf("dns tcp write upstream: %v", err)
+					return
+				}
+				// Read upstream response and relay back to client.
+				var respLen uint16
+				if err := binary.Read(upConn, binary.BigEndian, &respLen); err != nil {
+					log.Printf("dns tcp read upstream len: %v", err)
+					return
+				}
+				respMsg := make([]byte, respLen)
+				if _, err := io.ReadFull(upConn, respMsg); err != nil {
+					log.Printf("dns tcp read upstream msg: %v", err)
+					return
+				}
+				binary.BigEndian.PutUint16(prefix, respLen)
+				_, _ = c.Write(append(prefix, respMsg...))
+			}(conn)
+		}
+	}()
+
+	stop = func() {
+		close(stopCh)
+		udpConn.Close()
+		tcpLn.Close()
+	}
+	return actualAddr, stop, nil
+}
+
 func main() {
-	listen := flag.String("listen", "169.254.7.1:8888", "")
+	listen := flag.String("listen", "169.254.7.1:8888", "HTTP proxy listen address")
+	dnsListen := flag.String("dns", "169.254.7.1:53", "DNS forwarder listen address")
+	upstream := flag.String("upstream", "", "DNS upstream (default: first non-169.254 nameserver from /etc/resolv.conf with :53)")
 	flag.Parse()
+
+	// Resolve upstream if not set.
+	upstreamAddr := *upstream
+	if upstreamAddr == "" {
+		upstreamAddr = firstNonLinkLocalNameserver()
+	}
+	if upstreamAddr == "" {
+		upstreamAddr = "8.8.8.8:53"
+		log.Printf("dns: no upstream found, falling back to %s", upstreamAddr)
+	}
+
+	// Start DNS forwarder.
+	_, dnsStop, err := startDNSForwarder(*dnsListen, upstreamAddr)
+	if err != nil {
+		log.Fatalf("dns forwarder: %v", err)
+	}
+	defer dnsStop()
+	log.Printf("dns-forwarder on %s → %s", *dnsListen, upstreamAddr)
+
 	srv := &http.Server{
 		Addr: *listen,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
