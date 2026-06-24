@@ -10,3 +10,9 @@ agent/venv/
 NimoOS-AI
 dist/
 deploy/agent/egress-proxy/egress-proxy
+
+# Claude Code local guidance — not for upload
+CLAUDE.md
+
+# Superpowers specs/plans — 仅本地,不提交 git
+docs/superpowers/
