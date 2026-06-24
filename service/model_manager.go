@@ -59,6 +59,7 @@ type ollamaTagsResponse struct {
 
 type ModelManager struct {
 	ollamaBaseURL string
+	openvino      *OpenVINOAdapter
 	hfBaseURL     string
 	db            *sql.DB
 	client        *http.Client // no timeout: model downloads can be very long
@@ -66,9 +67,10 @@ type ModelManager struct {
 	jobsMu        sync.RWMutex
 }
 
-func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
+func NewModelManager(ollamaBaseURL string, openvino *OpenVINOAdapter, db *sql.DB) *ModelManager {
 	return &ModelManager{
 		ollamaBaseURL: ollamaBaseURL,
+		openvino:      openvino,
 		hfBaseURL:     defaultHFBaseURL,
 		db:            db,
 		client:        &http.Client{},
@@ -98,7 +100,27 @@ func (m *ModelManager) ListModels() ([]*Model, error) {
 			SupportsThinking: SupportsThinking("ollama", t.Name),
 		})
 	}
+	models = append(models, m.openvinoModels()...)
 	return models, nil
+}
+
+// openvinoModels lists OVMS servables as user-facing "model@device" entries.
+// Returns nil when OVMS is unavailable (graceful degrade).
+func (m *ModelManager) openvinoModels() []*Model {
+	if m.openvino == nil {
+		return nil
+	}
+	internalNames := m.openvino.ListServedModels()
+	out := make([]*Model, 0, len(internalNames))
+	for _, in := range internalNames {
+		display := ovmsDisplayName(in)
+		out = append(out, &Model{
+			Name:             "openvino:" + display,
+			Source:           ModelSourceOpenVINO,
+			SupportsThinking: SupportsThinking("openvino", display),
+		})
+	}
+	return out
 }
 
 func (m *ModelManager) listCachedModels() ([]*Model, error) {

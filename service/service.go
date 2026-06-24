@@ -76,7 +76,7 @@ func NewService(cfg *config.Config) Services {
 	ovChecker := NewOpenVINOChecker(cfg.OpenVINOURL)
 	ovAdapter := NewOpenVINOAdapter(cfg.OpenVINOURL, cfg.OpenVINODevices)
 	router := &Router{providers: providerSvc, db: db}
-	modelMgr := NewModelManager(common.OllamaBaseURL, db)
+	modelMgr := NewModelManager(common.OllamaBaseURL, ovAdapter, db)
 	sessionSvc := &sessionService{db: db}
 	blacklistSvc := &blacklistService{db: db}
 	skillsRoot := filepath.Join(cfg.DataPath, "skills")

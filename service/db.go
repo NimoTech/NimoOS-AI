@@ -83,6 +83,7 @@ type Model struct {
 const (
 	ModelSourceOllama      = "ollama"
 	ModelSourceHuggingFace = "huggingface"
+	ModelSourceOpenVINO    = "openvino"
 )
 
 func migrate(db *sql.DB) error {

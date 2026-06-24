@@ -22,7 +22,7 @@ func TestModelManager_ListModels(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	models, err := mm.ListModels()
 	require.NoError(t, err)
 	require.Len(t, models, 1)
@@ -43,7 +43,7 @@ func TestModelManager_DeleteModel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	err := mm.DeleteModel("llama3:8b")
 	require.NoError(t, err)
 	require.Equal(t, "llama3:8b", gotName)
@@ -60,7 +60,7 @@ func TestModelManager_PullModel_SendsCorrectRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	progress := make(chan PullProgress, 10)
 	err := mm.PullModel("llama3:8b", progress)
 	require.NoError(t, err)
