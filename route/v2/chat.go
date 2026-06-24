@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NimoTech/NimoOS-AI/pkg/config"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
@@ -96,6 +97,15 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 // device. OpenVINO is a local backend, so it is not subject to the AllowRemote
 // privacy policy (same as Ollama).
 func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body []byte, stream bool) error {
+	if config.Cfg != nil && !config.Cfg.OpenVINOEnabled {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    "backend_disabled",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 后端已禁用",
+			},
+		})
+	}
 	adapter := h.svc.OpenVINOAdapter()
 
 	device := target.device
