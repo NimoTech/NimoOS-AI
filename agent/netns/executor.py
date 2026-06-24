@@ -131,14 +131,42 @@ def _build_proxy_env(extra_env: dict) -> dict:
 
     Mirrors the env-building logic in _execute (shell) so that MCP stdio
     server processes also have their egress routed through the proxy.
+
+    Priority (lowest → highest):
+      1. Hard defaults (HOME, PATH, TERM)
+      2. Runtime vars from executor os.environ (npm_config_cache, UV_CACHE_DIR,
+         NIMOOS_MCP_HOME, passthrough LANG/LC_*/TZ/TMPDIR) — lets the executor's
+         own environment seed npm/uv cache dirs even if the client didn't pass them
+      3. extra_env from caller (client-computed _stdio_env) — wins over defaults
+      4. Proxy vars — ALWAYS last, non-negotiable (Task 5 security invariant)
     """
     base_env = {
         "HOME": "/work",
         "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
         "TERM": "dumb",
     }
+    # Layer 2: runtime vars from the executor's own environment.
+    # These seed npm/uv cache paths and locale vars so MCP server sub-processes
+    # work correctly even when the client side didn't forward them.
+    _RUNTIME_PASSTHROUGH = (
+        "npm_config_cache", "UV_CACHE_DIR", "NIMOOS_MCP_HOME",
+        "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+    )
+    for k in _RUNTIME_PASSTHROUGH:
+        v = os.environ.get(k)
+        if v:
+            base_env[k] = v
+    # Also pull HOME from NIMOOS_MCP_HOME if available (mirrors client.py _stdio_env)
+    mcp_home = os.environ.get("NIMOOS_MCP_HOME")
+    if mcp_home:
+        base_env["HOME"] = mcp_home
+
+    # Layer 3: caller-supplied env (highest-priority except proxy).
     base_env.update(extra_env)
-    # Proxy vars MUST come last — always override anything the caller supplied.
+
+    # Layer 4: Proxy vars MUST come last — always override anything the caller
+    # supplied. This is the Task 5 security invariant: the egress choke-point
+    # cannot be bypassed by passing crafted env vars.
     base_env["HTTP_PROXY"] = PROXY_BASE_URL
     base_env["HTTPS_PROXY"] = PROXY_BASE_URL
     base_env["http_proxy"] = PROXY_BASE_URL
@@ -187,11 +215,14 @@ def _serve_mcp_socket(
     server_sock: socket.socket,
     proc: subprocess.Popen,
     stop_event: threading.Event,
+    sock_path: str,
 ) -> None:
     """Accept one connection on *server_sock*, bridge it to *proc* stdin/stdout.
 
     This runs in a daemon thread.  When the connection closes or the process
-    exits, stop_event is set and the thread returns.
+    exits, stop_event is set and the thread returns.  The socket file at
+    *sock_path* is always unlinked on exit (I-1 fix).  The MCP server process
+    *proc* is always reaped on exit (I-2 fix).
     """
     try:
         server_sock.settimeout(30.0)
@@ -219,6 +250,7 @@ def _serve_mcp_socket(
     except OSError:
         pass
     finally:
+        # I-1: close proc pipes first so the process sees EOF, then reap it.
         try:
             proc.stdin.close()
         except Exception:
@@ -227,8 +259,33 @@ def _serve_mcp_socket(
             proc.stdout.close()
         except Exception:
             pass
+        # I-2: reap the MCP server process — terminate → wait → kill if needed.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # I-1: close and unlink the per-server socket file.
         try:
             server_sock.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
         except Exception:
             pass
 
@@ -291,10 +348,11 @@ def _execute_mcp_stdio(req: dict) -> dict:
 
     stop_event = threading.Event()
 
-    # Bridge thread: accept one connection and relay stdin/stdout ↔ socket
+    # Bridge thread: accept one connection and relay stdin/stdout ↔ socket.
+    # sock_path is passed so _serve_mcp_socket can unlink it on exit (I-1).
     bridge_thread = threading.Thread(
         target=_serve_mcp_socket,
-        args=(server_sock, proc, stop_event),
+        args=(server_sock, proc, stop_event, sock_path),
         daemon=True,
     )
     bridge_thread.start()
