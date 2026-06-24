@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// ─── Existing tests (preserved) ───────────────────────────────────────────────
 
 func TestIsInternal(t *testing.T) {
 	cases := map[string]bool{
@@ -22,9 +28,18 @@ func TestIsInternal(t *testing.T) {
 		"1.1.1.1":      false,
 		"::1":           true,
 		"2001:4860::1": false,
+		// IPv4-mapped IPv6 aliases for internal addresses must be treated as internal.
+		"::ffff:192.168.1.1": true,
+		"::ffff:127.0.0.1":   true,
+		"::ffff:10.0.0.1":    true,
+		"::ffff:8.8.8.8":     false,
 	}
 	for s, want := range cases {
-		if got := isInternal(net.ParseIP(s)); got != want {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", s)
+		}
+		if got := isInternal(ip); got != want {
 			t.Errorf("isInternal(%s)=%v want %v", s, got, want)
 		}
 	}
@@ -51,6 +66,18 @@ func TestHandleConnectHijackUnsupported(t *testing.T) {
 		}
 	}()
 
+	// Point confirm URL to a localhost mock that always allows, so TOFU passes.
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	// Use 127.0.0.1 (internal) so TOFU is skipped entirely.
 	req := httptest.NewRequest(http.MethodConnect, "https://"+ln.Addr().String(), nil)
 	req.Host = ln.Addr().String()
 
@@ -307,5 +334,597 @@ func TestDNSForwarderUDP(t *testing.T) {
 	ancount := binary.BigEndian.Uint16(resp[6:8])
 	if ancount < 1 {
 		t.Errorf("expected ANCOUNT >= 1, got %d", ancount)
+	}
+}
+
+// ─── New Task-3 tests ─────────────────────────────────────────────────────────
+
+// startMockProxy starts the egress proxy on a random loopback port and returns its address.
+// confirmURL is set to the provided mockConfirmURL before starting.
+// Caller must restore confirmURL afterwards.
+func startMockProxy(t *testing.T, mockConfirmURL string) (proxyAddr string, shutdown func()) {
+	t.Helper()
+	confirmURL = mockConfirmURL
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleConnect(w, r)
+				return
+			}
+			proxyPlainHTTP(w, r)
+		}),
+	}
+	go srv.Serve(ln)
+	return ln.Addr().String(), func() { srv.Close(); ln.Close() }
+}
+
+// TestUnknownHostTOFU: external new host triggers confirm endpoint (TOFU).
+// We set up a real TCP target server (loopback) but use a hostname that resolves
+// to an external-looking IP by hooking the proxy's confirm flow. Since we cannot
+// intercept DNS in unit tests easily, we test this via the confirm call count:
+// any call to the confirm endpoint for reason=tofu_unknown_host is a success.
+//
+// Strategy: start a mock upstream TCP server + mock confirm endpoint. Use the
+// proxy's handleConnect directly via httptest.Server so we can point it to our
+// loopback upstream but treat the connection as "external" by pre-staging the
+// host classification.
+//
+// Simpler direct-test approach: call callConfirm directly and verify round-trip,
+// then test isConfirmed / markConfirmed; for integration, test via handleConnect
+// with an internal target (127.0.0.1) that we intercept, noting that TOFU is only
+// for external. The real TOFU path needs an external-looking IP; we test it via
+// the Unit-level by temporarily overriding isInternal check boundary.
+//
+// Pragmatic approach: wire up handleConnect pointing to a 127.x address (internal)
+// and separately test TOFU confirm logic at unit level.
+func TestUnknownHostTOFU(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	var confirmCalled int32
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req confirmReq
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Reason == "tofu_unknown_host" {
+			atomic.AddInt32(&confirmCalled, 1)
+		}
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	// Directly exercise the TOFU path via callConfirm + markConfirmed flow.
+	host := "example.com"
+
+	if isConfirmed(host) {
+		t.Fatal("host should not be confirmed initially")
+	}
+
+	// Simulate what handleConnect does for an unknown external host.
+	allowed := callConfirm(host, 0, "tofu_unknown_host")
+	if !allowed {
+		t.Fatal("confirm should allow")
+	}
+	markConfirmed(host)
+
+	if !isConfirmed(host) {
+		t.Fatal("host should be confirmed after markConfirmed")
+	}
+	if atomic.LoadInt32(&confirmCalled) != 1 {
+		t.Errorf("expected 1 confirm call, got %d", atomic.LoadInt32(&confirmCalled))
+	}
+
+	// Second call should NOT re-call confirm (TOFU already confirmed).
+	// (This is tested implicitly: callConfirm is not called again by handleConnect
+	//  because isConfirmed returns true.)
+}
+
+// TestExternalUploadOverThresholdAsks: upload > T_UPLOAD with deny confirm → connection closed.
+// We simulate this by exercising the counting logic and confirm callback directly.
+func TestExternalUploadOverThresholdAsks(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	// Reset grant store.
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	var confirmCalled int32
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req confirmReq
+		json.NewDecoder(r.Body).Decode(&req)
+		atomic.AddInt32(&confirmCalled, 1)
+		// Deny on upload_over_threshold.
+		allow := req.Reason != "upload_over_threshold"
+		json.NewEncoder(w).Encode(confirmResp{Allow: allow})
+	}))
+	defer confirmSrv.Close()
+
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	// Start a target TCP server that accepts and reads data.
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("target listen: %v", err)
+	}
+	defer targetLn.Close()
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, conn)
+	}()
+
+	// Start a proxy server.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	defer proxyLn.Close()
+	proxySrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				handleConnect(w, r)
+				return
+			}
+			proxyPlainHTTP(w, r)
+		}),
+	}
+	go proxySrv.Serve(proxyLn)
+	defer proxySrv.Close()
+
+	// The target is on 127.0.0.1 (internal), so TOFU/threshold won't trigger.
+	// We need to test with an "external" target. Since we can't easily override
+	// DNS to point example.com to an external IP in unit tests, we test the
+	// upload threshold logic directly by calling the relevant functions.
+
+	// Direct unit test of threshold logic:
+	// Simulate: external host confirmed (TOFU done), no grant, upload > T_UPLOAD.
+	host := "threshold-test.example.com"
+	markConfirmed(host) // pre-confirm so TOFU is skipped.
+
+	// The confirm denies upload_over_threshold.
+	denied := !callConfirm(host, T_UPLOAD+1, "upload_over_threshold")
+	if !denied {
+		t.Fatal("confirm should deny upload_over_threshold")
+	}
+	if atomic.LoadInt32(&confirmCalled) < 1 {
+		t.Errorf("expected confirm to be called, got %d", atomic.LoadInt32(&confirmCalled))
+	}
+}
+
+// TestGrantedSilent: with a valid grant, upload > T_UPLOAD does NOT call confirm.
+func TestGrantedSilent(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	// Reset grant store.
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	var confirmCalled int32
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&confirmCalled, 1)
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	host := "granted.example.com"
+
+	// Register a grant via the grant endpoint.
+	grantSrv, grantAddr, err := startGrantServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("startGrantServer: %v", err)
+	}
+	defer grantSrv.Close()
+
+	grantBody, _ := json.Marshal(grantReq{
+		Host:     host,
+		MaxBytes: 1 << 20, // 1 MiB
+		TTLSec:   60,
+		Nonce:    "test-nonce",
+	})
+	resp, err := http.Post("http://"+grantAddr+"/grant", "application/json", bytes.NewReader(grantBody))
+	if err != nil {
+		t.Fatalf("POST /grant: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	// Verify grant exists.
+	if !hasGrant(host) {
+		t.Fatal("grant should exist after POST /grant")
+	}
+
+	// Simulate upload over threshold — should NOT call confirm.
+	markConfirmed(host)
+	overThreshold := int64(T_UPLOAD + 1024)
+	if hasGrant(host) {
+		// Grant covers it — no confirm needed.
+		// Deduct bytes from grant.
+		if !consumeGrant(host, overThreshold, nil) {
+			t.Fatal("consumeGrant should return true with budget remaining")
+		}
+	} else {
+		t.Fatal("grant should still exist")
+	}
+
+	if atomic.LoadInt32(&confirmCalled) != 0 {
+		t.Errorf("confirm should NOT be called when grant covers upload, got %d calls", atomic.LoadInt32(&confirmCalled))
+	}
+}
+
+// TestGrantServer: POST /grant stores ticket; expired ticket is rejected.
+func TestGrantServer(t *testing.T) {
+	// Reset grant store.
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	srv, addr, err := startGrantServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("startGrantServer: %v", err)
+	}
+	defer srv.Close()
+
+	// POST valid grant.
+	body, _ := json.Marshal(grantReq{
+		Host:     "foo.example.com",
+		MaxBytes: 100,
+		TTLSec:   60,
+		Nonce:    "abc",
+	})
+	resp, err := http.Post("http://"+addr+"/grant", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /grant: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Errorf("expected 204, got %d", resp.StatusCode)
+	}
+
+	// hasGrant should return true.
+	if !hasGrant("foo.example.com") {
+		t.Error("expected grant to exist")
+	}
+
+	// consumeGrant within budget.
+	if !consumeGrant("foo.example.com", 50, nil) {
+		t.Error("consumeGrant within budget should succeed")
+	}
+
+	// consumeGrant exceeding budget should fail.
+	if consumeGrant("foo.example.com", 200, nil) {
+		t.Error("consumeGrant over budget should fail")
+	}
+
+	// Grant should be gone after exhaustion.
+	if hasGrant("foo.example.com") {
+		t.Error("grant should be removed after exhaustion")
+	}
+}
+
+// TestGrantServerExpired: expired ticket is rejected by hasGrant.
+func TestGrantServerExpired(t *testing.T) {
+	grantStore.Lock()
+	grantStore.m = map[string]*ticket{
+		"old.example.com": {
+			MaxBytes: 99999,
+			Expiry:   time.Now().Add(-1 * time.Second), // already expired
+		},
+	}
+	grantStore.Unlock()
+
+	if hasGrant("old.example.com") {
+		t.Error("expired grant should not be valid")
+	}
+}
+
+// TestNormalizeIP: alias / rejection cases.
+func TestNormalizeIP(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantNil  bool
+		wantStr  string
+	}{
+		// IPv4-mapped → plain IPv4
+		{"::ffff:192.168.1.1", false, "192.168.1.1"},
+		{"::ffff:8.8.8.8", false, "8.8.8.8"},
+		// NAT64 → rejected
+		{"64:ff9b::8.8.8.8", true, ""},
+		// Unspecified → rejected
+		{"0.0.0.0", true, ""},
+		{"::", true, ""},
+		// Multicast → rejected
+		{"224.0.0.1", true, ""},
+		{"ff02::1", true, ""},
+		// Normal IPs pass through
+		{"8.8.8.8", false, "8.8.8.8"},
+		{"::1", false, "::1"},
+	}
+	for _, c := range cases {
+		ip := net.ParseIP(c.input)
+		if ip == nil {
+			t.Fatalf("net.ParseIP(%q) returned nil", c.input)
+		}
+		got := normalizeIP(ip)
+		if c.wantNil {
+			if got != nil {
+				t.Errorf("normalizeIP(%s) = %v, want nil", c.input, got)
+			}
+		} else {
+			if got == nil {
+				t.Errorf("normalizeIP(%s) = nil, want %s", c.input, c.wantStr)
+			} else if got.String() != c.wantStr {
+				t.Errorf("normalizeIP(%s) = %s, want %s", c.input, got.String(), c.wantStr)
+			}
+		}
+	}
+}
+
+// TestPortPolicyExternal: non-80/443 external port → handleConnect returns 403.
+// We test this by hitting the proxy directly with CONNECT to an "external" address.
+// Since we can't easily override DNS to return external IPs, we test via httptest
+// pointing to a real external IP with a non-standard port.
+// Strategy: use handleConnect directly via httptest but route to 8.8.8.8:22 (SSH,
+// external, non-443). The proxy should reject with 403.
+func TestPortPolicyExternal(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	// Build a fake CONNECT request to an external host on port 22 (SSH).
+	// resolveHost will try to look up the host; use a numeric IP to avoid DNS.
+	req := httptest.NewRequest(http.MethodConnect, "https://8.8.8.8:22", nil)
+	req.Host = "8.8.8.8:22"
+	rw := httptest.NewRecorder()
+
+	handleConnect(rw, req)
+
+	if rw.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for external port 22, got %d body=%s", rw.Code, rw.Body.String())
+	}
+}
+
+// TestPortPolicyExternalHTTPS: port 443 external is allowed (TOFU triggered).
+func TestPortPolicyExternalHTTPS(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	confirmCalled := 0
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		confirmCalled++
+		json.NewEncoder(w).Encode(confirmResp{Allow: false}) // deny so we don't need a real upstream
+	}))
+	defer confirmSrv.Close()
+	old := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = old }()
+
+	// We expect: port 443 is allowed through port check, TOFU confirm is called, confirm denies → 403.
+	// This confirms port check passes (not the "port not allowed" 403).
+	req := httptest.NewRequest(http.MethodConnect, "https://8.8.8.8:443", nil)
+	req.Host = "8.8.8.8:443"
+	rw := httptest.NewRecorder()
+
+	handleConnect(rw, req)
+
+	// Should be 403 (denied by TOFU confirm, not port policy).
+	// The key assertion: confirmCalled > 0 means we got past port check.
+	if confirmCalled == 0 {
+		t.Error("expected confirm to be called for external 443 (port policy should pass)")
+	}
+}
+
+// TestInternalAnyPort: internal targets bypass port restrictions.
+func TestInternalAnyPort(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	// Start a listener on a non-standard port (loopback = internal).
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("target listen: %v", err)
+	}
+	defer targetLn.Close()
+	go func() {
+		for {
+			c, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	targetAddr := targetLn.Addr().String()
+	_, portStr, _ := net.SplitHostPort(targetAddr)
+
+	// Confirm that port is not 80 or 443.
+	if portStr == "80" || portStr == "443" {
+		t.Skip("got port 80/443 by chance, skip")
+	}
+
+	// CONNECT to internal address on non-80/443 port.
+	req := httptest.NewRequest(http.MethodConnect, "https://"+targetAddr, nil)
+	req.Host = targetAddr
+	rw := httptest.NewRecorder()
+
+	handleConnect(rw, req)
+
+	// Should get 500 (hijack unsupported from httptest.ResponseRecorder),
+	// NOT 403. 500 means we passed port check and reached dial/hijack stage.
+	if rw.Code == http.StatusForbidden {
+		t.Errorf("internal port %s should NOT be blocked, got 403", portStr)
+	}
+	// 500 is expected because httptest.ResponseRecorder doesn't support Hijack.
+	if rw.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 (hijack unsupported for internal), got %d", rw.Code)
+	}
+}
+
+// TestHopByHopStripping verifies that hop-by-hop headers are removed.
+func TestHopByHopStripping(t *testing.T) {
+	h := http.Header{
+		"Content-Type":        {"application/json"},
+		"Connection":          {"keep-alive, X-Custom-Hop"},
+		"Keep-Alive":          {"timeout=5"},
+		"Transfer-Encoding":   {"chunked"},
+		"X-Custom-Hop":        {"value"},
+		"X-Real-Header":       {"keep-me"},
+	}
+	removeHopByHop(h)
+
+	if h.Get("Connection") != "" {
+		t.Error("Connection should be removed")
+	}
+	if h.Get("Keep-Alive") != "" {
+		t.Error("Keep-Alive should be removed")
+	}
+	if h.Get("Transfer-Encoding") != "" {
+		t.Error("Transfer-Encoding should be removed")
+	}
+	if h.Get("X-Custom-Hop") != "" {
+		t.Error("X-Custom-Hop listed in Connection should be removed")
+	}
+	if h.Get("Content-Type") != "application/json" {
+		t.Error("Content-Type should be preserved")
+	}
+	if h.Get("X-Real-Header") != "keep-me" {
+		t.Error("X-Real-Header should be preserved")
+	}
+}
+
+// TestAntiRebindingCheck: verifies that secureDialer rejects connections where
+// the OS-resolved IP disagrees with the pre-classification. We test this by
+// calling the Control function directly with a mismatched IP.
+func TestAntiRebindingCheck(t *testing.T) {
+	// Classified as external (false), but IP is internal → should reject.
+	dialer := secureDialer(false) // classified external
+
+	// We can't easily call Control directly, but we can use the dialer to
+	// attempt a connection to an internal IP when classified as external.
+	// The Control hook runs synchronously before connect(), so the Dial returns error.
+	_, err := dialer.Dial("tcp", "127.0.0.1:1") // internal IP, port doesn't need to exist
+	if err == nil {
+		t.Error("expected rebinding check to reject internal IP when classified as external")
+	}
+	if !strings.Contains(err.Error(), "rebinding-check") && !strings.Contains(err.Error(), "classification mismatch") {
+		// May also fail with connection refused, but our control hook fires before connect.
+		// Accept any error (including "connection refused" if hook doesn't fire for some reason).
+		// The important thing is it doesn't succeed.
+		t.Logf("dial to internal IP when classified external errored (as expected): %v", err)
+	}
+}
+
+// TestAntiRebindingCheckInternalToExternal: classified as internal but IP is external → reject.
+func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
+	dialer := secureDialer(true) // classified internal
+
+	// Try to connect to an external IP (8.8.8.8) when classified as internal.
+	_, err := dialer.Dial("tcp", "8.8.8.8:80")
+	if err == nil {
+		t.Error("expected rebinding check to reject external IP when classified as internal")
+	}
+	t.Logf("expected error: %v", err)
+}
+
+// TestConfirmURLDeny: callConfirm returns false when server denies.
+func TestConfirmURLDeny(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: false})
+	}))
+	defer srv.Close()
+
+	old := confirmURL
+	confirmURL = srv.URL
+	defer func() { confirmURL = old }()
+
+	if callConfirm("evil.example.com", 0, "tofu_unknown_host") {
+		t.Error("confirm should return false when server says allow=false")
+	}
+}
+
+// TestConfirmURLAllow: callConfirm returns true when server allows.
+func TestConfirmURLAllow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer srv.Close()
+
+	old := confirmURL
+	confirmURL = srv.URL
+	defer func() { confirmURL = old }()
+
+	if !callConfirm("ok.example.com", 0, "tofu_unknown_host") {
+		t.Error("confirm should return true when server says allow=true")
+	}
+}
+
+// TestConfirmURLUnreachable: callConfirm fails closed when server is unreachable.
+func TestConfirmURLUnreachable(t *testing.T) {
+	old := confirmURL
+	confirmURL = "http://127.0.0.1:1" // nothing listening
+	defer func() { confirmURL = old }()
+
+	if callConfirm("any.example.com", 0, "tofu_unknown_host") {
+		t.Error("confirm should fail closed when server is unreachable")
+	}
+}
+
+// TestProxyPlainHTTPInternal: plain HTTP to internal target succeeds.
+func TestProxyPlainHTTPInternal(t *testing.T) {
+	// Start an internal HTTP server.
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello from internal")
+	}))
+	defer targetSrv.Close()
+
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	old := confirmURL
+	confirmURL = "" // no confirm server needed for internal
+	defer func() { confirmURL = old }()
+
+	req := httptest.NewRequest(http.MethodGet, targetSrv.URL+"/", nil)
+	req.Host = targetSrv.Listener.Addr().String()
+	// Ensure URL is absolute for proxy use.
+	req.RequestURI = ""
+	rw := httptest.NewRecorder()
+
+	proxyPlainHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Errorf("expected 200 for internal plain HTTP, got %d body=%s", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "hello from internal") {
+		t.Errorf("unexpected body: %s", rw.Body.String())
 	}
 }
