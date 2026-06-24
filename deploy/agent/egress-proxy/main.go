@@ -21,7 +21,13 @@ var internalV6 = []*net.IPNet{
 	cidr("fe80::/10"),
 }
 
-func cidr(s string) *net.IPNet { _, n, _ := net.ParseCIDR(s); return n }
+func cidr(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
 
 func isInternal(ip net.IP) bool {
 	if ip == nil {
@@ -47,9 +53,19 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	hj, _ := w.(http.Hijacker)
-	cli, _, _ := hj.Hijack()
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		dst.Close()
+		return
+	}
+	cli, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		dst.Close()
+		return
+	}
+	_, _ = cli.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	go func() { io.Copy(dst, cli); dst.Close() }()
 	io.Copy(cli, dst)
 	cli.Close()
@@ -86,5 +102,7 @@ func proxyPlainHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("proxyPlainHTTP: copy body: %v", err)
+	}
 }
