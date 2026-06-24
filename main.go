@@ -119,7 +119,7 @@ func main() {
 		}
 	}
 
-	handler := route.InitV2Router(svc, config.Cfg.RuntimePath, config.Cfg.AgentURL, config.Cfg.OllamaURL)
+	handler := route.InitV2Router(svc, config.Cfg.RuntimePath, config.Cfg.AgentURL, config.Cfg.OllamaURL, config.Cfg.OpenVINOURL)
 
 	// Notify systemd
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {

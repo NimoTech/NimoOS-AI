@@ -17,7 +17,7 @@ import (
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 )
 
-func InitV2Router(svc service.Services, runtimePath string, agentURL string, ollamaURL string) http.Handler {
+func InitV2Router(svc service.Services, runtimePath string, agentURL string, ollamaURL string, openvinoURL string) http.Handler {
 	chat := v2.NewChatHandler(svc)
 	providers := v2.NewProvidersHandler(svc)
 	policy := v2.NewPolicyHandler(svc)
@@ -29,7 +29,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	agent.StartHealthMonitor()
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
 	searchClient := service.NewSearchClient(runtimePath + "/search.url")
-	services := v2.NewServicesStatusHandler(agent, ollamaURL, parserClient, searchClient)
+	services := v2.NewServicesStatusHandler(agent, ollamaURL, openvinoURL, parserClient, searchClient)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
