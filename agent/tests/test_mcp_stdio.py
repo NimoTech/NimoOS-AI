@@ -18,25 +18,43 @@ def test_stdio_env_protects_core_and_passthrough(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_connect_stdio_branch(monkeypatch):
+    """stdio transport branch uses MCPServerNetnsStdio via netns executor."""
     captured = {}
 
-    class FakeStdioSrv:
-        def __init__(self, params=None, client_session_timeout_seconds=None, name=None):
-            captured["params"] = params
+    class FakeNetnsStdio:
+        def __init__(self, socket_path=None, name=None,
+                     cache_tools_list=False,
+                     client_session_timeout_seconds=None, **kwargs):
+            captured["socket_path"] = socket_path
+            captured["name"] = name
             captured["timeout"] = client_session_timeout_seconds
-        async def connect(self): captured["connected"] = True
 
-    import agents.mcp as am
-    monkeypatch.setattr(am, "MCPServerStdio", FakeStdioSrv, raising=False)
+        async def connect(self):
+            captured["connected"] = True
+
+    import mcp_client.netns_stdio as ns_mod
+    monkeypatch.setattr(ns_mod, "MCPServerNetnsStdio", FakeNetnsStdio)
+
+    import netns.client as netns_client_mod
+
+    async def fake_start_mcp_stdio(command, args, env, **kwargs):
+        captured["command"] = command
+        captured["args"] = args
+        captured["env"] = env
+        return "/var/run/nimoos/agent-mcp-fake.sock"
+
+    monkeypatch.setattr(netns_client_mod, "start_mcp_stdio", fake_start_mcp_stdio)
 
     server = {"id": 1, "name": "fs", "transport": "stdio",
               "command": "npx", "args": ["-y", "x"], "env": {"K": "V"}}
     conn = await mc._connect(server)
     assert captured["connected"] is True
-    assert captured["params"]["command"] == "npx"
-    assert captured["params"]["args"] == ["-y", "x"]
-    assert captured["params"]["env"]["K"] == "V"
-    assert "PATH" in captured["params"]["env"]
+    assert captured["command"] == "npx"
+    assert captured["args"] == ["-y", "x"]
+    assert captured["env"]["K"] == "V"
+    assert "PATH" in captured["env"]
+    assert captured["socket_path"] == "/var/run/nimoos/agent-mcp-fake.sock"
+    assert captured["name"] == "fs"
     assert captured["timeout"] == mc.STDIO_CONNECT_TIMEOUT
 
 

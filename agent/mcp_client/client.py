@@ -249,13 +249,19 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             name=server.get("name", "mcp"),
         )
     elif transport == "stdio":
-        from agents.mcp import MCPServerStdio
-        srv = MCPServerStdio(
-            params={"command": server["command"],
-                    "args": server.get("args", []),
-                    "env": _stdio_env(server.get("env", {}))},
-            client_session_timeout_seconds=session_to,
+        from mcp_client.netns_stdio import MCPServerNetnsStdio
+        import netns.client as netns_client
+        socket_path = await netns_client.start_mcp_stdio(
+            command=server["command"],
+            args=server.get("args", []),
+            env=_stdio_env(server.get("env", {})),
+            connect_timeout=connect_to,
+        )
+        srv = MCPServerNetnsStdio(
+            socket_path=socket_path,
             name=server.get("name", "mcp"),
+            cache_tools_list=False,
+            client_session_timeout_seconds=session_to,
         )
     else:
         raise ValueError(f"unsupported transport: {transport}")

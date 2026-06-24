@@ -18,11 +18,13 @@ Startup sequence:
 Request schema (NDJSON, one JSON object per line):
   {
     "id":          str,          — echoed back in response
-    "cmd":         str,          — shell command string
+    "cmd":         str,          — shell command string (kind="shell" only)
+    "command":     str,          — executable path (kind="mcp_stdio" only)
+    "args":        list[str],    — argv (kind="mcp_stdio" only)
     "timeout_sec": int,          — max wall-clock seconds (capped at MAX_TIMEOUT_SEC)
     "env":         dict[str,str],— extra environment variables (merged into base env)
     "cwd":         str,          — working directory for the command
-    "kind":        str           — P0: only "shell" is supported
+    "kind":        str           — "shell" or "mcp_stdio"
   }
 
 Response schema:
@@ -30,6 +32,12 @@ Response schema:
     "id":     str,   — echoed from request
     "exit":   int,   — process exit code; -1 on internal error; 124 on timeout
     "output": str    — combined stdout+stderr, truncated to MAX_OUTPUT_BYTES
+  }
+  kind="mcp_stdio" response:
+  {
+    "id":          str,  — echoed from request
+    "socket_path": str,  — unix socket path that bridges process stdin/stdout
+    "pid":         int   — process PID (for later stop requests)
   }
   On unknown kind:
   {
@@ -53,10 +61,12 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
 import threading
+import uuid
 
 from netns import bootstrap
 
@@ -73,6 +83,7 @@ NPROC = 1024  # per-user process limit inside the sandbox
 
 DEFAULT_SOCK_PATH = "/var/run/nimoos/agent-exec.sock"
 DEFAULT_PID_FILE = "/var/run/nimoos/agent-exec.pid"
+MCP_SOCK_DIR = os.environ.get("NIMOOS_MCP_SOCK_DIR", "/var/run/nimoos")
 
 PROXY_BASE_URL = f"http://{bootstrap.PROXY_IP}:8888"
 
@@ -112,13 +123,196 @@ def _truncate(data: bytes, limit: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP stdio bridge
+# ---------------------------------------------------------------------------
+
+def _build_proxy_env(extra_env: dict) -> dict:
+    """Build execution environment with injected proxy vars.
+
+    Mirrors the env-building logic in _execute (shell) so that MCP stdio
+    server processes also have their egress routed through the proxy.
+    """
+    base_env = {
+        "HOME": "/work",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "TERM": "dumb",
+    }
+    base_env.update(extra_env)
+    # Proxy vars MUST come last — always override anything the caller supplied.
+    base_env["HTTP_PROXY"] = PROXY_BASE_URL
+    base_env["HTTPS_PROXY"] = PROXY_BASE_URL
+    base_env["http_proxy"] = PROXY_BASE_URL
+    base_env["https_proxy"] = PROXY_BASE_URL
+    base_env["NO_PROXY"] = ""
+    base_env["no_proxy"] = ""
+    return base_env
+
+
+def _bridge_pipe_to_socket(src, dst, stop_event: threading.Event) -> None:
+    """Copy bytes from file-like *src* (read) to socket *dst* (send) until EOF or stop."""
+    try:
+        while not stop_event.is_set():
+            ready, _, _ = select.select([src], [], [src], 0.5)
+            if not ready:
+                continue
+            chunk = os.read(src.fileno(), 4096)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except (OSError, BrokenPipeError):
+        pass
+    finally:
+        stop_event.set()
+
+
+def _bridge_socket_to_pipe(src: socket.socket, dst, stop_event: threading.Event) -> None:
+    """Copy bytes from socket *src* (recv) to file-like *dst* (write) until EOF or stop."""
+    try:
+        while not stop_event.is_set():
+            ready, _, _ = select.select([src], [], [src], 0.5)
+            if not ready:
+                continue
+            chunk = src.recv(4096)
+            if not chunk:
+                break
+            dst.write(chunk)
+            dst.flush()
+    except (OSError, BrokenPipeError):
+        pass
+    finally:
+        stop_event.set()
+
+
+def _serve_mcp_socket(
+    server_sock: socket.socket,
+    proc: subprocess.Popen,
+    stop_event: threading.Event,
+) -> None:
+    """Accept one connection on *server_sock*, bridge it to *proc* stdin/stdout.
+
+    This runs in a daemon thread.  When the connection closes or the process
+    exits, stop_event is set and the thread returns.
+    """
+    try:
+        server_sock.settimeout(30.0)
+        conn, _ = server_sock.accept()
+        conn.setblocking(True)
+        stop_event.clear()
+
+        # Two threads: one for each direction
+        t_out = threading.Thread(
+            target=_bridge_pipe_to_socket,
+            args=(proc.stdout, conn, stop_event),
+            daemon=True,
+        )
+        t_in = threading.Thread(
+            target=_bridge_socket_to_pipe,
+            args=(conn, proc.stdin, stop_event),
+            daemon=True,
+        )
+        t_out.start()
+        t_in.start()
+        # Wait until either direction closes
+        stop_event.wait()
+        t_out.join(timeout=1.0)
+        t_in.join(timeout=1.0)
+    except OSError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            server_sock.close()
+        except Exception:
+            pass
+
+
+def _execute_mcp_stdio(req: dict) -> dict:
+    """Spawn an MCP stdio server in the current netns and bridge it to a Unix socket.
+
+    The subprocess inherits the executor's network namespace, ensuring all
+    outbound connections are subject to the same egress controls as shell commands.
+
+    Returns:
+        {"id": ..., "socket_path": ..., "pid": ...}  on success
+        {"id": ..., "error": ...}                     on failure
+    """
+    req_id = req.get("id", "")
+    command = req.get("command", "")
+    args = req.get("args") or []
+    extra_env = req.get("env") or {}
+
+    if not command:
+        return {"id": req_id, "error": "mcp_stdio: 'command' is required"}
+
+    proc_env = _build_proxy_env(extra_env)
+
+    # Per-server socket path: unique per request
+    sock_name = f"agent-mcp-{uuid.uuid4().hex[:12]}.sock"
+    sock_dir = MCP_SOCK_DIR
+    os.makedirs(sock_dir, exist_ok=True)
+    sock_path = os.path.join(sock_dir, sock_name)
+
+    # Remove any stale socket
+    try:
+        os.unlink(sock_path)
+    except FileNotFoundError:
+        pass
+
+    # Bind the Unix socket before spawning the process so the client can connect
+    # immediately after receiving the socket_path.
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(sock_path)
+    server_sock.listen(1)
+
+    try:
+        proc = subprocess.Popen(
+            [command] + list(args),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=proc_env,
+            start_new_session=True,
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        server_sock.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        return {"id": req_id, "error": f"mcp_stdio spawn error: {exc}"}
+
+    stop_event = threading.Event()
+
+    # Bridge thread: accept one connection and relay stdin/stdout ↔ socket
+    bridge_thread = threading.Thread(
+        target=_serve_mcp_socket,
+        args=(server_sock, proc, stop_event),
+        daemon=True,
+    )
+    bridge_thread.start()
+
+    return {"id": req_id, "socket_path": sock_path, "pid": proc.pid}
+
+
+# ---------------------------------------------------------------------------
 # Command execution
 # ---------------------------------------------------------------------------
 
 def _execute(req: dict) -> dict:
-    """Run a shell command from *req* and return a response dict."""
+    """Dispatch *req* to the appropriate handler and return a response dict."""
     req_id = req.get("id", "")
     kind = req.get("kind", "shell")
+
+    if kind == "mcp_stdio":
+        return _execute_mcp_stdio(req)
 
     if kind != "shell":
         return {"id": req_id, "error": f"unsupported kind: {kind!r}"}
