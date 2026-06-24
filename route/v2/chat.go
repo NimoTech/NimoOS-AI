@@ -120,7 +120,7 @@ func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body
 	resp, err := adapter.ChatCompletions(bytes.NewReader(rewritten))
 	if err != nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
-			"error": map[string]string{
+			"error": map[string]interface{}{
 				"code":    "backend_unavailable",
 				"type":    "service_unavailable",
 				"message": "OpenVINO 服务未就绪",
