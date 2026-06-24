@@ -263,6 +263,7 @@ type modelTarget struct {
 	backend    service.Backend
 	providerID int64
 	bareModel  string
+	device     string // 仅 openvino 后端使用;"" 表示用默认设备
 }
 
 // parseModelTarget reads the model field, classifies the routing target, and
@@ -288,6 +289,15 @@ func parseModelTarget(body []byte) (modelTarget, []byte) {
 
 	tgt := modelTarget{bareModel: model}
 	switch {
+	case strings.HasPrefix(model, "openvino:"):
+		tgt.backend = service.BackendOpenVINO
+		rest := model[len("openvino:"):]
+		if idx := strings.LastIndex(rest, "@"); idx >= 0 {
+			tgt.bareModel = rest[:idx]
+			tgt.device = rest[idx+1:]
+		} else {
+			tgt.bareModel = rest
+		}
 	case strings.HasPrefix(model, "local:"):
 		tgt.backend = service.BackendLocal
 		tgt.bareModel = model[len("local:"):]
@@ -336,6 +346,25 @@ func stripInternalFields(body []byte) []byte {
 		return body
 	}
 	delete(req, "_backend")
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// setModelField rewrites the "model" field of an OpenAI-format request body.
+// Used to translate a user-facing model name into the OVMS internal servable name.
+func setModelField(body []byte, model string) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return body
+	}
+	req["model"] = encoded
 	out, err := json.Marshal(req)
 	if err != nil {
 		return body

@@ -30,6 +30,44 @@ func TestChatHandler_MissingUserID_Returns401(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, httpErr.Code)
 }
 
+func TestParseModelTargetOpenVINO(t *testing.T) {
+	body := []byte(`{"model":"openvino:qwen3-vl-int4@GPU.1","messages":[]}`)
+	tgt, _ := parseModelTarget(body)
+	if tgt.backend != service.BackendOpenVINO {
+		t.Fatalf("backend = %q, want openvino", tgt.backend)
+	}
+	if tgt.bareModel != "qwen3-vl-int4" {
+		t.Errorf("bareModel = %q, want qwen3-vl-int4", tgt.bareModel)
+	}
+	if tgt.device != "GPU.1" {
+		t.Errorf("device = %q, want GPU.1", tgt.device)
+	}
+}
+
+func TestParseModelTargetOpenVINONoDevice(t *testing.T) {
+	body := []byte(`{"model":"openvino:qwen3-vl-int4","messages":[]}`)
+	tgt, _ := parseModelTarget(body)
+	if tgt.backend != service.BackendOpenVINO {
+		t.Fatalf("backend = %q, want openvino", tgt.backend)
+	}
+	if tgt.bareModel != "qwen3-vl-int4" || tgt.device != "" {
+		t.Errorf("got model=%q device=%q, want model=qwen3-vl-int4 device=\"\"", tgt.bareModel, tgt.device)
+	}
+}
+
+func TestSetModelField(t *testing.T) {
+	out := setModelField([]byte(`{"model":"x","messages":[]}`), "qwen3-vl-int4-gpu1")
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	json.Unmarshal(m["model"], &got)
+	if got != "qwen3-vl-int4-gpu1" {
+		t.Errorf("model = %q, want qwen3-vl-int4-gpu1", got)
+	}
+}
+
 func TestParseModelTarget(t *testing.T) {
 	cases := []struct {
 		name      string
