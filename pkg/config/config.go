@@ -14,9 +14,12 @@ type Config struct {
 	DataPath      string
 	MasterKeyPath string
 	LogPath       string
-	AgentURL      string
-	AgentTimeout  int
-	OllamaURL     string
+	AgentURL        string
+	AgentTimeout    int
+	OllamaURL       string
+	OpenVINOURL     string
+	OpenVINOEnabled bool
+	OpenVINODevices string // 逗号分隔的常驻设备,如 "GPU.1" 或 "GPU.1,GPU.0";第一个为默认设备
 }
 
 func Init(configFile, confSample string) error {
@@ -41,9 +44,12 @@ func Init(configFile, confSample string) error {
 		DataPath:      v.GetString("common.DataPath"),
 		MasterKeyPath: v.GetString("ai.MasterKeyPath"),
 		LogPath:       v.GetString("common.LogPath"),
-		AgentURL:      v.GetString("agent.AgentURL"),
-		AgentTimeout:  v.GetInt("agent.AgentTimeout"),
-		OllamaURL:     v.GetString("agent.OllamaURL"),
+		AgentURL:        v.GetString("agent.AgentURL"),
+		AgentTimeout:    v.GetInt("agent.AgentTimeout"),
+		OllamaURL:       v.GetString("agent.OllamaURL"),
+		OpenVINOURL:     v.GetString("openvino.URL"),
+		OpenVINOEnabled: v.GetBool("openvino.Enabled"),
+		OpenVINODevices: v.GetString("openvino.Devices"),
 	}
 
 	if Cfg.RuntimePath == "" {
@@ -66,6 +72,18 @@ func Init(configFile, confSample string) error {
 	}
 	if Cfg.OllamaURL == "" {
 		Cfg.OllamaURL = "http://127.0.0.1:11434"
+	}
+	if Cfg.OpenVINOURL == "" {
+		Cfg.OpenVINOURL = "http://127.0.0.1:9100"
+	}
+	// Enabled 默认 true:仅当配置里显式写了 openvino.Enabled 才用其值,否则 true。
+	if v.IsSet("openvino.Enabled") {
+		Cfg.OpenVINOEnabled = v.GetBool("openvino.Enabled")
+	} else {
+		Cfg.OpenVINOEnabled = true
+	}
+	if Cfg.OpenVINODevices == "" {
+		Cfg.OpenVINODevices = "GPU.1"
 	}
 	return nil
 }
