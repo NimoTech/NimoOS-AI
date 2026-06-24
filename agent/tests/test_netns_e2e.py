@@ -12,9 +12,11 @@ Root-gated section (test_netns_e2e_*):
 
 Wires up the real stack on the host (no Docker needed):
   1. Go egress-proxy binary (pre-built at deploy/agent/egress-proxy/egress-proxy).
-  2. executor.main() in a background thread (real unshare + config_child_iface).
-  3. bootstrap.create_netns(pid) to wire veth pair.
-  4. Stub HTTP confirm server that records calls and returns allow/deny.
+  2. executor via production entry point: subprocess.Popen(python -m netns.executor)
+     — exercises the real executor.main() startup sequence including _wait_for_iface.
+  3. Parent reads PID file → bootstrap.create_netns(pid) → VETH_E moved into netns.
+  4. executor._wait_for_iface detects VETH_E → config_child_iface() → socket ready.
+  5. Stub HTTP confirm server that records calls and returns allow/deny.
 
 Coverage:
   [e2e-1] id -u inside netns == 0 (root)
@@ -158,111 +160,31 @@ def _send_exec_request(sock_path: str, cmd: str, timeout_sec: int = 15,
 # Fixture: full stack (executor + veth + egress-proxy + stub confirm)
 # ---------------------------------------------------------------------------
 
-def _launch_executor_with_netns(sock_path: str, pid_path: str) -> int:
-    """Fork a child process that:
-      1. unshare(CLONE_NEWNET) — enters a fresh network namespace
-      2. signals the parent via a pipe that unshare is done (PID file written)
-      3. waits for the parent to call create_netns (veth-e moved into our netns)
-      4. calls config_child_iface()
-      5. binds the executor socket and runs the accept loop
-
-    Returns the child PID.  The pipe-based synchronisation ensures that
-    create_netns() happens *before* config_child_iface() — the critical ordering
-    constraint that executor.main() cannot enforce on its own when called from
-    a thread (there is no inter-thread barrier between write-PID and config_child).
-    """
-    import ctypes
-    sys.path.insert(0, _AGENT_DIR)
-    from netns import bootstrap, executor as exec_mod
-
-    CLONE_NEWNET = 0x40000000
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-
-    # Pipe: child → parent "unshare done, please call create_netns"
-    r_ready, w_ready = os.pipe()
-    # Pipe: parent → child "veth is in your netns, proceed"
-    r_go, w_go = os.pipe()
-
-    pid = os.fork()
-
-    if pid == 0:
-        # ---- CHILD ----
-        os.close(r_ready)
-        os.close(w_go)
-        try:
-            # 1. Enter new netns
-            ret = libc.unshare(CLONE_NEWNET)
-            if ret != 0:
-                errno = ctypes.get_errno()
-                os._exit(1)
-
-            # 2. Write PID file (parent reads this to call create_netns)
-            os.makedirs(os.path.dirname(pid_path), exist_ok=True)
-            with open(pid_path, "w") as fh:
-                fh.write(str(os.getpid()) + "\n")
-
-            # Signal parent: "unshare done"
-            os.write(w_ready, b"x")
-            os.close(w_ready)
-
-            # 3. Wait for parent: "veth-e is in our netns"
-            os.read(r_go, 1)
-            os.close(r_go)
-
-            # 4. Configure network inside new netns
-            bootstrap.config_child_iface()
-
-            # 5. Bind executor socket and serve
-            # (reuse executor's socket serve loop directly)
-            import socket as _socket
-            import json as _json
-            import threading as _threading
-
-            sock_dir = os.path.dirname(sock_path)
-            if sock_dir:
-                os.makedirs(sock_dir, exist_ok=True)
-            try:
-                os.unlink(sock_path)
-            except FileNotFoundError:
-                pass
-
-            server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            server.bind(sock_path)
-            server.listen(64)
-
-            # Accept loop
-            while True:
-                try:
-                    conn, _ = server.accept()
-                except OSError:
-                    break
-                t = _threading.Thread(
-                    target=exec_mod._handle_connection, args=(conn,), daemon=True
-                )
-                t.start()
-        except Exception:
-            pass
-        os._exit(0)
-
-    # ---- PARENT ----
-    os.close(w_ready)
-    os.close(r_go)
-    return pid, r_ready, w_go
-
-
 @pytest.fixture()
 def netns_stack(tmp_path):
-    """Bring up the full netns stack for e2e tests.
+    """Bring up the full netns stack for e2e tests using the production entry point.
 
-    Uses fork+pipe synchronisation (mirroring test_netns_bootstrap.py) to ensure
-    create_netns() runs *before* config_child_iface() in the child.  This is the
-    critical ordering that executor.main()-in-a-thread cannot guarantee.
+    Launches the executor via:
+        subprocess.Popen([sys.executable, "-m", "netns.executor"], ...)
+    which exercises executor.main() — the real production startup sequence
+    including _wait_for_iface (the Fix 1 guard).
+
+    Startup ordering:
+      1. Popen executor (it runs: unshare → write PID → _wait_for_iface(VETH_E))
+      2. Parent polls PID file until populated, then reads the executor PID.
+      3. bootstrap.create_netns(pid) → VETH_E is moved into executor's netns.
+      4. executor's _wait_for_iface sees /sys/class/net/nimoos-veth-e → proceeds.
+      5. Start egress-proxy AFTER create_netns (it needs 169.254.7.1 to bind).
+      6. Poll executor socket until it appears (executor bound it after config).
+      7. Poll proxy port until reachable.
+
+    Teardown: kill executor + proxy, bootstrap.teardown(), delete sock/pid files.
 
     Yields a dict with keys:
       sock_path    — executor Unix socket path
       confirm_srv  — the stub confirm HTTPServer instance (check .calls, set .allow)
       proxy_proc   — the egress-proxy subprocess
+      executor_proc — the executor subprocess (for teardown)
     """
     sys.path.insert(0, _AGENT_DIR)
     from netns import bootstrap
@@ -273,34 +195,51 @@ def netns_stack(tmp_path):
     # Start stub confirm server (allow by default)
     confirm_srv, confirm_url = _start_stub_confirm(allow=True)
     proxy_proc = None
-    executor_pid = None
-    w_go_fd = None
-    r_ready_fd = None
+    executor_proc = None
 
     try:
         # Best-effort teardown of any stale veth from a prior crashed run
         bootstrap.teardown()
 
-        # Fork executor child with pipe-based synchronisation.
-        # Order is critical:
-        #   a) Fork child (unshare + write PID + wait for "go" signal)
-        #   b) create_netns(child_pid) — veth-h comes UP, 169.254.7.1 is now routable
-        #   c) Start egress-proxy AFTER create_netns so it can bind 169.254.7.1:8888
-        #   d) Send "go" to child (config_child_iface + socket bind)
-        executor_pid, r_ready_fd, w_go_fd = _launch_executor_with_netns(
-            sock_path, pid_path
+        # Launch executor via production entry point.
+        # The executor will: unshare(CLONE_NEWNET) → write PID file →
+        # _wait_for_iface(VETH_E) (blocks here until we call create_netns below).
+        exec_env = os.environ.copy()
+        exec_env["NIMOOS_EXEC_SOCK"] = sock_path
+        exec_env["NIMOOS_EXEC_PID_FILE"] = pid_path
+        executor_proc = subprocess.Popen(
+            [sys.executable, "-m", "netns.executor"],
+            cwd=_AGENT_DIR,
+            env=exec_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
 
-        # Wait for child: "unshare done" signal
-        data = os.read(r_ready_fd, 1)
-        os.close(r_ready_fd)
-        r_ready_fd = None
-        assert data == b"x", "Executor child did not signal readiness"
+        # Wait for PID file to be written by executor (signals unshare complete)
+        executor_pid = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if os.path.exists(pid_path):
+                try:
+                    with open(pid_path) as fh:
+                        content = fh.read().strip()
+                    if content:
+                        executor_pid = int(content)
+                        break
+                except (ValueError, OSError):
+                    pass
+            time.sleep(0.05)
+        assert executor_pid is not None, (
+            f"Executor PID file never appeared or was empty at {pid_path}"
+        )
 
-        # Wire veth pair BEFORE starting proxy (proxy needs 169.254.7.1 to bind)
+        # Wire veth pair — this moves VETH_E into the executor's netns.
+        # The executor's _wait_for_iface() will now see /sys/class/net/nimoos-veth-e
+        # and proceed to config_child_iface().
+        # Must happen BEFORE starting proxy (proxy needs 169.254.7.1 on VETH_H to bind).
         bootstrap.create_netns(executor_pid)
 
-        # Start egress-proxy NOW — 169.254.7.1 (VETH_H) is up, proxy can bind
+        # Start egress-proxy NOW — 169.254.7.1 (VETH_H) is up after create_netns
         proxy_proc = subprocess.Popen(
             [
                 _PROXY_BIN,
@@ -313,16 +252,17 @@ def netns_stack(tmp_path):
             stderr=subprocess.STDOUT,
         )
 
-        # Tell child: "veth-e is in your netns, proceed with config_child_iface"
-        os.write(w_go_fd, b"x")
-        os.close(w_go_fd)
-        w_go_fd = None
-
-        # Wait for executor socket to appear (child binds it after config_child_iface)
-        deadline = time.monotonic() + 10.0
+        # Wait for executor socket to appear (executor binds it after config_child_iface)
+        deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
             if os.path.exists(sock_path):
                 break
+            # Check executor has not crashed
+            if executor_proc.poll() is not None:
+                out = executor_proc.stdout.read().decode(errors="replace")
+                raise RuntimeError(
+                    f"Executor exited early (rc={executor_proc.returncode}): {out}"
+                )
             time.sleep(0.05)
         assert os.path.exists(sock_path), (
             f"Executor socket never appeared at {sock_path}"
@@ -345,20 +285,10 @@ def netns_stack(tmp_path):
 
     except Exception:
         # Ensure cleanup even when setup fails so subsequent tests are not poisoned
-        if w_go_fd is not None:
+        if executor_proc is not None:
             try:
-                os.close(w_go_fd)
-            except Exception:
-                pass
-        if r_ready_fd is not None:
-            try:
-                os.close(r_ready_fd)
-            except Exception:
-                pass
-        if executor_pid is not None:
-            try:
-                os.kill(executor_pid, signal.SIGKILL)
-                os.waitpid(executor_pid, 0)
+                executor_proc.kill()
+                executor_proc.wait(timeout=3)
             except Exception:
                 pass
         if proxy_proc is not None:
@@ -366,8 +296,17 @@ def netns_stack(tmp_path):
                 proxy_proc.terminate()
                 proxy_proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proxy_proc.kill()
+                except Exception:
+                    pass
         bootstrap.teardown()
+        # Remove stale sock/pid files
+        for p in (sock_path, pid_path):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
         try:
             confirm_srv.shutdown()
         except Exception:
@@ -378,14 +317,15 @@ def netns_stack(tmp_path):
         "sock_path": sock_path,
         "confirm_srv": confirm_srv,
         "proxy_proc": proxy_proc,
-        "executor_pid": executor_pid,
+        "executor_proc": executor_proc,
+        "executor_pid": executor_proc.pid,
     }
 
     # ---- Teardown ----
-    # Kill executor child
+    # Kill executor process
     try:
-        os.kill(executor_pid, signal.SIGKILL)
-        os.waitpid(executor_pid, os.WNOHANG)
+        executor_proc.kill()
+        executor_proc.wait(timeout=3)
     except Exception:
         pass
 
@@ -401,6 +341,13 @@ def netns_stack(tmp_path):
 
     # Teardown veth
     bootstrap.teardown()
+
+    # Remove sock/pid files
+    for p in (sock_path, pid_path):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
 
     # Stop stub confirm server
     try:

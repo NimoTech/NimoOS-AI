@@ -90,6 +90,8 @@ def executor_server(tmp_path, monkeypatch):
 
     # Patch: unshare → no-op (ctypes call)
     monkeypatch.setattr(executor, "_do_unshare", lambda: None)
+    # Patch: _wait_for_iface → no-op (veth-e not present in non-root test)
+    monkeypatch.setattr(executor, "_wait_for_iface", lambda name, timeout=10.0: None)
     # Patch: config_child_iface → no-op
     import netns.bootstrap as bootstrap
     monkeypatch.setattr(bootstrap, "config_child_iface", lambda: None)

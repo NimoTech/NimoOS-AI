@@ -9,6 +9,8 @@ Startup sequence:
   1. libc.unshare(CLONE_NEWNET) — enter a fresh network namespace.
   2. Write os.getpid() to the PID file so the parent process can call
      bootstrap.create_netns(pid) to wire up the veth pair.
+  2b. Poll /sys/class/net/nimoos-veth-e (up to 10 s) until the parent has
+     moved VETH_E into this netns via create_netns().
   3. Call bootstrap.config_child_iface() to configure lo + VETH_E inside the
      new netns.
   4. Listen on a Unix-domain socket for NDJSON command requests.
@@ -60,15 +62,19 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import select
 import signal
 import socket
 import subprocess
 import threading
+import time
 import uuid
 
 from netns import bootstrap
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -101,6 +107,32 @@ def _do_unshare() -> None:
     if ret != 0:
         errno = ctypes.get_errno()
         raise OSError(errno, os.strerror(errno))
+
+
+def _wait_for_iface(name: str, timeout: float = 10.0) -> None:
+    """Wait until network interface *name* appears in the current netns.
+
+    Uses /sys/class/net/<name> which reflects the *current* process's network
+    namespace — after unshare(CLONE_NEWNET) only interfaces that have been
+    moved into this netns appear here.  The parent process calls
+    bootstrap.create_netns(pid) to move VETH_E into this netns; once that
+    completes the /sys entry becomes visible.
+
+    Raises:
+        RuntimeError: if the interface does not appear within *timeout* seconds.
+    """
+    sysfs_path = f"/sys/class/net/{name}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(sysfs_path):
+            return
+        time.sleep(0.05)
+    logger.error(
+        "executor: timed out waiting %gs for interface %r to appear in netns", timeout, name
+    )
+    raise RuntimeError(
+        f"timed out waiting {timeout}s for interface {name!r} to appear in netns"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -492,13 +524,20 @@ def main(*, _ready_event=None) -> None:
     # 1. Enter a fresh network namespace
     _do_unshare()
 
-    # 2. Write PID file
+    # 2. Write PID file so the parent process can call bootstrap.create_netns(pid)
+    #    to move VETH_E into this network namespace.
     pid_file = os.environ.get("NIMOOS_EXEC_PID_FILE", DEFAULT_PID_FILE)
     pid_dir = os.path.dirname(pid_file)
     if pid_dir:
         os.makedirs(pid_dir, exist_ok=True)
     with open(pid_file, "w") as fh:
         fh.write(str(os.getpid()) + "\n")
+
+    # 2b. Wait for the parent to move VETH_E into this netns.
+    #     The parent reads the PID file and calls bootstrap.create_netns(pid)
+    #     which runs `ip link set VETH_E netns <pid>`.  Only after that does
+    #     /sys/class/net/nimoos-veth-e appear in our namespace.
+    _wait_for_iface(bootstrap.VETH_E)
 
     # 3. Configure network inside new netns
     bootstrap.config_child_iface()
