@@ -216,6 +216,93 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
         # Skip the _maybe_grant_network confirmation flow and build_view entirely
         # (view is only used by bwrap to mount authorized paths; netns ignores it).
         # The `network` parameter is accepted for API compatibility but ignored.
+
+        # ── A-path: content-judge + grant-ticket before netns upload ─────────
+        # Lazy imports: keep bwrap fallback loadable even if egress package is absent.
+        from egress import parse as _ep, rules as _er, judge as _ej, grant as _eg  # noqa: PLC0415
+
+        intent = _ep.parse_upload(command)
+        if intent is not None and intent.external:
+            v = _er.assess(intent.files, inline_payload=None)
+
+            if v.level == "block":
+                return (
+                    "该上传被隐私策略拦截,未执行。"
+                    f"原因:{v.reason}。"
+                    "如确需外发请人工处理。"
+                )
+
+            elif v.level == "clean":
+                # Small and clean — skip LLM, go straight to grant + execute.
+                pass
+
+            else:  # suspect
+                # Read first file content for LLM judge; fall back to b"" on error.
+                content: bytes = b""
+                if intent.files:
+                    try:
+                        with open(intent.files[0], "rb") as _fh:
+                            content = _fh.read(4096)
+                    except OSError:
+                        content = b""
+
+                verdict = await _ej.judge(content, intent.host)
+
+                if verdict == "block":
+                    return (
+                        "该上传被内容审查拦截,未执行。"
+                        "上传内容被判断为含有敏感/隐私数据。"
+                        "如确需外发请人工处理。"
+                    )
+                elif verdict == "ask":
+                    mgr = CONFIRM_MGR_VAR.get()
+                    sink = EVENT_QUEUE_VAR.get()
+                    if mgr is None or sink is None:
+                        # No confirm channel available — fail safe: refuse.
+                        return (
+                            "无法确认上传操作(无确认通道),未执行。"
+                            "请通过界面确认后重试,或人工处理。"
+                        )
+                    confirm_id = mgr.register(
+                        session_id,
+                        "egress_upload",
+                        f"Agent 请求上传文件到外部主机 {intent.host}",
+                        command,
+                    )
+                    await sink.put({
+                        "type": "confirmation_required",
+                        "confirm_id": confirm_id,
+                        "action": "egress_upload",
+                        "description": f"Agent 请求上传文件到外部主机 {intent.host}",
+                        "host": intent.host,
+                        "files": intent.files,
+                        "reason": v.reason,
+                        "command": command,
+                    })
+                    granted = await mgr.wait(confirm_id)
+                    if not granted:
+                        return (
+                            "用户拒绝或未能确认上传操作,未执行。"
+                        )
+                # verdict == "allow" OR user confirmed → fall through to grant + execute
+
+            # Compute byte budget: sum of file sizes + 16 KiB headroom.
+            # For inline/no-file uploads default to 1 MiB.
+            _INLINE_DEFAULT_BYTES = 1 * 1024 * 1024
+            _HEADROOM = 16 * 1024
+            if intent.files:
+                total_bytes = _HEADROOM
+                for _fp in intent.files:
+                    try:
+                        total_bytes += os.path.getsize(_fp)
+                    except OSError:
+                        total_bytes += _INLINE_DEFAULT_BYTES
+            else:
+                total_bytes = _INLINE_DEFAULT_BYTES
+
+            _eg.register_grant(intent.host, max_bytes=total_bytes, ttl_sec=60)
+        # ── end A-path ────────────────────────────────────────────────────────
+
         return await _run(command, timeout_sec, False, None)
 
     db = DB_VAR.get()
