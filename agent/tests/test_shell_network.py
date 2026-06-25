@@ -32,6 +32,7 @@ def _mem_db():
 @pytest.mark.asyncio
 async def test_network_denied_returns_message_without_running(monkeypatch):
     conn = _mem_db()
+    monkeypatch.setattr(shell, "EXEC_MODE", "bwrap")
     shell.SESSION_ID_VAR.set("s1"); shell.DB_VAR.set(conn)
     shell.CONFIRM_MGR_VAR.set(_Mgr(False)); shell.EVENT_QUEUE_VAR.set(_Sink())
     called = False
@@ -46,6 +47,7 @@ async def test_network_denied_returns_message_without_running(monkeypatch):
 @pytest.mark.asyncio
 async def test_network_granted_persists_for_session(monkeypatch):
     conn = _mem_db()
+    monkeypatch.setattr(shell, "EXEC_MODE", "bwrap")
     shell.SESSION_ID_VAR.set("s1"); shell.DB_VAR.set(conn)
     mgr = _Mgr(True); shell.CONFIRM_MGR_VAR.set(mgr); shell.EVENT_QUEUE_VAR.set(_Sink())
     seen_net = []
@@ -63,6 +65,7 @@ async def test_network_granted_persists_for_session(monkeypatch):
 @pytest.mark.asyncio
 async def test_confirm_event_emitted(monkeypatch):
     conn = _mem_db()
+    monkeypatch.setattr(shell, "EXEC_MODE", "bwrap")
     shell.SESSION_ID_VAR.set("s1"); shell.DB_VAR.set(conn)
     sink = _Sink(); shell.CONFIRM_MGR_VAR.set(_Mgr(True)); shell.EVENT_QUEUE_VAR.set(sink)
     async def _fake_run(cmd, t, net, view): return "[exit 0]\n"
@@ -74,6 +77,7 @@ async def test_confirm_event_emitted(monkeypatch):
 @pytest.mark.asyncio
 async def test_offline_failure_appends_hint(monkeypatch):
     conn = _mem_db()
+    monkeypatch.setattr(shell, "EXEC_MODE", "bwrap")
     shell.SESSION_ID_VAR.set("s1"); shell.DB_VAR.set(conn)
     async def _fake_run(cmd, t, net, view): return "[exit 6]\ncurl: could not resolve host"
     monkeypatch.setattr(shell, "_run", _fake_run)

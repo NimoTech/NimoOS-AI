@@ -9,3 +9,4 @@ __pycache__/
 agent/venv/
 NimoOS-AI
 dist/
+deploy/agent/egress-proxy/egress-proxy

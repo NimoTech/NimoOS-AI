@@ -7,11 +7,20 @@ services:
     image: localhost/nimoos-agent:bundled
     pull_policy: never
     network_mode: host          # 绑 127.0.0.1:8282,nimoos-ai 反代不变
-    # Task 0 spike 已确认:不需要 SYS_ADMIN(bwrap 用无特权 userns);三个 security-opt 缺一不可
-    security_opt:
-      - seccomp=unconfined       # 放行 unshare/clone/mount
-      - apparmor=unconfined      # 否则 "Failed to make / slave"
-      - systempaths=unconfined   # 否则 "Can't mount proc"(Docker 掩盖 /proc)
+    # netns/unshare egress isolation: NET_ADMIN(veth/netns) + SYS_ADMIN(unshare --net/--mount)
+    # seccomp/apparmor/systempaths=unconfined dropped — unshare path does not require them
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    mem_limit: 2g
+    pids_limit: 1024
+    cpus: "2.0"
+    # executor 的 pid/socket 与 MCP per-server socket 必须落在【可写】挂载;
+    # /var/run/nimoos 是只读服务发现目录(executor 写它会 EROFS),改指 rw 的 ai/agent 卷。
+    environment:
+      NIMOOS_EXEC_SOCK: /var/lib/nimoos/ai/agent/agent-exec.sock
+      NIMOOS_EXEC_PID_FILE: /var/lib/nimoos/ai/agent/agent-exec.pid
+      NIMOOS_MCP_SOCK_DIR: /var/lib/nimoos/ai/agent
     volumes:
       # rslave:容器能看到容器启动后宿主新挂载(USB→/media、阵列→/DATA);单向、不反向泄漏。
       - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }
