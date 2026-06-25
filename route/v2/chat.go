@@ -123,6 +123,18 @@ func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body
 		})
 	}
 
+	// On-demand load: ensure this model is loaded into OVMS (loads it, evicting
+	// any other, on first use). Blocks until ready — first load can take minutes.
+	if err := adapter.EnsureLoaded(target.bareModel, device); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    "model_load_failed",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 模型加载失败: " + err.Error(),
+			},
+		})
+	}
+
 	// Rewrite the model field to the OVMS internal servable name.
 	internal := service.OVMSModelName(target.bareModel, device)
 	rewritten := setModelField(body, internal)

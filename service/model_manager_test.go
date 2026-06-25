@@ -34,19 +34,21 @@ func TestModelManager_ListModels(t *testing.T) {
 // Ollama 不可达时,模型列表仍应聚合 OVMS 的 openvino servable(回归:
 // 旧实现在 Ollama down 分支直接 return,跳过了 openvino 聚合)。
 func TestModelManager_ListModels_OllamaDown_StillListsOpenVINO(t *testing.T) {
-	ovms := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/v1/config", r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"qwen3-vl-int4-gpu1":{"model_version_status":[{"version":"1","state":"AVAILABLE"}]}}`))
-	}))
-	defer ovms.Close()
+	// 发现来自扫描模型目录(不依赖 OVMS 是否在跑):准备一个含 IR 的临时目录。
+	src := t.TempDir()
+	mdir := filepath.Join(src, "qwen3.6-35b-a3b-int4")
+	require.NoError(t, os.MkdirAll(mdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(mdir, "openvino_language_model.xml"), []byte("<x/>"), 0o644))
 
-	// ollamaBaseURL 指向一个不可达地址,触发 Ollama-down 分支。
-	mm := NewModelManager("http://127.0.0.1:1", NewOpenVINOAdapter(ovms.URL, "GPU.1"), nil)
+	ov := NewOpenVINOAdapter("http://127.0.0.1:9100", "GPU.1")
+	ov.srcModelsPath = src // 同包测试可直接设私有字段
+
+	// ollamaBaseURL 指向不可达地址,触发 Ollama-down 分支。
+	mm := NewModelManager("http://127.0.0.1:1", ov, nil)
 	models, err := mm.ListModels()
 	require.NoError(t, err)
 	require.Len(t, models, 1)
-	require.Equal(t, "openvino:qwen3-vl-int4@GPU.1", models[0].Name)
+	require.Equal(t, "openvino:qwen3.6-35b-a3b-int4@GPU.1", models[0].Name)
 	require.Equal(t, ModelSourceOpenVINO, models[0].Source)
 }
 

@@ -7,6 +7,9 @@ func TestOVMSModelName(t *testing.T) {
 		{"qwen3-vl-int4", "GPU.1", "qwen3-vl-int4-gpu1"},
 		{"qwen3-vl-int4", "GPU.0", "qwen3-vl-int4-gpu0"},
 		{"llama3", "CPU", "llama3-cpu"},
+		// 带点号的目录名要被 sanitize 成合法 servable 名(点号→连字符)
+		{"qwen3.6-35b-a3b-int4", "GPU.1", "qwen3-6-35b-a3b-int4-gpu1"},
+		{"qwen2-0.5b-int4", "GPU.0", "qwen2-0-5b-int4-gpu0"},
 	}
 	for _, c := range cases {
 		if got := OVMSModelName(c.model, c.device); got != c.want {

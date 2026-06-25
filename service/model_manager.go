@@ -109,23 +109,24 @@ func (m *ModelManager) ListModels() ([]*Model, error) {
 	return models, nil
 }
 
-// openvinoModels lists OVMS servables as user-facing "model@device" entries.
-// Returns nil when OVMS is unavailable (graceful degrade).
+// openvinoModels lists available OpenVINO models as "model@device" options by
+// scanning the model directory. Listing does NOT load them — a model loads into
+// OVMS on first use (Ollama-style). Returns nil when none are present.
 func (m *ModelManager) openvinoModels() []*Model {
 	if m.openvino == nil {
 		return nil
 	}
-	internalNames := m.openvino.ListServedModels()
-	if len(internalNames) == 0 {
-		return nil // OVMS 不可达或无模型时遵守"返回 nil"约定
+	avail := m.openvino.AvailableModels()
+	if len(avail) == 0 {
+		return nil
 	}
-	out := make([]*Model, 0, len(internalNames))
-	for _, in := range internalNames {
-		display := ovmsDisplayName(in)
+	out := make([]*Model, 0, len(avail))
+	for _, am := range avail {
+		display := am.Display + "@" + am.Device
 		out = append(out, &Model{
 			Name:             "openvino:" + display,
 			Source:           ModelSourceOpenVINO,
-			SupportsThinking: SupportsThinking("openvino", display),
+			SupportsThinking: SupportsThinking("openvino", am.Display),
 		})
 	}
 	return out

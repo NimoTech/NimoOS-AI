@@ -210,6 +210,14 @@ func (h *AgentHandler) routeOpenVINO(c echo.Context) bool {
 		restore(body)
 		return false
 	}
+	// On-demand load: ensure OVMS has this model loaded before the agent's Python
+	// client calls it (blocks until ready; first load can take minutes). Best-effort
+	// — on failure we still route so OVMS surfaces a clear error to the caller.
+	if h.svc != nil {
+		if adapter := h.svc.OpenVINOAdapter(); adapter != nil {
+			_ = adapter.EnsureLoaded(bare, device)
+		}
+	}
 	enc, err := json.Marshal(service.OVMSModelName(bare, device))
 	if err != nil {
 		restore(body)

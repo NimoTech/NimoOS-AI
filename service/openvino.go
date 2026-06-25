@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -14,12 +15,30 @@ import (
 // ── 纯函数:用户名 ↔ OVMS 内部名映射 ──────────────────────────
 
 // OVMSModelName maps a user-facing (model, device) pair to the OVMS internal
-// servable name. "qwen3-vl-int4","GPU.1" → "qwen3-vl-int4-gpu1".
-// OVMS model names cannot contain '@' or '.', so the device is lowercased and
-// its dot stripped, then joined with '-'.
+// servable name. "qwen3-vl-int4","GPU.1" → "qwen3-vl-int4-gpu1";
+// "qwen3.6-35b-a3b-int4","GPU.1" → "qwen3-6-35b-a3b-int4-gpu1".
+// OVMS servable names cannot contain '@' or '.', so both the model name and the
+// device are sanitized: lowercased with every char outside [a-z0-9-] replaced by
+// '-'. The model's original (dotted) name stays the user-facing display name; the
+// sanitized form is only the internal/servable + repo directory name.
 func OVMSModelName(model, device string) string {
-	d := strings.ToLower(strings.ReplaceAll(device, ".", ""))
-	return model + "-" + d
+	// device: lowercase, dots stripped → GPU.1→gpu1 (keeps the legacy form).
+	dev := strings.ToLower(strings.ReplaceAll(device, ".", ""))
+	return sanitizeServablePart(model) + "-" + dev
+}
+
+// sanitizeServablePart lowercases s and replaces any char outside [a-z0-9-] with
+// '-' so the result is a legal OVMS servable-name component.
+func sanitizeServablePart(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
 }
 
 // ovmsDisplayName reverses OVMSModelName for the model list: it finds a trailing
@@ -116,16 +135,29 @@ func (o *OpenVINOChecker) Start(ctx context.Context) {
 
 // ── OpenVINOAdapter:代理 + 设备集 + 列模型 ──────────────────
 
-// OpenVINOAdapter proxies LLM requests to a local OVMS instance and knows which
-// devices are resident (from config).
+// OpenVINOAdapter proxies LLM requests to a local OVMS instance. Models are NOT
+// pre-loaded: they live as IR dirs under srcModelsPath and are listed as options;
+// a model is loaded into OVMS on first use (EnsureLoaded), Ollama-style.
 type OpenVINOAdapter struct {
 	baseURL string
-	devices []string // resident devices, e.g. ["GPU.1"]; devices[0] is the default
-	client  *http.Client
+	devices []string // selectable devices, e.g. ["GPU.1"]; devices[0] is the default
+
+	// On-demand model loading paths.
+	srcModelsPath string // raw IR model dirs the user drops in (one subdir per model)
+	repoPath      string // OVMS servable repo (staged graph.pbtxt + version dirs)
+	configPath    string // OVMS config.json this adapter rewrites to load/unload
+	loadMu        sync.Mutex
+	client        *http.Client
 }
 
+const (
+	defaultOVSrcModelsPath = "/var/lib/nimoos/ai/models"
+	defaultOVRepoPath      = "/var/lib/nimoos/ai/openvino/models"
+	defaultOVConfigPath    = "/var/lib/nimoos/ai/openvino/config.json"
+)
+
 // NewOpenVINOAdapter builds an adapter. devicesCSV is the comma-separated
-// resident device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
+// selectable device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
 func NewOpenVINOAdapter(baseURL, devicesCSV string) *OpenVINOAdapter {
 	var devs []string
 	for _, d := range strings.Split(devicesCSV, ",") {
@@ -137,13 +169,16 @@ func NewOpenVINOAdapter(baseURL, devicesCSV string) *OpenVINOAdapter {
 		devs = []string{"GPU.1"}
 	}
 	return &OpenVINOAdapter{
-		baseURL: baseURL,
-		devices: devs,
-		client:  &http.Client{}, // no timeout: streaming can be long
+		baseURL:       baseURL,
+		devices:       devs,
+		srcModelsPath: defaultOVSrcModelsPath,
+		repoPath:      defaultOVRepoPath,
+		configPath:    defaultOVConfigPath,
+		client:        &http.Client{}, // no timeout: streaming can be long
 	}
 }
 
-// Devices returns the resident device list.
+// Devices returns the selectable device list.
 func (a *OpenVINOAdapter) Devices() []string { return a.devices }
 
 // DefaultDevice returns the device used when the caller omits "@device".
