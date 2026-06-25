@@ -77,6 +77,23 @@ class TestPathBlacklist:
         v = assess([clean, "/home/user/.aws/config"])
         assert v.level == "block"
 
+    def test_docker_config_nested_blocked(self):
+        """/.docker/config.json nested under a home dir must be blocked.
+
+        Regression: pattern '.docker/config.json' is gitignore-anchored when
+        it contains an intermediate '/'; the fix adds a '**/' variant so the
+        pattern fires at any depth.
+        """
+        v = assess(["/home/u/.docker/config.json"])
+        assert v.level == "block"
+        assert "blacklist" in v.reason
+
+    def test_gcloud_credentials_nested_blocked(self):
+        """/.config/gcloud/ nested under an arbitrary prefix must be blocked."""
+        v = assess(["/x/.config/gcloud/creds.json"])
+        assert v.level == "block"
+        assert "blacklist" in v.reason
+
 
 # ─── Content scan — block patterns ───────────────────────────────────────────
 
@@ -122,7 +139,7 @@ class TestContentBlock:
 
     def test_aws_akid_wrong_length_not_blocked(self, tmp_path):
         """AKID with only 15 chars after AKIA → should NOT match (must be exactly 16)."""
-        p = _write(tmp_path, "short.txt", "AKIA123456789012345")  # 19 chars → > 16, no match
+        p = _write(tmp_path, "short.txt", "AKIA123456789012345")  # 19 chars total → AKIA+15, < 16, no match
         # The regex is AKIA[0-9A-Z]{16} → matches the first 20 chars exactly
         # "AKIAIOSFODNN7EXAMPLE" is 20 chars: AKIA + 16 chars.
         # Here "AKIA123456789012345" is AKIA + 15 chars — should not match
