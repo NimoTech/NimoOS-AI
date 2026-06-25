@@ -221,3 +221,88 @@ def test_startup_orchestration_popen_failure_does_not_raise(tmp_path, monkeypatc
     client = TestClient(m.app)
     resp = client.get("/healthz")
     assert resp.status_code == 200
+
+
+def test_clean_stale_runtime_removes_pid_and_sock(tmp_path, monkeypatch):
+    """_clean_stale_runtime deletes a leftover pid file and exec socket."""
+    m, _ = _reload_main(tmp_path, monkeypatch)
+
+    pid_file = tmp_path / "agent-exec.pid"
+    sock_path = tmp_path / "agent-exec.sock"
+    pid_file.write_text("99999\n")
+    sock_path.write_text("")  # plain file stands in for a stale socket inode
+
+    m._clean_stale_runtime(str(pid_file), str(sock_path), str(tmp_path))
+
+    assert not pid_file.exists()
+    assert not sock_path.exists()
+
+
+def test_clean_stale_runtime_removes_mcp_sockets(tmp_path, monkeypatch):
+    """_clean_stale_runtime sweeps orphaned per-MCP-server sockets."""
+    m, _ = _reload_main(tmp_path, monkeypatch)
+
+    keep = tmp_path / "something-else.sock"
+    s1 = tmp_path / "agent-mcp-aaaa.sock"
+    s2 = tmp_path / "agent-mcp-bbbb.sock"
+    for p in (keep, s1, s2):
+        p.write_text("")
+
+    m._clean_stale_runtime(
+        str(tmp_path / "agent-exec.pid"),
+        str(tmp_path / "agent-exec.sock"),
+        str(tmp_path),
+    )
+
+    assert not s1.exists()
+    assert not s2.exists()
+    assert keep.exists()  # only agent-mcp-*.sock are swept
+
+
+def test_clean_stale_runtime_missing_files_no_error(tmp_path, monkeypatch):
+    """_clean_stale_runtime is a no-op (no raise) when nothing exists."""
+    m, _ = _reload_main(tmp_path, monkeypatch)
+    # Must not raise even though none of these paths exist.
+    m._clean_stale_runtime(
+        str(tmp_path / "nope.pid"),
+        str(tmp_path / "nope.sock"),
+        str(tmp_path / "no-such-dir"),
+    )
+
+
+def test_egress_startup_rejects_stale_pid(tmp_path, monkeypatch):
+    """If the pid file holds a PID != the spawned child, create_netns is not called."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("NIMOOS_AGENT_EXEC_MODE", "netns")
+    pid_file = tmp_path / "agent-exec.pid"
+    monkeypatch.setenv("NIMOOS_EXEC_PID_FILE", str(pid_file))
+    monkeypatch.setenv("NIMOOS_EXEC_SOCK", str(tmp_path / "agent-exec.sock"))
+    monkeypatch.setenv("NIMOOS_MCP_SOCK_DIR", str(tmp_path))
+
+    for mod in list(sys.modules.keys()):
+        if mod in ("main", "agent", "db"):
+            del sys.modules[mod]
+    import main as m
+
+    class FakeProc:
+        pid = 4242
+
+    # Popen returns a child whose pid is 4242, but the (stale) pid file says 1.
+    def fake_popen(*args, **kwargs):
+        # Simulate the stale file surviving cleanup: write a *different* pid.
+        pid_file.write_text("1\n")
+        return FakeProc()
+
+    called = {"create_netns": False}
+
+    def fake_create_netns(pid):
+        called["create_netns"] = True
+
+    monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
+    from netns import bootstrap as _bs
+    monkeypatch.setattr(_bs, "create_netns", fake_create_netns)
+
+    import asyncio
+    asyncio.run(m._egress_startup())  # must not raise (error is swallowed)
+
+    assert called["create_netns"] is False  # stale pid → veth wiring refused
