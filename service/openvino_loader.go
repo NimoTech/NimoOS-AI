@@ -36,7 +36,9 @@ func (a *OpenVINOAdapter) AvailableModels() []AvailableModel {
 	}
 	var out []AvailableModel
 	for _, e := range entries {
-		if !e.IsDir() || !isOVModelDir(filepath.Join(a.srcModelsPath, e.Name())) {
+		// 用 isOVModelDir(os.Stat 跟随软链)判断,不用 e.IsDir()——后者对"指向目录的
+		// 符号链接"返回 false,会漏掉软链进来的模型。
+		if !isOVModelDir(filepath.Join(a.srcModelsPath, e.Name())) {
 			continue
 		}
 		for _, dev := range a.devices {
