@@ -123,6 +123,9 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 	if h.routeOpenVINO(c) {
 		c.Request().Header.Set("X-Agent-Provider-Key", "openvino")
 		c.Request().Header.Set("X-Agent-Provider-Url", config.Cfg.OpenVINOURL+"/v3")
+		// 让 Python 侧据此套用 Qwen 系的思考开关(think/enable_thinking),
+		// UI 关闭思考时模型才会跳过冗长 reasoning、直接产出工具调用/答案。
+		c.Request().Header.Set("X-Agent-Provider-Type", "openvino")
 	} else if providerType == "ollama" {
 		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
 		c.Request().Header.Set("X-Agent-Provider-Url", "http://127.0.0.1:11434/v1")

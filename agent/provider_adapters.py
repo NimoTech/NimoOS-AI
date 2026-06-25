@@ -32,6 +32,7 @@ class ProviderType(str, Enum):
     ANTHROPIC = "anthropic"
     QWEN = "qwen"
     OLLAMA = "ollama"
+    OPENVINO = "openvino"
     OTHER = "other"
 
 
@@ -99,7 +100,7 @@ def build_model_settings(
             extra_args={"reasoning_effort": _OPENAI_EFFORT[thinking.level]},
         )
 
-    if provider_type in (ProviderType.OLLAMA, ProviderType.QWEN):
+    if provider_type in (ProviderType.OLLAMA, ProviderType.QWEN, ProviderType.OPENVINO):
         # Ollama's OpenAI-compatible endpoint accepts a top-level `think` bool
         # (forwarded to /api/chat). For Qwen3 served by Ollama or DashScope this
         # toggles the <think> block emission. `chat_template_kwargs.enable_thinking`
