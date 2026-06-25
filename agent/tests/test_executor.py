@@ -288,3 +288,70 @@ def test_output_truncation_integration(executor_server):
     # Output should be truncated
     assert len(resp["output"]) < 20000
     assert "truncated" in resp["output"]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _wait_for_iface (no root required)
+# ---------------------------------------------------------------------------
+
+class TestWaitForIface:
+    """Verify _wait_for_iface uses 'ip link show' (netlink) not /sys/class/net."""
+
+    def test_calls_ip_link_show(self, monkeypatch):
+        """_wait_for_iface must call 'ip link show <name>' and return on rc==0."""
+        executor = _import_executor()
+        calls: list[list[str]] = []
+
+        class FakeResult:
+            returncode = 0
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return FakeResult()
+
+        monkeypatch.setattr("netns.executor.subprocess.run", fake_run)
+        executor._wait_for_iface("nimoos-veth-e")
+
+        assert calls, "_wait_for_iface did not call subprocess.run at all"
+        assert calls[0] == ["ip", "link", "show", "nimoos-veth-e"], (
+            f"Expected ['ip','link','show','nimoos-veth-e'], got {calls[0]!r}"
+        )
+
+    def test_does_not_use_sysfs(self, monkeypatch):
+        """_wait_for_iface must NOT call os.path.exists for /sys/class/net check."""
+        executor = _import_executor()
+        sysfs_checked: list[str] = []
+
+        real_exists = os.path.exists
+
+        def spy_exists(path):
+            if "/sys/class/net" in str(path):
+                sysfs_checked.append(str(path))
+            return real_exists(path)
+
+        class FakeResult:
+            returncode = 0
+
+        monkeypatch.setattr("netns.executor.subprocess.run", lambda *a, **kw: FakeResult())
+        monkeypatch.setattr(os.path, "exists", spy_exists)
+
+        executor._wait_for_iface("nimoos-veth-e")
+
+        assert not sysfs_checked, (
+            f"_wait_for_iface checked /sys/class/net — must use ip link instead: {sysfs_checked}"
+        )
+
+    def test_timeout_raises_runtime_error(self, monkeypatch):
+        """When ip link always returns non-zero, RuntimeError must be raised after timeout."""
+        executor = _import_executor()
+
+        class FakeResult:
+            returncode = 1
+
+        monkeypatch.setattr("netns.executor.subprocess.run", lambda *a, **kw: FakeResult())
+        # Use a very short timeout so the test is fast
+        monkeypatch.setattr("netns.executor.time.sleep", lambda _: None)
+
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError, match="timed out"):
+            executor._wait_for_iface("nimoos-veth-e", timeout=0.01)
