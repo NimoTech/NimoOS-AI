@@ -15,6 +15,12 @@ services:
     mem_limit: 2g
     pids_limit: 1024
     cpus: "2.0"
+    # executor 的 pid/socket 与 MCP per-server socket 必须落在【可写】挂载;
+    # /var/run/nimoos 是只读服务发现目录(executor 写它会 EROFS),改指 rw 的 ai/agent 卷。
+    environment:
+      NIMOOS_EXEC_SOCK: /var/lib/nimoos/ai/agent/agent-exec.sock
+      NIMOOS_EXEC_PID_FILE: /var/lib/nimoos/ai/agent/agent-exec.pid
+      NIMOOS_MCP_SOCK_DIR: /var/lib/nimoos/ai/agent
     volumes:
       # rslave:容器能看到容器启动后宿主新挂载(USB→/media、阵列→/DATA);单向、不反向泄漏。
       - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }

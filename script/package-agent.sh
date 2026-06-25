@@ -24,6 +24,14 @@ if ! docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
   echo "   或给本机 docker 配 registry-mirrors(/etc/docker/daemon.json)再重试。" >&2
   exit 1
 fi
+# egress-proxy:在宿主用 Go 预编译静态二进制(Dockerfile 直接 COPY,避开多阶段 golang 镜像依赖)。
+echo "==> 预编译 egress-proxy 静态二进制 ..."
+if ! command -v go >/dev/null 2>&1; then
+  echo "!! 未找到 go(需在宿主编译 egress-proxy)。装 go 或把已编好的二进制放到 deploy/agent/egress-proxy/egress-proxy" >&2
+  exit 1
+fi
+( cd "${ROOT}/deploy/agent/egress-proxy" && CGO_ENABLED=0 go build -o egress-proxy . )
+
 # DOCKER_BUILDKIT=0:用经典构建器,基础镜像在本地即直接复用、不去 registry 重新解析元数据
 # (BuildKit 即便本地有也会 HEAD docker.io,离线会超时)。
 DOCKER_BUILDKIT=0 docker build -t "${IMAGE_REF}" -f "${ROOT}/deploy/agent/Dockerfile" "${ROOT}"
