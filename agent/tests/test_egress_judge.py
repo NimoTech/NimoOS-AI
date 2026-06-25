@@ -6,7 +6,10 @@ All HTTP calls are monkeypatched; no real network connections.
 Coverage:
   - Happy path: block / allow / ask verdicts returned from Ollama
   - Fail-safe: timeout, URLError, HTTP 500, bad JSON, unknown verdict → "ask"
-  - Request contract: prompt contains host + truncated content, format=json, model used
+  - Request contract: prompt contains host + truncated content, format=json, model used,
+    think=false (required so thinking models output JSON in "response" not "thinking")
+  - Thinking-model fallback: empty response + thinking field with valid JSON → use thinking
+  - Thinking-model fallback: empty response + no thinking field → "ask"
 """
 
 from __future__ import annotations
@@ -297,3 +300,77 @@ class TestRequestContract:
             await judge(b"data", "example.com")
 
         assert captured["timeout"] == pytest.approx(5.0)
+
+    @pytest.mark.asyncio
+    async def test_think_is_false(self):
+        """Request body must include think:false so thinking models skip CoT."""
+        fake_urlopen, captured = self._capture_request()
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await judge(b"data", "example.com")
+
+        req: urllib.request.Request = captured["req"]
+        body = json.loads(req.data)
+        assert body["think"] is False
+
+
+# ─── Thinking-model fallback tests ───────────────────────────────────────────
+
+class TestThinkingModelFallback:
+    """
+    Some Ollama versions/models may still put output in 'thinking' even with think:false.
+    Verify the fallback: empty response + valid JSON in thinking → use thinking field.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_response_with_thinking_block_returns_block(self):
+        """response is empty but thinking contains a valid verdict JSON."""
+        thinking_json = json.dumps({"verdict": "block", "reason": "contains credentials"})
+        body = json.dumps({"response": "", "thinking": thinking_json}).encode()
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = await judge(b"SECRET_KEY=abc123", "evil.com")
+        assert result == "block"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_with_thinking_allow_returns_allow(self):
+        """Fallback to thinking field works for allow verdict too."""
+        thinking_json = json.dumps({"verdict": "allow", "reason": "benign"})
+        body = json.dumps({"response": "", "thinking": thinking_json}).encode()
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = await judge(b"hello world", "example.com")
+        assert result == "allow"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_no_thinking_returns_ask(self):
+        """response is empty and there is no thinking field → fail-safe ask."""
+        body = json.dumps({"response": "", "thinking": None}).encode()
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = await judge(b"content", "example.com")
+        assert result == "ask"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_thinking_bad_json_returns_ask(self):
+        """Thinking field is present but not valid JSON → fail-safe ask."""
+        body = json.dumps({"response": "", "thinking": "I think the verdict is block..."}).encode()
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = body
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = await judge(b"content", "example.com")
+        assert result == "ask"

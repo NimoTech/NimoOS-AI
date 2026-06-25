@@ -108,6 +108,7 @@ def _call_ollama_sync(
             "prompt": prompt,
             "stream": False,
             "format": "json",
+            "think": False,
         }
     ).encode("utf-8")
 
@@ -159,13 +160,28 @@ async def judge(content: bytes, host: str) -> str:
         logger.warning("egress.judge: unexpected error calling Ollama: %s", exc)
         return "ask"
 
-    # Ollama wraps the model output in the "response" field
+    # Ollama wraps the model output in the "response" field.
+    # When think:false is set, thinking models output JSON directly in "response".
+    # Fallback: if response is empty but "thinking" contains parseable JSON (some
+    # model versions may still think despite the flag), attempt to extract from there.
     raw_response = response_dict.get("response", "")
     if not isinstance(raw_response, str):
         logger.warning(
             "egress.judge: Ollama 'response' field is not a string: %r", raw_response
         )
         return "ask"
+
+    if not raw_response.strip():
+        # response is empty — check thinking field as fallback
+        thinking = response_dict.get("thinking")
+        if isinstance(thinking, str) and thinking.strip():
+            logger.warning(
+                "egress.judge: 'response' is empty; attempting to parse verdict from 'thinking' field"
+            )
+            raw_response = thinking
+        else:
+            logger.warning("egress.judge: Ollama returned empty 'response' and no 'thinking' field")
+            return "ask"
 
     try:
         model_output = json.loads(raw_response)
