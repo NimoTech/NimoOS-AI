@@ -31,7 +31,9 @@ services:
       # skills 根目录:Go(host)在此播种 builtin/ 并建 .runtime/<user>/ symlink 视图;
       # 容器内 Python list_skills/read_skill_file 只读扫描,故 read_only。
       - { type: bind, source: /var/lib/nimoos/ai/skills, target: /var/lib/nimoos/ai/skills, read_only: true }
-      - { type: bind, source: /etc/nimoos, target: /etc/nimoos, read_only: true }
+      # NOTE: /etc/nimoos 不再挂载(P2c)。agent 配置全走 NIMOOS_* env,从不读 /etc/nimoos;
+      # 该挂载曾把 ai_master.key/服务配置暴露给 root 命令。mount 遮蔽被 docker-default
+      # AppArmor 拦死(§14.5),故直接去挂载消除暴露。宿主真实 /etc/nimoos 及其他服务不受影响。
     restart: unless-stopped
     logging:
       driver: json-file
