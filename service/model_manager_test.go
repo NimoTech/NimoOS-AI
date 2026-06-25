@@ -31,6 +31,25 @@ func TestModelManager_ListModels(t *testing.T) {
 	require.Equal(t, int64(4294967296), models[0].SizeBytes)
 }
 
+// Ollama 不可达时,模型列表仍应聚合 OVMS 的 openvino servable(回归:
+// 旧实现在 Ollama down 分支直接 return,跳过了 openvino 聚合)。
+func TestModelManager_ListModels_OllamaDown_StillListsOpenVINO(t *testing.T) {
+	ovms := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/config", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"qwen3-vl-int4-gpu1":{"model_version_status":[{"version":"1","state":"AVAILABLE"}]}}`))
+	}))
+	defer ovms.Close()
+
+	// ollamaBaseURL 指向一个不可达地址,触发 Ollama-down 分支。
+	mm := NewModelManager("http://127.0.0.1:1", NewOpenVINOAdapter(ovms.URL, "GPU.1"), nil)
+	models, err := mm.ListModels()
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	require.Equal(t, "openvino:qwen3-vl-int4@GPU.1", models[0].Name)
+	require.Equal(t, ModelSourceOpenVINO, models[0].Source)
+}
+
 func TestModelManager_DeleteModel(t *testing.T) {
 	var gotName string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
