@@ -415,7 +415,7 @@ class CreateSessionRequest(BaseModel):
 
 class RunRequest(BaseModel):
     message: str = ""
-    model: str = "gpt-4o-mini"
+    model: str = ""
     kind: str = "chat"          # 'chat' | 'init'
     init_target: str | None = None
     thinking: ThinkingConfigPayload | None = None
@@ -1572,6 +1572,10 @@ async def run_session(
     x_agent_provider_url: str = Header(..., alias="X-Agent-Provider-Url"),
 ):
     _assert_owns_session(session_id, x_user_id)
+    if not (req.model or "").strip():
+        # 没有有效模型名:明确报错,而不是悄悄用某个默认名去打后端(会得到迷惑性的 404)。
+        raise HTTPException(status_code=400,
+                            detail="no model selected — pick a model before sending")
     if req.kind == "init" and _session_agent_type(session_id) != "general":
         # kind=init generates agent.md for a directory — path-layer only.
         raise HTTPException(status_code=400,

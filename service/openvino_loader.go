@@ -183,7 +183,7 @@ node: {
       device: "` + device + `",
       plugin_config: '{"PERFORMANCE_HINT":"LATENCY"}',
       reasoning_parser: "qwen3",
-      tool_parser: "hermes3"
+      tool_parser: "qwen3coder"
     }
   }
   input_stream_handler {
