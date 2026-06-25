@@ -35,7 +35,11 @@ IMPLICIT_IGNORE = [
 BUILTIN_HARD_BLACKLIST = [
     # credentials / keys (unanchored: block anywhere in the tree)
     ".ssh/", ".gnupg/", ".pki/", ".aws/",
-    ".config/gcloud/", ".docker/config.json",
+    # Patterns containing an intermediate "/" are anchored by gitignore semantics
+    # (i.e. only match relative to the spec root). Add "**/" variants so they
+    # are matched at any depth when checked against stripped absolute paths.
+    ".config/gcloud/", "**/.config/gcloud/",
+    ".docker/config.json", "**/.docker/config.json",
     "*.key", "*.pem", "*.p12", "*.pfx",
     "id_rsa*", "id_ed25519*", "id_ecdsa*",
     # absolute system paths (anchored with / so they only match at filesystem

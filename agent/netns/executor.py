@@ -112,19 +112,23 @@ def _do_unshare() -> None:
 def _wait_for_iface(name: str, timeout: float = 10.0) -> None:
     """Wait until network interface *name* appears in the current netns.
 
-    Uses /sys/class/net/<name> which reflects the *current* process's network
-    namespace — after unshare(CLONE_NEWNET) only interfaces that have been
-    moved into this netns appear here.  The parent process calls
-    bootstrap.create_netns(pid) to move VETH_E into this netns; once that
-    completes the /sys entry becomes visible.
+    Uses ``ip link show <name>`` (netlink) rather than /sys/class/net/<name>
+    because /sys is not remounted per-netns after unshare(CLONE_NEWNET) and
+    therefore reflects the *host* namespace's interfaces, causing a false
+    positive before the parent has moved VETH_E into this netns.  ``ip link``
+    queries the kernel via netlink and strictly reflects the calling process's
+    current network namespace.
 
     Raises:
         RuntimeError: if the interface does not appear within *timeout* seconds.
     """
-    sysfs_path = f"/sys/class/net/{name}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sysfs_path):
+        result = subprocess.run(
+            ["ip", "link", "show", name],
+            capture_output=True,
+        )
+        if result.returncode == 0:
             return
         time.sleep(0.05)
     logger.error(
