@@ -97,13 +97,16 @@ async def test_non_upload_runs_directly(monkeypatch):
 
     monkeypatch.setattr(egress_parse, "parse_upload", lambda cmd: None)
 
+    # M1 fix: patch the real module function, not a non-existent shell attribute.
+    # shell.py does `from egress import ... judge as _ej` then calls `_ej.judge(...)`,
+    # so patch the function on the actual egress.judge module.
+    import egress.judge as _judge_mod
+
     async def _fake_judge(content, host):
         judge_called.append(True)
         return "allow"
 
-    monkeypatch.setattr(
-        "skills.shell._egress_judge", _fake_judge, raising=False
-    )
+    monkeypatch.setattr(_judge_mod, "judge", _fake_judge)
     monkeypatch.setattr(egress_grant, "register_grant",
                         lambda *a, **kw: grant_called.append(True) or True)
 
@@ -383,3 +386,31 @@ async def test_bwrap_mode_unaffected(monkeypatch):
     assert not parse_called, "parse_upload must NOT be called in bwrap mode"
     # bwrap denial message
     assert "拒绝" in result
+
+
+# ---------------------------------------------------------------------------
+# Test 11: A-path unexpected exception → fail-closed (I2 regression guard)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_apath_unexpected_exception_fail_closed(monkeypatch):
+    """I2: if parse_upload raises unexpectedly, command must NOT execute and
+    a conservative refusal must be returned (no exception escapes)."""
+    nc_calls = _patch_netns_client(monkeypatch)
+
+    # Simulate an unexpected error deep in A-path evaluation (e.g. pathspec
+    # version incompatibility, bad import, etc.)
+    def _parse_raises(cmd):
+        raise RuntimeError("simulated pathspec incompatibility")
+
+    monkeypatch.setattr(egress_parse, "parse_upload", _parse_raises)
+
+    # Must NOT raise; must return a conservative refusal string
+    result = await shell._run_command_impl(
+        "curl -T /DATA/data.csv https://api.example.com/upload", 30, False
+    )
+
+    assert not nc_calls, "netns_client.run_command must NOT be called on A-path exception"
+    assert result, "must return a non-empty refusal message"
+    # Message should indicate failure/refusal (not an empty string or traceback)
+    assert any(kw in result for kw in ["内部错误", "无法评估", "人工处理", "error", "未执行"])
