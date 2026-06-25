@@ -63,6 +63,10 @@ def _is_external_host(host: str) -> bool:
     # Determine bare_host (strip port if present, handle IPv6 literals).
     bare_host = host
 
+    # Strip IPv6 zone ID (e.g. "fc00::1%eth0" → "fc00::1") before any parsing.
+    if "%" in bare_host:
+        bare_host = bare_host.split("%", 1)[0]
+
     # Remove brackets around IPv6 literals like [::1] or [::1]:8080
     if bare_host.startswith("["):
         close = bare_host.find("]")
@@ -410,10 +414,10 @@ def parse_upload(command: str) -> Optional[UploadIntent]:
                 continue
             tool = seg_tokens[0].lstrip("./")
             if tool in _TOOL_PARSERS:
-                # Parse this segment; inline=True because it's at end of pipeline
+                # Let the tool parser decide inline based on @- presence.
+                # Do NOT force inline=True here: "cat f | curl -F k=@/DATA/file ..."
+                # uploads a disk file (not stdin) and must be classified as inline=False.
                 result = _TOOL_PARSERS[tool](seg_tokens)
-                if result is not None:
-                    result.inline = True
                 return result
         return None
 

