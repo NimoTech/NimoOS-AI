@@ -12,7 +12,7 @@ returns "ask" — never silently allow on failure.
 
 Environment variables:
     NIMOOS_OLLAMA_URL           default: http://127.0.0.1:11434
-    NIMOOS_EGRESS_JUDGE_MODEL   default: qwen3:0.6b
+    NIMOOS_EGRESS_JUDGE_MODEL   default: qwen3.5:0.8b
     NIMOOS_EGRESS_JUDGE_TIMEOUT default: 20.0  (seconds)
     NIMOOS_EGRESS_JUDGE_MAXBYTES default: 4096
 """
@@ -32,7 +32,7 @@ logger = logging.getLogger("nimoos-agent")
 # ─── Config helpers ───────────────────────────────────────────────────────────
 
 _DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-_DEFAULT_MODEL = "qwen3:0.6b"
+_DEFAULT_MODEL = "qwen3.5:0.8b"
 _DEFAULT_TIMEOUT = 20.0
 _DEFAULT_MAXBYTES = 4096
 
@@ -144,7 +144,7 @@ async def judge(content: bytes, host: str) -> str:
     content_text = content[:maxbytes].decode("utf-8", errors="replace")
     prompt = _build_prompt(content_text, host, model)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     fn = partial(_call_ollama_sync, url, model, prompt, timeout)
 
     try:
