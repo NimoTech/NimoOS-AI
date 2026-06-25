@@ -39,6 +39,11 @@ def create_netns(executor_pid: int) -> None:
     """Create a veth pair and configure the host end.
 
     Steps (all run as the calling process, which must have CAP_NET_ADMIN):
+    0. Delete any stale VETH_H (and its peer) left over from a previous run
+       that did not exit cleanly (e.g. force-recreate / SIGKILL).  Errors are
+       intentionally ignored — if the interface does not exist yet the command
+       simply fails with ENODEV and we continue.  Deleting VETH_H also removes
+       the paired VETH_E, so this single command cleans up both ends.
     1. Create a veth pair: VETH_H <-> VETH_E (both initially in host netns).
     2. Move VETH_E into the executor's network namespace (identified by PID).
     3. Assign PROXY_IP/PREFIX to VETH_H.
@@ -46,6 +51,11 @@ def create_netns(executor_pid: int) -> None:
 
     The child end (VETH_E) is configured separately by config_child_iface().
     """
+    # Step 0: evict any stale veth pair so the add below is always idempotent.
+    subprocess.run(
+        ["ip", "link", "del", VETH_H],
+        capture_output=True,  # suppress "Cannot find device" when not present
+    )
     subprocess.run(
         ["ip", "link", "add", VETH_H, "type", "veth", "peer", "name", VETH_E],
         check=True,

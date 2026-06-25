@@ -199,3 +199,149 @@ def test_netns_bootstrap_full_lifecycle():
         # Best-effort cleanup so the interface does not linger
         teardown()
         raise
+
+
+@pytest.mark.skipif(_ip_missing, reason="ip binary not found")
+def test_netns_create_netns_idempotent_with_stale_veth():
+    """create_netns must succeed even when a stale veth pair already exists.
+
+    Simulates a force-recreate / SIGKILL scenario where the previous container
+    left nimoos-veth-h and nimoos-veth-e behind in the host netns.
+
+    Flow:
+      1. Create a stale veth pair (nimoos-veth-h / nimoos-veth-e) in the host
+         netns, as if a prior run was killed before teardown().
+      2. Fork a child that unshares its network namespace.
+      3. Parent calls create_netns(child_pid) — must NOT raise "File exists".
+      4. Parent signals child; child calls config_child_iface() — must NOT
+         raise "Cannot find device nimoos-veth-e".
+      5. Child verifies on-link route to PROXY_IP is present via VETH_E.
+      6. Parent tears down and confirms no veth remains.
+    """
+    from netns.bootstrap import (
+        VETH_E,
+        VETH_H,
+        config_child_iface,
+        create_netns,
+        teardown,
+    )
+
+    CLONE_NEWNET = 0x40000000
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+    # ----------------------------------------------------------------
+    # Step 1: inject a stale veth pair (mimics un-cleaned prior run)
+    # ----------------------------------------------------------------
+    stale = subprocess.run(
+        ["ip", "link", "add", VETH_H, "type", "veth", "peer", "name", VETH_E],
+        capture_output=True,
+    )
+    assert stale.returncode == 0, (
+        f"Failed to create stale veth pair for test setup: {stale.stderr.decode()!r}"
+    )
+
+    # Pipes for synchronisation
+    r_ready, w_ready = os.pipe()    # child → parent: "unshare done"
+    r_go, w_go = os.pipe()          # parent → child: "veth ready"
+    r_result, w_result = os.pipe()  # child → parent: assertion results
+
+    pid = os.fork()
+
+    if pid == 0:
+        # ----------------------------------------------------------------
+        # CHILD side
+        # ----------------------------------------------------------------
+        os.close(r_ready)
+        os.close(w_go)
+        os.close(r_result)
+
+        try:
+            ret = libc.unshare(CLONE_NEWNET)
+            if ret != 0:
+                errno = ctypes.get_errno()
+                os.write(w_result, f"FAIL:unshare errno {errno}".encode())
+                os.close(w_result)
+                os._exit(1)
+
+            os.write(w_ready, b"x")
+            os.close(w_ready)
+
+            # Wait for parent to move the veth into our netns
+            os.read(r_go, 1)
+            os.close(r_go)
+
+            # This must not raise "Cannot find device nimoos-veth-e"
+            config_child_iface()
+
+            # Verify on-link route to proxy IP exists
+            onl = subprocess.run(
+                ["ip", "route", "get", "169.254.7.1"],
+                capture_output=True,
+                text=True,
+            )
+            onl_out = (onl.stdout + onl.stderr).strip()
+            os.write(w_result, onl_out.encode())
+            os.close(w_result)
+
+        except Exception as exc:
+            try:
+                os.write(w_result, f"FAIL:exception:{exc}".encode())
+                os.close(w_result)
+            except Exception:
+                pass
+            os._exit(2)
+
+        os._exit(0)
+
+    # ----------------------------------------------------------------
+    # PARENT side
+    # ----------------------------------------------------------------
+    os.close(w_ready)
+    os.close(r_go)
+    os.close(w_result)
+
+    try:
+        os.read(r_ready, 1)
+        os.close(r_ready)
+
+        # Must succeed despite stale veth — this is the core assertion
+        create_netns(pid)
+
+        os.write(w_go, b"x")
+        os.close(w_go)
+
+        chunks = []
+        while True:
+            chunk = os.read(r_result, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(r_result)
+
+        raw = b"".join(chunks).decode(errors="replace")
+
+        _, child_status = os.waitpid(pid, 0)
+        child_exit = os.WEXITSTATUS(child_status)
+
+        teardown()
+
+        show_rc = subprocess.run(
+            ["ip", "link", "show", VETH_H],
+            capture_output=True,
+        ).returncode
+
+        # ----------------------------------------------------------------
+        # Assertions
+        # ----------------------------------------------------------------
+        assert "FAIL" not in raw, f"Child reported failure: {raw!r}"
+        assert child_exit == 0, f"Child exited with status {child_exit}; raw={raw!r}"
+        assert f"dev {VETH_E}" in raw, (
+            f"Expected on-link route via '{VETH_E}' in child output, got: {raw!r}"
+        )
+        assert show_rc != 0, (
+            f"Expected '{VETH_H}' to be absent after teardown(), but ip link show returned 0"
+        )
+
+    except Exception:
+        teardown()
+        raise
