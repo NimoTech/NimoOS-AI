@@ -228,6 +228,41 @@ def _wait_for_pid_file(pid_file: str, timeout: float = 5.0, interval: float = 0.
     raise TimeoutError(f"executor pid file {pid_file!r} not ready after {timeout}s")
 
 
+def _clean_stale_runtime(pid_file: str, sock_path: str, mcp_sock_dir: str) -> None:
+    """Remove stale runtime artifacts left by a previous executor instance.
+
+    The executor's pid/socket live on a *persistent* writable mount
+    (/var/lib/nimoos/ai/agent), so they survive `docker restart`.  A stale pid
+    file is dangerous: _wait_for_pid_file would read the PREVIOUS run's (dead,
+    possibly recycled) PID and create_netns() would then move VETH_E into the
+    wrong network namespace.  Deleting these before spawning the new executor
+    guarantees _wait_for_pid_file can only return the fresh PID.
+
+    Best-effort: every error is swallowed — cleanup must never block startup.
+    """
+    import glob
+
+    for path in (pid_file, sock_path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            _LOG.warning("clean stale runtime: unlink %s: %s", path, exc)
+
+    # Orphaned per-MCP-server sockets (agent-mcp-*.sock) accumulate across restarts.
+    try:
+        for p in glob.glob(os.path.join(mcp_sock_dir, "agent-mcp-*.sock")):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                _LOG.warning("clean stale runtime: unlink %s: %s", p, exc)
+    except Exception as exc:
+        _LOG.warning("clean stale runtime: glob %s: %s", mcp_sock_dir, exc)
+
+
 def _teardown_children() -> None:
     """Terminate executor and proxy subprocesses. Safe to call multiple times."""
     global _executor_proc, _proxy_proc
@@ -269,8 +304,16 @@ async def _egress_startup():
         return
 
     pid_file = _env_str("NIMOOS_EXEC_PID_FILE", "/var/run/nimoos/agent-exec.pid")
+    sock_path = _env_str("NIMOOS_EXEC_SOCK", "/var/run/nimoos/agent-exec.sock")
+    mcp_sock_dir = _env_str("NIMOOS_MCP_SOCK_DIR", "/var/run/nimoos")
 
     try:
+        # 0. Clear stale runtime artifacts from a previous (possibly SIGKILLed)
+        #    executor.  These live on a persistent mount and survive restarts;
+        #    a stale pid file would otherwise make _wait_for_pid_file return a
+        #    dead/recycled PID and wire VETH_E into a foreign netns.
+        _clean_stale_runtime(pid_file, sock_path, mcp_sock_dir)
+
         # 1. Fork executor (python -m netns.executor) from the agent root dir
         #    so that `import netns` resolves correctly.
         agent_root = os.path.dirname(os.path.abspath(__file__))
@@ -282,6 +325,15 @@ async def _egress_startup():
 
         # 2. Wait for executor to write its PID file (it runs unshare then writes)
         exec_pid = _wait_for_pid_file(pid_file, timeout=5.0)
+        # Defense-in-depth: the executor shares our PID namespace (no pidns), so
+        # the PID it writes MUST equal the child handle's pid.  A mismatch means
+        # cleanup missed a stale file — refuse rather than wire veth into a
+        # foreign/dead netns.
+        if _executor_proc is None or exec_pid != _executor_proc.pid:
+            raise RuntimeError(
+                "stale pid file: read %s, expected %s"
+                % (exec_pid, getattr(_executor_proc, "pid", None))
+            )
         _LOG.info("egress startup: executor netns pid=%d", exec_pid)
 
         # 3. Create veth pair and configure the host side (requires CAP_NET_ADMIN)
