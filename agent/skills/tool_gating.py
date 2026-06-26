@@ -49,11 +49,11 @@ def categories_overview() -> str:
 
 
 def _persist(categories: list[str]) -> None:
-    """把当前解锁集落库(独立函数,便于测试 monkeypatch)。"""
+    """把给定的已解锁类别列表落库(独立函数,便于测试 monkeypatch)。"""
     import db
     session_id = GATING_SESSION_VAR.get("")
     if session_id:
-        db.set_unlocked_categories(session_id, sorted(current_unlocked()))
+        db.set_unlocked_categories(session_id, categories)
 
 
 def expand_categories(categories: list[str]) -> str:
