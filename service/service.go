@@ -74,7 +74,7 @@ func NewService(cfg *config.Config) Services {
 	checker := NewOllamaChecker(common.OllamaBaseURL)
 	local := NewLocalAdapter(common.OllamaBaseURL)
 	ovChecker := NewOpenVINOChecker(cfg.OpenVINOURL)
-	ovAdapter := NewOpenVINOAdapter(cfg.OpenVINOURL, cfg.OpenVINODevices)
+	ovAdapter := NewOpenVINOAdapter(cfg.OpenVINOURL, cfg.OpenVINODevices, cfg.OpenVINOMaxLoaded, cfg.OpenVINOIdleTTLMinutes)
 	router := &Router{providers: providerSvc, db: db}
 	modelMgr := NewModelManager(common.OllamaBaseURL, ovAdapter, db)
 	sessionSvc := &sessionService{db: db}

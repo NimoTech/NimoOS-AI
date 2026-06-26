@@ -20,6 +20,8 @@ type Config struct {
 	OpenVINOURL     string
 	OpenVINOEnabled bool
 	OpenVINODevices string // 逗号分隔的常驻设备,如 "GPU.1" 或 "GPU.1,GPU.0";第一个为默认设备
+	OpenVINOMaxLoaded      int // 同时最多驻留的模型数(对齐 Ollama OLLAMA_MAX_LOADED_MODELS),默认 3
+	OpenVINOIdleTTLMinutes int // 空闲多少分钟后自动卸载(对齐 Ollama keep_alive),默认 5;0=永不卸载
 }
 
 func Init(configFile, confSample string) error {
@@ -50,6 +52,8 @@ func Init(configFile, confSample string) error {
 		OpenVINOURL:     v.GetString("openvino.URL"),
 		OpenVINOEnabled: v.GetBool("openvino.Enabled"),
 		OpenVINODevices: v.GetString("openvino.Devices"),
+		OpenVINOMaxLoaded:      v.GetInt("openvino.MaxLoadedModels"),
+		OpenVINOIdleTTLMinutes: v.GetInt("openvino.IdleTTLMinutes"),
 	}
 
 	if Cfg.RuntimePath == "" {
@@ -84,6 +88,13 @@ func Init(configFile, confSample string) error {
 	}
 	if Cfg.OpenVINODevices == "" {
 		Cfg.OpenVINODevices = "GPU.1"
+	}
+	if Cfg.OpenVINOMaxLoaded <= 0 {
+		Cfg.OpenVINOMaxLoaded = 3
+	}
+	// IdleTTLMinutes:显式 0 = 永不卸载,必须与"键缺失"区分 —— 仅当未设置时才取默认 5。
+	if !v.IsSet("openvino.IdleTTLMinutes") {
+		Cfg.OpenVINOIdleTTLMinutes = 5
 	}
 	return nil
 }

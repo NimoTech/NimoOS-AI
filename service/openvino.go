@@ -148,6 +148,12 @@ type OpenVINOAdapter struct {
 	configPath    string // OVMS config.json this adapter rewrites to load/unload
 	loadMu        sync.Mutex
 	client        *http.Client
+
+	// 多模型驻留 + 空闲回收(对齐 Ollama)。loaded 是写入 config.json 的常驻集,唯一事实源;
+	// 所有读写都在 loadMu 下。
+	loaded    map[string]*loadedModel
+	maxLoaded int           // 同时最多驻留数,默认 3
+	idleTTL   time.Duration // 空闲多久卸载;0=永不卸载
 }
 
 const (
@@ -158,7 +164,9 @@ const (
 
 // NewOpenVINOAdapter builds an adapter. devicesCSV is the comma-separated
 // selectable device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
-func NewOpenVINOAdapter(baseURL, devicesCSV string) *OpenVINOAdapter {
+// maxLoaded 是同时最多驻留的模型数(<=0 视作默认 3);idleTTLMinutes 是空闲卸载分钟数
+// (0 = 永不卸载)。构造时从现有 config.json 重建驻留集(reconcileFromConfig)。
+func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes int) *OpenVINOAdapter {
 	var devs []string
 	for _, d := range strings.Split(devicesCSV, ",") {
 		if t := strings.TrimSpace(d); t != "" {
@@ -168,14 +176,23 @@ func NewOpenVINOAdapter(baseURL, devicesCSV string) *OpenVINOAdapter {
 	if len(devs) == 0 {
 		devs = []string{"GPU.1"}
 	}
-	return &OpenVINOAdapter{
+	if maxLoaded <= 0 {
+		maxLoaded = 3
+	}
+	a := &OpenVINOAdapter{
 		baseURL:       baseURL,
 		devices:       devs,
 		srcModelsPath: defaultOVSrcModelsPath,
 		repoPath:      defaultOVRepoPath,
 		configPath:    defaultOVConfigPath,
 		client:        &http.Client{}, // no timeout: streaming can be long
+		loaded:        map[string]*loadedModel{},
+		maxLoaded:     maxLoaded,
+		idleTTL:       time.Duration(idleTTLMinutes) * time.Minute,
 	}
+	a.reconcileFromConfig()
+	go a.reaperLoop()
+	return a
 }
 
 // Devices returns the selectable device list.
