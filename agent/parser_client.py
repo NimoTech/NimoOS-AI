@@ -82,5 +82,22 @@ class ParserClient:
             raise httpx.HTTPStatusError(msg, request=e.request, response=e.response) from e
         return r.json()
 
+    async def agent_memory_upsert(self, user_id, session_id, chunks):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/agent-memory/upsert",
+            json={"user_id": str(user_id), "session_id": session_id,
+                  "chunks": chunks})
+        r.raise_for_status()
+        return r.json()
+
+    async def agent_memory_query(self, user_id, query, top_k=5):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/agent-memory/query",
+            json={"user_id": str(user_id), "query": query, "top_k": top_k})
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()
