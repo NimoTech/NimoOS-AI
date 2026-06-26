@@ -11,6 +11,13 @@ AgentURL = http://127.0.0.1:8282
 AgentTimeout = 60
 OllamaURL = http://127.0.0.1:11434
 
+[openvino]
+URL = http://127.0.0.1:9100
+Enabled = true
+# 常驻设备(逗号分隔),第一个为省略 @device 时的默认。默认只常驻独显 GPU.1;
+# 要同时常驻核显写 "GPU.1,GPU.0"(核显吃 32GB 共享内存,偏紧)。
+Devices = GPU.1
+
 # Attachment limits (override via env NIMOOS_MAX_ATTACHMENT_SIZE etc.)
 MaxAttachmentSize         = 524288000     ; 500 MB, global upper bound
 MaxImageAttachmentSize    = 20971520      ; 20 MB, image kind only

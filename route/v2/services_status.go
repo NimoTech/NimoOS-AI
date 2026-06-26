@@ -24,23 +24,26 @@ type ParserStatus struct {
 }
 
 type ServicesStatusResponse struct {
-	Ollama ServiceStatus `json:"ollama"`
-	Agent  ServiceStatus `json:"agent"`
-	Search ServiceStatus `json:"search"`
-	Parser ParserStatus  `json:"parser"`
+	Ollama   ServiceStatus `json:"ollama"`
+	OpenVINO ServiceStatus `json:"openvino"`
+	Agent    ServiceStatus `json:"agent"`
+	Search   ServiceStatus `json:"search"`
+	Parser   ParserStatus  `json:"parser"`
 }
 
 type ServicesStatusHandler struct {
 	agentHandler *AgentHandler
 	ollamaURL    string
+	openvinoURL  string
 	parserClient *service.ParserClient
 	searchClient *service.SearchClient
 }
 
-func NewServicesStatusHandler(agentHandler *AgentHandler, ollamaURL string, parserClient *service.ParserClient, searchClient *service.SearchClient) *ServicesStatusHandler {
+func NewServicesStatusHandler(agentHandler *AgentHandler, ollamaURL, openvinoURL string, parserClient *service.ParserClient, searchClient *service.SearchClient) *ServicesStatusHandler {
 	return &ServicesStatusHandler{
 		agentHandler: agentHandler,
 		ollamaURL:    ollamaURL,
+		openvinoURL:  openvinoURL,
 		parserClient: parserClient,
 		searchClient: searchClient,
 	}
@@ -55,13 +58,21 @@ func (h *ServicesStatusHandler) Status(c echo.Context) error {
 		wg   sync.WaitGroup
 	)
 
-	wg.Add(4)
+	wg.Add(5)
 
 	go func() {
 		defer wg.Done()
 		resp.Ollama = ServiceStatus{
 			Running: h.checkOllama(ctx),
 			URL:     h.ollamaURL,
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		resp.OpenVINO = ServiceStatus{
+			Running: h.checkOpenVINO(ctx),
+			URL:     h.openvinoURL,
 		}
 	}()
 
@@ -85,6 +96,23 @@ func (h *ServicesStatusHandler) Status(c echo.Context) error {
 	wg.Wait()
 
 	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *ServicesStatusHandler) checkOpenVINO(ctx context.Context) bool {
+	if h.openvinoURL == "" {
+		return false
+	}
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.openvinoURL+"/v2/health/ready", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 func (h *ServicesStatusHandler) checkOllama(ctx context.Context) bool {

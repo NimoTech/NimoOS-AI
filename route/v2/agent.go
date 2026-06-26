@@ -1,8 +1,10 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -11,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NimoTech/NimoOS-AI/pkg/config"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
@@ -114,7 +117,16 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 	}
 
 	providerType := c.Request().Header.Get("X-Agent-Provider-Type")
-	if providerType == "ollama" {
+	// OpenVINO(OVMS):agent 路由不像 chat.go 有模型名前缀路由,这里检测 run body 里
+	// 形如 "name@GPU.1" 的 OVMS 设备后缀模型,把 agent 指向 OVMS(OpenAI 兼容,无鉴权),
+	// 并把 model 改写成 OVMS 内部 servable 名("name-gpu1")。优先级高于 provider_type。
+	if h.routeOpenVINO(c) {
+		c.Request().Header.Set("X-Agent-Provider-Key", "openvino")
+		c.Request().Header.Set("X-Agent-Provider-Url", config.Cfg.OpenVINOURL+"/v3")
+		// 让 Python 侧据此套用 Qwen 系的思考开关(think/enable_thinking),
+		// UI 关闭思考时模型才会跳过冗长 reasoning、直接产出工具调用/答案。
+		c.Request().Header.Set("X-Agent-Provider-Type", "openvino")
+	} else if providerType == "ollama" {
 		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
 		c.Request().Header.Set("X-Agent-Provider-Url", "http://127.0.0.1:11434/v1")
 	} else if h.svc != nil {
@@ -159,6 +171,86 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 
 	h.proxy.ServeHTTP(c.Response().Writer, c.Request())
 	return nil
+}
+
+// routeOpenVINO inspects a JSON request body for an OVMS device-suffixed model
+// name ("name@GPU.1") and, when found, rewrites the body's "model" field to the
+// OVMS internal servable name ("name-gpu1") so the agent's OpenAI client talks
+// to OVMS directly. Returns true iff the request was rewritten for OpenVINO.
+// The body is always restored (rewritten or not) so the reverse proxy can
+// forward it. Non-JSON / bodyless requests are ignored.
+func (h *AgentHandler) routeOpenVINO(c echo.Context) bool {
+	req := c.Request()
+	if req.Body == nil || !strings.HasPrefix(req.Header.Get("Content-Type"), "application/json") {
+		return false
+	}
+	body, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	restore := func(b []byte) {
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		req.ContentLength = int64(len(b))
+		req.Header.Set("Content-Length", strconv.Itoa(len(b)))
+	}
+	if err != nil {
+		restore(body)
+		return false
+	}
+	var m map[string]json.RawMessage
+	var model string
+	if json.Unmarshal(body, &m) != nil {
+		restore(body)
+		return false
+	}
+	if raw, ok := m["model"]; !ok || json.Unmarshal(raw, &model) != nil {
+		restore(body)
+		return false
+	}
+	// UI 从本地模型列表选 OpenVINO 模型时,model 形如 "openvino:<dir>@<device>"
+	// (model_manager 的 provider 前缀)。必须先剥掉 "openvino:",否则 ':' 会被
+	// sanitize 成 '-',servable 多出 "openvino-" 头,OVMS 找不到 graph → 404。
+	model = strings.TrimPrefix(model, "openvino:")
+	bare, device, ok := parseOVMSDeviceSuffix(model)
+	if !ok {
+		restore(body)
+		return false
+	}
+	// On-demand load: ensure OVMS has this model loaded before the agent's Python
+	// client calls it (blocks until ready; first load can take minutes). Best-effort
+	// — on failure we still route so OVMS surfaces a clear error to the caller.
+	if h.svc != nil {
+		if adapter := h.svc.OpenVINOAdapter(); adapter != nil {
+			_ = adapter.EnsureLoaded(bare, device)
+		}
+	}
+	enc, err := json.Marshal(service.OVMSModelName(bare, device))
+	if err != nil {
+		restore(body)
+		return false
+	}
+	m["model"] = enc
+	nb, err := json.Marshal(m)
+	if err != nil {
+		restore(body)
+		return false
+	}
+	restore(nb)
+	return true
+}
+
+// parseOVMSDeviceSuffix splits "name@GPU.1" into ("name","GPU.1",true). It only
+// matches a trailing @<device> where device starts with GPU/NPU or equals CPU —
+// the device forms OVMSModelName produces. Anything else returns ok=false.
+func parseOVMSDeviceSuffix(model string) (bare, device string, ok bool) {
+	i := strings.LastIndex(model, "@")
+	if i <= 0 || i == len(model)-1 {
+		return "", "", false
+	}
+	bare, device = model[:i], model[i+1:]
+	up := strings.ToUpper(device)
+	if strings.HasPrefix(up, "GPU") || strings.HasPrefix(up, "NPU") || up == "CPU" {
+		return bare, device, true
+	}
+	return "", "", false
 }
 
 func (h *AgentHandler) resolveProvider(userID string) (key, provURL string, ok bool) {

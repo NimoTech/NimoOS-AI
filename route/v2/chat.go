@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NimoTech/NimoOS-AI/pkg/config"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
@@ -47,6 +48,8 @@ func (h *ChatHandler) ChatCompletions(c echo.Context) error {
 	switch target.backend {
 	case service.BackendLocal:
 		return h.forwardToLocal(c, bytes.NewReader(body), stream)
+	case service.BackendOpenVINO:
+		return h.forwardToOpenVINO(c, target, body, stream)
 	case service.BackendCloud:
 		// Reuse Decide(forceCloud=true) purely for the AllowRemote veto.
 		if _, derr := h.svc.Router().Decide(userID, true); derr != nil {
@@ -80,6 +83,69 @@ func (h *ChatHandler) forwardToLocal(c echo.Context, body io.Reader, stream bool
 				"code":    "local_model_failed",
 				"type":    "escalation_required",
 				"message": "Local model failed. Set X-NimoOS-Force-Cloud: true to retry with cloud.",
+			},
+		})
+	}
+	defer resp.Body.Close()
+	if stream {
+		return proxySSEResponse(c, resp)
+	}
+	return proxyResponse(c, resp)
+}
+
+// forwardToOpenVINO routes a request to the local OVMS backend on the requested
+// device. OpenVINO is a local backend, so it is not subject to the AllowRemote
+// privacy policy (same as Ollama).
+func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body []byte, stream bool) error {
+	if config.Cfg != nil && !config.Cfg.OpenVINOEnabled {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    "backend_disabled",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 后端已禁用",
+			},
+		})
+	}
+	adapter := h.svc.OpenVINOAdapter()
+
+	device := target.device
+	if device == "" {
+		device = adapter.DefaultDevice()
+	}
+	if !adapter.HasDevice(device) {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":      "unknown_device",
+				"type":      "invalid_request_error",
+				"message":   "device not resident on OpenVINO backend",
+				"available": adapter.Devices(),
+			},
+		})
+	}
+
+	// On-demand load: ensure this model is loaded into OVMS (loads it, evicting
+	// any other, on first use). Blocks until ready — first load can take minutes.
+	if err := adapter.EnsureLoaded(target.bareModel, device); err != nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    "model_load_failed",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 模型加载失败: " + err.Error(),
+			},
+		})
+	}
+
+	// Rewrite the model field to the OVMS internal servable name.
+	internal := service.OVMSModelName(target.bareModel, device)
+	rewritten := setModelField(body, internal)
+
+	resp, err := adapter.ChatCompletions(bytes.NewReader(rewritten))
+	if err != nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    "backend_unavailable",
+				"type":    "service_unavailable",
+				"message": "OpenVINO 服务未就绪",
 			},
 		})
 	}
@@ -263,6 +329,7 @@ type modelTarget struct {
 	backend    service.Backend
 	providerID int64
 	bareModel  string
+	device     string // 仅 openvino 后端使用;"" 表示用默认设备
 }
 
 // parseModelTarget reads the model field, classifies the routing target, and
@@ -288,6 +355,15 @@ func parseModelTarget(body []byte) (modelTarget, []byte) {
 
 	tgt := modelTarget{bareModel: model}
 	switch {
+	case strings.HasPrefix(model, "openvino:"):
+		tgt.backend = service.BackendOpenVINO
+		rest := model[len("openvino:"):]
+		if idx := strings.LastIndex(rest, "@"); idx >= 0 {
+			tgt.bareModel = rest[:idx]
+			tgt.device = rest[idx+1:]
+		} else {
+			tgt.bareModel = rest
+		}
 	case strings.HasPrefix(model, "local:"):
 		tgt.backend = service.BackendLocal
 		tgt.bareModel = model[len("local:"):]
@@ -336,6 +412,25 @@ func stripInternalFields(body []byte) []byte {
 		return body
 	}
 	delete(req, "_backend")
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// setModelField rewrites the "model" field of an OpenAI-format request body.
+// Used to translate a user-facing model name into the OVMS internal servable name.
+func setModelField(body []byte, model string) []byte {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return body
+	}
+	req["model"] = encoded
 	out, err := json.Marshal(req)
 	if err != nil {
 		return body

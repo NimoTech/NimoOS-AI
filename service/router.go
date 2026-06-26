@@ -10,8 +10,9 @@ var ErrRemoteNotAllowed = errors.New("remote access is not allowed by privacy po
 type Backend string
 
 const (
-	BackendLocal Backend = "local"
-	BackendCloud Backend = "cloud"
+	BackendLocal    Backend = "local"
+	BackendCloud    Backend = "cloud"
+	BackendOpenVINO Backend = "openvino"
 )
 
 // ForceLocal is true only when AllowRemote is false (policy-enforced local).

@@ -30,6 +30,8 @@ func TestSupportsThinking(t *testing.T) {
 		{"ollama", "llama3", false},
 		{"ollama", "llama3.1:8b-instruct-q4_K_M", false},
 		{"ollama", "qwen2.5:7b", false},
+		{"openvino", "qwen3-vl-int4", true},
+		{"openvino", "some-plain-model", false},
 		{"other", "anything", false},
 		{"", "", false},
 	}

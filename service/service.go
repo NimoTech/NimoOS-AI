@@ -15,7 +15,9 @@ type Services interface {
 	DB() *sql.DB
 	MasterKey() *crypto.MasterKey
 	OllamaChecker() *OllamaChecker
+	OpenVINOChecker() *OpenVINOChecker
 	LocalAdapter() *LocalAdapter
+	OpenVINOAdapter() *OpenVINOAdapter
 	Router() *Router
 	Providers() *providerService
 	ModelManager() *ModelManager
@@ -26,30 +28,34 @@ type Services interface {
 }
 
 type services struct {
-	db            *sql.DB
-	masterKey     *crypto.MasterKey
-	ollamaChecker *OllamaChecker
-	localAdapter  *LocalAdapter
-	router        *Router
-	providers     *providerService
-	modelManager  *ModelManager
-	sessions      *sessionService
-	blacklist     *blacklistService
-	skills        *skillsService
-	mcp           *mcpService
+	db              *sql.DB
+	masterKey       *crypto.MasterKey
+	ollamaChecker   *OllamaChecker
+	openvinoChecker *OpenVINOChecker
+	localAdapter    *LocalAdapter
+	openvinoAdapter *OpenVINOAdapter
+	router          *Router
+	providers       *providerService
+	modelManager    *ModelManager
+	sessions        *sessionService
+	blacklist       *blacklistService
+	skills          *skillsService
+	mcp             *mcpService
 }
 
-func (s *services) DB() *sql.DB                   { return s.db }
-func (s *services) MasterKey() *crypto.MasterKey  { return s.masterKey }
-func (s *services) OllamaChecker() *OllamaChecker { return s.ollamaChecker }
-func (s *services) LocalAdapter() *LocalAdapter   { return s.localAdapter }
-func (s *services) Router() *Router               { return s.router }
-func (s *services) Providers() *providerService   { return s.providers }
-func (s *services) ModelManager() *ModelManager   { return s.modelManager }
-func (s *services) Sessions() *sessionService     { return s.sessions }
-func (s *services) Blacklist() *blacklistService  { return s.blacklist }
-func (s *services) Skills() *skillsService        { return s.skills }
-func (s *services) MCP() *mcpService              { return s.mcp }
+func (s *services) DB() *sql.DB                       { return s.db }
+func (s *services) MasterKey() *crypto.MasterKey      { return s.masterKey }
+func (s *services) OllamaChecker() *OllamaChecker     { return s.ollamaChecker }
+func (s *services) OpenVINOChecker() *OpenVINOChecker { return s.openvinoChecker }
+func (s *services) LocalAdapter() *LocalAdapter       { return s.localAdapter }
+func (s *services) OpenVINOAdapter() *OpenVINOAdapter { return s.openvinoAdapter }
+func (s *services) Router() *Router                   { return s.router }
+func (s *services) Providers() *providerService       { return s.providers }
+func (s *services) ModelManager() *ModelManager       { return s.modelManager }
+func (s *services) Sessions() *sessionService         { return s.sessions }
+func (s *services) Blacklist() *blacklistService      { return s.blacklist }
+func (s *services) Skills() *skillsService            { return s.skills }
+func (s *services) MCP() *mcpService                  { return s.mcp }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -67,8 +73,10 @@ func NewService(cfg *config.Config) Services {
 	providerSvc := &providerService{db: db}
 	checker := NewOllamaChecker(common.OllamaBaseURL)
 	local := NewLocalAdapter(common.OllamaBaseURL)
+	ovChecker := NewOpenVINOChecker(cfg.OpenVINOURL)
+	ovAdapter := NewOpenVINOAdapter(cfg.OpenVINOURL, cfg.OpenVINODevices)
 	router := &Router{providers: providerSvc, db: db}
-	modelMgr := NewModelManager(common.OllamaBaseURL, db)
+	modelMgr := NewModelManager(common.OllamaBaseURL, ovAdapter, db)
 	sessionSvc := &sessionService{db: db}
 	blacklistSvc := &blacklistService{db: db}
 	skillsRoot := filepath.Join(cfg.DataPath, "skills")
@@ -108,17 +116,19 @@ func NewService(cfg *config.Config) Services {
 	}
 
 	return &services{
-		db:            db,
-		masterKey:     mk,
-		ollamaChecker: checker,
-		localAdapter:  local,
-		router:        router,
-		providers:     providerSvc,
-		modelManager:  modelMgr,
-		sessions:      sessionSvc,
-		blacklist:     blacklistSvc,
-		skills:        skillsSvc,
-		mcp:           mcpSvc,
+		db:              db,
+		masterKey:       mk,
+		ollamaChecker:   checker,
+		openvinoChecker: ovChecker,
+		localAdapter:    local,
+		openvinoAdapter: ovAdapter,
+		router:          router,
+		providers:       providerSvc,
+		modelManager:    modelMgr,
+		sessions:        sessionSvc,
+		blacklist:       blacklistSvc,
+		skills:          skillsSvc,
+		mcp:             mcpSvc,
 	}
 }
 

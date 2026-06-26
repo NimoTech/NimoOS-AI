@@ -79,6 +79,18 @@ func main() {
 		checker.Start(ctx)
 	}()
 
+	// Start OpenVINO (OVMS) health checker when enabled.
+	if config.Cfg.OpenVINOEnabled {
+		go func() {
+			ov := svc.OpenVINOChecker()
+			ov.SetCallbacks(
+				func() { logger.Info("OpenVINO (OVMS) is unhealthy after 3 consecutive failures") },
+				func() { logger.Info("OpenVINO (OVMS) recovered") },
+			)
+			ov.Start(ctx)
+		}()
+	}
+
 	// Bind to a random port on localhost
 	listener, err := net.Listen("tcp", net.JoinHostPort(common.Localhost, "0"))
 	if err != nil {
@@ -107,7 +119,7 @@ func main() {
 		}
 	}
 
-	handler := route.InitV2Router(svc, config.Cfg.RuntimePath, config.Cfg.AgentURL, config.Cfg.OllamaURL)
+	handler := route.InitV2Router(svc, config.Cfg.RuntimePath, config.Cfg.AgentURL, config.Cfg.OllamaURL, config.Cfg.OpenVINOURL)
 
 	// Notify systemd
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {

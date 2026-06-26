@@ -2,6 +2,15 @@ package service
 
 import "testing"
 
+func TestClassifyProviderOpenVINO(t *testing.T) {
+	if got := ClassifyProvider("http://127.0.0.1:9100", ProtocolOpenAI); got != "openvino" {
+		t.Fatalf("want openvino, got %q", got)
+	}
+	if got := ClassifyProvider("http://localhost:9100/v3", ProtocolOpenAI); got != "openvino" {
+		t.Fatalf("want openvino, got %q", got)
+	}
+}
+
 func TestClassifyByBaseURL(t *testing.T) {
 	cases := []struct {
 		baseURL  string
