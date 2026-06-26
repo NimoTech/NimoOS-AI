@@ -88,7 +88,7 @@ def effective_score(row, now) -> float:
     return float(row["priority"]) + recency_boost + reinforcement
 
 
-def rank_for_injection(rows, now):
+def rank_for_injection(rows, now) -> list:
     return sorted(rows, key=lambda r: effective_score(r, now), reverse=True)
 
 

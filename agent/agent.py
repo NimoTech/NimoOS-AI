@@ -524,7 +524,7 @@ class AgentRunner:
             # Memory tools resolve identity from these per-run vars (never an
             # LLM parameter). session_id lets remember() stamp origin_session_id.
             memory_skills.USER_ID_VAR.set(str(user_id))
-            memory_skills.SESSION_ID_VAR.set(session_id)
+            memory_skills.SESSION_ID_VAR.set(str(session_id))
 
             # Photos service auth: album endpoints validate the user JWT, so
             # forward the caller's Authorization header to the photo tools.
