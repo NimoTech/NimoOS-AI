@@ -5,10 +5,15 @@ the chat main path; bounded by hard timeout + attempt cap + sequential single-fl
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 
 import memory_store
+from memory_lock import get_user_lock
+
+_LOG = logging.getLogger("nimoos-agent.memory_extract")
 
 POLL_SECONDS = 30
 IDLE_SECONDS = 120
@@ -156,3 +161,78 @@ def apply_extraction(conn, user_id, snapshot, result, *, now=None) -> dict:
         memory_store.bump_recall(conn, ref_ids, now=now)
         counts["referenced"] = len(ref_ids)
     return counts
+
+
+def _claim_idle_job(conn, now):
+    """Pick the oldest pending job whose session has been idle >= IDLE_SECONDS.
+    Returns the row (sqlite3.Row) or None."""
+    return conn.execute(
+        "SELECT * FROM memory_extract_jobs "
+        "WHERE status='pending' AND enqueued_at <= ? "
+        "ORDER BY enqueued_at ASC LIMIT 1",
+        (now - IDLE_SECONDS,),
+    ).fetchone()
+
+
+def _fail_job(conn, session_id, attempts, err, now):
+    if attempts >= MAX_ATTEMPTS:
+        conn.execute("DELETE FROM memory_extract_jobs WHERE session_id=?", (session_id,))
+    else:
+        conn.execute(
+            "UPDATE memory_extract_jobs SET status='pending', last_error=?, updated_at=? "
+            "WHERE session_id=?", (err, now, session_id))
+    conn.commit()
+
+
+async def process_pending_once(conn, *, llm_call, history_loader, now=None):
+    now = now if now is not None else int(time.time())
+    job = _claim_idle_job(conn, now)
+    if job is None:
+        return None
+    session_id, user_id = job["session_id"], job["user_id"]
+    attempts = job["attempts"] + 1
+    conn.execute("UPDATE memory_extract_jobs SET status='running', attempts=?, updated_at=? "
+                 "WHERE session_id=?", (attempts, now, session_id))
+    conn.commit()
+
+    lock = get_user_lock(user_id)
+    # 1) snapshot existing memories under the lock (short)
+    async with lock:
+        rows = memory_store.list_active(conn, user_id, now=now)
+        existing = [{"id": r["id"], "kind": r["kind"], "text": r["text"]} for r in rows]
+        snapshot = {r["id"]: r["updated_at"] for r in rows}
+
+    # 2) LLM call OUTSIDE the lock, hard-bounded
+    try:
+        history = history_loader(session_id)
+        prompt = build_extraction_prompt(history, existing)
+        raw = await asyncio.wait_for(llm_call(job, prompt), timeout=LLM_TIMEOUT)
+        result = parse_extraction(raw)
+        if result is None:
+            raise ValueError("unparseable extraction response")
+    except Exception as e:                       # timeout / network / parse / creds
+        _LOG.warning("memory extract failed for %s: %s", session_id, e)
+        _fail_job(conn, session_id, attempts, str(e), now)
+        return session_id
+
+    # 3) apply under the lock (short), then delete the job row
+    async with lock:
+        mx_counts = apply_extraction(conn, user_id, snapshot, result, now=now)
+    conn.execute("DELETE FROM memory_extract_jobs WHERE session_id=?", (session_id,))
+    conn.commit()
+    _LOG.info("memory extract %s: %s", session_id, mx_counts)
+    return session_id
+
+
+async def worker_loop(conn, *, stop_event):
+    """Poll loop; one job per tick (sequential, CPU-NAS friendly)."""
+    while not stop_event.is_set():
+        try:
+            await process_pending_once(conn, llm_call=_default_llm_call,
+                                       history_loader=_default_history_loader)
+        except Exception as e:                   # never let the loop die
+            _LOG.exception("memory worker tick error: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
