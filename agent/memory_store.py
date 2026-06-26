@@ -143,3 +143,32 @@ def is_memory_enabled(conn, user_id) -> bool:
     if row is None:
         return True
     return row["value"] != "0"
+
+
+def supersede_memory(conn, old_id, user_id, text, kind, *, priority=0,
+                     origin_session_id=None, now=None):
+    """Replace an active memory with a successor that inherits the family
+    (lineage_id) and recall_count; mark the predecessor 'superseded'. Returns
+    the new id, or None if old_id is not an active row for user_id."""
+    now = now if now is not None else int(time.time())
+    pred = conn.execute(
+        "SELECT lineage_id, recall_count FROM memory_entries "
+        "WHERE id=? AND user_id=? AND status='active'",
+        (old_id, str(user_id)),
+    ).fetchone()
+    if pred is None:
+        return None
+    new_id = add_memory(conn, user_id, text, kind, source="auto",
+                        priority=priority, origin_session_id=origin_session_id,
+                        lineage_id=pred["lineage_id"], now=now)
+    conn.execute(
+        "UPDATE memory_entries SET recall_count=?, supersedes=?, updated_at=? "
+        "WHERE id=?",
+        (pred["recall_count"], old_id, now, new_id),
+    )
+    conn.execute(
+        "UPDATE memory_entries SET status='superseded', updated_at=? WHERE id=?",
+        (now, old_id),
+    )
+    conn.commit()
+    return new_id

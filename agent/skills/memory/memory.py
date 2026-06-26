@@ -12,6 +12,7 @@ from agents import function_tool
 
 import db as db_module
 import memory_store
+from memory_lock import get_user_lock
 
 # Set per-run by AgentRunner.run; read at tool-call time.
 USER_ID_VAR: ContextVar[str] = ContextVar("memory_user_id", default="")
@@ -29,13 +30,14 @@ async def _remember_impl(text: str, kind: str = "fact", priority: int = 0) -> st
     conn = db_module.get_connection()
     if not memory_store.is_memory_enabled(conn, uid):
         return json.dumps({"status": "disabled"}, ensure_ascii=False)
-    dup = memory_store.find_active_duplicate(conn, uid, text)
-    if dup:
-        return json.dumps({"status": "duplicate", "id": dup}, ensure_ascii=False)
-    sid = SESSION_ID_VAR.get() or None
-    mem_id = memory_store.add_memory(
-        conn, uid, text, kind, source="tool", priority=priority,
-        origin_session_id=sid)
+    async with get_user_lock(uid):
+        dup = memory_store.find_active_duplicate(conn, uid, text)
+        if dup:
+            return json.dumps({"status": "duplicate", "id": dup}, ensure_ascii=False)
+        sid = SESSION_ID_VAR.get() or None
+        mem_id = memory_store.add_memory(
+            conn, uid, text, kind, source="tool", priority=priority,
+            origin_session_id=sid)
     return json.dumps({"status": "added", "id": mem_id}, ensure_ascii=False)
 
 

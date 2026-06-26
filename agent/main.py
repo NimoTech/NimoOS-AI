@@ -180,6 +180,12 @@ async def _attachments_startup():
         _LOG.warning("attachment GC failed: %s", e)
 
 
+@app.on_event("startup")
+async def _memory_worker_startup():
+    import memory_extract
+    memory_extract.start_worker(_db())
+
+
 # ---------------------------------------------------------------------------
 # Startup orchestration helpers (netns + egress-proxy + executor)
 # ---------------------------------------------------------------------------
@@ -1660,6 +1666,14 @@ def _start_run(session_id: str, user_id: str, message: str,
                     ("error" if error_msg else "done", error_msg, int(time.time()), run_id),
                 )
                 _conn.commit()
+            except Exception:
+                pass
+            try:
+                import memory_extract
+                memory_extract.maybe_enqueue_extract_job(
+                    _conn, session_id, user_id,
+                    provider_url=provider_url, provider_key=provider_key,
+                    provider_type=provider_type, model_name=model)
             except Exception:
                 pass
             # Don't leave references to a finished task pinned in _active_runs;
