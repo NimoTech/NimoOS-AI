@@ -4,7 +4,7 @@ from skills import tool_gating as tg
 def test_overview_lists_all_categories():
     txt = tg.categories_overview()
     for cat in ("apps", "files", "photos", "wiki",
-                "documents", "system", "events", "mcp"):
+                "documents", "system", "events", "memory", "mcp"):
         assert cat in txt
 
 
