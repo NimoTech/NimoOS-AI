@@ -24,13 +24,29 @@ type Config struct {
 	OpenVINOIdleTTLMinutes int // 空闲多少分钟后自动卸载(对齐 Ollama keep_alive),默认 5;0=永不卸载
 }
 
+// Init loads the config and assigns it to the package-level Cfg. It is the
+// production entry point; tests should call Load instead so they don't mutate
+// (or race on) the global.
 func Init(configFile, confSample string) error {
+	cfg, err := Load(configFile, confSample)
+	if err != nil {
+		return err
+	}
+	Cfg = cfg
+	return nil
+}
+
+// Load reads and parses the config file (writing confSample when the file is
+// absent) and returns a fully-defaulted *Config. It does NOT touch the
+// package-level Cfg, so callers and tests can build configs without shared
+// global state.
+func Load(configFile, confSample string) (*Config, error) {
 	if configFile == "" {
 		configFile = "/etc/nimoos/ai.conf"
 	}
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
 		if err := os.WriteFile(configFile, []byte(confSample), 0644); err != nil {
-			return fmt.Errorf("failed to write default config: %w", err)
+			return nil, fmt.Errorf("failed to write default config: %w", err)
 		}
 	}
 
@@ -38,10 +54,10 @@ func Init(configFile, confSample string) error {
 	v.SetConfigFile(configFile)
 	v.SetConfigType("ini")
 	if err := v.ReadInConfig(); err != nil {
-		return fmt.Errorf("failed to read config: %w", err)
+		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
-	Cfg = &Config{
+	cfg := &Config{
 		RuntimePath:   v.GetString("common.RuntimePath"),
 		DataPath:      v.GetString("common.DataPath"),
 		MasterKeyPath: v.GetString("ai.MasterKeyPath"),
@@ -56,45 +72,45 @@ func Init(configFile, confSample string) error {
 		OpenVINOIdleTTLMinutes: v.GetInt("openvino.IdleTTLMinutes"),
 	}
 
-	if Cfg.RuntimePath == "" {
-		Cfg.RuntimePath = "/var/run/nimoos"
+	if cfg.RuntimePath == "" {
+		cfg.RuntimePath = "/var/run/nimoos"
 	}
-	if Cfg.DataPath == "" {
-		Cfg.DataPath = "/var/lib/nimoos/ai"
+	if cfg.DataPath == "" {
+		cfg.DataPath = "/var/lib/nimoos/ai"
 	}
-	if Cfg.MasterKeyPath == "" {
-		Cfg.MasterKeyPath = "/etc/nimoos/ai_master.key"
+	if cfg.MasterKeyPath == "" {
+		cfg.MasterKeyPath = "/etc/nimoos/ai_master.key"
 	}
-	if Cfg.LogPath == "" {
-		Cfg.LogPath = "/var/log/nimoos"
+	if cfg.LogPath == "" {
+		cfg.LogPath = "/var/log/nimoos"
 	}
-	if Cfg.AgentURL == "" {
-		Cfg.AgentURL = "http://127.0.0.1:8282"
+	if cfg.AgentURL == "" {
+		cfg.AgentURL = "http://127.0.0.1:8282"
 	}
-	if Cfg.AgentTimeout == 0 {
-		Cfg.AgentTimeout = 60
+	if cfg.AgentTimeout == 0 {
+		cfg.AgentTimeout = 60
 	}
-	if Cfg.OllamaURL == "" {
-		Cfg.OllamaURL = "http://127.0.0.1:11434"
+	if cfg.OllamaURL == "" {
+		cfg.OllamaURL = "http://127.0.0.1:11434"
 	}
-	if Cfg.OpenVINOURL == "" {
-		Cfg.OpenVINOURL = "http://127.0.0.1:9100"
+	if cfg.OpenVINOURL == "" {
+		cfg.OpenVINOURL = "http://127.0.0.1:9100"
 	}
 	// Enabled 默认 true:仅当配置里显式写了 openvino.Enabled 才用其值,否则 true。
 	if v.IsSet("openvino.Enabled") {
-		Cfg.OpenVINOEnabled = v.GetBool("openvino.Enabled")
+		cfg.OpenVINOEnabled = v.GetBool("openvino.Enabled")
 	} else {
-		Cfg.OpenVINOEnabled = true
+		cfg.OpenVINOEnabled = true
 	}
-	if Cfg.OpenVINODevices == "" {
-		Cfg.OpenVINODevices = "GPU.1"
+	if cfg.OpenVINODevices == "" {
+		cfg.OpenVINODevices = "GPU.1"
 	}
-	if Cfg.OpenVINOMaxLoaded <= 0 {
-		Cfg.OpenVINOMaxLoaded = 3
+	if cfg.OpenVINOMaxLoaded <= 0 {
+		cfg.OpenVINOMaxLoaded = 3
 	}
 	// IdleTTLMinutes:显式 0 = 永不卸载,必须与"键缺失"区分 —— 仅当未设置时才取默认 5。
 	if !v.IsSet("openvino.IdleTTLMinutes") {
-		Cfg.OpenVINOIdleTTLMinutes = 5
+		cfg.OpenVINOIdleTTLMinutes = 5
 	}
-	return nil
+	return cfg, nil
 }
