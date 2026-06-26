@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     thinking_enabled  INTEGER,
     thinking_level    TEXT,
     agent_type        TEXT NOT NULL DEFAULT 'general',
-    network_granted   INTEGER NOT NULL DEFAULT 0
+    network_granted   INTEGER NOT NULL DEFAULT 0,
+    recall_indexed_msgs INTEGER NOT NULL DEFAULT 0,
+    recall_chunk_seq    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -180,6 +182,18 @@ CREATE TABLE IF NOT EXISTS memory_extract_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_status
     ON memory_extract_jobs(status, enqueued_at);
+
+CREATE TABLE IF NOT EXISTS recall_index_jobs (
+    session_id   TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending', -- 'pending'|'running'|'done'|'error'
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    enqueued_at  INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_jobs_status
+    ON recall_index_jobs(status, enqueued_at);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -246,6 +260,12 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "unlocked_tool_categories" not in existing:
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN unlocked_tool_categories TEXT")
+    if "recall_indexed_msgs" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN "
+                     "recall_indexed_msgs INTEGER NOT NULL DEFAULT 0")
+    if "recall_chunk_seq" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN "
+                     "recall_chunk_seq INTEGER NOT NULL DEFAULT 0")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}

@@ -1,0 +1,52 @@
+import pytest
+from db import init_db
+import recall_index as ri
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = init_db(str(tmp_path / "m.db"))
+    yield c
+    c.close()
+
+
+def test_sessions_has_recall_offset_columns(conn):
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    assert {"recall_indexed_msgs", "recall_chunk_seq"} <= cols
+
+
+def test_enqueue_when_enabled_and_coalesces(conn):
+    assert ri.maybe_enqueue_index_job(conn, "s1", "u1", now=1000) is True
+    assert ri.maybe_enqueue_index_job(conn, "s1", "u1", now=2000) is True
+    rows = conn.execute(
+        "SELECT * FROM recall_index_jobs WHERE session_id='s1'").fetchall()
+    assert len(rows) == 1                      # coalesced
+    assert rows[0]["enqueued_at"] == 2000      # refreshed
+    assert rows[0]["status"] == "pending"
+
+
+def test_not_enqueued_when_disabled(conn):
+    conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
+                 "VALUES('u1','memory_enabled','0',0)")
+    assert ri.maybe_enqueue_index_job(conn, "s1", "u1", now=1000) is False
+    assert conn.execute("SELECT COUNT(*) c FROM recall_index_jobs"
+                        ).fetchone()["c"] == 0
+
+
+def test_chunk_messages_starts_at_offset_and_splits():
+    msgs = [
+        {"role": "user", "content": "a" * 1500},
+        {"role": "assistant", "content": "b" * 1500},
+        {"role": "user", "content": "c" * 100},
+    ]
+    chunks = ri.chunk_messages(msgs, start_chunk_no=7, now=42, max_chars=2000)
+    assert [c["chunk_no"] for c in chunks] == [7, 8]   # numbering continues from 7
+    assert all(c["created_at"] == 42 for c in chunks)
+    assert "user: " + "a" * 1500 in chunks[0]["text"]
+
+
+def test_chunk_messages_skips_empty():
+    msgs = [{"role": "user", "content": ""},
+            {"role": "assistant", "content": "hi"}]
+    chunks = ri.chunk_messages(msgs, start_chunk_no=0, now=1, max_chars=2000)
+    assert len(chunks) == 1 and chunks[0]["chunk_no"] == 0
