@@ -165,7 +165,7 @@ const (
 // NewOpenVINOAdapter builds an adapter. devicesCSV is the comma-separated
 // selectable device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
 // maxLoaded 是同时最多驻留的模型数(<=0 视作默认 3);idleTTLMinutes 是空闲卸载分钟数
-// (0 = 永不卸载)。构造时从现有 config.json 重建驻留集(reconcileFromConfig)。
+// (0 = 永不卸载)。构造时按 OVMS 实时服务集重建驻留集(reconcileFromOVMS)。
 func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes int) *OpenVINOAdapter {
 	var devs []string
 	for _, d := range strings.Split(devicesCSV, ",") {
@@ -190,7 +190,7 @@ func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes in
 		maxLoaded:     maxLoaded,
 		idleTTL:       time.Duration(idleTTLMinutes) * time.Minute,
 	}
-	a.reconcileFromConfig()
+	a.reconcileFromOVMS()
 	go a.reaperLoop()
 	return a
 }
