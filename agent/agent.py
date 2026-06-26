@@ -32,6 +32,8 @@ import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
 import skills.search as search_skills
+import skills.memory as memory_skills
+import memory_store
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
@@ -129,6 +131,13 @@ def _compose_system_prompt(conn, session_id: str, base: str,
     if truncated:
         block += f"\n[...{truncated} more agent.md files truncated]"
     return base + block
+
+
+def compose_memory_block(conn, user_id: str) -> str:
+    """Render the profile-memory block for injection. Empty string when the
+    user has no active memories. Pure SQL + arithmetic — safe on the main path.
+    """
+    return memory_store.render_user_block(conn, str(user_id))
 
 
 def _fetch_attachments(attachment_ids, session_id):
@@ -512,6 +521,11 @@ class AgentRunner:
             # tracked follow-up).
             search_skills.USER_ID_VAR.set(str(user_id))
 
+            # Memory tools resolve identity from these per-run vars (never an
+            # LLM parameter). session_id lets remember() stamp origin_session_id.
+            memory_skills.USER_ID_VAR.set(str(user_id))
+            memory_skills.SESSION_ID_VAR.set(session_id)
+
             # Photos service auth: album endpoints validate the user JWT, so
             # forward the caller's Authorization header to the photo tools.
             photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
@@ -583,6 +597,12 @@ class AgentRunner:
             base_with_wiki = (wiki_block + "\n\n" + base) if wiki_block else base
             if profile.compose_resources:
                 full_prompt = _compose_system_prompt(self._conn, session_id, base_with_wiki)
+                # Profile-memory block (P1): cross-session user facts, ranked by
+                # effective score, token-budgeted. Empty when no memories. The
+                # enable/disable toggle is wired in P5 (memory_settings).
+                mem_block = compose_memory_block(self._conn, user_id)
+                if mem_block:
+                    full_prompt = full_prompt + "\n\n" + mem_block
             else:
                 full_prompt = base_with_wiki
 
