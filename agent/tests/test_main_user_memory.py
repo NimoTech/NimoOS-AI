@@ -85,6 +85,7 @@ async def test_settings_put_then_get_roundtrip(tmp_path, monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         p = await ac.put("/agent/user-memory/settings",
                          headers={"X-User-Id": "u1"}, json={"enabled": False})
+        assert p.status_code == 200
         assert p.json() == {"enabled": False}
         g = await ac.get("/agent/user-memory/settings", headers={"X-User-Id": "u1"})
     assert g.json() == {"enabled": False}
@@ -93,3 +94,14 @@ async def test_settings_put_then_get_roundtrip(tmp_path, monkeypatch):
         "SELECT value FROM user_settings WHERE user_id='u1' AND key='memory_enabled'"
     ).fetchone()
     assert row["value"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_settings_requires_user_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        g = await ac.get("/agent/user-memory/settings")
+        p = await ac.put("/agent/user-memory/settings", json={"enabled": True})
+    assert g.status_code == 401
+    assert p.status_code == 401

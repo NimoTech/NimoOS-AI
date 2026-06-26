@@ -1519,12 +1519,16 @@ async def delete_user_memory(mem_id: str, request: Request):
 @app.get("/agent/user-memory/settings")
 async def get_memory_settings(request: Request):
     user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
     return {"enabled": memory_store.is_memory_enabled(_db(), user_id)}
 
 
 @app.put("/agent/user-memory/settings")
 async def put_memory_settings(request: Request, body: MemorySettingsPayload):
     user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
     conn = _db()
     conn.execute(
         "INSERT INTO user_settings(user_id, key, value, updated_at) "
