@@ -1495,6 +1495,23 @@ async def list_user_memory(request: Request):
     ]
 
 
+@app.delete("/agent/user-memory/{mem_id}")
+async def delete_user_memory(mem_id: str, request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    conn = _db()
+    row = conn.execute(
+        "SELECT id FROM memory_entries "
+        "WHERE id=? AND user_id=? AND status='active'",
+        (mem_id, user_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    memory_store.disable_memory(conn, mem_id)
+    return {"status": "deleted", "id": mem_id}
+
+
 @app.get("/agent/sessions/{session_id}/thinking")
 async def get_session_thinking(session_id: str, request: Request):
     """Return the session's thinking override, or null fields if unset.
