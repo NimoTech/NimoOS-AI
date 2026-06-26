@@ -236,3 +236,39 @@ async def worker_loop(conn, *, stop_event):
             await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
         except asyncio.TimeoutError:
             pass
+
+
+from openai import AsyncOpenAI
+
+
+async def _default_llm_call(job, prompt) -> str:
+    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"])
+    resp = await client.chat.completions.create(
+        model=job["model_name"],
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _default_history_loader(session_id) -> list:
+    import db
+    row = db.get_connection().execute(
+        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        return []
+    import json as _json
+    try:
+        h = _json.loads(row["content"])
+        return h if isinstance(h, list) else []
+    except (ValueError, KeyError):
+        return []
+
+
+def start_worker(conn):
+    """Launch the background worker; returns (task, stop_event)."""
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
+    return task, stop_event
