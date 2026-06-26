@@ -79,3 +79,14 @@ def disable_by_text(conn, user_id, query):
     for mid in ids:
         disable_memory(conn, mid)
     return ids
+
+
+def effective_score(row, now) -> float:
+    age_days = max(0.0, (now - row["last_recalled_at"]) / 86400.0)
+    recency_boost = 2.0 / (1.0 + age_days / 30.0)
+    reinforcement = math.log1p(row["recall_count"])
+    return float(row["priority"]) + recency_boost + reinforcement
+
+
+def rank_for_injection(rows, now):
+    return sorted(rows, key=lambda r: effective_score(r, now), reverse=True)
