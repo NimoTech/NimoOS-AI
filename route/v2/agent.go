@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -212,12 +211,9 @@ func (h *AgentHandler) routeOpenVINO(c echo.Context) bool {
 	model = strings.TrimPrefix(model, "openvino:")
 	bare, device, ok := parseOVMSDeviceSuffix(model)
 	if !ok {
-		log.Printf("[OVDBG] routeOpenVINO: model=%q no device suffix → not openvino", model)
 		restore(body)
 		return false
 	}
-	log.Printf("[OVDBG] routeOpenVINO MATCH: in=%q bare=%q device=%q servable=%q ct=%q bodylen=%d",
-		model, bare, device, service.OVMSModelName(bare, device), req.Header.Get("Content-Type"), len(body))
 	// On-demand load: ensure OVMS has this model loaded before the agent's Python
 	// client calls it (blocks until ready; first load can take minutes). Best-effort
 	// — on failure we still route so OVMS surfaces a clear error to the caller.
@@ -238,7 +234,6 @@ func (h *AgentHandler) routeOpenVINO(c echo.Context) bool {
 		return false
 	}
 	restore(nb)
-	log.Printf("[OVDBG] routeOpenVINO REWROTE: newbody=%s", string(nb))
 	return true
 }
 
