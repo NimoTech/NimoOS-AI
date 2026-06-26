@@ -33,6 +33,7 @@ def test_core_objects_not_mutated():
     orig = APP_TOOLS[0]
     agent_mod.select_tools_for_run([], session_id="s1", profile=None)
     assert orig.is_enabled is True
+    assert not callable(orig.is_enabled)   # 原件 is_enabled 仍是布尔 True,未被换成门控回调
 
 
 class _PinnedProfile:

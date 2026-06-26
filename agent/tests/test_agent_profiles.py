@@ -25,7 +25,9 @@ def test_select_tools_general_unchanged(monkeypatch):
                         lambda ids, sid: [])
     tools = agent_module.select_tools_for_run(
         [], session_id="s1", profile=PROFILES["general"])
-    assert len(tools) == len(ALL_TOOLS)
+    names = {t.name for t in tools}
+    expected = {t.name for t in ALL_TOOLS} | {"expand_tools"}
+    assert names == expected
 
 
 def test_select_tools_no_profile_kwarg_backward_compat(monkeypatch):
@@ -33,4 +35,6 @@ def test_select_tools_no_profile_kwarg_backward_compat(monkeypatch):
     monkeypatch.setattr(agent_module, "_fetch_attachments",
                         lambda ids, sid: [])
     tools = agent_module.select_tools_for_run([], session_id="s1")
-    assert len(tools) == len(ALL_TOOLS)
+    names = {t.name for t in tools}
+    expected = {t.name for t in ALL_TOOLS} | {"expand_tools"}
+    assert names == expected

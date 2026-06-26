@@ -294,6 +294,7 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
             core.append(t)
             continue
         cat = _reg.category_of(name)
+        assert cat is not None, f"tool {name!r} missing from CATEGORY_TOOLS"
         gated.append(dataclasses.replace(t, is_enabled=_gat.make_is_enabled(cat)))
 
     tools = core + [_gat.expand_tools] + gated
