@@ -60,6 +60,41 @@ async def _forget_impl(query_or_id: str) -> str:
     return json.dumps({"status": "forgotten", "ids": ids}, ensure_ascii=False)
 
 
+_recall_parser_client = None
+
+
+def _query_agent_memory(user_id, query, top_k=5):
+    """Seam over ParserClient.agent_memory_query (monkeypatched in tests)."""
+    global _recall_parser_client
+    if _recall_parser_client is None:
+        from parser_client import ParserClient
+        _recall_parser_client = ParserClient()
+    return _recall_parser_client.agent_memory_query(user_id, query, top_k=top_k)
+
+
+async def _recall_impl(query: str, top_k: int = 5) -> str:
+    uid = USER_ID_VAR.get()
+    if not uid:
+        return json.dumps({"error": "no user context"}, ensure_ascii=False)
+    conn = db_module.get_connection()
+    if not memory_store.is_memory_enabled(conn, uid):
+        return json.dumps({"status": "disabled"}, ensure_ascii=False)
+    try:
+        res = await _query_agent_memory(uid, query, top_k=top_k)
+    except Exception:
+        return json.dumps({"status": "unavailable"}, ensure_ascii=False)
+    return json.dumps({"hits": res.get("hits", [])}, ensure_ascii=False)
+
+
+@function_tool
+async def recall(query: str, top_k: int = 5) -> str:
+    """Recall relevant snippets from your PAST conversations with this user
+    (cross-session episodic memory). Use when the user refers to something
+    discussed before ("what did we decide about…", "the issue from last time").
+    Returns matching conversation snippets; empty if nothing relevant."""
+    return await _recall_impl(query, top_k)
+
+
 @function_tool
 async def remember(text: str, kind: str = "fact", priority: int = 0) -> str:
     """Persist a durable fact, preference, or long-term goal about the user so
@@ -76,4 +111,4 @@ async def forget(query_or_id: str) -> str:
     return await _forget_impl(query_or_id)
 
 
-MEMORY_TOOLS = [remember, forget]
+MEMORY_TOOLS = [remember, forget, recall]

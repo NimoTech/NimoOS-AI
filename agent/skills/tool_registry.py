@@ -19,7 +19,7 @@ from skills import WIKI_TOOLS
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "run_command", "read_file", "list_dir",
     "nimoos_search", "list_skills", "read_skill_file",
-    "remember", "forget",
+    "remember", "forget", "recall",
 })
 
 
