@@ -1,9 +1,4 @@
 {
   "model_config_list": [],
-  "mediapipe_config_list": [
-    {
-      "name": "qwen3-vl-int4-gpu1",
-      "base_path": "/var/lib/nimoos/ai/openvino/models/qwen3-vl-int4-gpu1"
-    }
-  ]
+  "mediapipe_config_list": []
 }
