@@ -274,17 +274,44 @@ def compact_image_blocks(history, *, image_id_resolver):
 
 
 def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
-    """Return tool list. Restricted profiles pin the list with no dynamic
-    additions; otherwise conditionally appends `read_attachment` when at
-    least one attachment is non-image (unchanged original behavior)."""
+    """组装本次 run 的工具。
+
+    pinned profile(profile.tools 非空):原样返回固定集,不门控。
+    general profile:常驻工具(原对象,is_enabled 默认 True)+ expand_tools +
+    其余工具的门控副本(dataclasses.replace 注入 is_enabled,不改共享原件)。
+    """
+    import dataclasses
+    from skills import tool_registry as _reg
+    from skills import tool_gating as _gat
+
     if profile is not None and profile.tools is not None:
         return list(profile.tools)
+
+    core, gated = [], []
+    for t in ALL_TOOLS:
+        name = getattr(t, "name", getattr(t, "__name__", ""))
+        if name in _reg.CORE_TOOL_NAMES:
+            core.append(t)
+            continue
+        cat = _reg.category_of(name)
+        gated.append(dataclasses.replace(t, is_enabled=_gat.make_is_enabled(cat)))
+
+    tools = core + [_gat.expand_tools] + gated
+
+    # 条件附加 read_attachment(常驻,沿用原逻辑)
     rows = _fetch_attachments(attachment_ids, session_id)
-    has_non_image = any(r["kind"] != "image" for r in rows)
-    if has_non_image:
+    if any(r["kind"] != "image" for r in rows):
         from skills.attachments import read_attachment
-        return list(ALL_TOOLS) + [read_attachment]
-    return list(ALL_TOOLS)
+        tools.append(read_attachment)
+    return tools
+
+
+def gate_runtime_tools(tools, category: str):
+    """给运行时工具(如 MCP)套上某类别的 is_enabled 门控副本。"""
+    import dataclasses
+    from skills import tool_gating as _gat
+    return [dataclasses.replace(t, is_enabled=_gat.make_is_enabled(category))
+            for t in tools]
 
 
 def attachment_system_block(attachment_ids, *, session_id: str) -> str:
@@ -439,7 +466,7 @@ class AgentRunner:
         run_id: str = "",
         attachment_ids: list[str] = (),
         context_photo=None,
-        max_turns: "int | None" = 10,
+        max_turns: "int | None" = 13,
         continue_run: bool = False,
         context_album=None,
         auth_header: str = "",
@@ -489,6 +516,11 @@ class AgentRunner:
             shell_skills.USER_PATTERNS_VAR.set(user_patterns or [])
             shell_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             shell_skills.EVENT_QUEUE_VAR.set(sink)
+
+            from skills import tool_gating as _gat
+            import db as _db
+            _gat.GATING_SESSION_VAR.set(session_id)
+            _gat.UNLOCKED_VAR.set(set(_db.get_unlocked_categories(session_id, conn=self._conn)))
 
             # --- Wiki integration ---
             wiki_client = self._wiki_client_for(session_id, user_id)
@@ -646,6 +678,14 @@ class AgentRunner:
                     "back to the interface language.]"
                 )
 
+            if profile is None or profile.tools is None:
+                full_prompt += (
+                    "\n\n[工具发现:你起步只有少量核心工具和 expand_tools。"
+                    "要使用其他能力(应用管理、文件写改、照片、wiki、文档、系统、"
+                    "事件、MCP 等),先调用 expand_tools(['类别',…]) 解锁,"
+                    "解锁的工具会在下一步出现。请一次性解锁本次预计要用的所有类别。]"
+                )
+
             # model_settings belongs on Agent, NOT on OpenAIChatCompletionsModel —
             # the SDK constructor only takes (model, openai_client,
             # should_replay_reasoning_content). The Runner pulls model_settings
@@ -663,7 +703,9 @@ class AgentRunner:
                 instructions=full_prompt,
                 tools=select_tools_for_run(attachment_ids,
                                            session_id=session_id,
-                                           profile=profile) + mcp_tools,
+                                           profile=profile)
+                + (gate_runtime_tools(mcp_tools, "mcp")
+                   if (profile is None or profile.tools is None) else mcp_tools),
                 model=model,
                 model_settings=model_settings,
             )
