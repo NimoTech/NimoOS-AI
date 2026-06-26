@@ -51,6 +51,8 @@ async def _forget_impl(query_or_id: str) -> str:
         return json.dumps({"status": "forgotten", "ids": [row["id"]]},
                           ensure_ascii=False)
     ids = memory_store.disable_by_text(conn, uid, query_or_id)
+    if not ids:
+        return json.dumps({"status": "not_found", "ids": []}, ensure_ascii=False)
     return json.dumps({"status": "forgotten", "ids": ids}, ensure_ascii=False)
 
 

@@ -80,3 +80,11 @@ async def test_forget_by_id(conn):
     out = json.loads(await mem_skill._forget_impl(mid))
     assert out["ids"] == [mid]
     assert len(ms.list_active(conn, "u1")) == 0
+
+
+@pytest.mark.asyncio
+async def test_forget_no_match_returns_not_found(conn):
+    mem_skill.USER_ID_VAR.set("u1")
+    out = json.loads(await mem_skill._forget_impl("nothing matches this"))
+    assert out["status"] == "not_found"
+    assert out["ids"] == []
