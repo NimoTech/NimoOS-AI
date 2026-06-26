@@ -164,6 +164,22 @@ CREATE INDEX IF NOT EXISTS idx_memory_user_active
     ON memory_entries(user_id, status, priority DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_lineage
     ON memory_entries(lineage_id, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_extract_jobs (
+    session_id    TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending', -- 'pending'|'running'|'done'|'error'
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    provider_url  TEXT,
+    provider_key  TEXT,
+    provider_type TEXT,
+    model_name    TEXT,
+    last_error    TEXT,
+    enqueued_at   INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_extract_jobs_status
+    ON memory_extract_jobs(status, enqueued_at);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
