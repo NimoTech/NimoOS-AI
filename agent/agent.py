@@ -536,7 +536,23 @@ class AgentRunner:
                 shell_skills.SANDBOX_SKILLS_VAR.set(runtime_view)
             # SANDBOX_SHELL_ROOT_VAR stays default (real persistent work dir for chat).
 
-            client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
+            if provider_type == "openvino":
+                import httpx as _httpx
+                async def _ovdbg_req(request):
+                    try:
+                        if request.url.path.endswith("/chat/completions"):
+                            import json as _json
+                            b = _json.loads(request.content.decode("utf-8", "replace"))
+                            picked = {k: b.get(k) for k in ("think", "chat_template_kwargs", "reasoning_effort", "enable_thinking", "tool_choice", "parallel_tool_calls")}
+                            print(f"[OVDBG-WIRE] -> keys={sorted(b.keys())} | thinking_params={_json.dumps(picked, ensure_ascii=False)}", flush=True)
+                            with open("/var/lib/nimoos/ai/agent/ovdbg_body.json", "w") as _f:
+                                _f.write(request.content.decode("utf-8", "replace"))
+                    except Exception as _e:
+                        print(f"[OVDBG-WIRE] hook err {_e}", flush=True)
+                _hc = _httpx.AsyncClient(event_hooks={"request": [_ovdbg_req]})
+                client = AsyncOpenAI(base_url=provider_url, api_key=provider_key, http_client=_hc)
+            else:
+                client = AsyncOpenAI(base_url=provider_url, api_key=provider_key)
             # `should_replay_reasoning_content` lets the SDK inject prior
             # `reasoning_content` back onto assistant messages when replaying
             # history. DeepSeek thinking-mode (deepseek-v4-flash, deepseek-reasoner)
@@ -550,6 +566,8 @@ class AgentRunner:
             except ValueError:
                 pt = ProviderType.OTHER
             model_settings = build_model_settings(pt, thinking)
+
+            print(f"[OVDBG-PY] run model_name={model_name!r} provider_type={provider_type!r} base_url={provider_url!r} thinking={thinking!r} extra_body={getattr(model_settings,'extra_body',None)!r}", flush=True)
 
             model = OpenAIChatCompletionsModel(
                 model=model_name,

@@ -162,6 +162,12 @@ func (a *OpenVINOAdapter) writeConfigSingle(servable string) error {
 // ovmsGraphPbtxt builds the MediaPipe graph for a Qwen3 LLM servable on `device`,
 // with the loopback back-edge + SyncSet handler OVMS requires, plus the Qwen3
 // reasoning/tool parsers so <think>/<tool_call> are returned structured.
+//
+// enable_prefix_caching + dynamic_split_fuse + cache_size 是性能关键:agent 模式
+// 每次会话都注入相同的大段 system prompt(工具+skills 定义),工具调用还会触发多轮
+// LLM 请求。没有前缀缓存时每轮都要把几千 token 的前缀从头 prefill(实测 ~3s/轮);
+// 开启后重复前缀的 prefill 降到 ~0.2s(实测 15× 提升),跨请求也命中。cache_size
+// 单位 GB,2GB 在 19GB 权重 + 24GB 显存的 B60 上留有余量。
 func ovmsGraphPbtxt(device string) string {
 	return `input_stream: "HTTP_REQUEST_PAYLOAD:input"
 output_stream: "HTTP_RESPONSE_PAYLOAD:output"
@@ -182,6 +188,9 @@ node: {
       models_path: "./1",
       device: "` + device + `",
       plugin_config: '{"PERFORMANCE_HINT":"LATENCY"}',
+      enable_prefix_caching: true,
+      dynamic_split_fuse: true,
+      cache_size: 2,
       reasoning_parser: "qwen3",
       tool_parser: "qwen3coder"
     }
