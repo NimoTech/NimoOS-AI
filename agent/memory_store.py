@@ -90,3 +90,42 @@ def effective_score(row, now) -> float:
 
 def rank_for_injection(rows, now):
     return sorted(rows, key=lambda r: effective_score(r, now), reverse=True)
+
+
+MAX_INJECT_ENTRIES = 30
+MAX_INJECT_CHARS = 4000  # ~1500 tokens, conservative. P4 introduces the shared estimator.
+
+
+def render_user_block(conn, user_id, *, now=None,
+                      max_entries=MAX_INJECT_ENTRIES,
+                      max_chars=MAX_INJECT_CHARS) -> str:
+    now = now if now is not None else int(time.time())
+    rows = list_active(conn, user_id, now=now)
+    if not rows:
+        return ""
+    ranked = rank_for_injection(rows, now)
+    lines = []
+    used = 0
+    for r in ranked[:max_entries]:
+        line = f"- ({r['kind']}) {r['text']}"
+        if lines and used + len(line) > max_chars:
+            break
+        if not lines and len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line)
+    if not lines:
+        return ""
+    return "## 关于这位用户\n\n" + "\n".join(lines)
+
+
+def bump_recall(conn, ids, *, now=None) -> None:
+    if not ids:
+        return
+    now = now if now is not None else int(time.time())
+    conn.executemany(
+        "UPDATE memory_entries SET recall_count = recall_count + 1, "
+        "last_recalled_at=? WHERE id=?",
+        [(now, i) for i in ids],
+    )
+    conn.commit()
