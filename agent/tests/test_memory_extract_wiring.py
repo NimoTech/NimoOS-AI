@@ -4,12 +4,19 @@ import db as db_module
 import memory_store as ms
 
 
-def test_default_history_loader_reads_latest_messages(tmp_path, monkeypatch):
-    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
-    conn = main_module._db()
+def test_default_history_loader_reads_latest_messages(tmp_path):
+    import json as _j
+    import importlib
+    import sys
+    # Re-import db freshly so we get whichever db module object is currently
+    # live in sys.modules — the same one memory_extract._default_history_loader
+    # will resolve when it calls `import db` at runtime.
+    if "db" in sys.modules:
+        del sys.modules["db"]
+    import db as _db
+    conn = _db.init_db(str(tmp_path / "agent.db"))  # publishes db._conn singleton
     conn.execute("INSERT INTO sessions(id,user_id,created_at,updated_at) "
                  "VALUES('s1','u1',0,0)")
-    import json as _j
     conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) "
                  "VALUES('m1','s1','user',?,1)",
                  (_j.dumps([{"role": "user", "content": "hi"}]),))
