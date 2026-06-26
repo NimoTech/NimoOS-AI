@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import db as db_module
+import memory_store
 from agent import AgentRunner
 from confirm import ConfirmManager
 from openai import AsyncOpenAI
@@ -1476,6 +1477,22 @@ async def put_max_turns(request: Request, body: MaxTurnsPayload):
     )
     conn.commit()
     return {"ok": True}
+
+
+@app.get("/agent/user-memory")
+async def list_user_memory(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    conn = _db()
+    rows = memory_store.list_active(conn, user_id)
+    ranked = memory_store.rank_for_injection(rows, int(time.time()))
+    return [
+        {"id": r["id"], "kind": r["kind"], "text": r["text"],
+         "source": r["source"], "priority": r["priority"],
+         "recall_count": r["recall_count"], "updated_at": r["updated_at"]}
+        for r in ranked
+    ]
 
 
 @app.get("/agent/sessions/{session_id}/thinking")
