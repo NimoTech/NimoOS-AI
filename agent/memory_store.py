@@ -129,3 +129,17 @@ def bump_recall(conn, ids, *, now=None) -> None:
         [(now, i) for i in ids],
     )
     conn.commit()
+
+
+def is_memory_enabled(conn, user_id) -> bool:
+    """Read the per-user memory total switch from user_settings. Absent row =
+    enabled (backward-compatible default). Single source for the injection gate
+    (agent.compose_memory_block), the remember() write gate, and the settings
+    endpoint."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='memory_enabled'",
+        (str(user_id),),
+    ).fetchone()
+    if row is None:
+        return True
+    return row["value"] != "0"
