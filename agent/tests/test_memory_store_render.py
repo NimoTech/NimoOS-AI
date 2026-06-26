@@ -29,7 +29,7 @@ def test_entry_budget_truncates(conn):
     for i in range(40):
         ms.add_memory(conn, "u1", f"fact {i}", "fact", priority=i, now=1000)
     block = ms.render_user_block(conn, "u1", now=1000, max_entries=5)
-    assert block.count("\n- ") == 5
+    assert block.count("- (fact) ") == 5
 
 
 def test_char_budget_truncates(conn):
