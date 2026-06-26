@@ -450,6 +450,10 @@ class MaxTurnsPayload(BaseModel):
     max_turns: int = Field(ge=0)
 
 
+class MemorySettingsPayload(BaseModel):
+    enabled: bool
+
+
 class ContextPhoto(BaseModel):
     id: str
     name: str = ""
@@ -1510,6 +1514,27 @@ async def delete_user_memory(mem_id: str, request: Request):
         raise HTTPException(status_code=404, detail="not found")
     memory_store.disable_memory(conn, mem_id)
     return {"status": "deleted", "id": mem_id}
+
+
+@app.get("/agent/user-memory/settings")
+async def get_memory_settings(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    return {"enabled": memory_store.is_memory_enabled(_db(), user_id)}
+
+
+@app.put("/agent/user-memory/settings")
+async def put_memory_settings(request: Request, body: MemorySettingsPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    conn = _db()
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES(?, 'memory_enabled', ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (user_id, "1" if body.enabled else "0", int(time.time())),
+    )
+    conn.commit()
+    return {"enabled": body.enabled}
 
 
 @app.get("/agent/sessions/{session_id}/thinking")

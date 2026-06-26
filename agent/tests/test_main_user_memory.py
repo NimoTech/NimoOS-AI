@@ -64,3 +64,32 @@ async def test_delete_missing_is_404(tmp_path, monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         r = await ac.delete("/agent/user-memory/nope", headers={"X-User-Id": "u1"})
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_settings_default_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    main_module._db()
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.get("/agent/user-memory/settings", headers={"X-User-Id": "u1"})
+    assert r.status_code == 200
+    assert r.json() == {"enabled": True}
+
+
+@pytest.mark.asyncio
+async def test_settings_put_then_get_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    main_module._db()
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        p = await ac.put("/agent/user-memory/settings",
+                         headers={"X-User-Id": "u1"}, json={"enabled": False})
+        assert p.json() == {"enabled": False}
+        g = await ac.get("/agent/user-memory/settings", headers={"X-User-Id": "u1"})
+    assert g.json() == {"enabled": False}
+    conn = main_module._db()
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id='u1' AND key='memory_enabled'"
+    ).fetchone()
+    assert row["value"] == "0"
