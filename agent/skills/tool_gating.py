@@ -27,3 +27,69 @@ def make_is_enabled(category: str) -> Callable[[Any, Any], bool]:
     def _is_enabled(_ctx: Any, _agent: Any) -> bool:
         return category in current_unlocked()
     return _is_enabled
+
+
+# ---------------------------------------------------------------------------
+# expand_tools 元工具
+# ---------------------------------------------------------------------------
+
+from agents import function_tool
+from skills import tool_registry as _reg
+
+
+def _name(tool) -> str:
+    return getattr(tool, "name", getattr(tool, "__name__", ""))
+
+
+def categories_overview() -> str:
+    lines = ["可解锁的工具类别(调用 expand_tools 解锁后,工具会在下一步出现):"]
+    for cat, desc in _reg.CATEGORY_DESCRIPTIONS.items():
+        lines.append(f"- {cat}: {desc}")
+    return "\n".join(lines)
+
+
+def _persist(categories: list[str]) -> None:
+    """把当前解锁集落库(独立函数,便于测试 monkeypatch)。"""
+    import db
+    session_id = GATING_SESSION_VAR.get("")
+    if session_id:
+        db.set_unlocked_categories(session_id, sorted(current_unlocked()))
+
+
+def expand_categories(categories: list[str]) -> str:
+    """纯逻辑:解锁给定类别,返回给模型看的文本。被 expand_tools 包裹。"""
+    if not categories:
+        return categories_overview()
+    valid = set(_reg.CATEGORY_TOOLS.keys())
+    unknown = [c for c in categories if c not in valid]
+    if unknown:
+        return (f"未知类别 {unknown}。合法类别:" + ", ".join(sorted(valid)) +
+                "。请用这些类别名重试。")
+    cur = current_unlocked()
+    if not isinstance(cur, set):     # 兜底:确保可原地修改
+        cur = set(cur)
+        UNLOCKED_VAR.set(cur)
+    newly = [c for c in categories if c not in cur]
+    cur.update(categories)
+    _persist(sorted(cur))
+    lines = [f"已解锁:{', '.join(categories)}。现在可用以下工具:"]
+    for c in categories:
+        for t in _reg.CATEGORY_TOOLS[c]:
+            lines.append(f"- {_name(t)}")
+    if not newly:
+        lines.append("(这些类别此前已解锁)")
+    return "\n".join(lines)
+
+
+@function_tool
+def expand_tools(categories: list[str]) -> str:
+    """解锁一组工具类别,使其工具在下一步可被调用。
+
+    起步时你只有少量核心工具。需要其他能力时,先用本工具解锁相应类别,
+    一次可传多个,尽量一次性解锁本任务预计要用的所有类别。
+    传空列表则返回所有可解锁类别的总览。
+
+    Args:
+        categories: 要解锁的类别名列表,如 ["apps", "files"]。
+    """
+    return expand_categories(categories)
