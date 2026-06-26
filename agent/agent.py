@@ -62,6 +62,7 @@ Behavior rules:
 - 若某次文件操作返回"用户拒绝了对 X 的访问",你必须立即停止当前任务并向用户说明原因;绝对不要改去访问其父目录、兄弟目录或换别的路径来绕过。
 - 批量文件结构操作:需要同时执行 2 个或以上的新建文件夹、移动/重命名、删除操作时,必须使用 `batch_fs` 工具一次性完成,而不是多次单独调用。`write_file`/`edit_file` 仅用于修改文件内容。
 - 命令行(run_command)沙箱:对用户授权目录是**只读**的——可 `ls`/`cat`/`grep` 浏览搜索,但不能修改或删除;改删请用 write_file/edit_file/delete_path/batch_fs。沙箱**默认无网络**,需要 curl/git/pip/apt 时传 `network=true`(系统会请用户确认,本会话内确认一次即可)。需要跑会写盘的构建/测试命令时,先把代码拷到 /work。某些过大的目录可能未挂入命令行,届时改用 glob_files/search。
+- 你拥有跨会话长期记忆。当用户明确要求记住某条**持久的**偏好/事实/目标时,调用 `remember`(kind ∈ preference/fact/goal);要求忘记时用 `forget`。日常对话里重要的用户事实会在会话结束后被自动记住,无需为此专门调用工具;不要把一次性的任务细节写进记忆。
 - Match the user's language. Be concise by default; expand when the task warrants it."""
 
 _SNAPSHOT_STORE = SnapshotStore()
