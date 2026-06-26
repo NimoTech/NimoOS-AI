@@ -59,6 +59,7 @@ type ollamaTagsResponse struct {
 
 type ModelManager struct {
 	ollamaBaseURL string
+	openvino      *OpenVINOAdapter
 	hfBaseURL     string
 	db            *sql.DB
 	client        *http.Client // no timeout: model downloads can be very long
@@ -66,9 +67,10 @@ type ModelManager struct {
 	jobsMu        sync.RWMutex
 }
 
-func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
+func NewModelManager(ollamaBaseURL string, openvino *OpenVINOAdapter, db *sql.DB) *ModelManager {
 	return &ModelManager{
 		ollamaBaseURL: ollamaBaseURL,
+		openvino:      openvino,
 		hfBaseURL:     defaultHFBaseURL,
 		db:            db,
 		client:        &http.Client{},
@@ -79,7 +81,12 @@ func NewModelManager(ollamaBaseURL string, db *sql.DB) *ModelManager {
 func (m *ModelManager) ListModels() ([]*Model, error) {
 	resp, err := m.client.Get(m.ollamaBaseURL + "/api/tags")
 	if err != nil {
-		return m.listCachedModels()
+		// Ollama 不可达:退回缓存模型,但 OpenVINO(OVMS)独立于 Ollama,仍需聚合。
+		cached, cerr := m.listCachedModels()
+		if cerr != nil {
+			return nil, cerr
+		}
+		return append(cached, m.openvinoModels()...), nil
 	}
 	defer resp.Body.Close()
 
@@ -98,7 +105,31 @@ func (m *ModelManager) ListModels() ([]*Model, error) {
 			SupportsThinking: SupportsThinking("ollama", t.Name),
 		})
 	}
+	models = append(models, m.openvinoModels()...)
 	return models, nil
+}
+
+// openvinoModels lists available OpenVINO models as "model@device" options by
+// scanning the model directory. Listing does NOT load them — a model loads into
+// OVMS on first use (Ollama-style). Returns nil when none are present.
+func (m *ModelManager) openvinoModels() []*Model {
+	if m.openvino == nil {
+		return nil
+	}
+	avail := m.openvino.AvailableModels()
+	if len(avail) == 0 {
+		return nil
+	}
+	out := make([]*Model, 0, len(avail))
+	for _, am := range avail {
+		display := am.Display + "@" + am.Device
+		out = append(out, &Model{
+			Name:             "openvino:" + display,
+			Source:           ModelSourceOpenVINO,
+			SupportsThinking: SupportsThinking("openvino", am.Display),
+		})
+	}
+	return out
 }
 
 func (m *ModelManager) listCachedModels() ([]*Model, error) {

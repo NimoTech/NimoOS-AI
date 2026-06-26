@@ -22,13 +22,34 @@ func TestModelManager_ListModels(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	models, err := mm.ListModels()
 	require.NoError(t, err)
 	require.Len(t, models, 1)
 	require.Equal(t, "llama3:8b", models[0].Name)
 	require.Equal(t, "Q4_K_M", models[0].Quantization)
 	require.Equal(t, int64(4294967296), models[0].SizeBytes)
+}
+
+// Ollama 不可达时,模型列表仍应聚合 OVMS 的 openvino servable(回归:
+// 旧实现在 Ollama down 分支直接 return,跳过了 openvino 聚合)。
+func TestModelManager_ListModels_OllamaDown_StillListsOpenVINO(t *testing.T) {
+	// 发现来自扫描模型目录(不依赖 OVMS 是否在跑):准备一个含 IR 的临时目录。
+	src := t.TempDir()
+	mdir := filepath.Join(src, "qwen3.6-35b-a3b-int4")
+	require.NoError(t, os.MkdirAll(mdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(mdir, "openvino_language_model.xml"), []byte("<x/>"), 0o644))
+
+	ov := NewOpenVINOAdapter("http://127.0.0.1:9100", "GPU.1")
+	ov.srcModelsPath = src // 同包测试可直接设私有字段
+
+	// ollamaBaseURL 指向不可达地址,触发 Ollama-down 分支。
+	mm := NewModelManager("http://127.0.0.1:1", ov, nil)
+	models, err := mm.ListModels()
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	require.Equal(t, "openvino:qwen3.6-35b-a3b-int4@GPU.1", models[0].Name)
+	require.Equal(t, ModelSourceOpenVINO, models[0].Source)
 }
 
 func TestModelManager_DeleteModel(t *testing.T) {
@@ -43,7 +64,7 @@ func TestModelManager_DeleteModel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	err := mm.DeleteModel("llama3:8b")
 	require.NoError(t, err)
 	require.Equal(t, "llama3:8b", gotName)
@@ -60,7 +81,7 @@ func TestModelManager_PullModel_SendsCorrectRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	mm := NewModelManager(server.URL, nil)
+	mm := NewModelManager(server.URL, nil, nil)
 	progress := make(chan PullProgress, 10)
 	err := mm.PullModel("llama3:8b", progress)
 	require.NoError(t, err)

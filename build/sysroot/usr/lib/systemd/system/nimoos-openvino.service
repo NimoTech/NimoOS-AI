@@ -1,0 +1,17 @@
+[Unit]
+Description=NimoOS OpenVINO Model Server (OVMS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# OVMS 二进制路径按 deploy-openvino.sh 安装位置;默认 /opt/ovms/bin/ovms
+ExecStart=/opt/ovms/bin/ovms --config_path /var/lib/nimoos/ai/openvino/config.json --rest_port 9100 --rest_bind_address 127.0.0.1
+# 访问 Intel GPU 需在 render/video 组
+SupplementaryGroups=render video
+Restart=always
+RestartSec=5
+# OVMS 依赖其安装目录下的共享库
+Environment=LD_LIBRARY_PATH=/opt/ovms/lib
+
+[Install]
+WantedBy=multi-user.target

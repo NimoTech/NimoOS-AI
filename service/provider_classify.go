@@ -23,6 +23,8 @@ func ClassifyProvider(baseURL string, protocol Protocol) string {
 		return "qwen"
 	case strings.Contains(host, "127.0.0.1:11434") || strings.Contains(host, "localhost:11434"):
 		return "ollama"
+	case strings.Contains(host, "127.0.0.1:9100") || strings.Contains(host, "localhost:9100"):
+		return "openvino"
 	default:
 		return "other"
 	}

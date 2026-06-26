@@ -205,6 +205,9 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "network_granted" not in existing:
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN network_granted INTEGER NOT NULL DEFAULT 0")
+    if "unlocked_tool_categories" not in existing:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN unlocked_tool_categories TEXT")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}
@@ -300,4 +303,34 @@ def is_network_granted(conn, session_id: str) -> bool:
 def grant_network(conn, session_id: str) -> None:
     conn.execute(
         "UPDATE sessions SET network_granted=1 WHERE id=?", (session_id,))
+    conn.commit()
+
+
+import json as _json
+
+
+def get_unlocked_categories(session_id: str, conn=None) -> list[str]:
+    """返回该会话已解锁的工具类别(NULL/缺失→[])。"""
+    conn = conn or get_connection()
+    row = conn.execute(
+        "SELECT unlocked_tool_categories FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    if not row or row[0] is None:
+        return []
+    try:
+        val = _json.loads(row[0])
+        return val if isinstance(val, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def set_unlocked_categories(session_id: str, categories: list[str], conn=None) -> None:
+    """覆盖写该会话的已解锁类别(去重排序后存 JSON 数组)。"""
+    conn = conn or get_connection()
+    payload = _json.dumps(sorted(set(categories)))
+    conn.execute(
+        "UPDATE sessions SET unlocked_tool_categories=? WHERE id=?",
+        (payload, session_id),
+    )
     conn.commit()
