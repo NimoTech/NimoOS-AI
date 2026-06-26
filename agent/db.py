@@ -142,6 +142,28 @@ CREATE TABLE IF NOT EXISTS access_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_access_req_session
   ON access_requests(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id                TEXT PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    kind              TEXT NOT NULL,              -- 'preference' | 'fact' | 'goal'
+    text              TEXT NOT NULL,
+    source            TEXT NOT NULL,              -- 'auto' | 'tool' | 'user'
+    priority          INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'active', -- 'active'|'disabled'|'superseded'
+    lineage_id        TEXT NOT NULL,
+    supersedes        TEXT,
+    recall_count      INTEGER NOT NULL DEFAULT 0,
+    last_recalled_at  INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    expires_at        INTEGER,
+    origin_session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_user_active
+    ON memory_entries(user_id, status, priority DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_lineage
+    ON memory_entries(lineage_id, created_at);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
