@@ -110,3 +110,49 @@ def parse_extraction(text):
     ref_raw = obj.get("referenced", [])
     referenced = [r for r in ref_raw if isinstance(r, str)] if isinstance(ref_raw, list) else []
     return {"actions": actions, "referenced": referenced}
+
+
+def _current(conn, mem_id, user_id):
+    return conn.execute(
+        "SELECT updated_at FROM memory_entries "
+        "WHERE id=? AND user_id=? AND status='active'",
+        (mem_id, str(user_id)),
+    ).fetchone()
+
+
+def apply_extraction(conn, user_id, snapshot, result, *, now=None) -> dict:
+    now = now if now is not None else int(time.time())
+    counts = {"added": 0, "updated": 0, "noop": 0, "referenced": 0, "skipped": 0}
+    for a in result.get("actions", []):
+        op = a["op"]
+        if op == "ADD":
+            if memory_store.find_active_duplicate(conn, user_id, a["text"]):
+                counts["skipped"] += 1
+                continue
+            memory_store.add_memory(conn, user_id, a["text"], a["kind"],
+                                    source="auto", priority=a.get("priority", 0),
+                                    now=now)
+            counts["added"] += 1
+        elif op in ("UPDATE", "NOOP"):
+            mid = a["id"]
+            row = _current(conn, mid, user_id)
+            # optimistic: target must be unchanged since the snapshot
+            if row is None or mid not in snapshot or row["updated_at"] != snapshot[mid]:
+                counts["skipped"] += 1
+                continue
+            if op == "UPDATE":
+                new_id = memory_store.supersede_memory(
+                    conn, mid, user_id, a["text"], a["kind"],
+                    priority=a.get("priority", 0), now=now)
+                counts["updated" if new_id else "skipped"] += 1
+            else:  # NOOP — touch updated_at so it sorts as recently seen
+                conn.execute(
+                    "UPDATE memory_entries SET updated_at=? WHERE id=?", (now, mid))
+                conn.commit()
+                counts["noop"] += 1
+    ref_ids = [r for r in result.get("referenced", [])
+               if _current(conn, r, user_id) is not None]
+    if ref_ids:
+        memory_store.bump_recall(conn, ref_ids, now=now)
+        counts["referenced"] = len(ref_ids)
+    return counts
