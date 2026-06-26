@@ -27,6 +27,8 @@ async def _remember_impl(text: str, kind: str = "fact", priority: int = 0) -> st
             {"error": f"invalid kind: {kind}; use one of {memory_store.VALID_KINDS}"},
             ensure_ascii=False)
     conn = db_module.get_connection()
+    if not memory_store.is_memory_enabled(conn, uid):
+        return json.dumps({"status": "disabled"}, ensure_ascii=False)
     dup = memory_store.find_active_duplicate(conn, uid, text)
     if dup:
         return json.dumps({"status": "duplicate", "id": dup}, ensure_ascii=False)

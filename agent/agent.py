@@ -134,9 +134,12 @@ def _compose_system_prompt(conn, session_id: str, base: str,
 
 
 def compose_memory_block(conn, user_id: str) -> str:
-    """Render the profile-memory block for injection. Empty string when the
-    user has no active memories. Pure SQL + arithmetic — safe on the main path.
+    """Render the profile-memory block for injection. Empty string when memory
+    is disabled for the user or there are no active memories. Pure SQL +
+    arithmetic — safe on the main path.
     """
+    if not memory_store.is_memory_enabled(conn, str(user_id)):
+        return ""
     return memory_store.render_user_block(conn, str(user_id))
 
 
