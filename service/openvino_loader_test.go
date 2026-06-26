@@ -2,6 +2,8 @@ package service
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -141,10 +143,13 @@ func TestReapOnceNeverWhenTTLZero(t *testing.T) {
 	}
 }
 
-func TestReconcileFromConfig(t *testing.T) {
+// reconcile 按 OVMS 实时已服务集(/v1/config 里 state=AVAILABLE 的 servable)重建,
+// 不再读磁盘 config.json。这样整机重启后(OVMS 由 ExecStartPre 清空启动 → 实时服务集
+// 为空)不会把上次的模型复活;仅 nimoos-ai 单独重启、OVMS 仍驻留时才恢复。
+func TestReconcileFromOVMS(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
-	// 造两个 servable 的 graph.pbtxt(含 device),外加一个缺 graph 的坏条目。
+	// 造两个 servable 的 graph.pbtxt(含 device)。missing-gpu1 故意不建 graph → 应跳过。
 	for name, dev := range map[string]string{"x-gpu1": "GPU.1", "y-gpu0": "GPU.0"} {
 		d := filepath.Join(repo, name)
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -154,25 +159,28 @@ func TestReconcileFromConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cfgPath := filepath.Join(dir, "config.json")
-	cfg := ovmsConfig{
-		ModelConfigList: []any{},
-		MediapipeConfigList: []ovmsMediapipeEntry{
-			{Name: "x-gpu1", BasePath: filepath.Join(repo, "x-gpu1")},
-			{Name: "y-gpu0", BasePath: filepath.Join(repo, "y-gpu0")},
-			{Name: "missing-gpu1", BasePath: filepath.Join(repo, "missing-gpu1")}, // 无 graph → 跳过
-		},
-	}
-	cb, _ := json.MarshalIndent(cfg, "", "  ")
-	if err := os.WriteFile(cfgPath, cb, 0o644); err != nil {
-		t.Fatal(err)
-	}
 
-	a := &OpenVINOAdapter{repoPath: repo, configPath: cfgPath, loaded: map[string]*loadedModel{}}
-	a.reconcileFromConfig()
+	// 模拟 OVMS /v1/config:x-gpu1 / y-gpu0 / missing-gpu1 均 AVAILABLE;
+	// loading-gpu1 处于 LOADING(非 AVAILABLE)→ ListServedModels 不返回。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/config" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"x-gpu1":        {"model_version_status":[{"state":"AVAILABLE"}]},
+			"y-gpu0":        {"model_version_status":[{"state":"AVAILABLE"}]},
+			"missing-gpu1":  {"model_version_status":[{"state":"AVAILABLE"}]},
+			"loading-gpu1":  {"model_version_status":[{"state":"LOADING"}]}
+		}`))
+	}))
+	defer srv.Close()
+
+	a := &OpenVINOAdapter{baseURL: srv.URL, repoPath: repo, loaded: map[string]*loadedModel{}}
+	a.reconcileFromOVMS()
 
 	if len(a.loaded) != 2 {
-		t.Fatalf("loaded = %d, want 2 (bad entry skipped)", len(a.loaded))
+		t.Fatalf("loaded = %d, want 2 (missing-gpu1 无 graph 跳过、loading-gpu1 非 AVAILABLE 不返回)", len(a.loaded))
 	}
 	if a.loaded["x-gpu1"] == nil || a.loaded["x-gpu1"].device != "GPU.1" {
 		t.Errorf("x-gpu1 device wrong: %+v", a.loaded["x-gpu1"])
@@ -182,5 +190,23 @@ func TestReconcileFromConfig(t *testing.T) {
 	}
 	if _, ok := a.loaded["missing-gpu1"]; ok {
 		t.Error("missing-gpu1 should be skipped (no graph.pbtxt)")
+	}
+	if _, ok := a.loaded["loading-gpu1"]; ok {
+		t.Error("loading-gpu1 should be skipped (not AVAILABLE)")
+	}
+}
+
+// 整机冷启动场景:OVMS 实时服务集为空 → reconcile 后 loaded 必须为空(不复活旧模型)。
+func TestReconcileFromOVMSEmptyOnFreshBoot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	a := &OpenVINOAdapter{baseURL: srv.URL, repoPath: t.TempDir(), loaded: map[string]*loadedModel{}}
+	a.reconcileFromOVMS()
+
+	if len(a.loaded) != 0 {
+		t.Fatalf("fresh boot loaded = %d, want 0 (绝不能复活旧模型)", len(a.loaded))
 	}
 }

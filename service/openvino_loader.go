@@ -312,26 +312,23 @@ func (a *OpenVINOAdapter) writeConfigLocked() error {
 	return os.WriteFile(a.configPath, b, 0o644)
 }
 
-// reconcileFromConfig 在进程启动时从现有 config.json 重建 a.loaded:config.json 可能
-// 还列着上次运行驻留的模型(OVMS 也可能仍驻着),内存里却是空的。逐条从其 graph.pbtxt
-// 解析 device 填回(lastUsed=now,给完整一个 TTL 周期)。best-effort:任何读/解析失败的
-// 条目跳过。无需加锁(仅构造时单线程调用)。
-func (a *OpenVINOAdapter) reconcileFromConfig() {
-	b, err := os.ReadFile(a.configPath)
-	if err != nil {
-		return // 还没有 config.json → 没有驻留模型
-	}
-	var cfg ovmsConfig
-	if json.Unmarshal(b, &cfg) != nil {
-		return
-	}
+// reconcileFromOVMS 在进程启动时按 OVMS "实时已服务的模型"重建 a.loaded,而不是盲信
+// 磁盘上的 config.json。理由:config.json 是跨重启持久化的文件,整机重启后 OVMS 会直接
+// 按它把上次会话驻留的模型自动加载——但那并不代表用户本次想加载(还会在开机内存高峰期
+// 触发 OOM 循环)。真正的事实源是"OVMS 此刻实际在服务什么":
+//   - 整机冷启动:OVMS 由 unit 的 ExecStartPre 清空 config 启动 → 这里查到空集 → loaded
+//     为空,模型只在按需(EnsureLoaded)时才挂载。
+//   - 仅 nimoos-ai 单独重启(OVMS 仍在运行):这里查到 OVMS 真实驻留集 → 正确恢复。
+// 逐条从其 graph.pbtxt 解析 device 填回(lastUsed=now,给完整一个 TTL 周期)。best-effort:
+// OVMS 不可达 / 无服务 / 解析失败 → 对应条目跳过。无需加锁(仅构造时单线程调用)。
+func (a *OpenVINOAdapter) reconcileFromOVMS() {
 	now := time.Now()
-	for _, e := range cfg.MediapipeConfigList {
-		dev := a.parseDeviceFromGraph(e.Name)
+	for _, name := range a.ListServedModels() {
+		dev := a.parseDeviceFromGraph(name)
 		if dev == "" {
 			continue // 无法恢复设备 → 跳过
 		}
-		a.loaded[e.Name] = &loadedModel{servable: e.Name, device: dev, lastUsed: now}
+		a.loaded[name] = &loadedModel{servable: name, device: dev, lastUsed: now}
 	}
 }
 
