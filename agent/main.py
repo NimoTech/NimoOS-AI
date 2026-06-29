@@ -186,6 +186,12 @@ async def _memory_worker_startup():
     memory_extract.start_worker(_db())
 
 
+@app.on_event("startup")
+async def _recall_worker_startup():
+    import recall_index
+    recall_index.start_worker(_db())
+
+
 # ---------------------------------------------------------------------------
 # Startup orchestration helpers (netns + egress-proxy + executor)
 # ---------------------------------------------------------------------------
@@ -1674,6 +1680,11 @@ def _start_run(session_id: str, user_id: str, message: str,
                     _conn, session_id, user_id,
                     provider_url=provider_url, provider_key=provider_key,
                     provider_type=provider_type, model_name=model)
+            except Exception:
+                pass
+            try:
+                import recall_index
+                recall_index.maybe_enqueue_index_job(_conn, session_id, user_id)
             except Exception:
                 pass
             # Don't leave references to a finished task pinned in _active_runs;

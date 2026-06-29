@@ -10,7 +10,7 @@ def test_core_names_exact():
     assert tr.CORE_TOOL_NAMES == frozenset(
         {"run_command", "read_file", "list_dir",
          "nimoos_search", "list_skills", "read_skill_file",
-         "remember", "forget"})
+         "remember", "forget", "recall"})
 
 
 def test_categories_exact_keys():

@@ -176,11 +176,13 @@ def _claim_idle_job(conn, now):
 
 def _fail_job(conn, session_id, attempts, err, now):
     if attempts >= MAX_ATTEMPTS:
-        conn.execute("DELETE FROM memory_extract_jobs WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM memory_extract_jobs "
+                     "WHERE session_id=? AND status='running'", (session_id,))
     else:
         conn.execute(
-            "UPDATE memory_extract_jobs SET status='pending', last_error=?, updated_at=? "
-            "WHERE session_id=?", (err, now, session_id))
+            "UPDATE memory_extract_jobs SET status='pending', last_error=?, "
+            "updated_at=? WHERE session_id=? AND status='running'",
+            (err, now, session_id))
     conn.commit()
 
 
@@ -218,7 +220,8 @@ async def process_pending_once(conn, *, llm_call, history_loader, now=None):
     # 3) apply under the lock (short), then delete the job row
     async with lock:
         mx_counts = apply_extraction(conn, user_id, snapshot, result, now=now)
-    conn.execute("DELETE FROM memory_extract_jobs WHERE session_id=?", (session_id,))
+    conn.execute("DELETE FROM memory_extract_jobs "
+                 "WHERE session_id=? AND status='running'", (session_id,))
     conn.commit()
     _LOG.info("memory extract %s: %s", session_id, mx_counts)
     return session_id
