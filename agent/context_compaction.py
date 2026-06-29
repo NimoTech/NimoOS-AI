@@ -83,11 +83,12 @@ def estimate_messages_tokens(messages) -> int:
 
 def _key_matches(key: str, name: str) -> bool:
     """Substring match for normal keys; short keys (len<4, e.g. 'o1'/'o3')
-    require a non-alphanumeric boundary before and a non-digit after, so
-    'o1-mini'/'-o1' match but 'do3'/'no1se'/'o13b' do not."""
+    require a non-alphanumeric boundary on both sides, so 'o1-mini'/'-o1'/bare
+    'o1' match but 'do3'/'no1se'/'o13b'/'o1pro' do not (real o1/o3 names are
+    always followed by '-' or end-of-string)."""
     if len(key) >= 4:
         return key in name
-    return re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![0-9])",
+    return re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])",
                      name) is not None
 
 

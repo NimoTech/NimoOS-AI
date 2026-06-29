@@ -55,6 +55,7 @@ def test_resolve_window_short_key_boundary(tmp_path):
     assert cc.resolve_window(conn, "u1", "do3-test") == cc.DEFAULT_CONTEXT_WINDOW
     assert cc.resolve_window(conn, "u1", "no1se-model") == cc.DEFAULT_CONTEXT_WINDOW
     assert cc.resolve_window(conn, "u1", "o13b") == cc.DEFAULT_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "o1pro") == cc.DEFAULT_CONTEXT_WINDOW
     # long-key substring matching still lenient (qwen2.5 glued version)
     assert cc.resolve_window(conn, "u1", "qwen2.5-7b") == 32768
     conn.close()
