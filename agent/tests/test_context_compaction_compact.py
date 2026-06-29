@@ -29,8 +29,12 @@ def _big_history(turns, chars):
     return h
 
 
-async def _noop_sum(instr, prior, fold):  # should not be called
-    raise AssertionError("summarize_fn must not be called")
+class _CallCounter:
+    def __init__(self): self.n = 0
+
+    async def __call__(self, instr, prior, fold):
+        self.n += 1
+        return "SHOULD_NOT_BE_USED"
 
 
 async def _fake_sum(instr, prior, fold):
@@ -50,19 +54,23 @@ async def test_bypass_when_disabled(conn):
     conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
                  "VALUES('u1','compaction_enabled','0',0)"); conn.commit()
     h = _big_history(50, 500)
+    counter = _CallCounter()
     block, send = await cc.compact_for_run(
         conn, session_id="s1", user_id="u1", model_name="qwen",
-        history=h, current_text="hi", summarize_fn=_noop_sum)
+        history=h, current_text="hi", summarize_fn=counter)
     assert block == "" and send == h
+    assert counter.n == 0, f"summarize_fn must not be called, but was called {counter.n} time(s)"
 
 
 @pytest.mark.asyncio
 async def test_no_trigger_under_line(conn):
     h = [_u("hello"), _a("hi")]
+    counter = _CallCounter()
     block, send = await cc.compact_for_run(
         conn, session_id="s1", user_id="u1", model_name="gpt-4o",
-        history=h, current_text="ok", summarize_fn=_noop_sum)
+        history=h, current_text="ok", summarize_fn=counter)
     assert send == h and block == ""        # no summary yet, nothing folded
+    assert counter.n == 0, f"summarize_fn must not be called, but was called {counter.n} time(s)"
 
 
 @pytest.mark.asyncio
