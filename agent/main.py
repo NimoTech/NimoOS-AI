@@ -464,6 +464,8 @@ class MaxTurnsPayload(BaseModel):
 
 class MemorySettingsPayload(BaseModel):
     enabled: bool
+    compaction_enabled: "bool | None" = None
+    context_window: "int | None" = None
 
 
 class ContextPhoto(BaseModel):
@@ -1533,7 +1535,11 @@ async def get_memory_settings(request: Request):
     user_id = request.headers.get("X-User-Id", "")
     if not user_id:
         raise HTTPException(status_code=401, detail="X-User-Id required")
-    return {"enabled": memory_store.is_memory_enabled(_db(), user_id)}
+    return {
+        "enabled": memory_store.is_memory_enabled(_db(), user_id),
+        "compaction_enabled": memory_store.is_compaction_enabled(_db(), user_id),
+        "context_window": memory_store.get_context_window(_db(), user_id),
+    }
 
 
 @app.put("/agent/user-memory/settings")
@@ -1549,8 +1555,31 @@ async def put_memory_settings(request: Request, body: MemorySettingsPayload):
         "updated_at=excluded.updated_at",
         (user_id, "1" if body.enabled else "0", int(time.time())),
     )
+    if body.compaction_enabled is not None:
+        conn.execute(
+            "INSERT INTO user_settings(user_id, key, value, updated_at) "
+            "VALUES(?, 'compaction_enabled', ?, ?) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+            "updated_at=excluded.updated_at",
+            (user_id, "1" if body.compaction_enabled else "0", int(time.time())),
+        )
+    if body.context_window is not None:
+        val = body.context_window if (
+            isinstance(body.context_window, int) and body.context_window > 0
+        ) else ""
+        conn.execute(
+            "INSERT INTO user_settings(user_id, key, value, updated_at) "
+            "VALUES(?, 'context_window', ?, ?) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+            "updated_at=excluded.updated_at",
+            (user_id, str(val), int(time.time())),
+        )
     conn.commit()
-    return {"enabled": body.enabled}
+    return {
+        "enabled": body.enabled,
+        "compaction_enabled": memory_store.is_compaction_enabled(conn, user_id),
+        "context_window": memory_store.get_context_window(conn, user_id),
+    }
 
 
 @app.get("/agent/sessions/{session_id}/thinking")
