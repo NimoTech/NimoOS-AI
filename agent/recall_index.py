@@ -161,10 +161,12 @@ async def _default_upsert(user_id, session_id, chunks):
     await _get_parser_client().agent_memory_upsert(user_id, session_id, chunks)
 
 
-def _default_history_loader(session_id) -> list:
-    import db
+def _read_history(conn, session_id) -> list:
+    """Load a session's full history snapshot from the threaded connection
+    (the agent persists the whole conversation as one latest row,
+    role='history', content=json.dumps(history))."""
     import json as _json
-    row = db.get_connection().execute(
+    row = conn.execute(
         "SELECT content FROM messages WHERE session_id=? "
         "ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
     if not row:
@@ -177,10 +179,12 @@ def _default_history_loader(session_id) -> list:
 
 
 async def worker_loop(conn, *, stop_event):
+    def history_loader(session_id):
+        return _read_history(conn, session_id)
     while not stop_event.is_set():
         try:
             await process_pending_once(conn, upsert_call=_default_upsert,
-                                       history_loader=_default_history_loader)
+                                       history_loader=history_loader)
         except Exception as e:
             _LOG.exception("recall worker tick error: %s", e)
         try:
