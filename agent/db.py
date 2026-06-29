@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_type        TEXT NOT NULL DEFAULT 'general',
     network_granted   INTEGER NOT NULL DEFAULT 0,
     recall_indexed_msgs INTEGER NOT NULL DEFAULT 0,
-    recall_chunk_seq    INTEGER NOT NULL DEFAULT 0
+    recall_chunk_seq    INTEGER NOT NULL DEFAULT 0,
+    rolling_summary       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -266,6 +267,8 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "recall_chunk_seq" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "recall_chunk_seq INTEGER NOT NULL DEFAULT 0")
+    if "rolling_summary" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN rolling_summary TEXT")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}
