@@ -212,3 +212,45 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
     except Exception as e:
         _LOG.warning("compaction error, bypassing (%s): %s", session_id, e)
         return "", history
+
+
+def _load_snapshot_history(conn, session_id) -> list:
+    """Latest cumulative history snapshot (role='history', content=json list)
+    — same source the run path persists/reads."""
+    import json as _json
+    row = conn.execute(
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+    if not row:
+        return []
+    try:
+        h = _json.loads(row["content"])
+        return h if isinstance(h, list) else []
+    except (ValueError, KeyError):
+        return []
+
+
+def compute_usage(conn, *, session_id, user_id, model) -> dict:
+    """Read-only current context usage for a session: estimated tokens of
+    (rolling_summary + history snapshot) vs the resolved model window. Never
+    writes, never triggers compaction. Same estimator as compaction, so pct
+    aligns with the THRESHOLD trigger."""
+    window = resolve_window(conn, user_id, model)
+    try:
+        # Scope by user_id: a session is only readable by its owner. A
+        # non-existent OR not-owned session returns zeros (no cross-user
+        # info leak — IDOR guard), mirroring other user-scoped agent endpoints.
+        srow = conn.execute(
+            "SELECT rolling_summary FROM sessions WHERE id=? AND user_id=?",
+            (session_id, str(user_id))).fetchone()
+        if srow is None:
+            tokens = 0
+        else:
+            summary = srow["rolling_summary"] or ""
+            history = _load_snapshot_history(conn, session_id)
+            tokens = estimate_tokens(summary) + estimate_messages_tokens(history)
+    except Exception as e:
+        _LOG.warning("context usage compute failed for %s: %s", session_id, e)
+        tokens = 0
+    pct = round(100 * tokens / window) if window else 0
+    return {"tokens": tokens, "window": window, "pct": pct}

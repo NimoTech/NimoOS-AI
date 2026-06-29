@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import db as db_module
+import context_compaction
 import memory_store
 from agent import AgentRunner
 from confirm import ConfirmManager
@@ -1540,6 +1541,19 @@ async def get_memory_settings(request: Request):
         "compaction_enabled": memory_store.is_compaction_enabled(_db(), user_id),
         "context_window": memory_store.get_context_window(_db(), user_id),
     }
+
+
+@app.get("/agent/context-usage")
+async def get_context_usage(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    session_id = request.query_params.get("session_id", "")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    model = request.query_params.get("model", "")
+    return context_compaction.compute_usage(
+        _db(), session_id=session_id, user_id=user_id, model=model)
 
 
 @app.put("/agent/user-memory/settings")
