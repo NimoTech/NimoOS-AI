@@ -237,11 +237,18 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
     aligns with the THRESHOLD trigger."""
     window = resolve_window(conn, user_id, model)
     try:
-        srow = conn.execute("SELECT rolling_summary FROM sessions WHERE id=?",
-                            (session_id,)).fetchone()
-        summary = (srow["rolling_summary"] if srow else "") or ""
-        history = _load_snapshot_history(conn, session_id)
-        tokens = estimate_tokens(summary) + estimate_messages_tokens(history)
+        # Scope by user_id: a session is only readable by its owner. A
+        # non-existent OR not-owned session returns zeros (no cross-user
+        # info leak — IDOR guard), mirroring other user-scoped agent endpoints.
+        srow = conn.execute(
+            "SELECT rolling_summary FROM sessions WHERE id=? AND user_id=?",
+            (session_id, str(user_id))).fetchone()
+        if srow is None:
+            tokens = 0
+        else:
+            summary = srow["rolling_summary"] or ""
+            history = _load_snapshot_history(conn, session_id)
+            tokens = estimate_tokens(summary) + estimate_messages_tokens(history)
     except Exception as e:
         _LOG.warning("context usage compute failed for %s: %s", session_id, e)
         tokens = 0

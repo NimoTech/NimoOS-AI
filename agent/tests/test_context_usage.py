@@ -68,3 +68,13 @@ def test_user_context_window_override(conn):
     _snapshot(conn, "s1", [{"role": "user", "content": "x" * 100}])
     u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="gpt-4o")
     assert u["window"] == 5000
+
+
+def test_cross_user_session_returns_zero(conn):
+    # IDOR guard: a session owned by u1 must not leak its usage to u2.
+    _sess(conn, sid="s1", user="u1")
+    _snapshot(conn, "s1", [{"role": "user", "content": "机密" * 100}])
+    owner = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
+    other = cc.compute_usage(conn, session_id="s1", user_id="u2", model="qwen")
+    assert owner["tokens"] > 0
+    assert other["tokens"] == 0 and other["pct"] == 0   # not owned → zeros
