@@ -1,7 +1,6 @@
 import json
 import uuid
 import time
-import asyncio
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -19,7 +18,8 @@ def runner(tmp_path):
     return agent_module.AgentRunner(conn)
 
 
-def test_make_summarize_fn_calls_client():
+@pytest.mark.asyncio
+async def test_make_summarize_fn_calls_client():
     captured = {}
 
     class FakeMsg:
@@ -43,8 +43,7 @@ def test_make_summarize_fn_calls_client():
         chat = FakeChat()
 
     fn = agent_module._make_summarize_fn(FakeClient(), "qwen")
-    out = asyncio.get_event_loop().run_until_complete(
-        fn("INSTR", "PRIOR", "FOLD"))
+    out = await fn("INSTR", "PRIOR", "FOLD")
     assert out == "ROLLED"
     assert captured["model"] == "qwen"
     # instruction as system, prior+fold as user content
