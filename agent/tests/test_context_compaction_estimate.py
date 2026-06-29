@@ -42,3 +42,20 @@ def test_resolve_window_map_then_default(tmp_path):
     assert cc.resolve_window(conn, "u1", "qwen2.5-7b") == 32768
     assert cc.resolve_window(conn, "u1", "some-unknown-local") == cc.DEFAULT_CONTEXT_WINDOW
     conn.close()
+
+
+def test_resolve_window_short_key_boundary(tmp_path):
+    conn = init_db(str(tmp_path / "m.db"))
+    # real o1/o3 family names match → 128000
+    assert cc.resolve_window(conn, "u1", "o1") == 128000
+    assert cc.resolve_window(conn, "u1", "o1-mini") == 128000
+    assert cc.resolve_window(conn, "u1", "o3-mini") == 128000
+    assert cc.resolve_window(conn, "u1", "openai/o1-preview") == 128000
+    # embedded 'o1'/'o3' that are NOT the o1/o3 family must NOT false-match
+    assert cc.resolve_window(conn, "u1", "do3-test") == cc.DEFAULT_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "no1se-model") == cc.DEFAULT_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "o13b") == cc.DEFAULT_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "o1pro") == cc.DEFAULT_CONTEXT_WINDOW
+    # long-key substring matching still lenient (qwen2.5 glued version)
+    assert cc.resolve_window(conn, "u1", "qwen2.5-7b") == 32768
+    conn.close()
