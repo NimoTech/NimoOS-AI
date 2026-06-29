@@ -76,6 +76,27 @@ def _get_lock(session_id: str) -> asyncio.Lock:
     return _session_locks[session_id]
 
 
+def _make_summarize_fn(client, model_name):
+    """Build the (injected) summarize callable for context compaction. Uses the
+    conversation's OWN provider client/model (no new model). Returns the
+    summary text; raises on failure (compact_for_run wraps with wait_for and
+    catches)."""
+    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
+        body = (f"【已有摘要】\n{prior_summary or '(无)'}\n\n"
+                f"【更早的对话片段】\n{fold_text}")
+        resp = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "system", "content": instruction},
+                      {"role": "user", "content": body}],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        if resp.choices:
+            return (getattr(resp.choices[0].message, "content", "") or "").strip()
+        return ""
+    return _summarize
+
+
 def _compose_system_prompt(conn, session_id: str, base: str,
                             *, max_per_file: int = 8 * 1024,
                             max_total: int = 32 * 1024) -> str:
@@ -705,18 +726,6 @@ class AgentRunner:
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
             mcp_tools = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
-            agent = Agent(
-                name="NimoOS Agent",
-                instructions=full_prompt,
-                tools=select_tools_for_run(attachment_ids,
-                                           session_id=session_id,
-                                           profile=profile)
-                + (gate_runtime_tools(mcp_tools, "mcp")
-                   if (profile is None or profile.tools is None) else mcp_tools),
-                model=model,
-                model_settings=model_settings,
-            )
-
             user_content = build_user_content(
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,
@@ -729,10 +738,35 @@ class AgentRunner:
             # supported for input_image".
             history = hydrate_image_blocks(
                 history, session_id=session_id, data_root=data_root)
+
+            # --- P4 context compaction (main path; bypass/fail → no-op/truncate) ---
+            import context_compaction
+            _summarize_fn = _make_summarize_fn(client, model_name)
+            _cur_text = user_content if isinstance(user_content, str) else json.dumps(
+                user_content, ensure_ascii=False)
+            summary_block, send_history = await context_compaction.compact_for_run(
+                self._conn, session_id=session_id, user_id=str(user_id),
+                model_name=model_name, history=history, current_text=_cur_text,
+                summarize_fn=_summarize_fn)
+            if summary_block:
+                full_prompt = full_prompt + "\n\n" + summary_block
+
+            agent = Agent(
+                name="NimoOS Agent",
+                instructions=full_prompt,
+                tools=select_tools_for_run(attachment_ids,
+                                           session_id=session_id,
+                                           profile=profile)
+                + (gate_runtime_tools(mcp_tools, "mcp")
+                   if (profile is None or profile.tools is None) else mcp_tools),
+                model=model,
+                model_settings=model_settings,
+            )
+
             if continue_run:
-                input_messages = history
+                input_messages = send_history
             else:
-                input_messages = history + [{"role": "user", "content": user_content}]
+                input_messages = send_history + [{"role": "user", "content": user_content}]
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None

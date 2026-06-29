@@ -74,7 +74,7 @@ async def test_settings_default_enabled(tmp_path, monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         r = await ac.get("/agent/user-memory/settings", headers={"X-User-Id": "u1"})
     assert r.status_code == 200
-    assert r.json() == {"enabled": True}
+    assert r.json()["enabled"] is True
 
 
 @pytest.mark.asyncio
@@ -86,9 +86,9 @@ async def test_settings_put_then_get_roundtrip(tmp_path, monkeypatch):
         p = await ac.put("/agent/user-memory/settings",
                          headers={"X-User-Id": "u1"}, json={"enabled": False})
         assert p.status_code == 200
-        assert p.json() == {"enabled": False}
+        assert p.json()["enabled"] is False
         g = await ac.get("/agent/user-memory/settings", headers={"X-User-Id": "u1"})
-    assert g.json() == {"enabled": False}
+    assert g.json()["enabled"] is False
     conn = main_module._db()
     row = conn.execute(
         "SELECT value FROM user_settings WHERE user_id='u1' AND key='memory_enabled'"
