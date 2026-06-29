@@ -138,3 +138,27 @@ async def test_window_precheck_skips_oversized_fold(conn):
         history=h, current_text="q", summarize_fn=counting)
     assert called["n"] == 0          # fold never fits W=200 → no call
     assert len(send) < len(h)        # fell back to truncation
+
+
+@pytest.mark.asyncio
+async def test_bloat_gate_uses_tokens_not_chars(conn):
+    # small window so it triggers; fold is ASCII (cheap per char)
+    conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
+                 "VALUES('u1','context_window','2000',0)"); conn.commit()
+    h = []
+    for i in range(15):
+        h.append(_u("q%d " % i + "x" * 200))   # ASCII fold (~50 tok / 200 chars)
+        h.append(_a("a%d " % i + "y" * 200))
+
+    async def cjk_heavy(instr, prior, fold):
+        # fewer CHARS than fold_text, but CJK → more estimated TOKENS than fold
+        return "中" * (len(fold) // 2)
+
+    block, send = await cc.compact_for_run(
+        conn, session_id="s1", user_id="u1", model_name="x",
+        history=h, current_text="q", summarize_fn=cjk_heavy)
+    # char-len gate would ACCEPT (shorter string) and write the bloated summary;
+    # token gate REJECTS it → rolling_summary stays empty, send is truncated.
+    row = conn.execute("SELECT rolling_summary FROM sessions WHERE id='s1'").fetchone()
+    assert row["rolling_summary"] in (None, "")
+    assert len(send) < len(h)

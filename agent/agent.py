@@ -34,6 +34,7 @@ import skills.skills_registry as skills_registry
 import skills.search as search_skills
 import skills.memory as memory_skills
 import memory_store
+import context_compaction
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
@@ -740,10 +741,14 @@ class AgentRunner:
                 history, session_id=session_id, data_root=data_root)
 
             # --- P4 context compaction (main path; bypass/fail → no-op/truncate) ---
-            import context_compaction
             _summarize_fn = _make_summarize_fn(client, model_name)
-            _cur_text = user_content if isinstance(user_content, str) else json.dumps(
-                user_content, ensure_ascii=False)
+            # continue_run has no new user message (it's already in history), so
+            # don't double-count it in the token estimate.
+            if continue_run:
+                _cur_text = ""
+            else:
+                _cur_text = user_content if isinstance(user_content, str) else json.dumps(
+                    user_content, ensure_ascii=False)
             summary_block, send_history = await context_compaction.compact_for_run(
                 self._conn, session_id=session_id, user_id=str(user_id),
                 model_name=model_name, history=history, current_text=_cur_text,

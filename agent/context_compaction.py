@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import memory_store
 
@@ -80,15 +81,25 @@ def estimate_messages_tokens(messages) -> int:
     return sum(estimate_tokens(_message_text(m)) for m in (messages or []))
 
 
+def _key_matches(key: str, name: str) -> bool:
+    """Substring match for normal keys; short keys (len<4, e.g. 'o1'/'o3')
+    require a non-alphanumeric boundary before and a non-digit after, so
+    'o1-mini'/'-o1' match but 'do3'/'no1se'/'o13b' do not."""
+    if len(key) >= 4:
+        return key in name
+    return re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![0-9])",
+                     name) is not None
+
+
 def resolve_window(conn, user_id, model_name) -> int:
-    """user_settings.context_window (positive int) > MODEL_WINDOW_MAP substring
-    match > DEFAULT_CONTEXT_WINDOW."""
+    """user_settings.context_window (positive int) > MODEL_WINDOW_MAP match >
+    DEFAULT_CONTEXT_WINDOW."""
     user_w = memory_store.get_context_window(conn, user_id)
     if user_w:
         return user_w
     name = (model_name or "").lower()
     for key, win in MODEL_WINDOW_MAP.items():
-        if key in name:
+        if _key_matches(key, name):
             return win
     return DEFAULT_CONTEXT_WINDOW
 
@@ -185,7 +196,8 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
             except Exception as e:
                 _LOG.warning("compaction summarize failed (%s): %s",
                              session_id, e)
-            if out and out.strip() and len(out) < len(fold_text):
+            if (out and out.strip()
+                    and estimate_tokens(out) < estimate_tokens(fold_text)):
                 new_S = out.strip()
                 _write_summary(conn, session_id, new_S)
                 send_history = history[cut:]

@@ -84,6 +84,36 @@ async def test_run_injects_summary_and_uses_compacted_history(runner, monkeypatc
     assert seen["input"][-1]["role"] == "user"
 
 
+@pytest.mark.asyncio
+async def test_continue_run_passes_empty_current_text(runner, monkeypatch):
+    # continue_run has no new user message; it must not be double-counted in
+    # the compaction token estimate → current_text == "".
+    seen = {}
+
+    async def fake_compact(conn, **kw):
+        seen["current_text"] = kw.get("current_text")
+        return ("", kw.get("history"))
+    monkeypatch.setattr(cc, "compact_for_run", fake_compact)
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        m = MagicMock()
+        async def empty():
+            return
+            yield
+        m.stream_events = empty
+        m.to_input_list.return_value = []
+        m.final_output = ""
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(
+            session_id="s1", user_id="u1", message="", sink=_CollectSink(),
+            provider_key="k", provider_url="http://x", model_name="qwen",
+            continue_run=True)
+
+    assert seen["current_text"] == ""
+
+
 class _CollectSink:
     def __init__(self): self.events = []
     async def put(self, e): self.events.append(e)
