@@ -145,6 +145,33 @@ def is_memory_enabled(conn, user_id) -> bool:
     return row["value"] != "0"
 
 
+def is_compaction_enabled(conn, user_id) -> bool:
+    """Per-user single-session compaction switch from user_settings.
+    Absent/empty row → enabled (default on, same default semantics as
+    is_memory_enabled)."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='compaction_enabled'",
+        (str(user_id),)).fetchone()
+    if row is None or row["value"] in (None, ""):
+        return True
+    return str(row["value"]) not in ("0", "false", "False")
+
+
+def get_context_window(conn, user_id) -> "int | None":
+    """User-provided model context window (tokens). Returns a positive int or
+    None (absent / non-int / <=0 → None, caller falls back to map/default)."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key='context_window'",
+        (str(user_id),)).fetchone()
+    if row is None:
+        return None
+    try:
+        n = int(str(row["value"]).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def supersede_memory(conn, old_id, user_id, text, kind, *, priority=0,
                      origin_session_id=None, now=None):
     """Replace an active memory with a successor that inherits the family
