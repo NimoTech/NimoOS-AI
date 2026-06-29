@@ -7,6 +7,7 @@ messages array. Summarization uses the conversation's own model (no new
 model)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import memory_store
@@ -90,3 +91,111 @@ def resolve_window(conn, user_id, model_name) -> int:
         if key in name:
             return win
     return DEFAULT_CONTEXT_WINDOW
+
+
+def _user_indices(history) -> list:
+    return [i for i, m in enumerate(history)
+            if isinstance(m, dict) and m.get("role") == "user"]
+
+
+def keepk_cut(history, keep_turns) -> int:
+    """Index of the keep_turns-th user message from the end (history[cut:]
+    keeps the last keep_turns turns). Fewer than keep_turns users → 0."""
+    us = _user_indices(history)
+    if len(us) <= keep_turns:
+        return 0
+    return us[len(us) - keep_turns]
+
+
+def _prev_user_boundary(history, cut) -> int:
+    """Largest user-message index strictly < cut, else 0."""
+    us = [i for i in _user_indices(history) if i < cut]
+    return us[-1] if us else 0
+
+
+def _read_summary(conn, session_id) -> str:
+    row = conn.execute("SELECT rolling_summary FROM sessions WHERE id=?",
+                       (session_id,)).fetchone()
+    if not row:
+        return ""
+    return row["rolling_summary"] or ""
+
+
+def _write_summary(conn, session_id, summary) -> None:
+    conn.execute("UPDATE sessions SET rolling_summary=? WHERE id=?",
+                 (summary, session_id))
+    conn.commit()
+
+
+def summary_block(summary) -> str:
+    s = (summary or "").strip()
+    return f"{SUMMARY_HEADER}\n{s}" if s else ""
+
+
+SUMMARIZE_INSTRUCTION = (
+    "你是对话历史压缩器。把【已有摘要】和【更早的对话片段】融合成一段更紧凑、"
+    "信息无损的滚动摘要:保留关键事实、用户偏好、已做的决定、未决问题、实体与"
+    "结论;去掉寒暄与冗余。只输出摘要正文,不要解释、不要前后缀。"
+)
+
+
+def _truncate_to_fit(send_history, summary_text, current_text, line) -> list:
+    """Drop oldest user-turns from send_history (user boundaries) until it fits
+    line; always keep at least the last turn."""
+    us = _user_indices(send_history)
+    if not us:
+        return send_history
+    base = estimate_tokens(summary_text) + estimate_tokens(current_text)
+    for c in us:                      # ascending user boundaries
+        cand = send_history[c:]
+        if base + estimate_messages_tokens(cand) <= line:
+            return cand
+    return send_history[us[-1]:]       # keep only the last turn
+
+
+async def compact_for_run(conn, *, session_id, user_id, model_name,
+                          history, current_text, summarize_fn, now=None):
+    try:
+        if not memory_store.is_compaction_enabled(conn, user_id):
+            return "", history
+        S = _read_summary(conn, session_id)
+        W = resolve_window(conn, user_id, model_name)
+        line = int(THRESHOLD * W)
+        total = (estimate_tokens(S) + estimate_messages_tokens(history)
+                 + estimate_tokens(current_text))
+        if total <= line:
+            return summary_block(S), history
+
+        cut = keepk_cut(history, RECENT_TURNS)
+        instr_overhead = estimate_tokens(SUMMARIZE_INSTRUCTION) + estimate_tokens(S)
+        # window precheck: shrink cut until fold fits the summarizer window W
+        while cut > 0 and (instr_overhead
+                           + estimate_messages_tokens(history[:cut])) > W:
+            cut = _prev_user_boundary(history, cut)
+
+        new_S = S
+        send_history = history
+        if cut > 0:
+            fold_text = "\n".join(_message_text(m) for m in history[:cut])
+            out = None
+            try:
+                out = await asyncio.wait_for(
+                    summarize_fn(SUMMARIZE_INSTRUCTION, S, fold_text),
+                    timeout=COMPACT_LLM_TIMEOUT)
+            except Exception as e:
+                _LOG.warning("compaction summarize failed (%s): %s",
+                             session_id, e)
+            if out and out.strip() and len(out) < len(fold_text):
+                new_S = out.strip()
+                _write_summary(conn, session_id, new_S)
+                send_history = history[cut:]
+            # else: keep old S, send_history stays = history → terminal truncate
+
+        if (estimate_tokens(new_S) + estimate_messages_tokens(send_history)
+                + estimate_tokens(current_text)) > line:
+            send_history = _truncate_to_fit(send_history, new_S,
+                                            current_text, line)
+        return summary_block(new_S), send_history
+    except Exception as e:
+        _LOG.warning("compaction error, bypassing (%s): %s", session_id, e)
+        return "", history
