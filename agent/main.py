@@ -17,7 +17,7 @@ _LOG = logging.getLogger("nimoos-agent")
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_MD_BYTES = 50 * 1024
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 import db as db_module
 import context_compaction
+import mcp_tokens
 import memory_store
 from agent import AgentRunner
 from confirm import ConfirmManager
@@ -161,6 +162,40 @@ app = FastAPI(title="nimoos-agent")
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+from fastapi import Body, Header
+from fastapi.responses import JSONResponse
+
+
+def _require_uid(x_user: str | None) -> str:
+    if not x_user:
+        raise HTTPException(status_code=401, detail="missing user identity")
+    return x_user
+
+
+@app.post("/mcp-tokens")
+async def mcp_token_create(payload: dict = Body(default={}),
+                           x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    tok_id, token = mcp_tokens.create(
+        _conn, uid, str(payload.get("label", "")), now_ms=int(time.time() * 1000))
+    return JSONResponse(status_code=201,
+                        content={"id": tok_id, "token": token,
+                                 "label": payload.get("label", "")})
+
+
+@app.get("/mcp-tokens")
+async def mcp_token_list(x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    return {"tokens": mcp_tokens.list_for_user(_conn, uid)}
+
+
+@app.delete("/mcp-tokens/{token_id}")
+async def mcp_token_delete(token_id: str,
+                           x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    return {"revoked": mcp_tokens.revoke(_conn, uid, token_id)}
 
 
 @app.on_event("startup")
