@@ -235,15 +235,23 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
 
         cut = keepk_cut(history, RECENT_TURNS)
         instr_overhead = estimate_tokens(SUMMARIZE_INSTRUCTION) + estimate_tokens(S)
-        # window precheck: shrink cut until fold fits the summarizer window W
-        while cut > 0 and (instr_overhead
-                           + estimate_messages_tokens(history[:cut])) > W:
+        # Build the TRUNCATED fold actually sent to the summarizer, shrinking cut
+        # until that truncated fold fits the summarizer window W. (Estimating the
+        # full history here would wrongly shrink cut to 0 for tool-heavy sessions
+        # and disable compaction — the fold we send is the truncated one.)
+        fold_text = ""
+        while cut > 0:
+            fold_text = "\n".join(
+                _message_text(m, max_output_chars=SUMMARY_OUTPUT_MAX_CHARS)
+                for m in history[:cut])
+            if instr_overhead + estimate_tokens(fold_text) <= W:
+                break
             cut = _prev_user_boundary(history, cut)
+            fold_text = ""
 
         new_S = S
         send_history = history
         if cut > 0:
-            fold_text = "\n".join(_message_text(m) for m in history[:cut])
             out = None
             try:
                 out = await asyncio.wait_for(
