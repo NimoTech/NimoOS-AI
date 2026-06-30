@@ -46,10 +46,11 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
 		Skipper: func(c echo.Context) bool {
-			// _internal routes are localhost-only (LocalhostOnly middleware) and
-			// accept X-NimoOS-User-ID from the request directly. They serve local
-			// daemon traffic (e.g. wiki-summary worker) that has no JWT.
-			return strings.HasPrefix(c.Path(), common.V2APIPath+"/_internal/")
+			p := c.Path()
+			if strings.HasPrefix(p, common.V2APIPath+"/_internal/") {
+				return true
+			}
+			return v2.MCPDataPath(p) // /v1/ai/mcp[, /*] — token-authed in Python
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
@@ -160,6 +161,13 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// Search proxy → forwards /v1/ai/search/* to the Search service (/v1/search/*)
 	searchProxy := &v2.SearchProxy{Client: searchClient}
 	g.Any("/search/*", searchProxy.Proxy)
+
+	// MCP Streamable-HTTP proxy (data + token management)
+	mcpProxy := v2.NewMCPProxy(agentURL) // same agentURL NewAgentHandler uses
+	g.Any("/mcp", mcpProxy.Serve)
+	g.Any("/mcp/*", mcpProxy.Serve)
+	g.Any("/mcp-tokens", mcpProxy.Serve)
+	g.Any("/mcp-tokens/*", mcpProxy.Serve)
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
