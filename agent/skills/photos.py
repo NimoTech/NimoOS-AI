@@ -15,6 +15,11 @@ _TIMEOUT = 30.0
 # JWT; search/smart merely tolerates its absence for localhost callers.
 AUTH_HEADER_VAR: ContextVar[str] = ContextVar("photos_auth_header", default="")
 
+# Per-run user id (set by agent.py for chat, by the MCP adapter for MCP). Sent
+# as X-NimoOS-User-ID so localhost-skipped endpoints scope to the real user
+# instead of falling back to "default".
+USER_ID_VAR: ContextVar[str] = ContextVar("photos_user_id", default="")
+
 # Per-run vision sub-call config, set by agent.py before each run:
 # {"ok": bool, "base_url": str, "api_key": str, "model": str}. look_at_photos
 # issues a one-shot vision request with these credentials — tool-output
@@ -24,8 +29,14 @@ VISION_CFG_VAR: ContextVar[dict] = ContextVar("photos_vision_cfg", default={})
 
 
 def _auth_headers() -> dict:
+    h: dict = {}
     auth = AUTH_HEADER_VAR.get()
-    return {"Authorization": auth} if auth else {}
+    if auth:
+        h["Authorization"] = auth
+    uid = USER_ID_VAR.get()
+    if uid:
+        h["X-NimoOS-User-ID"] = uid
+    return h
 
 
 def _photos_base_url() -> str | None:
@@ -35,26 +46,8 @@ def _photos_base_url() -> str | None:
         return None
 
 
-@function_tool
-async def search_photos(query: str, year: int = 0, limit: int = 20,
-                        ocr_text: str = "") -> str:
-    """Search photos by semantic description using CLIP AI.
-
-    Args:
-        query: MUST be ENGLISH ONLY — never pass Chinese or any other
-               language; non-English queries are rejected by this tool.
-               Translate the user's request into ONE short English
-               description of what the photo looks like ("sunset at
-               beach", "computer store receipt") before calling.
-        year:  Optional year filter (e.g. 2025). 0 means no filter.
-        limit: Max results to return (1-50).
-        ocr_text: OPTIONAL, for text-bearing targets only (receipts,
-               documents, screenshots): a SHORT keyword expected to be
-               printed INSIDE the photo, in the photo's own language
-               (e.g. Chinese receipts → "发票" / store name). Exact-text
-               matches are merged on top of the visual results. Leave
-               empty for purely visual searches.
-    """
+async def _search_photos_impl(query: str, year: int = 0, limit: int = 20,
+                              ocr_text: str = "") -> str:
     base_url = _photos_base_url()
     if not base_url:
         return json.dumps({"error": "Photos service is unavailable."})
@@ -130,6 +123,29 @@ async def search_photos(query: str, year: int = 0, limit: int = 20,
 
 
 @function_tool
+async def search_photos(query: str, year: int = 0, limit: int = 20,
+                        ocr_text: str = "") -> str:
+    """Search photos by semantic description using CLIP AI.
+
+    Args:
+        query: MUST be ENGLISH ONLY — never pass Chinese or any other
+               language; non-English queries are rejected by this tool.
+               Translate the user's request into ONE short English
+               description of what the photo looks like ("sunset at
+               beach", "computer store receipt") before calling.
+        year:  Optional year filter (e.g. 2025). 0 means no filter.
+        limit: Max results to return (1-50).
+        ocr_text: OPTIONAL, for text-bearing targets only (receipts,
+               documents, screenshots): a SHORT keyword expected to be
+               printed INSIDE the photo, in the photo's own language
+               (e.g. Chinese receipts → "发票" / store name). Exact-text
+               matches are merged on top of the visual results. Leave
+               empty for purely visual searches.
+    """
+    return await _search_photos_impl(query, year, limit, ocr_text)
+
+
+@function_tool
 async def create_album(name: str) -> str:
     """Create a new photo album.
 
@@ -181,14 +197,7 @@ async def add_to_album(album_id: str, asset_ids: list[str]) -> str:
         return f"Photos service error: {e}"
 
 
-@function_tool
-async def list_albums() -> str:
-    """List the user's photo albums.
-
-    Returns JSON: {count, albums: [{id, name, assetCount, dateStart,
-    dateEnd}]} (dates are YYYY-MM-DD or empty). Use it to find albums
-    that need renaming or organizing.
-    """
+async def _list_albums_impl() -> str:
     base_url = _photos_base_url()
     if not base_url:
         return json.dumps({"error": "Photos service is unavailable."})
@@ -212,6 +221,17 @@ async def list_albums() -> str:
         return json.dumps({"count": len(albums), "albums": albums})
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+@function_tool
+async def list_albums() -> str:
+    """List the user's photo albums.
+
+    Returns JSON: {count, albums: [{id, name, assetCount, dateStart,
+    dateEnd}]} (dates are YYYY-MM-DD or empty). Use it to find albums
+    that need renaming or organizing.
+    """
+    return await _list_albums_impl()
 
 
 @function_tool

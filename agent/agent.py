@@ -588,6 +588,7 @@ class AgentRunner:
             # Photos service auth: album endpoints validate the user JWT, so
             # forward the caller's Authorization header to the photo tools.
             photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
+            photos_skills.USER_ID_VAR.set(str(user_id))
 
             # Vision sub-call config for look_at_photos: the tool issues a
             # one-shot vision request with the caller's provider credentials
