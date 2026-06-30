@@ -76,18 +76,17 @@ async def test_list_full_tree_error_passthrough(monkeypatch):
     assert "truncated" not in out
 
 
-# append to NimoOS-AI/agent/tests/test_mcp_server_tools.py
-import json
-import pytest
-from mcp_server import tools
 from skills import photos as sphotos
 
 
 def test_whitelist_now_has_eight_including_photos():
     names = {d["name"] for d in tools.list_tool_defs()}
-    assert "search_photos" in names and "list_albums" in names
-    assert len(names) == 8
-    for bad in ("create_album", "add_to_album"):  # write tools never exposed
+    assert names == {
+        "nimoos_search", "read_document", "read_file_chunk",
+        "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
+        "search_photos", "list_albums",
+    }
+    for bad in ("create_album", "add_to_album"):
         assert bad not in names
 
 
@@ -106,6 +105,7 @@ async def test_call_search_photos_dispatches(monkeypatch):
     out = await tools.call("search_photos", {"query": "beach", "limit": 99})
     assert json.loads(out) == {"count": 0, "results": []}
     assert seen["query"] == "beach"
+    assert seen["limit"] == 50
 
 
 @pytest.mark.asyncio
