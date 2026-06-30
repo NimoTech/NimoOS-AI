@@ -70,7 +70,8 @@ async def test_overhead_makes_compaction_trigger_earlier(conn):
     await cc.compact_for_run(conn, session_id="s1", user_id="u1", model_name="x",
                              history=h, current_text="q", summarize_fn=fake,
                              overhead_tokens=5000)
-    assert calls["n"] >= 1 and calls["n"] >= base_calls
+    # explicit both-sides: no-overhead does NOT trigger; big overhead DOES
+    assert base_calls == 0 and calls["n"] >= 1
 
 
 @pytest.mark.asyncio
