@@ -164,6 +164,25 @@ async def healthz():
     return {"status": "ok"}
 
 
+import contextlib
+from mcp_server import server as _mcp_server
+
+_mcp_asgi, _mcp_session_mgr = _mcp_server.build(_conn)
+_mcp_exit_stack = contextlib.AsyncExitStack()
+
+app.mount("/mcp", _mcp_asgi)  # Starlette mount; matches /mcp and /mcp/...
+
+
+@app.on_event("startup")
+async def _mcp_startup():
+    await _mcp_exit_stack.enter_async_context(_mcp_session_mgr.run())
+
+
+@app.on_event("shutdown")
+async def _mcp_shutdown():
+    await _mcp_exit_stack.aclose()
+
+
 from fastapi import Body, Header
 from fastapi.responses import JSONResponse
 
