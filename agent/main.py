@@ -165,12 +165,37 @@ async def healthz():
 
 
 import contextlib
+from starlette.routing import Route as _StarletteRoute
 from mcp_server import server as _mcp_server
 
 _mcp_asgi, _mcp_session_mgr = _mcp_server.build(_conn)
 _mcp_exit_stack = contextlib.AsyncExitStack()
 
-app.mount("/mcp-rpc", _mcp_asgi)  # Starlette mount; matches /mcp-rpc and /mcp-rpc/...
+# Mount the MCP Streamable-HTTP ASGI app so that BOTH the bare path /mcp-rpc
+# AND the trailing-slash form /mcp-rpc/ (and any subpaths) dispatch directly
+# to the app without a 307 redirect.
+#
+# Problem: app.mount("/mcp-rpc", _mcp_asgi) creates a Starlette Mount whose
+# regex only matches /mcp-rpc/… (with leading slash after the prefix).  When
+# the bare /mcp-rpc is requested the Mount returns Match.NONE; the Router then
+# runs its redirect_slashes logic, finds a match for /mcp-rpc/, and emits a
+# 307.  External MCP clients configured with the bare URL break because the
+# redirect Location drops the /v1/ai prefix that the Go gateway stripped.
+#
+# Fix: add an explicit Starlette Route for the exact path /mcp-rpc that wraps
+# the ASGI callable in a trivial class (Route treats a class instance as a raw
+# ASGI app, not as a request→response function).  This route wins the FULL
+# match before the Router ever reaches its redirect_slashes branch.  The Mount
+# keeps handling /mcp-rpc/ and all subpaths.
+
+class _McpRpcBare:
+    """Wrap _mcp_asgi as a class so Starlette's Route treats it as a raw ASGI
+    app (not a request-response function) when registered with methods=None."""
+    async def __call__(self, scope, receive, send):
+        await _mcp_asgi(scope, receive, send)
+
+app.router.routes.insert(0, _StarletteRoute("/mcp-rpc", endpoint=_McpRpcBare(), methods=None))
+app.mount("/mcp-rpc", _mcp_asgi)  # handles /mcp-rpc/ and /mcp-rpc/{rest:path}
 
 
 @app.on_event("startup")

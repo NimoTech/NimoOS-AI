@@ -82,3 +82,63 @@ def _extract_json(resp):
                 return json.loads(line[5:].strip())
         raise AssertionError("no SSE data line")
     return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Regression: bare /mcp-rpc must NOT 307 (trailing-slash redirect bug)
+# ---------------------------------------------------------------------------
+
+_EXPECTED_TOOLS = {
+    "nimoos_search", "read_document", "read_file_chunk",
+    "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
+}
+
+
+def test_bare_path_no_redirect_returns_200(client):
+    """POST /mcp-rpc (no trailing slash) must return 200, not 307.
+
+    Before the fix, Starlette's redirect_slashes caused /mcp-rpc → 307
+    /mcp-rpc/ which is wrong for external clients behind a prefix-stripping
+    reverse proxy (e.g. the Go gateway strips /v1/ai before forwarding).
+    """
+    tok = _mk_token()
+    body = {"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}}
+    h = {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    r = client.post("/mcp-rpc", json=body, headers=h, follow_redirects=False)
+    assert r.status_code == 200, (
+        f"Expected 200 on bare /mcp-rpc, got {r.status_code} "
+        f"(Location: {r.headers.get('location', 'n/a')})"
+    )
+    payload = _extract_json(r)
+    names = {t["name"] for t in payload["result"]["tools"]}
+    assert names == _EXPECTED_TOOLS, f"Tool names mismatch: {names}"
+
+
+def test_trailing_slash_still_200(client):
+    """POST /mcp-rpc/ (trailing slash) must still return 200."""
+    tok = _mk_token()
+    body = {"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}}
+    h = {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    r = client.post("/mcp-rpc/", json=body, headers=h, follow_redirects=False)
+    assert r.status_code == 200, f"Expected 200 on /mcp-rpc/, got {r.status_code}"
+
+
+def test_bare_path_no_token_is_401_not_307(client):
+    """POST /mcp-rpc without auth must return 401, not 307 (redirect would skip auth)."""
+    body = {"jsonrpc": "2.0", "id": 12, "method": "tools/list", "params": {}}
+    h = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    r = client.post("/mcp-rpc", json=body, headers=h, follow_redirects=False)
+    assert r.status_code == 401, (
+        f"Expected 401 on bare /mcp-rpc without token, got {r.status_code}"
+    )
