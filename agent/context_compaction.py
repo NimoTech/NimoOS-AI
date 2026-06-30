@@ -20,6 +20,8 @@ DEFAULT_CONTEXT_WINDOW = 8192
 RECENT_TURNS = 6
 COMPACT_LLM_TIMEOUT = 60
 SAFETY_MARGIN = 1.15
+TOOLS_BASE_OVERHEAD = 80   # fixed framework boilerplate around the tools array
+                           # ("You have access to the following tools…")
 
 # substring (lowercased) → context window (tokens); first containment match wins
 MODEL_WINDOW_MAP = {
@@ -79,6 +81,29 @@ def _message_text(m) -> str:
 
 def estimate_messages_tokens(messages) -> int:
     return sum(estimate_tokens(_message_text(m)) for m in (messages or []))
+
+
+def estimate_tools_tokens(tools) -> int:
+    """Estimated tokens of the tool definitions sent to the model each request
+    (name + description + JSON-schema params), serialized, plus a fixed base
+    for the framework's tool-array boilerplate. getattr-tolerant; a tool that
+    fails to serialize is skipped, never raises. Empty/None → 0 (no base)."""
+    import json as _json
+    items = list(tools or [])
+    if not items:
+        return 0
+    total = TOOLS_BASE_OVERHEAD
+    for t in items:
+        try:
+            spec = {
+                "name": getattr(t, "name", "") or "",
+                "description": getattr(t, "description", "") or "",
+                "parameters": getattr(t, "params_json_schema", {}) or {},
+            }
+            total += estimate_tokens(_json.dumps(spec, ensure_ascii=False))
+        except Exception:
+            continue
+    return total
 
 
 def _key_matches(key: str, name: str) -> bool:
@@ -151,13 +176,14 @@ SUMMARIZE_INSTRUCTION = (
 )
 
 
-def _truncate_to_fit(send_history, summary_text, current_text, line) -> list:
+def _truncate_to_fit(send_history, summary_text, current_text, line,
+                     overhead=0) -> list:
     """Drop oldest user-turns from send_history (user boundaries) until it fits
     line; always keep at least the last turn."""
     us = _user_indices(send_history)
     if not us:
         return send_history
-    base = estimate_tokens(summary_text) + estimate_tokens(current_text)
+    base = overhead + estimate_tokens(summary_text) + estimate_tokens(current_text)
     for c in us:                      # ascending user boundaries
         cand = send_history[c:]
         if base + estimate_messages_tokens(cand) <= line:
@@ -166,14 +192,16 @@ def _truncate_to_fit(send_history, summary_text, current_text, line) -> list:
 
 
 async def compact_for_run(conn, *, session_id, user_id, model_name,
-                          history, current_text, summarize_fn, now=None):
+                          history, current_text, summarize_fn, now=None,
+                          overhead_tokens: int = 0):
     try:
         if not memory_store.is_compaction_enabled(conn, user_id):
             return "", history
         S = _read_summary(conn, session_id)
         W = resolve_window(conn, user_id, model_name)
         line = int(THRESHOLD * W)
-        total = (estimate_tokens(S) + estimate_messages_tokens(history)
+        total = (overhead_tokens + estimate_tokens(S)
+                 + estimate_messages_tokens(history)
                  + estimate_tokens(current_text))
         if total <= line:
             return summary_block(S), history
@@ -204,10 +232,22 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
                 send_history = history[cut:]
             # else: keep old S, send_history stays = history → terminal truncate
 
-        if (estimate_tokens(new_S) + estimate_messages_tokens(send_history)
+        if (overhead_tokens + estimate_tokens(new_S)
+                + estimate_messages_tokens(send_history)
                 + estimate_tokens(current_text)) > line:
             send_history = _truncate_to_fit(send_history, new_S,
-                                            current_text, line)
+                                            current_text, line,
+                                            overhead=overhead_tokens)
+        # Defensive: if even the truncated payload still exceeds LINE (small
+        # window + big overhead + huge current input — nothing left to drop),
+        # log a warning but DO NOT raise (never break chat); best-effort send.
+        if (overhead_tokens + estimate_tokens(new_S)
+                + estimate_messages_tokens(send_history)
+                + estimate_tokens(current_text)) > line:
+            _LOG.warning(
+                "context still over budget after compaction for %s "
+                "(overhead=%d, window-line=%d): input too long / too many tools",
+                session_id, overhead_tokens, line)
         return summary_block(new_S), send_history
     except Exception as e:
         _LOG.warning("compaction error, bypassing (%s): %s", session_id, e)
@@ -241,14 +281,16 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
         # non-existent OR not-owned session returns zeros (no cross-user
         # info leak — IDOR guard), mirroring other user-scoped agent endpoints.
         srow = conn.execute(
-            "SELECT rolling_summary FROM sessions WHERE id=? AND user_id=?",
-            (session_id, str(user_id))).fetchone()
+            "SELECT rolling_summary, last_overhead_tokens FROM sessions "
+            "WHERE id=? AND user_id=?", (session_id, str(user_id))).fetchone()
         if srow is None:
             tokens = 0
         else:
             summary = srow["rolling_summary"] or ""
+            overhead = srow["last_overhead_tokens"] or 0
             history = _load_snapshot_history(conn, session_id)
-            tokens = estimate_tokens(summary) + estimate_messages_tokens(history)
+            tokens = (overhead + estimate_tokens(summary)
+                      + estimate_messages_tokens(history))
     except Exception as e:
         _LOG.warning("context usage compute failed for %s: %s", session_id, e)
         tokens = 0
