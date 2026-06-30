@@ -8,6 +8,7 @@ model)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 
@@ -20,6 +21,8 @@ DEFAULT_CONTEXT_WINDOW = 8192
 RECENT_TURNS = 6
 COMPACT_LLM_TIMEOUT = 60
 SAFETY_MARGIN = 1.15
+SUMMARY_OUTPUT_MAX_CHARS = 500   # cap on function_call_output text fed to the
+                                 # summarizer (NOT the estimate, which is full)
 TOOLS_BASE_OVERHEAD = 80   # fixed framework boilerplate around the tools array
                            # ("You have access to the following tools…")
 
@@ -57,26 +60,50 @@ def estimate_tokens(text: str) -> int:
     return int(raw * SAFETY_MARGIN)
 
 
-def _message_text(m) -> str:
-    """Readable text of one history item (role + textified content),
-    robust to multimodal list content."""
+def _message_text(m, *, max_output_chars=None) -> str:
+    """Readable text of one history/SDK item. Handles standard {role, content}
+    (str or list of blocks) AND the agents SDK shapes with no content:
+    function_call (name+arguments), function_call_output (output — the largest
+    part), reasoning (summary[].text). Unknown → "" (don't count metadata).
+
+    Estimation calls with max_output_chars=None (full, accurate). The summary
+    fold path passes a cap so giant tool outputs don't overflow the summarizer
+    (only function_call_output.output is capped)."""
     if not isinstance(m, dict):
         return str(m)
-    role = m.get("role", "")
-    content = m.get("content", "")
-    if isinstance(content, str):
-        body = content
-    elif isinstance(content, list):
-        parts = []
-        for b in content:
-            if isinstance(b, dict):
-                parts.append(str(b.get("text") or b.get("content") or ""))
-            else:
-                parts.append(str(b))
-        body = " ".join(p for p in parts if p)
-    else:
-        body = str(content)
-    return f"{role}: {body}"
+    content = m.get("content")
+    if content:                       # user / assistant / type=message
+        role = m.get("role", "")
+        if isinstance(content, str):
+            body = content
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict):
+                    parts.append(str(b.get("text") or b.get("content") or ""))
+                else:
+                    parts.append(str(b))
+            body = " ".join(p for p in parts if p)
+        else:
+            body = str(content)
+        return f"{role}: {body}"
+    t = m.get("type")
+    if t == "function_call":
+        return f"{m.get('name', '')}: {m.get('arguments', '') or ''}"
+    if t == "function_call_output":
+        out = m.get("output")
+        if not isinstance(out, str):
+            out = json.dumps(out, ensure_ascii=False) if out is not None else ""
+        if max_output_chars is not None and len(out) > max_output_chars:
+            out = out[:max_output_chars] + f"…[+{len(out) - max_output_chars}字]"
+        return out
+    if t == "reasoning":
+        summ = m.get("summary")
+        if isinstance(summ, list):
+            return " ".join(str(b.get("text", "")) for b in summ
+                            if isinstance(b, dict))
+        return str(summ or "")
+    return ""
 
 
 def estimate_messages_tokens(messages) -> int:
@@ -208,15 +235,23 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
 
         cut = keepk_cut(history, RECENT_TURNS)
         instr_overhead = estimate_tokens(SUMMARIZE_INSTRUCTION) + estimate_tokens(S)
-        # window precheck: shrink cut until fold fits the summarizer window W
-        while cut > 0 and (instr_overhead
-                           + estimate_messages_tokens(history[:cut])) > W:
+        # Build the TRUNCATED fold actually sent to the summarizer, shrinking cut
+        # until that truncated fold fits the summarizer window W. (Estimating the
+        # full history here would wrongly shrink cut to 0 for tool-heavy sessions
+        # and disable compaction — the fold we send is the truncated one.)
+        fold_text = ""
+        while cut > 0:
+            fold_text = "\n".join(
+                _message_text(m, max_output_chars=SUMMARY_OUTPUT_MAX_CHARS)
+                for m in history[:cut])
+            if instr_overhead + estimate_tokens(fold_text) <= W:
+                break
             cut = _prev_user_boundary(history, cut)
+            fold_text = ""
 
         new_S = S
         send_history = history
         if cut > 0:
-            fold_text = "\n".join(_message_text(m) for m in history[:cut])
             out = None
             try:
                 out = await asyncio.wait_for(
