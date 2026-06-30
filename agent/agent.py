@@ -727,6 +727,16 @@ class AgentRunner:
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
             mcp_tools = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            run_tools = (select_tools_for_run(attachment_ids,
+                                              session_id=session_id, profile=profile)
+                         + (gate_runtime_tools(mcp_tools, "mcp")
+                            if (profile is None or profile.tools is None)
+                            else mcp_tools))
+            try:
+                _overhead = (context_compaction.estimate_tokens(full_prompt)
+                             + context_compaction.estimate_tools_tokens(run_tools))
+            except Exception:
+                _overhead = 0
             user_content = build_user_content(
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,
@@ -752,18 +762,14 @@ class AgentRunner:
             summary_block, send_history = await context_compaction.compact_for_run(
                 self._conn, session_id=session_id, user_id=str(user_id),
                 model_name=model_name, history=history, current_text=_cur_text,
-                summarize_fn=_summarize_fn)
+                summarize_fn=_summarize_fn, overhead_tokens=_overhead)
             if summary_block:
                 full_prompt = full_prompt + "\n\n" + summary_block
 
             agent = Agent(
                 name="NimoOS Agent",
                 instructions=full_prompt,
-                tools=select_tools_for_run(attachment_ids,
-                                           session_id=session_id,
-                                           profile=profile)
-                + (gate_runtime_tools(mcp_tools, "mcp")
-                   if (profile is None or profile.tools is None) else mcp_tools),
+                tools=run_tools,
                 model=model,
                 model_settings=model_settings,
             )
@@ -853,6 +859,13 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+                try:
+                    self._conn.execute(
+                        "UPDATE sessions SET last_overhead_tokens=? WHERE id=?",
+                        (_overhead, session_id))
+                    self._conn.commit()
+                except Exception:
+                    pass
             except MaxTurnsExceeded:
                 # 触顶不是错误,是"暂停":落库 + 发可继续事件,不发红色 error。
                 try:
