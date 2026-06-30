@@ -17,7 +17,7 @@ _LOG = logging.getLogger("nimoos-agent")
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_MD_BYTES = 50 * 1024
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 import db as db_module
 import context_compaction
+import mcp_tokens
 import memory_store
 from agent import AgentRunner
 from confirm import ConfirmManager
@@ -161,6 +162,84 @@ app = FastAPI(title="nimoos-agent")
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+import contextlib
+from starlette.routing import Route as _StarletteRoute
+from mcp_server import server as _mcp_server
+
+_mcp_asgi, _mcp_session_mgr = _mcp_server.build(_conn)
+_mcp_exit_stack = contextlib.AsyncExitStack()
+
+# Mount the MCP Streamable-HTTP ASGI app so that BOTH the bare path /mcp-rpc
+# AND the trailing-slash form /mcp-rpc/ (and any subpaths) dispatch directly
+# to the app without a 307 redirect.
+#
+# Problem: app.mount("/mcp-rpc", _mcp_asgi) creates a Starlette Mount whose
+# regex only matches /mcp-rpc/… (with leading slash after the prefix).  When
+# the bare /mcp-rpc is requested the Mount returns Match.NONE; the Router then
+# runs its redirect_slashes logic, finds a match for /mcp-rpc/, and emits a
+# 307.  External MCP clients configured with the bare URL break because the
+# redirect Location drops the /v1/ai prefix that the Go gateway stripped.
+#
+# Fix: add an explicit Starlette Route for the exact path /mcp-rpc that wraps
+# the ASGI callable in a trivial class (Route treats a class instance as a raw
+# ASGI app, not as a request→response function).  This route wins the FULL
+# match before the Router ever reaches its redirect_slashes branch.  The Mount
+# keeps handling /mcp-rpc/ and all subpaths.
+
+class _McpRpcBare:
+    """Wrap _mcp_asgi as a class so Starlette's Route treats it as a raw ASGI
+    app (not a request-response function) when registered with methods=None."""
+    async def __call__(self, scope, receive, send):
+        await _mcp_asgi(scope, receive, send)
+
+app.router.routes.insert(0, _StarletteRoute("/mcp-rpc", endpoint=_McpRpcBare(), methods=None))
+app.mount("/mcp-rpc", _mcp_asgi)  # handles /mcp-rpc/ and /mcp-rpc/{rest:path}
+
+
+@app.on_event("startup")
+async def _mcp_startup():
+    await _mcp_exit_stack.enter_async_context(_mcp_session_mgr.run())
+
+
+@app.on_event("shutdown")
+async def _mcp_shutdown():
+    await _mcp_exit_stack.aclose()
+
+
+from fastapi import Body, Header
+from fastapi.responses import JSONResponse
+
+
+def _require_uid(x_user: str | None) -> str:
+    if not x_user:
+        raise HTTPException(status_code=401, detail="missing user identity")
+    return x_user
+
+
+@app.post("/mcp-tokens")
+async def mcp_token_create(payload: dict = Body(default={}),
+                           x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    tok_id, token = mcp_tokens.create(
+        _conn, uid, str(payload.get("label", "")), now_ms=int(time.time() * 1000))
+    return JSONResponse(status_code=201,
+                        content={"id": tok_id, "token": token,
+                                 "label": payload.get("label", "")})
+
+
+@app.get("/mcp-tokens")
+async def mcp_token_list(x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    return {"tokens": mcp_tokens.list_for_user(_conn, uid)}
+
+
+@app.delete("/mcp-tokens/{token_id}")
+async def mcp_token_delete(token_id: str,
+                           x_nimoos_user_id: str | None = Header(default=None)):
+    uid = _require_uid(x_nimoos_user_id)
+    return {"revoked": mcp_tokens.revoke(_conn, uid, token_id)}
 
 
 @app.on_event("startup")
