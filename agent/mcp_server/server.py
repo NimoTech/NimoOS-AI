@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import time
 
-import anyio
 import mcp.types as mtypes
 from mcp.server.lowlevel import Server
-from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import mcp_tokens
@@ -33,38 +31,6 @@ def _build_lowlevel() -> Server:
     return server
 
 
-async def _handle_stateless_inline(server: Server, scope, receive, send,
-                                   json_response: bool) -> None:
-    """Run a single stateless MCP request inline (own task group per request).
-
-    Used as a fallback when the shared session_manager has not been started
-    (e.g. TestClient used without the context-manager form).  In production the
-    startup handler pre-warms the shared task group via session_manager.run(),
-    which is more efficient; this path is only hit when that hasn't happened."""
-    transport = StreamableHTTPServerTransport(
-        mcp_session_id=None,
-        is_json_response_enabled=json_response,
-    )
-
-    async def _run_server(*, task_status=anyio.TASK_STATUS_IGNORED):
-        async with transport.connect() as (read_stream, write_stream):
-            task_status.started()
-            try:
-                await server.run(
-                    read_stream,
-                    write_stream,
-                    server.create_initialization_options(),
-                    stateless=True,
-                )
-            except Exception:
-                pass
-
-    async with anyio.create_task_group() as tg:
-        await tg.start(_run_server)
-        await transport.handle_request(scope, receive, send)
-        await transport.terminate()
-
-
 def build(conn):
     server = _build_lowlevel()
     session_manager = StreamableHTTPSessionManager(
@@ -86,12 +52,6 @@ def build(conn):
             return
         # Same task as handle_request → ContextVars reach the tool dispatch.
         tools.setup_user_context(uid)
-        if session_manager._task_group is None:
-            # Startup handler hasn't run (e.g. TestClient without context-manager
-            # form). Fall back to an inline task group for this request.
-            await _handle_stateless_inline(server, scope, receive, send,
-                                           json_response=True)
-        else:
-            await session_manager.handle_request(scope, receive, send)
+        await session_manager.handle_request(scope, receive, send)
 
     return asgi, session_manager
