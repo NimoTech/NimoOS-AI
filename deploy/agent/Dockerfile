@@ -44,8 +44,10 @@ RUN set -eux; cd /tmp; \
 # 依赖层与代码层分离(层缓存关键):先只拷 requirements.txt 并装依赖,再拷源码。
 # 这样改任意 *.py 只让最后一层 COPY 失效(秒级、零下载),pip 层只在 requirements.txt
 # 变更时才重装。烤进镜像,host 不再建 venv。
+# PIP_INDEX_URL:默认官方源;国内/慢网构建可传 --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple 提速。
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY agent/requirements.txt /usr/share/nimoos/agent/requirements.txt
-RUN pip install --no-cache-dir -r /usr/share/nimoos/agent/requirements.txt
+RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r /usr/share/nimoos/agent/requirements.txt
 COPY agent/ /usr/share/nimoos/agent/
 
 WORKDIR /usr/share/nimoos/agent
