@@ -8,13 +8,12 @@ from skills import wiki as swiki
 
 def test_whitelist_is_exactly_six_read_tools():
     names = {d["name"] for d in tools.list_tool_defs()}
-    assert names == {
-        "nimoos_search", "read_document", "read_file_chunk",
-        "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
-    }
-    # no write/path/photos/vision tools leak in
-    for bad in ("write_file", "view_document_page", "search_photos",
-                "list_albums", "wiki_append_user_notes"):
+    # core 6 tools are present (photos tools added in Task 3)
+    for required in ("nimoos_search", "read_document", "read_file_chunk",
+                     "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes"):
+        assert required in names
+    # no write/path/vision tools leak in
+    for bad in ("write_file", "view_document_page", "wiki_append_user_notes"):
         assert bad not in names
 
 
@@ -75,3 +74,49 @@ async def test_list_full_tree_error_passthrough(monkeypatch):
     # Must NOT be wrapped in a nodes/truncated envelope
     assert "nodes" not in out
     assert "truncated" not in out
+
+
+# append to NimoOS-AI/agent/tests/test_mcp_server_tools.py
+import json
+import pytest
+from mcp_server import tools
+from skills import photos as sphotos
+
+
+def test_whitelist_now_has_eight_including_photos():
+    names = {d["name"] for d in tools.list_tool_defs()}
+    assert "search_photos" in names and "list_albums" in names
+    assert len(names) == 8
+    for bad in ("create_album", "add_to_album"):  # write tools never exposed
+        assert bad not in names
+
+
+def test_read_document_schema_unchanged_no_path():
+    spec = next(d for d in tools.list_tool_defs() if d["name"] == "read_document")
+    assert "path" not in spec["inputSchema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_call_search_photos_dispatches(monkeypatch):
+    seen = {}
+    async def fake(query, year=0, limit=20, ocr_text=""):
+        seen.update(query=query, limit=limit)
+        return json.dumps({"count": 0, "results": []})
+    monkeypatch.setattr(sphotos, "_search_photos_impl", fake)
+    out = await tools.call("search_photos", {"query": "beach", "limit": 99})
+    assert json.loads(out) == {"count": 0, "results": []}
+    assert seen["query"] == "beach"
+
+
+@pytest.mark.asyncio
+async def test_call_list_albums_dispatches(monkeypatch):
+    async def fake():
+        return json.dumps({"count": 1, "albums": [{"id": "a", "name": "x"}]})
+    monkeypatch.setattr(sphotos, "_list_albums_impl", fake)
+    out = json.loads(await tools.call("list_albums", {}))
+    assert out["count"] == 1
+
+
+def test_setup_user_context_sets_photos_uid():
+    tools.setup_user_context("42")
+    assert sphotos.USER_ID_VAR.get() == "42"

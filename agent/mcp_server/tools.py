@@ -9,6 +9,7 @@ import json
 
 from skills.search import search as _search
 from skills import wiki as _wiki
+from skills import photos as _photos
 from wiki_client import WikiClient
 
 MAX_TREE_NODES = 500
@@ -20,6 +21,7 @@ def setup_user_context(user_id: str) -> None:
     same asyncio task that will dispatch the tool (ContextVars are per-task)."""
     _search.USER_ID_VAR.set(str(user_id))
     _wiki.WIKI_CLIENT_VAR.set(WikiClient(user_id=str(user_id)))
+    _photos.USER_ID_VAR.set(str(user_id))
 
 
 async def _h_search(args: dict) -> str:
@@ -63,6 +65,20 @@ async def _h_wiki_recent_changes(args: dict) -> str:
     return await _wiki._wiki_recent_changes_impl(
         args["path"], int(args.get("since_days", 7) or 7),
         int(args.get("limit", 50) or 50))
+
+
+_PHOTOS_MAX_LIMIT = 50
+
+
+async def _h_search_photos(args: dict) -> str:
+    limit = min(int(args.get("limit", 20) or 20), _PHOTOS_MAX_LIMIT)
+    return await _photos._search_photos_impl(
+        args["query"], int(args.get("year", 0) or 0), limit,
+        args.get("ocr_text", "") or "")
+
+
+async def _h_list_albums(args: dict) -> str:
+    return await _photos._list_albums_impl()
 
 
 _STR = {"type": "string"}
@@ -112,6 +128,23 @@ TOOL_SPECS = [
      "inputSchema": {"type": "object", "required": ["path"], "properties": {
          "path": _STR, "since_days": _INT, "limit": _INT}},
      "handler": _h_wiki_recent_changes},
+    {"name": "search_photos",
+     "description": ("Search the user's photos by semantic description (CLIP). "
+                     "`query` MUST be a short ENGLISH description (e.g. 'sunset "
+                     "at beach'); non-English is rejected. `ocr_text` (optional) "
+                     "is a keyword printed INSIDE the photo, in its own language, "
+                     "for receipts/screenshots. limit max 50."),
+     "inputSchema": {"type": "object", "required": ["query"], "properties": {
+         "query": _STR,
+         "year": {**_INT, "description": "optional year filter, 0 = none"},
+         "limit": {**_INT, "description": "max results, 1-50"},
+         "ocr_text": {**_STR, "description": "optional in-photo text keyword"}}},
+     "handler": _h_search_photos},
+    {"name": "list_albums",
+     "description": ("List the user's photo albums: {count, albums:[{id, name, "
+                     "assetCount, dateStart, dateEnd}]} (capped at 100)."),
+     "inputSchema": {"type": "object", "properties": {}},
+     "handler": _h_list_albums},
 ]
 
 _BY_NAME = {s["name"]: s for s in TOOL_SPECS}
