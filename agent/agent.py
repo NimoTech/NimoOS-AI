@@ -9,10 +9,10 @@ import uuid
 from typing import AsyncIterator
 
 from agents import Agent, Runner
-import phoenix_tracing
 from agents.exceptions import MaxTurnsExceeded
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.reasoning_content_replay import default_should_replay_reasoning_content
+import phoenix_tracing
 from openai import AsyncOpenAI
 
 import db as db_module

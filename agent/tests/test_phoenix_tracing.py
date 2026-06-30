@@ -61,3 +61,4 @@ def test_run_config_built_when_enabled(monkeypatch):
     assert rc.trace_metadata["user_id"] == "u1"
     assert rc.trace_metadata["model"] == "deepseek-x"
     assert rc.trace_metadata["agent_type"] == "chat"
+    assert rc.workflow_name == "nimoos-agent"

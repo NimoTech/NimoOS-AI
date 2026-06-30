@@ -21,6 +21,9 @@ def otlp_endpoint() -> str:
 
 
 def project_name() -> str:
+    # NOTE: Phoenix/OpenInference reads PHOENIX_PROJECT from the environment to
+    # group traces by project; this value is used for logging here, not plumbed
+    # into the exporter.
     return os.environ.get("PHOENIX_PROJECT", "nimoos-agent")
 
 
@@ -32,7 +35,10 @@ def _install_processors() -> None:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
-    # ★ Privacy: drop the default BackendSpanExporter so nothing goes to OpenAI.
+    # Privacy: instrument() below uses exclusive_processor=True, which replaces
+    # the SDK processor list with only the OpenInference processor; this clear is
+    # belt-and-suspenders. Phoenix (the local OTLP TracerProvider) is the only
+    # export target — no span reaches OpenAI's backend.
     set_trace_processors([])
 
     provider = trace_sdk.TracerProvider()
