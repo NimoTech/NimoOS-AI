@@ -6,7 +6,7 @@ import main
 import mcp_tokens
 from skills.search import search as ssearch
 
-RPC = "/mcp"
+RPC = "/mcp-rpc"
 ACCEPT = {"Accept": "application/json, text/event-stream",
           "Content-Type": "application/json"}
 

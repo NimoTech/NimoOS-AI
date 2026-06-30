@@ -170,7 +170,7 @@ from mcp_server import server as _mcp_server
 _mcp_asgi, _mcp_session_mgr = _mcp_server.build(_conn)
 _mcp_exit_stack = contextlib.AsyncExitStack()
 
-app.mount("/mcp", _mcp_asgi)  # Starlette mount; matches /mcp and /mcp/...
+app.mount("/mcp-rpc", _mcp_asgi)  # Starlette mount; matches /mcp-rpc and /mcp-rpc/...
 
 
 @app.on_event("startup")

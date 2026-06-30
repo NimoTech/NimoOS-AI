@@ -13,10 +13,10 @@ import (
 )
 
 // MCPDataPath reports whether an Echo route path is the JWT-exempt MCP data
-// endpoint. Data (/v1/ai/mcp[, /*]) is token-authed inside the Python agent;
-// the management endpoint (/v1/ai/mcp-tokens) must NOT be exempt.
+// endpoint. Data (/v1/ai/mcp-rpc[, /*]) is token-authed inside the Python agent;
+// the management endpoints (/v1/ai/mcp/servers, /v1/ai/mcp-tokens) must NOT be exempt.
 func MCPDataPath(p string) bool {
-	base := common.V2APIPath + "/mcp"
+	base := common.V2APIPath + "/mcp-rpc"
 	return p == base || strings.HasPrefix(p, base+"/")
 }
 

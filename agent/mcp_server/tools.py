@@ -51,6 +51,8 @@ async def _h_wiki_list_full_tree(args: dict) -> str:
         nodes = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return raw  # error JSON from the skill — pass through
+    if isinstance(nodes, dict) and "error" in nodes:
+        return raw  # backend error — pass through unchanged
     if isinstance(nodes, list) and len(nodes) > MAX_TREE_NODES:
         return json.dumps({"truncated": True, "total": len(nodes),
                            "nodes": nodes[:MAX_TREE_NODES]}, ensure_ascii=False)

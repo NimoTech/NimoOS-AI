@@ -164,8 +164,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	// MCP Streamable-HTTP proxy (data + token management)
 	mcpProxy := v2.NewMCPProxy(agentURL) // same agentURL NewAgentHandler uses
-	g.Any("/mcp", mcpProxy.Serve)
-	g.Any("/mcp/*", mcpProxy.Serve)
+	g.Any("/mcp-rpc", mcpProxy.Serve)
+	g.Any("/mcp-rpc/*", mcpProxy.Serve)
 	g.Any("/mcp-tokens", mcpProxy.Serve)
 	g.Any("/mcp-tokens/*", mcpProxy.Serve)
 

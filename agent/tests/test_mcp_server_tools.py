@@ -61,3 +61,17 @@ async def test_list_full_tree_truncates(monkeypatch):
     out = json.loads(await tools.call("wiki_list_full_tree", {}))
     assert out["truncated"] is True
     assert len(out["nodes"]) == tools.MAX_TREE_NODES
+
+
+@pytest.mark.asyncio
+async def test_list_full_tree_error_passthrough(monkeypatch):
+    """When the wiki skill returns an error dict, it must not be wrapped in
+    a nodes/truncated envelope — it should pass through unchanged."""
+    async def fake_impl(root_id=""):
+        return json.dumps({"error": "wiki service unavailable"})
+    monkeypatch.setattr(swiki, "_wiki_list_full_tree_impl", fake_impl)
+    out = json.loads(await tools.call("wiki_list_full_tree", {}))
+    assert out == {"error": "wiki service unavailable"}
+    # Must NOT be wrapped in a nodes/truncated envelope
+    assert "nodes" not in out
+    assert "truncated" not in out
