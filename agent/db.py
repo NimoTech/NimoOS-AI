@@ -196,6 +196,17 @@ CREATE TABLE IF NOT EXISTS recall_index_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_recall_jobs_status
     ON recall_index_jobs(status, enqueued_at);
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
