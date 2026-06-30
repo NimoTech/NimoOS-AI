@@ -261,6 +261,16 @@ async def _attachments_startup():
 
 
 @app.on_event("startup")
+async def _tracing_startup():
+    """Initialise optional Phoenix tracing. Best-effort: never blocks startup."""
+    try:
+        import phoenix_tracing
+        phoenix_tracing.setup_tracing()
+    except Exception:
+        _LOG.warning("tracing startup failed; continuing", exc_info=True)
+
+
+@app.on_event("startup")
 async def _memory_worker_startup():
     import memory_extract
     memory_extract.start_worker(_db())
