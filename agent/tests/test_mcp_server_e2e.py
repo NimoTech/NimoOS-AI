@@ -1,6 +1,7 @@
 # NimoOS-AI/agent/tests/test_mcp_server_e2e.py
 import json
 import pytest
+import mcp.types as mtypes
 from fastapi.testclient import TestClient
 import main
 import mcp_tokens
@@ -89,8 +90,9 @@ def _extract_json(resp):
 # ---------------------------------------------------------------------------
 
 _EXPECTED_TOOLS = {
-    "nimoos_search", "read_document", "read_file_chunk",
-    "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
+    "list_albums", "nimoos_search", "read_document", "read_file_chunk",
+    "search_photos", "view_document_page", "wiki_get_node",
+    "wiki_list_full_tree", "wiki_recent_changes",
 }
 
 
@@ -163,3 +165,48 @@ def test_tools_call_error_is_iserror(client):
              token=tok, _id=42, client=client)
     payload = _extract_json(r)
     assert payload["result"]["isError"] is True
+
+
+def _get_raw_call_handler():
+    """Recover the undecorated `_call` closure from `_build_lowlevel`.
+
+    `Server.call_tool()`'s decorator registers a wrapping `handler` in
+    `server.request_handlers[CallToolRequest]` that itself has a generic
+    `except Exception: return self._make_error_result(str(e))` — meaning an
+    HTTP round-trip can't distinguish our explicit
+    `except tools.McpToolError` branch in `_call` from the SDK's fallback.
+    The decorator does `return func` unchanged, so the raw `_call` is
+    reachable as a free variable closed over by `handler`.
+    """
+    from mcp_server.server import _build_lowlevel
+
+    server = _build_lowlevel()
+    handler = server.request_handlers[mtypes.CallToolRequest]
+    idx = handler.__code__.co_freevars.index("func")
+    return handler.__closure__[idx].cell_contents
+
+
+@pytest.mark.asyncio
+async def test_call_mcptoolerror_branch_maps_to_iserror_directly(monkeypatch):
+    """Pin the explicit `except tools.McpToolError` branch in `server._call`.
+
+    Invokes the raw `_call` closure directly (bypassing the SDK's
+    `Server.call_tool()` wrapper, which has its own generic
+    `except Exception` -> isError=True fallback that would mask a deleted
+    branch). Confirmed by temporarily deleting the branch: this test failed
+    with `tools.McpToolError: boom` propagating uncaught, then passed again
+    once the branch was restored.
+    """
+    from mcp_server import tools
+
+    async def fake_call(name, arguments):
+        raise tools.McpToolError("boom")
+
+    monkeypatch.setattr(tools, "call", fake_call)
+
+    call = _get_raw_call_handler()
+    result = await call("whatever", {})
+
+    assert isinstance(result, mtypes.CallToolResult)
+    assert result.isError is True
+    assert result.content[0].text == "boom"
