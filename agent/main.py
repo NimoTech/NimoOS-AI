@@ -261,6 +261,17 @@ async def _attachments_startup():
 
 
 @app.on_event("startup")
+async def _tracing_startup():
+    """Install tracing and sync the enable flag from the global setting."""
+    try:
+        import phoenix_tracing
+        phoenix_tracing.setup_tracing()
+        phoenix_tracing.refresh_enabled_flag(_db())
+    except Exception:
+        _LOG.warning("tracing startup failed; continuing", exc_info=True)
+
+
+@app.on_event("startup")
 async def _memory_worker_startup():
     import memory_extract
     memory_extract.start_worker(_db())
@@ -540,6 +551,10 @@ class ThinkingConfigPayload(BaseModel):
 
 class MaxTurnsPayload(BaseModel):
     max_turns: int = Field(ge=0)
+
+
+class TracingSettingPayload(BaseModel):
+    enabled: bool
 
 
 class MemorySettingsPayload(BaseModel):
@@ -1577,6 +1592,19 @@ async def put_max_turns(request: Request, body: MaxTurnsPayload):
     return {"ok": True}
 
 
+@app.get("/agent/user-settings/tracing")
+async def get_tracing_setting(request: Request):
+    import phoenix_tracing
+    return {"enabled": phoenix_tracing.tracing_globally_enabled(_db())}
+
+
+@app.put("/agent/user-settings/tracing")
+async def put_tracing_setting(request: Request, body: TracingSettingPayload):
+    import phoenix_tracing
+    phoenix_tracing.set_tracing_globally_enabled(_db(), body.enabled)
+    return {"enabled": body.enabled}
+
+
 @app.get("/agent/user-memory")
 async def list_user_memory(request: Request):
     user_id = request.headers.get("X-User-Id", "")
@@ -2165,6 +2193,15 @@ async def mcp_test(request: Request):
     import mcp_client.client as mcp_client
     cfg = await request.json()
     return await mcp_client.test_server(cfg)
+
+
+@app.get("/agent/observability/compose")
+async def get_observability_compose():
+    import os
+    from fastapi.responses import PlainTextResponse
+    path = os.path.join(os.path.dirname(__file__), "observability", "phoenix_compose.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        return PlainTextResponse(f.read(), media_type="application/yaml")
 
 
 if __name__ == "__main__":

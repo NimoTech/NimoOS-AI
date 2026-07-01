@@ -1,0 +1,51 @@
+name: arize-phoenix
+services:
+  phoenix:
+    image: arizephoenix/phoenix:version-17.12.0
+    network_mode: bridge
+    ports:
+      - target: 6006
+        published: "6006"
+        protocol: tcp
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/phoenix
+      TZ: $TZ
+    volumes:
+      - type: bind
+        source: /DATA/AppData/$AppID
+        target: /mnt/phoenix
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          memory: "512M"
+    x-nimoos:
+      ports:
+        - container: "6006"
+          description:
+            en_us: Phoenix UI / OTLP port
+            zh_cn: Phoenix 界面 / OTLP 端口
+      volumes:
+        - container: /mnt/phoenix
+          description:
+            en_us: Phoenix data
+            zh_cn: Phoenix 数据
+x-nimoos:
+  architectures:
+    - amd64
+    - arm64
+  main: phoenix
+  author: Arize
+  category: Developer
+  title:
+    en_us: Agent Monitoring (Phoenix)
+    zh_cn: Agent 监控 (Phoenix)
+  tagline:
+    en_us: LLM/agent tracing UI
+    zh_cn: LLM/agent 全链路追踪
+  description:
+    en_us: Arize Phoenix — open-source LLM observability. Used by NimoOS Agent to visualize per-run traces.
+    zh_cn: Arize Phoenix —— 开源 LLM 可观测平台,NimoOS Agent 用它可视化每次运行的全链路追踪。
+  port_map: "6006"
+  index: /
+  tips: {}

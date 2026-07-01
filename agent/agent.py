@@ -12,6 +12,7 @@ from agents import Agent, Runner
 from agents.exceptions import MaxTurnsExceeded
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.reasoning_content_replay import default_should_replay_reasoning_content
+import phoenix_tracing
 from openai import AsyncOpenAI
 
 import db as db_module
@@ -783,7 +784,12 @@ class AgentRunner:
 
             stream = None
             try:
-                stream = Runner.run_streamed(agent, input_messages, max_turns=max_turns)
+                _trace_cfg = phoenix_tracing.build_trace_run_config(
+                    phoenix_tracing.tracing_enabled_now(),
+                    session_id, user_id, model_name, kind)
+                stream = Runner.run_streamed(
+                    agent, input_messages, max_turns=max_turns,
+                    run_config=_trace_cfg)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).
