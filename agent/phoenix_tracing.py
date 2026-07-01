@@ -89,3 +89,36 @@ def setup_tracing() -> bool:
         _LOG.warning("agent tracing setup failed; continuing without tracing",
                      exc_info=True)
         return False
+
+
+import time as _time
+
+_GLOBAL_SCOPE = "__global__"   # reserved user_id for process-wide settings;
+                               # protect in any user-cleanup logic (whitelist).
+
+
+def tracing_globally_enabled(conn) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT value FROM user_settings WHERE user_id=? AND key='tracing_enabled'",
+            (_GLOBAL_SCOPE,),
+        ).fetchone()
+    except Exception:
+        return False
+    return bool(row) and str(row["value"]) == "1"
+
+
+def set_tracing_globally_enabled(conn, enabled: bool) -> None:
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES(?, 'tracing_enabled', ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (_GLOBAL_SCOPE, "1" if enabled else "0", int(_time.time())),
+    )
+    conn.commit()
+    _set_flag(bool(enabled))
+
+
+def refresh_enabled_flag(conn) -> None:
+    _set_flag(tracing_globally_enabled(conn))

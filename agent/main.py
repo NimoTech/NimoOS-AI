@@ -552,6 +552,10 @@ class MaxTurnsPayload(BaseModel):
     max_turns: int = Field(ge=0)
 
 
+class TracingSettingPayload(BaseModel):
+    enabled: bool
+
+
 class MemorySettingsPayload(BaseModel):
     enabled: bool
     compaction_enabled: "bool | None" = None
@@ -1585,6 +1589,19 @@ async def put_max_turns(request: Request, body: MaxTurnsPayload):
     )
     conn.commit()
     return {"ok": True}
+
+
+@app.get("/agent/user-settings/tracing")
+async def get_tracing_setting(request: Request):
+    import phoenix_tracing
+    return {"enabled": phoenix_tracing.tracing_globally_enabled(_db())}
+
+
+@app.put("/agent/user-settings/tracing")
+async def put_tracing_setting(request: Request, body: TracingSettingPayload):
+    import phoenix_tracing
+    phoenix_tracing.set_tracing_globally_enabled(_db(), body.enabled)
+    return {"enabled": body.enabled}
 
 
 @app.get("/agent/user-memory")
