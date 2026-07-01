@@ -8,20 +8,14 @@ from skills import wiki as swiki
 
 def test_whitelist_is_exactly_six_read_tools():
     names = {d["name"] for d in tools.list_tool_defs()}
-    # core 6 tools are present (photos tools added in Task 3)
+    # core 6 tools are present (photos tools added in Task 3, view_document_page
+    # in Task 2 of Plan 2)
     for required in ("nimoos_search", "read_document", "read_file_chunk",
                      "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes"):
         assert required in names
-    # no write/path/vision tools leak in
-    for bad in ("write_file", "view_document_page", "wiki_append_user_notes"):
+    # no write tools leak in
+    for bad in ("write_file", "wiki_append_user_notes"):
         assert bad not in names
-
-
-def test_read_document_schema_has_no_path_param():
-    spec = next(d for d in tools.list_tool_defs() if d["name"] == "read_document")
-    props = spec["inputSchema"]["properties"]
-    assert "file_id" in props
-    assert "path" not in props and "ocr" not in props  # path reads are Plan 2
 
 
 @pytest.mark.asyncio
@@ -81,18 +75,14 @@ from skills import photos as sphotos
 
 def test_whitelist_now_has_eight_including_photos():
     names = {d["name"] for d in tools.list_tool_defs()}
-    assert names == {
+    for required in (
         "nimoos_search", "read_document", "read_file_chunk",
         "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
         "search_photos", "list_albums",
-    }
+    ):
+        assert required in names
     for bad in ("create_album", "add_to_album"):
         assert bad not in names
-
-
-def test_read_document_schema_unchanged_no_path():
-    spec = next(d for d in tools.list_tool_defs() if d["name"] == "read_document")
-    assert "path" not in spec["inputSchema"]["properties"]
 
 
 @pytest.mark.asyncio
@@ -120,3 +110,86 @@ async def test_call_list_albums_dispatches(monkeypatch):
 def test_setup_user_context_sets_photos_uid():
     tools.setup_user_context("42")
     assert sphotos.USER_ID_VAR.get() == "42"
+
+
+import asyncio
+from mcp_server import fs_gate
+
+
+def test_whitelist_now_has_nine_including_view():
+    names = {d["name"] for d in tools.list_tool_defs()}
+    assert "view_document_page" in names
+    assert len(names) == 9
+    for bad in ("write_file", "create_album", "add_to_album"):
+        assert bad not in names
+
+
+def test_read_document_schema_has_file_id_and_path():
+    spec = next(d for d in tools.list_tool_defs() if d["name"] == "read_document")
+    props = spec["inputSchema"]["properties"]
+    assert "file_id" in props and "path" in props and "ocr" in props
+
+
+@pytest.mark.asyncio
+async def test_read_document_rejects_both_file_id_and_path():
+    with pytest.raises(tools.McpToolError):
+        await tools.call("read_document", {"file_id": "a", "path": "/DATA/x.txt"})
+
+
+@pytest.mark.asyncio
+async def test_read_document_rejects_neither():
+    with pytest.raises(tools.McpToolError):
+        await tools.call("read_document", {})
+
+
+@pytest.mark.asyncio
+async def test_read_document_path_goes_through_gate(monkeypatch):
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
+                        lambda p, root="/DATA": "/DATA/ok.txt")
+    async def fake_extract(path, ocr=False, max_chars=24000, user_id=None):
+        assert path == "/DATA/ok.txt"
+        return {"text": "hello"}
+    monkeypatch.setattr(ssearch._parser_client, "extract", fake_extract)
+    out = json.loads(await tools.call("read_document", {"path": "/DATA/x.txt"}))
+    assert out["text"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_read_document_path_denied_raises(monkeypatch):
+    def deny(p, root="/DATA"):
+        raise fs_gate.McpPathDenied("outside")
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path", deny)
+    with pytest.raises(tools.McpToolError):
+        await tools.call("read_document", {"path": "/etc/passwd"})
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_returns_image(monkeypatch):
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
+                        lambda p, root="/DATA": "/DATA/doc.pdf")
+    async def fake_render(path, ps, pe, scale=2.0, user_id=None):
+        return {"pages": [{"png_b64": "AAA"}]}
+    monkeypatch.setattr(ssearch._parser_client, "render_pages", fake_render)
+    res = await tools.call("view_document_page", {"path": "/DATA/doc.pdf", "page": 1})
+    assert isinstance(res, tools.ImageResult)
+    assert res.data_b64 == "AAA" and res.mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_denied_raises(monkeypatch):
+    def deny(p, root="/DATA"):
+        raise fs_gate.McpPathDenied("outside")
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path", deny)
+    with pytest.raises(tools.McpToolError):
+        await tools.call("view_document_page", {"path": "/etc/x.pdf"})
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_missing_page_raises(monkeypatch):
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
+                        lambda p, root="/DATA": "/DATA/doc.pdf")
+    async def empty_render(path, ps, pe, scale=2.0, user_id=None):
+        return {"pages": []}
+    monkeypatch.setattr(ssearch._parser_client, "render_pages", empty_render)
+    with pytest.raises(tools.McpToolError):
+        await tools.call("view_document_page", {"path": "/DATA/doc.pdf", "page": 99})
