@@ -5,8 +5,10 @@ read_document never exposes the Plan-2 path/ocr params). No capability logic
 is reimplemented here."""
 from __future__ import annotations
 
+import asyncio
 import json
 
+from mcp_server import fs_gate
 from skills.search import search as _search
 from skills import wiki as _wiki
 from skills import photos as _photos
@@ -14,6 +16,17 @@ from wiki_client import WikiClient
 
 MAX_TREE_NODES = 500
 _SEARCH_MAX_TOP_K = 20
+
+
+class McpToolError(Exception):
+    """A tool-call business failure; the server maps it to isError=True."""
+
+
+class ImageResult:
+    """A tool result that must be returned as MCP ImageContent."""
+    def __init__(self, data_b64: str, mime: str = "image/png"):
+        self.data_b64 = data_b64
+        self.mime = mime
 
 
 def setup_user_context(user_id: str) -> None:
@@ -30,11 +43,30 @@ async def _h_search(args: dict) -> str:
         args["query"], args.get("sources"), args.get("filters"), top_k)
 
 
-async def _h_read_document(args: dict) -> str:
-    return await _search._read_document_impl(
-        file_id=args["file_id"], path=None, ocr=False,
-        offset=int(args.get("offset", 0) or 0),
-        max_chars=int(args.get("max_chars", 24000) or 24000))
+async def _h_read_document(args: dict):
+    fid = args.get("file_id")
+    path = args.get("path")
+    if fid and path:
+        raise McpToolError("provide file_id or path, not both")
+    if not fid and not path:
+        raise McpToolError("provide file_id or path")
+    max_chars = int(args.get("max_chars", 24000) or 24000)
+    if fid:
+        return await _search._read_document_impl(
+            file_id=fid, path=None, ocr=False,
+            offset=int(args.get("offset", 0) or 0), max_chars=max_chars)
+    try:
+        abs_path = fs_gate.mcp_resolve_read_path(path)
+    except fs_gate.McpPathDenied as e:
+        raise McpToolError(f"path not allowed: {e}")
+    uid = _search.USER_ID_VAR.get() or None
+    try:
+        res = await _search._parser_client.extract(
+            abs_path, ocr=bool(args.get("ocr", False)),
+            max_chars=max_chars, user_id=uid)
+    except Exception as e:
+        raise McpToolError(f"extract failed: {e}")
+    return json.dumps(res, ensure_ascii=False)
 
 
 async def _h_read_file_chunk(args: dict) -> str:
@@ -81,6 +113,31 @@ async def _h_list_albums(args: dict) -> str:
     return await _photos._list_albums_impl()
 
 
+async def _h_view_document_page(args: dict):
+    try:
+        abs_path = fs_gate.mcp_resolve_read_path(args["path"])
+    except fs_gate.McpPathDenied as e:
+        raise McpToolError(f"path not allowed: {e}")
+    uid = _search.USER_ID_VAR.get() or None
+    page = int(args.get("page", 1) or 1)
+    try:
+        rendered = await asyncio.wait_for(
+            _search._parser_client.render_pages(abs_path, page, page,
+                                                scale=1.5, user_id=uid),
+            timeout=60)
+    except asyncio.TimeoutError:
+        raise McpToolError("render timed out (document too complex)")
+    except Exception as e:
+        raise McpToolError(f"render failed: {e}")
+    pages = rendered.get("pages") or []
+    if not pages:
+        raise McpToolError(f"page {page} not found; the document may have fewer pages")
+    png_b64 = pages[0].get("png_b64")
+    if not png_b64:
+        raise McpToolError("render produced no image")
+    return ImageResult(png_b64, "image/png")
+
+
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 
@@ -96,13 +153,25 @@ TOOL_SPECS = [
          "top_k": {**_INT, "description": "hits per source, max 20"}}},
      "handler": _h_search},
     {"name": "read_document",
-     "description": ("Read an indexed document's extracted text by file_id "
-                     "(from nimoos_search). Use offset/max_chars to page through "
-                     "long documents."),
-     "inputSchema": {"type": "object", "required": ["file_id"], "properties": {
-         "file_id": _STR, "offset": _INT,
+     "description": ("Read a document's extracted text. Provide EITHER file_id "
+                     "(from nimoos_search, indexed) OR an absolute path under "
+                     "/DATA (any file). Not both. Use offset/max_chars to page."),
+     "inputSchema": {"type": "object", "properties": {
+         "file_id": _STR,
+         "path": {**_STR, "description": "absolute path under /DATA"},
+         "ocr": {"type": "boolean", "description": "force OCR (path only)"},
+         "offset": _INT,
          "max_chars": {**_INT, "description": "default 24000"}}},
      "handler": _h_read_document},
+    {"name": "view_document_page",
+     "description": ("Render a PDF page to an image and return it, so YOU (the "
+                     "client model) can look at scanned pages, tables, charts, or "
+                     "layout that text extraction misses. path must be an absolute "
+                     "path under /DATA."),
+     "inputSchema": {"type": "object", "required": ["path"], "properties": {
+         "path": {**_STR, "description": "absolute path under /DATA (PDF)"},
+         "page": {**_INT, "description": "1-based page number, default 1"}}},
+     "handler": _h_view_document_page},
     {"name": "read_file_chunk",
      "description": ("Read one indexed chunk of a file by file_id. kind/chunk_no "
                      "come from a nimoos_search hit; window fetches neighbours."),
