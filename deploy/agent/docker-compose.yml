@@ -21,10 +21,12 @@ services:
       NIMOOS_EXEC_SOCK: /var/lib/nimoos/ai/agent/agent-exec.sock
       NIMOOS_EXEC_PID_FILE: /var/lib/nimoos/ai/agent/agent-exec.pid
       NIMOOS_MCP_SOCK_DIR: /var/lib/nimoos/ai/agent
-      # Optional Phoenix (OTLP) tracing — OFF by default. Enable per-deploy with
-      # NIMOOS_AGENT_TRACING=1 docker compose up -d (needs a Phoenix on the host's
-      # :6006; net=host makes 127.0.0.1 reachable from inside).
-      NIMOOS_AGENT_TRACING: "${NIMOOS_AGENT_TRACING:-0}"
+      # Phoenix (OTLP) tracing endpoint/project. Enabling is a runtime setting
+      # (AI Settings "Agent monitoring" toggle → user_settings): instrumentation
+      # installs at startup and exports only while enabled; net=host makes
+      # 127.0.0.1:6006 reachable. Do NOT set NIMOOS_AGENT_TRACING here — the value
+      # "0" hard-disables instrumentation (escape hatch only), which would make
+      # the toggle a no-op.
       PHOENIX_OTLP_ENDPOINT: "${PHOENIX_OTLP_ENDPOINT:-http://127.0.0.1:6006/v1/traces}"
       PHOENIX_PROJECT: "${PHOENIX_PROJECT:-nimoos-agent}"
     volumes:
