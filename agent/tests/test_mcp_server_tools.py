@@ -193,3 +193,14 @@ async def test_view_document_page_missing_page_raises(monkeypatch):
     monkeypatch.setattr(ssearch._parser_client, "render_pages", empty_render)
     with pytest.raises(tools.McpToolError):
         await tools.call("view_document_page", {"path": "/DATA/doc.pdf", "page": 99})
+
+
+@pytest.mark.asyncio
+async def test_view_document_page_missing_png_raises(monkeypatch):
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
+                        lambda p, root="/DATA": "/DATA/doc.pdf")
+    async def render_no_png(path, ps, pe, scale=2.0, user_id=None):
+        return {"pages": [{}]}
+    monkeypatch.setattr(ssearch._parser_client, "render_pages", render_no_png)
+    with pytest.raises(tools.McpToolError):
+        await tools.call("view_document_page", {"path": "/DATA/doc.pdf", "page": 1})

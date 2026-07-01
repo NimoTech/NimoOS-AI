@@ -132,7 +132,10 @@ async def _h_view_document_page(args: dict):
     pages = rendered.get("pages") or []
     if not pages:
         raise McpToolError(f"page {page} not found; the document may have fewer pages")
-    return ImageResult(pages[0]["png_b64"], "image/png")
+    png_b64 = pages[0].get("png_b64")
+    if not png_b64:
+        raise McpToolError("render produced no image")
+    return ImageResult(png_b64, "image/png")
 
 
 _STR = {"type": "string"}
