@@ -785,6 +785,7 @@ class AgentRunner:
             stream = None
             try:
                 _trace_cfg = phoenix_tracing.build_trace_run_config(
+                    phoenix_tracing.tracing_enabled_now(),
                     session_id, user_id, model_name, kind)
                 stream = Runner.run_streamed(
                     agent, input_messages, max_turns=max_turns,

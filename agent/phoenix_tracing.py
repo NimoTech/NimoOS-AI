@@ -122,3 +122,25 @@ def set_tracing_globally_enabled(conn, enabled: bool) -> None:
 
 def refresh_enabled_flag(conn) -> None:
     _set_flag(tracing_globally_enabled(conn))
+
+
+def build_trace_run_config(enabled: bool, session_id, user_id, model_name, kind):
+    """Always return a RunConfig. enabled=False → tracing_disabled=True."""
+    from agents import RunConfig
+    if not enabled:
+        return RunConfig(tracing_disabled=True)
+    try:
+        return RunConfig(
+            workflow_name="nimoos-agent",
+            group_id=str(session_id),
+            trace_metadata={
+                "user_id": str(user_id),
+                "model": str(model_name),
+                "agent_type": str(kind),
+            },
+            tracing_disabled=False,
+        )
+    except Exception:
+        _LOG.warning("build_trace_run_config failed; disabling trace for this run",
+                     exc_info=True)
+        return RunConfig(tracing_disabled=True)

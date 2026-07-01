@@ -10,14 +10,11 @@ def _run_source():
                 return inspect.getsource(obj.run)
             except (OSError, TypeError):
                 continue
-    raise AssertionError("could not find a class with a run() method in agent.py")
+    raise AssertionError("no run() found")
 
 
-def test_run_passes_trace_run_config():
+def test_run_gates_on_flag_and_passes_run_config():
     src = _run_source()
-    assert "build_trace_run_config(" in src, "run() should build a trace RunConfig"
-    assert "run_config=" in src, "run_streamed should receive run_config="
-
-
-def test_agent_module_imports_phoenix_tracing():
-    assert "phoenix_tracing" in inspect.getsource(agentmod)
+    assert "tracing_enabled_now()" in src
+    assert "build_trace_run_config(" in src
+    assert "run_config=" in src

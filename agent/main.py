@@ -262,10 +262,11 @@ async def _attachments_startup():
 
 @app.on_event("startup")
 async def _tracing_startup():
-    """Initialise optional Phoenix tracing. Best-effort: never blocks startup."""
+    """Install tracing and sync the enable flag from the global setting."""
     try:
         import phoenix_tracing
         phoenix_tracing.setup_tracing()
+        phoenix_tracing.refresh_enabled_flag(_db())
     except Exception:
         _LOG.warning("tracing startup failed; continuing", exc_info=True)
 
