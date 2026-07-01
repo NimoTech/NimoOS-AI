@@ -2195,6 +2195,15 @@ async def mcp_test(request: Request):
     return await mcp_client.test_server(cfg)
 
 
+@app.get("/agent/observability/compose")
+async def get_observability_compose():
+    import os
+    from fastapi.responses import PlainTextResponse
+    path = os.path.join(os.path.dirname(__file__), "observability", "phoenix_compose.yaml")
+    with open(path, "r", encoding="utf-8") as f:
+        return PlainTextResponse(f.read(), media_type="application/yaml")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8282)
