@@ -1,19 +1,28 @@
 """Optional Phoenix (OTLP) tracing for the agent.
 
-Switch-gated via NIMOOS_AGENT_TRACING. When disabled (default) every entry
-point is a no-op and no OTel/OpenInference dependency is imported. Any failure
-during setup is swallowed — tracing must never break the agent.
+Instrumentation is installed once at startup (if deps import). Whether spans are
+actually exported is gated at runtime by an in-process flag (_enabled), synced
+from the global user_settings row and updated by the settings endpoint — so the
+UI toggle takes effect on the next run with no restart. When disabled, the
+GatedSpanExporter drops without touching the network, so stopping Phoenix never
+causes OTLP connection-retry log spam. Any setup failure is swallowed.
 """
 import logging
 import os
 
 _LOG = logging.getLogger("nimoos-agent.tracing")
 
-_TRUTHY = {"1", "true", "yes", "on"}
+# In-process enable flag; synced from user_settings at boot and on PUT.
+_enabled = False
 
 
-def tracing_enabled() -> bool:
-    return os.environ.get("NIMOOS_AGENT_TRACING", "").strip().lower() in _TRUTHY
+def tracing_enabled_now() -> bool:
+    return _enabled
+
+
+def _set_flag(v: bool) -> None:
+    global _enabled
+    _enabled = bool(v)
 
 
 def otlp_endpoint() -> str:
@@ -21,64 +30,62 @@ def otlp_endpoint() -> str:
 
 
 def project_name() -> str:
-    # NOTE: Phoenix/OpenInference reads PHOENIX_PROJECT from the environment to
-    # group traces by project; this value is used for logging here, not plumbed
-    # into the exporter.
     return os.environ.get("PHOENIX_PROJECT", "nimoos-agent")
 
 
-def _install_processors() -> None:
-    """Replace the SDK's default OpenAI exporter with an OTLP→Phoenix one."""
-    from agents import set_trace_processors
-    from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
-    from opentelemetry.sdk import trace as trace_sdk
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+try:
+    from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-    # Privacy: instrument() below uses exclusive_processor=True, which replaces
-    # the SDK processor list with only the OpenInference processor; this clear is
-    # belt-and-suspenders. Phoenix (the local OTLP TracerProvider) is the only
-    # export target — no span reaches OpenAI's backend.
-    set_trace_processors([])
+    class GatedSpanExporter(SpanExporter):
+        """Wrap an OTLP exporter; drop (no network) unless is_enabled()."""
+        def __init__(self, inner, is_enabled):
+            self._inner = inner
+            self._is_enabled = is_enabled
 
-    provider = trace_sdk.TracerProvider()
-    provider.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint()))
-    )
-    OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+        def export(self, spans):
+            if not self._is_enabled():
+                return SpanExportResult.SUCCESS
+            return self._inner.export(spans)
+
+        def shutdown(self):
+            return self._inner.shutdown()
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            return self._inner.force_flush(timeout_millis)
+except Exception:  # opentelemetry not installed — GatedSpanExporter unused
+    GatedSpanExporter = None  # type: ignore
+
+
+def _opted_out() -> bool:
+    return os.environ.get("NIMOOS_AGENT_TRACING", "").strip().lower() in {"0", "off", "false", "no"}
 
 
 def setup_tracing() -> bool:
-    """Initialise tracing if enabled. Returns True on success, else False."""
-    if not tracing_enabled():
+    """Install instrumentation + gated OTLP exporter. Returns True on success."""
+    if _opted_out():
         return False
     try:
-        _install_processors()
-        _LOG.info("agent tracing → Phoenix enabled (endpoint=%s, project=%s)",
+        from agents import set_trace_processors
+        from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
+        from opentelemetry.sdk import trace as trace_sdk
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        set_trace_processors([])  # drop SDK's default OpenAI exporter
+        resource = Resource.create({"openinference.project.name": project_name()})
+        provider = trace_sdk.TracerProvider(resource=resource)
+        gated = GatedSpanExporter(OTLPSpanExporter(endpoint=otlp_endpoint()),
+                                  tracing_enabled_now)
+        provider.add_span_processor(BatchSpanProcessor(gated))
+        OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+        # Suppress transient OTLP export errors (enabled but Phoenix briefly down).
+        logging.getLogger("opentelemetry.exporter.otlp").setLevel(logging.CRITICAL)
+        logging.getLogger("opentelemetry.sdk.trace.export").setLevel(logging.CRITICAL)
+        _LOG.info("agent tracing installed (endpoint=%s, project=%s)",
                   otlp_endpoint(), project_name())
         return True
-    except Exception:  # never break the agent on tracing failure
+    except Exception:
         _LOG.warning("agent tracing setup failed; continuing without tracing",
                      exc_info=True)
         return False
-
-
-def build_trace_run_config(session_id, user_id, model_name, kind):
-    """Return a RunConfig that groups this run by session, or None if disabled."""
-    if not tracing_enabled():
-        return None
-    try:
-        from agents import RunConfig
-        return RunConfig(
-            workflow_name="nimoos-agent",
-            group_id=str(session_id),
-            trace_metadata={
-                "user_id": str(user_id),
-                "model": str(model_name),
-                "agent_type": str(kind),
-            },
-        )
-    except Exception:
-        _LOG.warning("build_trace_run_config failed; running without trace metadata",
-                     exc_info=True)
-        return None
