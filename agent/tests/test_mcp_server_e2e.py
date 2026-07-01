@@ -142,3 +142,24 @@ def test_bare_path_no_token_is_401_not_307(client):
     assert r.status_code == 401, (
         f"Expected 401 on bare /mcp-rpc without token, got {r.status_code}"
     )
+
+
+def test_render_result_maps_types():
+    from mcp_server import server as mcpserver
+    from mcp_server import tools
+    import mcp.types as mt
+    text = mcpserver.render_result("hello")
+    assert len(text) == 1 and isinstance(text[0], mt.TextContent) and text[0].text == "hello"
+    img = mcpserver.render_result(tools.ImageResult("AAA", "image/png"))
+    assert len(img) == 1 and isinstance(img[0], mt.ImageContent)
+    assert img[0].data == "AAA" and img[0].mimeType == "image/png"
+
+
+def test_tools_call_error_is_iserror(client):
+    # read_document with both file_id and path -> McpToolError -> isError result
+    tok = _mk_token()
+    r = _rpc("tools/call",
+             {"name": "read_document", "arguments": {"file_id": "a", "path": "/DATA/x"}},
+             token=tok, _id=42, client=client)
+    payload = _extract_json(r)
+    assert payload["result"]["isError"] is True

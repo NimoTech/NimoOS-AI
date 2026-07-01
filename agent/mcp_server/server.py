@@ -14,6 +14,14 @@ import mcp_tokens
 from mcp_server import tools
 
 
+def render_result(res):
+    """Map a tools.call() result to MCP content blocks."""
+    from mcp_server import tools
+    if isinstance(res, tools.ImageResult):
+        return [mtypes.ImageContent(type="image", data=res.data_b64, mimeType=res.mime)]
+    return [mtypes.TextContent(type="text", text=res)]
+
+
 def _build_lowlevel() -> Server:
     server = Server("nimoos-mcp")
 
@@ -24,9 +32,14 @@ def _build_lowlevel() -> Server:
                 for d in tools.list_tool_defs()]
 
     @server.call_tool()
-    async def _call(name: str, arguments: dict) -> list[mtypes.TextContent]:
-        text = await tools.call(name, arguments or {})
-        return [mtypes.TextContent(type="text", text=text)]
+    async def _call(name: str, arguments: dict):
+        try:
+            res = await tools.call(name, arguments or {})
+        except tools.McpToolError as e:
+            return mtypes.CallToolResult(
+                content=[mtypes.TextContent(type="text", text=str(e))],
+                isError=True)
+        return render_result(res)
 
     return server
 
