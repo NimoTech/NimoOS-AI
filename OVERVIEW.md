@@ -60,8 +60,10 @@ NimoOS-AI 由两个独立的系统进程组成:
 | ANY | `/agent/*` | 反代到 Python Agent(`:8282`) |
 | GET | `/fs/mounts` | 列出 Agent 可访问的挂载点(picker scope) |
 | GET / POST / DELETE | `/blacklist` | 硬黑名单(AI 永不可见的路径/模式) |
+| GET / POST / DELETE | `/mcp-tokens[/:id]` | 对外 MCP server 的长效 token 管理(JWT 保护) |
+| POST | `/mcp-rpc/` | **对外 MCP server** 数据端点(JSON-RPC over Streamable-HTTP)。**JWT 豁免**,改由 Python 侧 Bearer token 校验 → user_id。详见下文「对外 MCP server」 |
 
-**鉴权**:所有路由强制 JWT 校验,**无 localhost 豁免**。这是有意为之 — 防止本机其他进程读到其他用户的云 API Key。校验后注入 `X-NimoOS-User-ID` / `X-NimoOS-User-Name` Header。
+**鉴权**:除 `/mcp-rpc/` 外所有路由强制 JWT 校验,**无 localhost 豁免**。这是有意为之 — 防止本机其他进程读到其他用户的云 API Key。校验后注入 `X-NimoOS-User-ID` / `X-NimoOS-User-Name` Header。`/mcp-rpc/` 是唯一例外:它面向外部 AI agent,用长效 MCP token 自行鉴权(见下)。
 
 CORS 暴露的自定义 Header:`X-NimoOS-Force-Cloud`、`X-User-Id`、`X-User-Name`、`X-Agent-Provider-Key/Url/Type`。
 
@@ -180,10 +182,33 @@ OllamaURL = http://127.0.0.1:11434
 | `provider_adapters.py` | 适配前端传来的 Provider 配置 |
 | `title_gen.py` | 会话标题自动生成 |
 | `run_sink.py` | 运行事件落库与回放 |
+| `mcp_tokens.py` | 对外 MCP token 的 SQLite 存取(哈希存储、`last_used_at` 节流写) |
+| `mcp_server/` | 对外 MCP server(协议适配 + 工具白名单 + 路径门控,见下文) |
 
-依赖见 `requirements.txt`:`fastapi`、`uvicorn`、`openai-agents`、`openai`、`httpx`、`pathspec`。
+依赖见 `requirements.txt`:`fastapi`、`uvicorn`、`openai-agents`、`openai`、`httpx`、`pathspec`、`mcp`(MCP SDK)。
 
 Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+JSON),与 Go 侧硬黑名单配合形成两层过滤。
+
+---
+
+## 对外 MCP server(供外部 AI agent)
+
+把本 NAS 的只读知识能力反向暴露为 **MCP 工具**,供外部 AI agent(Claude Desktop / Cursor 等)通过 MCP 协议调用。与 `mcp_client`(NimoOS 作 MCP 客户端去连别人)方向相反。代码在 `agent/mcp_server/`。
+
+**端点与传输**:外部地址 `http://<nas>/v1/ai/mcp-rpc/`(Go `nimoos-ai` 反代到 Python `:8282` 的 `/mcp-rpc/`)。用官方 `mcp` SDK 的 **Streamable-HTTP 单端点**(`stateless=True` + `json_response=True`);裸路径与带斜杠均返 200(`server.py` 用 raw-ASGI Route 规避 Starlette Mount 的 307 重定向)。
+
+**鉴权(方案 H)**:长效 token,`Authorization: Bearer nimoos_mcp_...`。
+- token 存 `agent.db` 的 `mcp_tokens` 表(**只存哈希**;`last_used_at` 60s 节流写)。
+- 管理端点 `/v1/ai/mcp-tokens`(GET/POST/DELETE,**JWT 保护**,注入 `X-NimoOS-User-ID`);创建返回的明文 token 仅此一次。UI 在 `/#/ai/settings?section=mcptokens`。
+- 数据端点 `/mcp-rpc/` **JWT 豁免**,由 Python 侧校验 Bearer token → 解析出 `user_id`,经 `USER_ID_VAR` 传给工具;后续对 Search/Wiki/Photos 的调用用 `localhost + X-NimoOS-User-ID`(选 H 而非 Go 签发内部 JWT,避免新增特权端点 + 刷新机制)。
+
+**工具白名单(当前 9 个,全只读;写工具永不暴露)**:`nimoos_search`、`read_document`(`file_id` XOR `path`)、`read_file_chunk`、`view_document_page`(把文档某页渲染成 PNG,以 MCP **ImageContent** 返回,交客户端自己的视觉模型看,无服务端 vision)、`wiki_get_node`、`wiki_list_full_tree`、`wiki_recent_changes`、`search_photos`、`list_albums`。
+
+**路径门控**:无头 MCP 无聊天 session,不能用 chat 的 `visible_resources` 门控。`mcp_server/fs_gate.py` 提供 deny-only 门控 `mcp_resolve_read_path()`:`realpath` 防 `..`/符号链接/前缀兄弟(`/DATA-evil`),只放 `/DATA`、挖掉 `/DATA/.system_data`;越界抛 `McpPathDenied`。硬失败(门控拒/渲染失败/超时/参数互斥)统一抛 `McpToolError` → `server._call` 映射为 `CallToolResult(isError=True)`。
+
+**模块**:`server.py`(ASGI/协议适配 + `_call` + `render_result`)、`tools.py`(白名单 `TOOL_SPECS` + 各 `_h_*` handler + `ImageResult`/`McpToolError`)、`fs_gate.py`(路径门控)。设计/计划见 `nimo_os_docs/docs/superpowers/specs/2026-06-*-nimoos-mcp-server-*` 及 `2026-06-30-mcp-*`、`2026-07-01-mcp-token-ui-*`。
+
+**caveat**:Photos 数据层当前无 per-user filter → 多用户下 `search_photos`/`list_albums` 暂不能宣称用户隔离(单用户 NAS 无影响)。
 
 ---
 
