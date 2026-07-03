@@ -15,11 +15,10 @@ def client(monkeypatch):
         return {"bot_username": "nimo_bot"} if token == "good:token" else None
     monkeypatch.setattr(TelegramAdapter, "validate_token",
                         staticmethod(fake_validate))
-    with TestClient(main.app) as c:
-        # Neutralize the manager so instance writes never start a REAL
-        # TelegramAdapter long-polling api.telegram.org from inside tests.
-        monkeypatch.setattr(main, "_channel_manager", None)
-        yield c
+    # No `with` context: keep lifespan/startup from running, so the MCP
+    # session-manager singleton is untouched and _channel_manager stays None.
+    monkeypatch.setattr(main, "_channel_manager", None)
+    yield TestClient(main.app)
 
 
 def test_instance_create_list_toggle_delete(client):
