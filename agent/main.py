@@ -336,6 +336,142 @@ async def _channels_shutdown():
         await _channel_manager.stop_all()
 
 
+class ChannelInstanceCreate(BaseModel):
+    channel_type: str
+    name: str = ""
+    config: dict = Field(default_factory=dict)
+
+
+class ChannelInstanceUpdate(BaseModel):
+    enabled: bool
+
+
+class PairingCodeRequest(BaseModel):
+    instance_id: str
+
+
+class BindingModelUpdate(BaseModel):
+    model: str
+
+
+def _mask_instance(row: dict) -> dict:
+    cfg = json.loads(row["config_json"])
+    token = cfg.get("bot_token", "")
+    return {"id": row["id"], "channel_type": row["channel_type"],
+            "name": row["name"], "enabled": bool(row["enabled"]),
+            "bot_username": cfg.get("bot_username", ""),
+            "token_tail": token[-4:] if token else "",
+            "created_at": row["created_at"]}
+
+
+@app.post("/agent/channels/instances")
+async def channel_instance_create(
+        body: ChannelInstanceCreate,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    from channels.manager import ADAPTERS
+    from channels.telegram import TelegramAdapter
+    if body.channel_type not in ADAPTERS:
+        raise HTTPException(status_code=422, detail="unsupported channel_type")
+    config = dict(body.config)
+    token = (config.get("bot_token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=422, detail="bot_token required")
+    info = await TelegramAdapter.validate_token(token)
+    if info is None:
+        raise HTTPException(status_code=422,
+                            detail="bot token rejected by Telegram")
+    config["bot_token"] = token
+    config.update(info)
+    row = channel_store.create_instance(
+        _conn, body.channel_type, body.name, config, x_user_id,
+        now_ms=int(time.time() * 1000))
+    if _channel_manager is not None:
+        await _channel_manager.reload()
+    return JSONResponse(status_code=201, content=_mask_instance(row))
+
+
+@app.get("/agent/channels/instances")
+async def channel_instance_list(
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    return {"instances": [_mask_instance(r)
+                          for r in channel_store.list_instances(_conn)]}
+
+
+@app.put("/agent/channels/instances/{iid}")
+async def channel_instance_update(
+        iid: str, body: ChannelInstanceUpdate,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    ok = channel_store.set_instance_enabled(
+        _conn, iid, body.enabled, now_ms=int(time.time() * 1000))
+    if not ok:
+        raise HTTPException(status_code=404, detail="instance not found")
+    if _channel_manager is not None:
+        await _channel_manager.reload()
+    return {"ok": True}
+
+
+@app.delete("/agent/channels/instances/{iid}")
+async def channel_instance_delete(
+        iid: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    ok = channel_store.delete_instance(_conn, iid)
+    if _channel_manager is not None:
+        await _channel_manager.reload()
+    return {"ok": ok}
+
+
+@app.post("/agent/channels/pairing-code")
+async def channel_pairing_code(
+        body: PairingCodeRequest,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    inst = channel_store.get_instance(_conn, body.instance_id)
+    if inst is None or not inst["enabled"]:
+        raise HTTPException(status_code=404, detail="instance not found")
+    code, expires = channel_store.create_pairing_code(
+        _conn, body.instance_id, x_user_id, now_ms=int(time.time() * 1000))
+    return JSONResponse(status_code=201,
+                        content={"code": code, "expires_at": expires})
+
+
+@app.get("/agent/channels/bindings")
+async def channel_binding_list(
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    out = []
+    for b in channel_store.list_bindings_for_user(_conn, x_user_id):
+        inst = channel_store.get_instance(_conn, b["instance_id"]) or {}
+        out.append({"id": b["id"], "instance_id": b["instance_id"],
+                    "channel_type": inst.get("channel_type", ""),
+                    "instance_name": inst.get("name", ""),
+                    "external_username": b["external_username"],
+                    "external_user_id": b["external_user_id"],
+                    "default_model": b["default_model"],
+                    "created_at": b["created_at"]})
+    return {"bindings": out}
+
+
+@app.delete("/agent/channels/bindings/{bid}")
+async def channel_binding_delete(
+        bid: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    return {"revoked": channel_store.revoke_binding(_conn, x_user_id, bid)}
+
+
+@app.put("/agent/channels/bindings/{bid}/model")
+async def channel_binding_model(
+        bid: str, body: BindingModelUpdate,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    ok = channel_store.set_binding_model(_conn, x_user_id, bid, body.model)
+    if not ok:
+        raise HTTPException(status_code=404, detail="binding not found")
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Startup orchestration helpers (netns + egress-proxy + executor)
 # ---------------------------------------------------------------------------
