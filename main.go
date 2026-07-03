@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net"
@@ -103,6 +105,20 @@ func main() {
 		logger.Error("failed to write URL file", zap.Error(err))
 		// URL file failure is non-fatal: Gateway registration below sends the address directly.
 		// Other consumers that read the URL file may fail to discover this service.
+	}
+
+	// Internal token for loopback-only endpoints that return secrets.
+	// LocalhostOnly alone is insufficient: the Gateway reverse-proxies
+	// /v1/ai/* (incl. /_internal/*) from loopback, satisfying LocalhostOnly,
+	// so a positive shared secret is required (mirrors the MCP-ticket guard
+	// on /_internal/mcp/runtime).
+	internalTokenBytes := make([]byte, 32)
+	if _, err := cryptorand.Read(internalTokenBytes); err != nil {
+		panic("failed to generate internal token: " + err.Error())
+	}
+	tokenFilePath := filepath.Join(config.Cfg.RuntimePath, "ai_internal.token")
+	if err := os.WriteFile(tokenFilePath, []byte(hex.EncodeToString(internalTokenBytes)), 0o600); err != nil {
+		logger.Error("failed to write internal token file", zap.Error(err))
 	}
 
 	// Register routes at Gateway

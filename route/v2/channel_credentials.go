@@ -1,7 +1,10 @@
 package v2
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -21,8 +24,22 @@ type providerCredentials struct {
 // the in-process Python channel workers obtain decrypted provider
 // credentials for a user. Registered under /_internal (LocalhostOnly,
 // JWT-skipped, never registered with the Gateway).
-func ProviderCredentials(svc service.Services) echo.HandlerFunc {
+//
+// LocalhostOnly alone is insufficient: the Gateway reverse-proxies
+// /v1/ai/* (incl. /_internal/*) from loopback, satisfying LocalhostOnly, so
+// this endpoint additionally requires a positive shared-secret token
+// (X-Internal-Token) read from {runtimePath}/ai_internal.token, mirroring
+// the X-Agent-MCP-Ticket guard on /_internal/mcp/runtime.
+func ProviderCredentials(svc service.Services, runtimePath string) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		expected, rerr := os.ReadFile(filepath.Join(runtimePath, "ai_internal.token"))
+		if rerr != nil || len(expected) == 0 ||
+			subtle.ConstantTimeCompare(expected,
+				[]byte(c.Request().Header.Get("X-Internal-Token"))) != 1 {
+			return c.JSON(http.StatusUnauthorized,
+				map[string]string{"message": "unauthorized"})
+		}
+
 		userID := c.QueryParam("user_id")
 		model := c.QueryParam("model")
 		if userID == "" || model == "" {

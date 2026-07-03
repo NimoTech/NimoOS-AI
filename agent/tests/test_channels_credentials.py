@@ -50,6 +50,24 @@ async def test_resolve_no_base_url_available(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resolve_sends_internal_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("NIMOOS_AI_INTERNAL_URL", raising=False)
+    (tmp_path / "ai.url").write_text("http://127.0.0.1:40000\n")
+    (tmp_path / "ai_internal.token").write_text("known-token-value\n")
+    monkeypatch.setenv("NIMOOS_RUNTIME_PATH", str(tmp_path))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Internal-Token") == "known-token-value"
+        return httpx.Response(200, json={
+            "provider_type": "deepseek", "base_url": "https://api.deepseek.com",
+            "api_key": "sk-x", "model": "deepseek-chat"})
+
+    out = await credentials.resolve("u1", "cloud:6:deepseek-chat",
+                                    transport=httpx.MockTransport(handler))
+    assert out["api_key"] == "sk-x"
+
+
+@pytest.mark.asyncio
 async def test_resolve_non_dict_json_returns_none(monkeypatch):
     monkeypatch.setenv("NIMOOS_AI_INTERNAL_URL", "http://ai.test")
     tnull = httpx.MockTransport(lambda r: httpx.Response(200, json=None))
