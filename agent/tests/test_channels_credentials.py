@@ -47,3 +47,12 @@ async def test_resolve_no_base_url_available(monkeypatch, tmp_path):
     monkeypatch.delenv("NIMOOS_AI_INTERNAL_URL", raising=False)
     monkeypatch.setenv("NIMOOS_RUNTIME_PATH", str(tmp_path))  # no ai.url file
     assert await credentials.resolve("u1", "m") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_non_dict_json_returns_none(monkeypatch):
+    monkeypatch.setenv("NIMOOS_AI_INTERNAL_URL", "http://ai.test")
+    tnull = httpx.MockTransport(lambda r: httpx.Response(200, json=None))
+    assert await credentials.resolve("u1", "m", transport=tnull) is None
+    tlist = httpx.MockTransport(lambda r: httpx.Response(200, json=[1]))
+    assert await credentials.resolve("u1", "m", transport=tlist) is None

@@ -43,6 +43,6 @@ async def resolve(user_id: str, model: str, *,
         data = r.json()
     except ValueError:
         return None
-    if not data.get("base_url") or not data.get("model"):
+    if not isinstance(data, dict) or not data.get("base_url") or not data.get("model"):
         return None
     return data
