@@ -283,6 +283,59 @@ async def _recall_worker_startup():
     recall_index.start_worker(_db())
 
 
+_channel_manager = None
+
+
+def _channel_start_run(session_id: str, user_id: str, message: str,
+                       creds: dict, chat_username: str = ""):
+    """Channel-side bridge into _start_run. Credentials come pre-resolved
+    from the Go internal endpoint instead of X-Agent-Provider-* headers."""
+    return _start_run(
+        session_id, user_id, message,
+        creds["api_key"], creds["base_url"], creds["model"],
+        provider_type=creds.get("provider_type", "other"),
+        chat_username=chat_username,
+    )
+
+
+async def _channel_cancel_run(session_id: str) -> bool:
+    """Mirror of cancel_session's task-cancel path, for channel /stop."""
+    sink = _active_runs.get(session_id)
+    if sink is None or sink.task is None or sink.task.done():
+        return False
+    sink.task.cancel()
+    try:
+        await asyncio.wait_for(sink.task, timeout=5.0)
+    except Exception:
+        pass
+    return True
+
+
+@app.on_event("startup")
+async def _channels_startup():
+    global _channel_manager
+    try:
+        from channels import credentials as channel_credentials
+        from channels.manager import ChannelManager
+        from channels.router import ChannelRouter
+        router = ChannelRouter(
+            _conn,
+            start_run=_channel_start_run,
+            cancel_run=_channel_cancel_run,
+            resolve_credentials=channel_credentials.resolve,
+        )
+        _channel_manager = ChannelManager(_conn, router)
+        await _channel_manager.start_all()
+    except Exception:
+        _LOG.exception("channels startup failed; continuing without channels")
+
+
+@app.on_event("shutdown")
+async def _channels_shutdown():
+    if _channel_manager is not None:
+        await _channel_manager.stop_all()
+
+
 # ---------------------------------------------------------------------------
 # Startup orchestration helpers (netns + egress-proxy + executor)
 # ---------------------------------------------------------------------------
