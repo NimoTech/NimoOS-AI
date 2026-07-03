@@ -6,7 +6,7 @@ import pytest
 import db as db_module
 from channels import store
 from channels.model import ChannelCapabilities, InboundMessage
-from channels.router import ChannelRouter
+from channels.router import ChannelRouter, MSG_BUSY
 
 
 class FakeAdapter:
@@ -164,3 +164,104 @@ async def test_credentials_failure_reports_error(env):
     await router.handle(a, _msg("hello", instance=inst["id"]))
     assert calls["runs"] == []
     assert "模型" in a.sent[-1][1] or "provider" in a.sent[-1][1]
+
+
+class GatedSink:
+    """start_run sink whose events are released by an external gate."""
+
+    def __init__(self, gate, label):
+        self._gate = gate
+        self._label = label
+
+    def subscribe(self):
+        q = asyncio.Queue()
+
+        async def feed():
+            await self._gate.wait()
+            q.put_nowait({"type": "message", "content": "pong " + self._label})
+            q.put_nowait({"type": "done"})
+
+        asyncio.ensure_future(feed())
+        return [], q
+
+    def unsubscribe(self, q):
+        pass
+
+
+def _gated_router(conn, gate, started):
+    def start_run(session_id, user_id, message, creds, chat_username):
+        started.append(message)
+        return GatedSink(gate, message)
+
+    async def cancel_run(session_id):
+        return True
+
+    async def resolve_credentials(user_id, model):
+        return {"provider_type": "ollama", "base_url": "http://x/v1",
+                "api_key": "o", "model": model}
+
+    return ChannelRouter(conn, start_run=start_run, cancel_run=cancel_run,
+                         resolve_credentials=resolve_credentials)
+
+
+async def _paired(conn, inst, router, adapter):
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(adapter, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+
+
+@pytest.mark.asyncio
+async def test_same_chat_serializes_fifo_and_rejects_over_pending(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    inst = store.create_instance(conn, "telegram", "", {"bot_token": "t"},
+                                 "u1", 0)
+    gate, started = asyncio.Event(), []
+    router = _gated_router(conn, gate, started)
+    a = FakeAdapter()
+    await _paired(conn, inst, router, a)
+
+    tasks = [asyncio.create_task(
+        router.handle(a, _msg(f"m{i}", instance=inst["id"])))
+        for i in range(1, 6)]
+    await asyncio.sleep(0.05)
+    assert started == ["m1"]                       # only head of queue runs
+    assert [t for _c, t in a.sent].count(MSG_BUSY) == 2   # m4, m5 rejected
+    gate.set()
+    await asyncio.gather(*tasks)
+    assert started == ["m1", "m2", "m3"]           # FIFO order preserved
+
+
+@pytest.mark.asyncio
+async def test_different_chats_run_concurrently(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    inst = store.create_instance(conn, "telegram", "", {"bot_token": "t"},
+                                 "u1", 0)
+    gate, started = asyncio.Event(), []
+    router = _gated_router(conn, gate, started)
+    a = FakeAdapter()
+    await _paired(conn, inst, router, a)
+
+    tasks = [asyncio.create_task(
+        router.handle(a, _msg("m1", chat="c1", instance=inst["id"]))),
+        asyncio.create_task(
+        router.handle(a, _msg("m2", chat="c2", instance=inst["id"])))]
+    await asyncio.sleep(0.05)
+    assert started == ["m1", "m2"]     # both in-flight before gate: overlap
+    gate.set()
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_stranger_tracking_dicts_are_bounded(env, monkeypatch):
+    conn, inst, router, _ = env
+    import channels.router as router_mod
+    monkeypatch.setattr(router_mod, "MAX_TRACKED_KEYS", 10)
+    a = FakeAdapter()
+    for i in range(50):
+        await router.handle(a, _msg("hi", user=f"tg{i}", chat=f"c{i}",
+                                    instance=inst["id"]))
+    assert len(router._unpaired_last) <= 10

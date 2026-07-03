@@ -20,6 +20,17 @@ PAIR_FAIL_LIMIT = 5               # bad /pair attempts per window...
 PAIR_FAIL_WINDOW = 3600.0         # ...per external user, then silence
 MAX_PENDING = 3                   # queued messages per chat during a run
 
+MAX_TRACKED_KEYS = 4096            # bound for stranger-keyed rate-limit dicts
+
+
+def _prune(d: dict, cap: int | None = None) -> None:
+    """Bound stranger-keyed dicts: when over cap, drop the oldest half
+    (dict preserves insertion order). Protects against unique-id spraying."""
+    limit = cap if cap is not None else MAX_TRACKED_KEYS
+    if len(d) > limit:
+        for k in list(d.keys())[: len(d) - limit // 2]:
+            d.pop(k, None)
+
 MSG_UNPAIRED = ("此账号尚未配对。请在 NimoOS 设置页(AI → Channels)生成配对码,"
                 "然后发送 /pair <配对码>。(Not paired — send /pair <code>.)")
 MSG_PAIR_USAGE = "用法: /pair <配对码> (usage: /pair <code>)"
@@ -100,6 +111,7 @@ class ChannelRouter:
             return
         fails.append(now)
         self._pair_fails[key] = fails
+        _prune(self._pair_fails)
         if len(fails) <= PAIR_FAIL_LIMIT:
             await self._send_text(adapter, msg.external_chat_id, MSG_PAIR_BAD)
         # beyond the limit: stay silent to starve brute-force probing
@@ -172,6 +184,7 @@ class ChannelRouter:
         if last is not None and now - last < UNPAIRED_REPLY_INTERVAL:
             return
         self._unpaired_last[key] = now
+        _prune(self._unpaired_last)
         await self._send_text(adapter, msg.external_chat_id, MSG_UNPAIRED)
 
     async def _send_text(self, adapter, chat_id: str, text: str) -> None:
