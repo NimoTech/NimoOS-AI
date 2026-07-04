@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import tempfile
 
@@ -23,10 +24,18 @@ _POLL_TIMEOUT = 50          # Telegram long-poll hold, seconds
 _ERROR_BACKOFF = 5.0        # sleep after a failed poll round
 _MAX_FILE = 20 * 1024 * 1024   # 20MB attachment download cap
 
+# mime prefix -> (Bot API method, multipart field name)
+_MEDIA_METHODS = {
+    "image": ("sendPhoto", "photo"),
+    "video": ("sendVideo", "video"),
+    "audio": ("sendAudio", "audio"),
+}
+
 
 class TelegramAdapter(ChannelAdapter):
     channel_type = "telegram"
-    capabilities = ChannelCapabilities(max_text_len=4096, supports_typing=True)
+    capabilities = ChannelCapabilities(max_text_len=4096, supports_typing=True,
+                                       supports_media=True)
 
     def __init__(self, instance_id, config, on_inbound, *,
                  transport: httpx.AsyncBaseTransport | None = None):
@@ -167,6 +176,23 @@ class TelegramAdapter(ChannelAdapter):
         data = r.json()
         if not data.get("ok"):
             _LOG.warning("sendMessage failed (instance %s): %s",
+                         self.instance_id, data)
+            return None
+        return str(data["result"]["message_id"])
+
+    async def send_file(self, external_chat_id: str, path: str,
+                        caption: str = "") -> str | None:
+        mime, _ = mimetypes.guess_type(path)
+        prefix = (mime or "").split("/", 1)[0]
+        method, field = _MEDIA_METHODS.get(prefix, ("sendDocument", "document"))
+        with open(path, "rb") as f:
+            r = await self._client.post(self._url(method),
+                                        data={"chat_id": external_chat_id,
+                                             "caption": caption},
+                                        files={field: f})
+        data = r.json()
+        if not data.get("ok"):
+            _LOG.warning("%s failed (instance %s): %s", method,
                          self.instance_id, data)
             return None
         return str(data["result"]["message_id"])

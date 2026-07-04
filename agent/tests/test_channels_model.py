@@ -1,4 +1,6 @@
 # NimoOS-AI/agent/tests/test_channels_model.py
+import pytest
+
 from channels.model import (ChannelAdapter, ChannelCapabilities,
                             InboundMessage, OutboundMessage, split_text)
 
@@ -45,3 +47,26 @@ def test_inbound_attachment_and_message_field():
     assert m.attachments == []          # 默认空,不破坏 M1 构造
     m.attachments.append(a)
     assert m.attachments[0].size == 12
+
+
+def test_channel_capabilities_supports_media_default_false():
+    caps = ChannelCapabilities(max_text_len=10)
+    assert caps.supports_media is False
+
+
+@pytest.mark.asyncio
+async def test_adapter_default_send_file_unsupported_returns_none(caplog):
+    class DummyAdapter(ChannelAdapter):
+        channel_type = "dummy"
+        capabilities = ChannelCapabilities(max_text_len=10)
+
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, external_chat_id, msg): return None
+
+    a = DummyAdapter("i1", {}, None)
+    with caplog.at_level("WARNING"):
+        result = await a.send_file("chat1", "/tmp/whatever.png")
+    assert result is None
+    assert any("send_file not supported by dummy" in rec.message
+               for rec in caplog.records)

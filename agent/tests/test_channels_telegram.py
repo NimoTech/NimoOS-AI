@@ -222,3 +222,56 @@ async def test_poll_document_over_cap_dropped_and_cleaned_up(monkeypatch):
     assert len(created_paths) == 1
     assert not os.path.exists(created_paths[0])
     await a.stop()
+
+
+def _bot_api_send_file(method_calls):
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        for method in ("sendPhoto", "sendVideo", "sendAudio", "sendDocument"):
+            if path.endswith(f"/{method}"):
+                method_calls.append(method)
+                return httpx.Response(200, json={"ok": True,
+                                                 "result": {"message_id": 123}})
+        return httpx.Response(404, json={"ok": False})
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_send_file_image_uses_send_photo(tmp_path):
+    p = tmp_path / "pic.png"
+    p.write_bytes(b"fakepng")
+    calls = []
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None,
+                        transport=_bot_api_send_file(calls))
+    mid = await a.send_file("99", str(p), caption="look")
+    assert calls == ["sendPhoto"]
+    assert mid == "123"
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_file_unknown_mime_uses_send_document(tmp_path):
+    p = tmp_path / "data.bin"
+    p.write_bytes(b"\x00\x01\x02")
+    calls = []
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None,
+                        transport=_bot_api_send_file(calls))
+    mid = await a.send_file("99", str(p))
+    assert calls == ["sendDocument"]
+    assert mid == "123"
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_file_failure_returns_none(tmp_path):
+    p = tmp_path / "data.bin"
+    p.write_bytes(b"\x00")
+    bad = httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"ok": False, "description": "boom"}))
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None, transport=bad)
+    assert await a.send_file("99", str(p)) is None
+    await a.stop()
+
+
+def test_telegram_capabilities_support_media():
+    assert TelegramAdapter.capabilities.supports_media is True

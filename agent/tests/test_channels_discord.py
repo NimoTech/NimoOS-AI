@@ -116,6 +116,45 @@ async def test_discord_attachment_download_failure_skips_only_that_attachment():
 
 
 @pytest.mark.asyncio
+async def test_send_file_resolves_channel_and_sends_with_caption(tmp_path):
+    p = tmp_path / "pic.png"
+    p.write_bytes(b"fakepng")
+    sent = {}
+    class FakeChannel:
+        async def send(self, content=None, file=None):
+            sent["content"] = content
+            sent["file"] = file
+            return types.SimpleNamespace(id=777)
+    class FakeClient:
+        def get_channel(self, cid): return None
+        async def fetch_channel(self, cid): sent["fetched"] = cid; return FakeChannel()
+    a = _adapter(client=FakeClient())
+    mid = await a.send_file("99", str(p), caption="look at this")
+    assert sent["fetched"] == 99 and sent["content"] == "look at this"
+    assert mid == "777"
+
+
+@pytest.mark.asyncio
+async def test_send_file_empty_caption_passes_none(tmp_path):
+    p = tmp_path / "data.bin"
+    p.write_bytes(b"\x00")
+    sent = {}
+    class FakeChannel:
+        async def send(self, content=None, file=None):
+            sent["content"] = content
+            return types.SimpleNamespace(id=1)
+    class FakeClient:
+        def get_channel(self, cid): return FakeChannel()
+    a = _adapter(client=FakeClient())
+    await a.send_file("99", str(p))
+    assert sent["content"] is None
+
+
+def test_discord_capabilities_support_media():
+    assert DiscordAdapter.capabilities.supports_media is True
+
+
+@pytest.mark.asyncio
 async def test_validate_token_ok_and_bad():
     def handler(request):
         assert request.headers.get("Authorization") == "Bot good"

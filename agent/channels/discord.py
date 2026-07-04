@@ -25,7 +25,8 @@ _MAX_FILE = 20 * 1024 * 1024   # 20MB attachment download cap
 
 class DiscordAdapter(ChannelAdapter):
     channel_type = "discord"
-    capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True)
+    capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True,
+                                       supports_media=True)
 
     def __init__(self, instance_id, config, on_inbound, *,
                  client=None):
@@ -161,6 +162,17 @@ class DiscordAdapter(ChannelAdapter):
         if channel is None:
             channel = await self._client.fetch_channel(cid)
         sent = await channel.send(msg.text)
+        return str(getattr(sent, "id", "")) or None
+
+    async def send_file(self, external_chat_id: str, path: str,
+                        caption: str = "") -> str | None:
+        import discord
+        cid = int(external_chat_id)
+        channel = self._client.get_channel(cid)
+        if channel is None:
+            channel = await self._client.fetch_channel(cid)
+        sent = await channel.send(content=caption or None,
+                                  file=discord.File(path))
         return str(getattr(sent, "id", "")) or None
 
     async def send_typing(self, external_chat_id: str) -> None:

@@ -72,6 +72,13 @@ class ChannelAdapter(ABC):
     async def send_typing(self, external_chat_id: str) -> None:
         return None
 
+    async def send_file(self, external_chat_id: str, path: str,
+                        caption: str = "") -> str | None:
+        import logging
+        logging.getLogger("nimoos-agent.channels").warning(
+            "send_file not supported by %s", self.channel_type)
+        return None
+
 
 def split_text(text: str, max_len: int) -> list[str]:
     """Split into <=max_len chunks, preferring newline then space boundaries
