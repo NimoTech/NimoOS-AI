@@ -10,6 +10,14 @@ from typing import Any, Awaitable, Callable, ClassVar
 
 
 @dataclass
+class InboundAttachment:
+    filename: str
+    mime: str
+    tmp_path: str
+    size: int
+
+
+@dataclass
 class InboundMessage:
     channel_type: str
     instance_id: str
@@ -20,6 +28,7 @@ class InboundMessage:
     text: str
     reply_to: str | None = None
     raw: dict = field(default_factory=dict)
+    attachments: "list[InboundAttachment]" = field(default_factory=list)
 
 
 @dataclass
