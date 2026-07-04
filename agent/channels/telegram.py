@@ -182,6 +182,10 @@ class TelegramAdapter(ChannelAdapter):
 
     async def send_file(self, external_chat_id: str, path: str,
                         caption: str = "") -> str | None:
+        """Send an attachment. Unlike `send`, a failed Telegram API call is
+        surfaced by raising (not returning None) so the caller can tell a
+        real send failure apart from "unsupported by this channel" (the
+        base-class default) and relay the actual reason to the model."""
         mime, _ = mimetypes.guess_type(path)
         prefix = (mime or "").split("/", 1)[0]
         method, field = _MEDIA_METHODS.get(prefix, ("sendDocument", "document"))
@@ -190,11 +194,14 @@ class TelegramAdapter(ChannelAdapter):
                                         data={"chat_id": external_chat_id,
                                              "caption": caption},
                                         files={field: f})
+        r.raise_for_status()
         data = r.json()
         if not data.get("ok"):
+            description = data.get("description", data) if \
+                isinstance(data, dict) else data
             _LOG.warning("%s failed (instance %s): %s", method,
                          self.instance_id, data)
-            return None
+            raise RuntimeError(f"Telegram send_file failed: {description}")
         return str(data["result"]["message_id"])
 
     async def send_typing(self, external_chat_id: str) -> None:

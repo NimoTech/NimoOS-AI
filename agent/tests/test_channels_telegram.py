@@ -224,16 +224,31 @@ async def test_poll_document_over_cap_dropped_and_cleaned_up(monkeypatch):
     await a.stop()
 
 
-def _bot_api_send_file(method_calls):
+def _bot_api_send_file(method_calls, requests_holder=None):
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         for method in ("sendPhoto", "sendVideo", "sendAudio", "sendDocument"):
             if path.endswith(f"/{method}"):
                 method_calls.append(method)
+                if requests_holder is not None:
+                    requests_holder.append(request)
                 return httpx.Response(200, json={"ok": True,
                                                  "result": {"message_id": 123}})
         return httpx.Response(404, json={"ok": False})
     return httpx.MockTransport(handler)
+
+
+def _multipart_field(request: httpx.Request, name: str) -> str | None:
+    """Pull a plain (non-file) multipart field's decoded value out of a
+    captured httpx.Request body, so tests can assert on what was actually
+    sent rather than trusting the mock to have received it."""
+    boundary = request.headers["content-type"].split("boundary=")[1]
+    parts = request.content.split(f"--{boundary}".encode())
+    marker = f'name="{name}"'.encode()
+    for part in parts:
+        if marker in part:
+            return part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[0].decode()
+    return None
 
 
 @pytest.mark.asyncio
@@ -241,16 +256,22 @@ async def test_send_file_image_uses_send_photo(tmp_path):
     p = tmp_path / "pic.png"
     p.write_bytes(b"fakepng")
     calls = []
+    requests = []
     a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None,
-                        transport=_bot_api_send_file(calls))
+                        transport=_bot_api_send_file(calls, requests))
     mid = await a.send_file("99", str(p), caption="look")
     assert calls == ["sendPhoto"]
     assert mid == "123"
+    assert _multipart_field(requests[0], "chat_id") == "99"
+    assert _multipart_field(requests[0], "caption") == "look"
     await a.stop()
 
 
 @pytest.mark.asyncio
-async def test_send_file_unknown_mime_uses_send_document(tmp_path):
+async def test_send_file_unknown_extension_with_octet_stream_mime_uses_send_document(tmp_path):
+    """`.bin` guesses to ("application/octet-stream", None) — a known mime
+    with an unmapped prefix. This is distinct from a truly unrecognized
+    extension (see test below), which guesses to (None, None)."""
     p = tmp_path / "data.bin"
     p.write_bytes(b"\x00\x01\x02")
     calls = []
@@ -263,13 +284,47 @@ async def test_send_file_unknown_mime_uses_send_document(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_send_file_failure_returns_none(tmp_path):
+async def test_send_file_unrecognized_extension_uses_send_document(tmp_path):
+    """mimetypes.guess_type('data.xyz123') == (None, None) — the true
+    "no guess at all" path, as opposed to a recognized-but-unmapped mime
+    like application/octet-stream. Both must fall through to sendDocument."""
+    p = tmp_path / "data.xyz123"
+    p.write_bytes(b"\x00\x01\x02")
+    calls = []
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None,
+                        transport=_bot_api_send_file(calls))
+    mid = await a.send_file("99", str(p))
+    assert calls == ["sendDocument"]
+    assert mid == "123"
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_file_failure_raises_with_reason(tmp_path):
+    """A Telegram-reported failure ({"ok": false, ...}) must raise so the
+    caller can distinguish a real send failure (relay the reason to the
+    model) from `None`, which means "unsupported by this channel"."""
     p = tmp_path / "data.bin"
     p.write_bytes(b"\x00")
     bad = httpx.MockTransport(
-        lambda r: httpx.Response(200, json={"ok": False, "description": "boom"}))
+        lambda r: httpx.Response(200, json={"ok": False,
+                                            "description": "chat not found"}))
     a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None, transport=bad)
-    assert await a.send_file("99", str(p)) is None
+    with pytest.raises(RuntimeError, match="chat not found"):
+        await a.send_file("99", str(p))
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_file_http_error_raises(tmp_path):
+    """A non-2xx HTTP response (e.g. network/proxy failure) must not be
+    mistaken for a successful send."""
+    p = tmp_path / "data.bin"
+    p.write_bytes(b"\x00")
+    bad = httpx.MockTransport(lambda r: httpx.Response(502, text="bad gateway"))
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, None, transport=bad)
+    with pytest.raises(httpx.HTTPStatusError):
+        await a.send_file("99", str(p))
     await a.stop()
 
 
