@@ -26,12 +26,18 @@ def _default_validate(path: str) -> Optional[str]:
 
     We call the non-interactive half of that chain, fs.ops._resolve_and_gate
     (paths.resolve — realpath + scope-check against visible_resources — then
-    ignore.gate — deny .system_data / hard-blacklist / gitignore), and skip
-    the interactive access-request escalation _resolve_and_gate_or_request
-    falls back to on out-of-scope paths: an outbound send must never pop a
-    scope-grant card, it should just be refused.
+    ignore.gate — hard-blacklist / gitignore rules), and skip the
+    interactive access-request escalation _resolve_and_gate_or_request falls
+    back to on out-of-scope paths: an outbound send must never pop a
+    scope-grant card, it should just be refused. Only paths that resolve
+    (after realpath, so `..`-traversal and symlink escapes are caught) into
+    one of the session's granted `visible_resources` are allowed; anything
+    else — including `.system_data` and other out-of-scope paths — is
+    denied simply because it falls outside that granted set, not by a
+    dedicated `.system_data` rule.
 
-    Returns the real absolute path if allowed, else None (never raises).
+    Returns the real absolute path if allowed, else None. Fails CLOSED:
+    never raises, and any unexpected error is treated as a denial.
     """
     from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
     import skills.filesystem as _fsskill
@@ -52,6 +58,11 @@ def _default_validate(path: str) -> Optional[str]:
         return _fsops._resolve_and_gate(ctx, path)
     except (_fspaths.PermissionDenied, _fsignore.BlockedImplicit,
             _fsignore.BlockedHardBlacklist, _fsignore.BlockedGitignore):
+        return None
+    except Exception:
+        # Deny-closed: any unexpected error (e.g. a transient sqlite error)
+        # must never propagate or fall through to treating `path` as
+        # authorized — fail the same way an explicit gate rejection does.
         return None
 
 
