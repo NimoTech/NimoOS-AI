@@ -9,11 +9,12 @@ import json
 import logging
 
 from channels import store
+from channels.discord import DiscordAdapter
 from channels.telegram import TelegramAdapter
 
 _LOG = logging.getLogger("nimoos-agent.channels.manager")
 
-ADAPTERS: dict[str, type] = {"telegram": TelegramAdapter}
+ADAPTERS: dict[str, type] = {"telegram": TelegramAdapter, "discord": DiscordAdapter}
 
 
 class ChannelManager:
