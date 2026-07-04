@@ -75,3 +75,31 @@ def test_pairing_code_requires_valid_instance(client):
     r = client.post("/agent/channels/pairing-code", headers=H,
                     json={"instance_id": "nope"})
     assert r.status_code == 404
+
+
+def test_create_discord_instance_and_invite_url(client, monkeypatch):
+    from channels.discord import DiscordAdapter
+    async def fake_validate(token, *, transport=None):
+        return {"bot_username": "nimo_disc", "application_id": "42099"} if token == "disc:token" else None
+    monkeypatch.setattr(DiscordAdapter, "validate_token",
+                        staticmethod(fake_validate))
+    r = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "discord", "name": "fam-disc",
+        "config": {"bot_token": "disc:token"}})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["channel_type"] == "discord"
+    assert body["bot_username"] == "nimo_disc"
+    assert body["token_tail"] == "oken" and "bot_token" not in body
+    assert "42099" in body["invite_url"] and body["invite_url"].startswith("https://discord.com/oauth2/authorize")
+
+
+def test_create_discord_rejects_bad_token(client, monkeypatch):
+    from channels.discord import DiscordAdapter
+    async def fake_validate(token, *, transport=None):
+        return None
+    monkeypatch.setattr(DiscordAdapter, "validate_token",
+                        staticmethod(fake_validate))
+    r = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "discord", "config": {"bot_token": "nope"}})
+    assert r.status_code == 422

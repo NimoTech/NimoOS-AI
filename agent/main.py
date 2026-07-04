@@ -357,11 +357,21 @@ class BindingModelUpdate(BaseModel):
 def _mask_instance(row: dict) -> dict:
     cfg = json.loads(row["config_json"])
     token = cfg.get("bot_token", "")
-    return {"id": row["id"], "channel_type": row["channel_type"],
-            "name": row["name"], "enabled": bool(row["enabled"]),
-            "bot_username": cfg.get("bot_username", ""),
-            "token_tail": token[-4:] if token else "",
-            "created_at": row["created_at"]}
+    out = {"id": row["id"], "channel_type": row["channel_type"],
+           "name": row["name"], "enabled": bool(row["enabled"]),
+           "bot_username": cfg.get("bot_username", ""),
+           "token_tail": token[-4:] if token else "",
+           "created_at": row["created_at"]}
+    if row["channel_type"] == "discord" and cfg.get("application_id"):
+        # Bots can only DM users who share a server; the admin needs this
+        # invite link to add the bot to a server before anyone can pair.
+        # permissions=274877991936 = View Channels + Send Messages +
+        # Read Message History (minimal for DM-based use).
+        out["invite_url"] = (
+            "https://discord.com/oauth2/authorize?client_id="
+            + str(cfg["application_id"])
+            + "&scope=bot&permissions=274877991936")
+    return out
 
 
 @app.post("/agent/channels/instances")
@@ -370,17 +380,15 @@ async def channel_instance_create(
         x_user_id: str = Header(..., alias="X-User-Id")):
     from channels import store as channel_store
     from channels.manager import ADAPTERS
-    from channels.telegram import TelegramAdapter
     if body.channel_type not in ADAPTERS:
         raise HTTPException(status_code=422, detail="unsupported channel_type")
     config = dict(body.config)
     token = (config.get("bot_token") or "").strip()
     if not token:
         raise HTTPException(status_code=422, detail="bot_token required")
-    info = await TelegramAdapter.validate_token(token)
+    info = await ADAPTERS[body.channel_type].validate_token(token)
     if info is None:
-        raise HTTPException(status_code=422,
-                            detail="bot token rejected by Telegram")
+        raise HTTPException(status_code=422, detail="bot token rejected")
     config["bot_token"] = token
     config.update(info)
     row = channel_store.create_instance(
