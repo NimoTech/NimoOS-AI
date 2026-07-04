@@ -12,10 +12,12 @@ from channels.router import ChannelRouter, MSG_BUSY
 class FakeAdapter:
     channel_type = "telegram"
 
-    def __init__(self, max_len=200):
+    def __init__(self, max_len=200, supports_media=False):
         self.capabilities = ChannelCapabilities(max_text_len=max_len,
-                                                supports_typing=True)
+                                                supports_typing=True,
+                                                supports_media=supports_media)
         self.sent, self.typing = [], 0
+        self.sent_files = []
 
     async def send(self, chat_id, msg):
         self.sent.append((chat_id, msg.text))
@@ -23,6 +25,10 @@ class FakeAdapter:
 
     async def send_typing(self, chat_id):
         self.typing += 1
+
+    async def send_file(self, chat_id, path, caption=""):
+        self.sent_files.append((chat_id, path, caption))
+        return "file-msg-1"
 
 
 class FakeSink:
@@ -50,8 +56,11 @@ def env(tmp_path):
                                  "u1", 0)
     calls = {"runs": [], "cancels": []}
 
-    def start_run(session_id, user_id, message, creds, chat_username):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=(), channel_send_file=None):
         calls["runs"].append((session_id, user_id, message, creds))
+        calls.setdefault("attachment_ids", []).append(attachment_ids)
+        calls.setdefault("channel_send_file", []).append(channel_send_file)
         return FakeSink([{"type": "message", "content": "pong " + message},
                          {"type": "done"}])
 
@@ -68,6 +77,12 @@ def env(tmp_path):
     router = ChannelRouter(conn, start_run=start_run, cancel_run=cancel_run,
                            resolve_credentials=resolve_credentials)
     return conn, inst, router, calls
+
+
+def _last_run_with_aids(calls):
+    sid, uid, message, creds = calls["runs"][-1]
+    aids = calls["attachment_ids"][-1]
+    return sid, uid, message, creds, aids
 
 
 @pytest.mark.asyncio
@@ -189,7 +204,8 @@ class GatedSink:
 
 
 def _gated_router(conn, gate, started):
-    def start_run(session_id, user_id, message, creds, chat_username):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=(), channel_send_file=None):
         started.append(message)
         return GatedSink(gate, message)
 
@@ -265,3 +281,73 @@ async def test_stranger_tracking_dicts_are_bounded(env, monkeypatch):
         await router.handle(a, _msg("hi", user=f"tg{i}", chat=f"c{i}",
                                     instance=inst["id"]))
     assert len(router._unpaired_last) <= 10
+
+
+@pytest.mark.asyncio
+async def test_inbound_attachment_passes_ids_and_placeholder(env, monkeypatch):
+    conn, inst, router, calls = env
+    import channels.inbound as inbound_mod
+    monkeypatch.setattr(inbound_mod, "save_and_ingest",
+                        lambda *a, **k: (["att_x"], []))
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    m = _msg("", instance=inst["id"])          # no text, attachment only
+    m.attachments = [type("A", (), {"filename": "x.png", "mime": "image/png",
+                                    "tmp_path": "/tmp/x", "size": 3})()]
+    await router.handle(a, m)
+    sid, uid, message, creds, aids = _last_run_with_aids(calls)
+    assert aids == ["att_x"] and message.strip() != ""            # placeholder non-empty
+
+
+@pytest.mark.asyncio
+async def test_all_attachments_skipped_and_no_text_does_not_start_run(env, monkeypatch):
+    conn, inst, router, calls = env
+    import channels.inbound as inbound_mod
+    monkeypatch.setattr(inbound_mod, "save_and_ingest",
+                        lambda *a, **k: ([], ["big.bin"]))
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    m = _msg("", instance=inst["id"])          # no text, attachment only, all skipped
+    m.attachments = [type("A", (), {"filename": "big.bin", "mime": "application/octet-stream",
+                                    "tmp_path": "/tmp/big.bin", "size": 999})()]
+    await router.handle(a, m)
+    assert calls["runs"] == []                                  # no run started
+    assert any("skipped" in t or "跳过" in t for _c, t in a.sent)  # skip notice sent
+
+
+@pytest.mark.asyncio
+async def test_media_capable_adapter_gets_bound_send_file_callback(env):
+    conn, inst, router, calls = env
+    a = FakeAdapter(supports_media=True)
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    await router.handle(a, _msg("hello", instance=inst["id"]))
+    send_cb = calls["channel_send_file"][-1]
+    assert send_cb is not None
+    mid = await send_cb("/DATA/x", "cap")
+    assert mid == "file-msg-1"
+    assert a.sent_files == [("c1", "/DATA/x", "cap")]
+
+
+@pytest.mark.asyncio
+async def test_non_media_adapter_gets_no_send_file_callback(env):
+    conn, inst, router, calls = env
+    a = FakeAdapter(supports_media=False)
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    await router.handle(a, _msg("hello", instance=inst["id"]))
+    assert calls["channel_send_file"][-1] is None

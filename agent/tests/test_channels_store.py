@@ -77,3 +77,13 @@ def test_chat_mapping_and_channel_session(tmp_path):
     sid2 = store.create_channel_session(c, "u1", "telegram")
     store.upsert_chat(c, "i1", "chat9", "b1", sid2, 2000)
     assert store.get_chat(c, "i1", "chat9")["session_id"] == sid2
+
+
+def test_set_binding_download_dir(tmp_path):
+    c = _conn(tmp_path)
+    inst = store.create_instance(c, "telegram", "", {"bot_token": "t"}, "u1", 0)
+    code, _ = store.create_pairing_code(c, inst["id"], "u1", now_ms=0)
+    b = store.redeem_pairing_code(c, inst["id"], code, "tg1", "a", now_ms=0)
+    assert store.set_binding_download_dir(c, "u1", b["id"], "/DATA/Downloads/telegram") is True
+    assert store.get_binding(c, inst["id"], "tg1")["download_dir"] == "/DATA/Downloads/telegram"
+    assert store.set_binding_download_dir(c, "u2", b["id"], "/x") is False   # unauthorized

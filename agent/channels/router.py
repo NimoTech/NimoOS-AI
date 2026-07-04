@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from channels import store
@@ -169,8 +170,39 @@ class ChannelRouter:
         else:
             session_id = chat["session_id"]
         await adapter.send_typing(msg.external_chat_id)
-        sink = self._start_run(session_id, binding["user_id"], msg.text,
-                               creds, binding.get("external_username") or "")
+        attachment_ids: list[str] = []
+        if msg.attachments:
+            from channels import inbound
+            import db as _db
+            ddir = binding.get("download_dir") or f"/DATA/Downloads/{msg.channel_type}"
+            data_root = os.environ.get(
+                "NIMOOS_AGENT_DATA_ROOT", str(_db._DB_PATH.parent))
+            attachment_ids, skipped = inbound.save_and_ingest(
+                self._conn, data_root, session_id, ddir, msg.attachments)
+            if skipped:
+                await self._send_text(adapter, msg.external_chat_id,
+                                      f"部分文件超出限制已跳过 (skipped): {', '.join(skipped)}")
+        run_text = msg.text
+        if not run_text and not attachment_ids:
+            # Nothing to run: no text, and no attachment was actually
+            # ingested (either none were sent, or all were skipped — the
+            # user already got the skip notice above).
+            return
+        if not run_text and attachment_ids:
+            run_text = ("[用户发来文件/图片,已存至 " + (binding.get("download_dir")
+                        or f"/DATA/Downloads/{msg.channel_type}")
+                        + "。请分析,或询问希望如何处理。]")
+        send_cb = None
+        if getattr(adapter.capabilities, "supports_media", False):
+            async def send_cb(path, caption, _a=adapter, _c=msg.external_chat_id):
+                mid = await _a.send_file(_c, path, caption)
+                if mid is None:
+                    raise RuntimeError("send_file returned no id")
+                return mid
+        sink = self._start_run(session_id, binding["user_id"], run_text,
+                               creds, binding.get("external_username") or "",
+                               attachment_ids=attachment_ids,
+                               channel_send_file=send_cb)
         final, error = await collect_final(sink, timeout=self._run_timeout)
         reply = final or (f"出错了 (error): {error}" if error else "(无回复 / empty reply)")
         await self._send_text(adapter, msg.external_chat_id, reply)

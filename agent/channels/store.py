@@ -141,6 +141,16 @@ def set_binding_model(conn, user_id: str, binding_id: str,
     return cur.rowcount > 0
 
 
+def set_binding_download_dir(conn, user_id: str, binding_id: str,
+                             download_dir: str) -> bool:
+    cur = conn.execute(
+        "UPDATE channel_bindings SET download_dir=? "
+        "WHERE id=? AND user_id=? AND revoked=0",
+        (download_dir, binding_id, str(user_id)))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 # -- chats & sessions --------------------------------------------------------
 
 def get_chat(conn, instance_id: str, external_chat_id: str) -> dict | None:

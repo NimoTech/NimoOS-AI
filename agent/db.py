@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS channel_bindings (
     external_username TEXT,
     user_id           TEXT NOT NULL,
     default_model     TEXT,
+    download_dir      TEXT,
     revoked           INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL,
     UNIQUE(instance_id, external_user_id)
@@ -338,6 +339,10 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}
     if "batch_id" not in staged_cols:
         conn.execute("ALTER TABLE staged_changes ADD COLUMN batch_id TEXT")
+    # Idempotent ALTER for existing databases without download_dir column.
+    cb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channel_bindings)")}
+    if "download_dir" not in cb_cols:
+        conn.execute("ALTER TABLE channel_bindings ADD COLUMN download_dir TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

@@ -287,7 +287,9 @@ _channel_manager = None
 
 
 def _channel_start_run(session_id: str, user_id: str, message: str,
-                       creds: dict, chat_username: str = ""):
+                       creds: dict, chat_username: str = "",
+                       *, attachment_ids: list[str] = (),
+                       channel_send_file=None):
     """Channel-side bridge into _start_run. Credentials come pre-resolved
     from the Go internal endpoint instead of X-Agent-Provider-* headers."""
     return _start_run(
@@ -295,6 +297,8 @@ def _channel_start_run(session_id: str, user_id: str, message: str,
         creds["api_key"], creds["base_url"], creds["model"],
         provider_type=creds.get("provider_type", "other"),
         chat_username=chat_username,
+        attachment_ids=attachment_ids,
+        channel_send_file=channel_send_file,
     )
 
 
@@ -352,6 +356,25 @@ class PairingCodeRequest(BaseModel):
 
 class BindingModelUpdate(BaseModel):
     model: str
+
+
+class BindingDownloadDirUpdate(BaseModel):
+    download_dir: str
+
+
+def _default_download_dir(channel_type: str) -> str:
+    return f"/DATA/Downloads/{channel_type}"
+
+
+def _validate_data_subdir(path: str) -> str | None:
+    """Return the abspath if it is inside /DATA and not under .system_data;
+    else None. (Channel download dirs must live in the user-visible /DATA.)"""
+    ap = os.path.abspath(path)
+    if ap != "/DATA" and not ap.startswith("/DATA/"):
+        return None
+    if "/.system_data" in ap + "/":
+        return None
+    return ap
 
 
 def _mask_instance(row: dict) -> dict:
@@ -458,6 +481,8 @@ async def channel_binding_list(
                     "external_username": b["external_username"],
                     "external_user_id": b["external_user_id"],
                     "default_model": b["default_model"],
+                    "download_dir": b["download_dir"] or _default_download_dir(
+                        inst.get("channel_type", "")),
                     "created_at": b["created_at"]})
     return {"bindings": out}
 
@@ -475,6 +500,21 @@ async def channel_binding_model(
         x_user_id: str = Header(..., alias="X-User-Id")):
     from channels import store as channel_store
     ok = channel_store.set_binding_model(_conn, x_user_id, bid, body.model)
+    if not ok:
+        raise HTTPException(status_code=404, detail="binding not found")
+    return {"ok": True}
+
+
+@app.put("/agent/channels/bindings/{bid}/download-dir")
+async def channel_binding_download_dir(
+        bid: str, body: BindingDownloadDirUpdate,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import store as channel_store
+    ap = _validate_data_subdir(body.download_dir)
+    if ap is None:
+        raise HTTPException(status_code=422,
+                            detail="download_dir must be under /DATA (not .system_data)")
+    ok = channel_store.set_binding_download_dir(_conn, x_user_id, bid, ap)
     if not ok:
         raise HTTPException(status_code=404, detail="binding not found")
     return {"ok": True}
@@ -1953,7 +1993,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                context_album=None,
                auth_header: str = "",
                user_lang: str = "",
-               mcp_servers: list | None = None) -> RunSink:
+               mcp_servers: list | None = None,
+               channel_send_file=None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -1988,6 +2029,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 auth_header=auth_header,
                 user_lang=user_lang,
                 mcp_servers=mcp_servers,
+                channel_send_file=channel_send_file,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean

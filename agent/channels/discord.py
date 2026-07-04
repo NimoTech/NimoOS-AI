@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 
 import httpx
 
 from channels.model import (ChannelAdapter, ChannelCapabilities,
-                            InboundMessage, OutboundMessage)
+                            InboundAttachment, InboundMessage, OutboundMessage)
 
 _LOG = logging.getLogger("nimoos-agent.channels.discord")
 
 _API = "https://discord.com/api/v10"
+_MAX_FILE = 20 * 1024 * 1024   # 20MB attachment download cap
 
 
 class DiscordAdapter(ChannelAdapter):
     channel_type = "discord"
-    capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True)
+    capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True,
+                                       supports_media=True)
 
     def __init__(self, instance_id, config, on_inbound, *,
                  client=None):
@@ -48,7 +52,11 @@ class DiscordAdapter(ChannelAdapter):
         if not self._is_dm(message):
             return None
         text = message.content or ""
-        if not text:
+        has_attachments = bool(getattr(message, "attachments", []))
+        # Relaxed filter: deliver a DM if it has text OR attachments — a
+        # pure-attachment message (no caption, unlike Telegram) must not be
+        # dropped just because `content` is empty.
+        if not text and not has_attachments:
             return None
         return InboundMessage(
             channel_type="discord", instance_id=self.instance_id,
@@ -57,10 +65,44 @@ class DiscordAdapter(ChannelAdapter):
             external_username=getattr(message.author, "name", None),
             message_id=str(message.id), text=text, raw={})
 
+    async def _extract_attachments(self, message) -> list[InboundAttachment]:
+        """Download each discord.py Attachment to a tempfile, respecting the
+        20MB cap. A single attachment's download failure is logged and
+        skipped rather than failing the whole inbound message."""
+        attachments: list[InboundAttachment] = []
+        for att in getattr(message, "attachments", []):
+            filename = getattr(att, "filename", "attachment")
+            size = getattr(att, "size", 0)
+            if size > _MAX_FILE:
+                _LOG.warning("discord attachment exceeds max_file (instance"
+                             " %s, filename %s, size %s)",
+                             self.instance_id, filename, size)
+                continue
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            try:
+                await att.save(tmp_path)
+            except Exception as e:
+                _LOG.warning("discord attachment download failed (instance"
+                             " %s, filename %s): %s",
+                             self.instance_id, filename, e)
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                continue
+            attachments.append(InboundAttachment(
+                filename=filename,
+                mime=getattr(att, "content_type", None) or "application/octet-stream",
+                tmp_path=tmp_path, size=size))
+        return attachments
+
     async def _handle_message(self, message) -> None:
         im = self._to_inbound(message)
         if im is None:
             return
+        im.attachments = await self._extract_attachments(message)
         # Fire-and-forget: a long agent run must not stall the gateway loop.
         t = asyncio.create_task(self._on_inbound(self, im))
         self._inflight.add(t)
@@ -120,6 +162,17 @@ class DiscordAdapter(ChannelAdapter):
         if channel is None:
             channel = await self._client.fetch_channel(cid)
         sent = await channel.send(msg.text)
+        return str(getattr(sent, "id", "")) or None
+
+    async def send_file(self, external_chat_id: str, path: str,
+                        caption: str = "") -> str | None:
+        import discord
+        cid = int(external_chat_id)
+        channel = self._client.get_channel(cid)
+        if channel is None:
+            channel = await self._client.fetch_channel(cid)
+        sent = await channel.send(content=caption or None,
+                                  file=discord.File(path))
         return str(getattr(sent, "id", "")) or None
 
     async def send_typing(self, external_chat_id: str) -> None:
