@@ -340,6 +340,18 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
     if any(r["kind"] != "image" for r in rows):
         from skills.attachments import read_attachment
         tools.append(read_attachment)
+
+    # channel-only outbound file tool: register only for channel-sourced
+    # sessions (sessions.source != 'web'), never for the web chat UI.
+    try:
+        import db as _dbmod
+        row = _dbmod.get_connection().execute(
+            "SELECT source FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row and row["source"] and row["source"] != "web":
+            from skills.send_attachment import send_attachment
+            tools.append(send_attachment)
+    except Exception:
+        pass
     return tools
 
 
@@ -547,6 +559,11 @@ class AgentRunner:
             fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
             fs_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             fs_access_request.clear_denied_for_session(session_id)
+
+            from skills.send_attachment import SESSION_ID_VAR as _SA_SESSION_VAR
+            _SA_SESSION_VAR.set(session_id)
+            # SEND_FILE_VAR is set only for channel runs — see Task B3 (run()
+            # gains a channel_send_file param threaded from _channel_start_run).
 
             shell_skills.SESSION_ID_VAR.set(session_id)
             shell_skills.DB_VAR.set(self._conn)
