@@ -46,16 +46,16 @@ def save_and_ingest(conn: sqlite3.Connection, data_root: str, session_id: str,
             if idx >= max_count:
                 skipped.append(att.filename)
                 continue
-            real_size = os.path.getsize(att.tmp_path)   # never trust caller-supplied att.size
-            if real_size > max_file or running_total + real_size > max_total:
-                skipped.append(att.filename)
-                continue
             try:
+                real_size = os.path.getsize(att.tmp_path)   # never trust caller-supplied att.size
+                if real_size > max_file or running_total + real_size > max_total:
+                    skipped.append(att.filename)
+                    continue
                 dest = _unique_dest(download_dir, att.filename)
                 shutil.move(att.tmp_path, dest)      # tmp -> /DATA (real bytes)
-                running_total += real_size
                 aid = ingest_external(conn, data_root, session_id,
                                       real_path=dest, filename=os.path.basename(dest))
+                running_total += real_size            # charge only after full success
                 ids.append(aid)
             except Exception:
                 _LOG.warning("failed to save/ingest attachment %r", att.filename,

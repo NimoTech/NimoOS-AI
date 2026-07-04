@@ -79,3 +79,54 @@ def test_per_attachment_error_isolated(tmp_path, monkeypatch):
                                    max_file=100, max_total=1000, max_count=10)
     assert len(ids) == 2 and skipped == ["b.txt"]
     assert not os.path.exists(t1) and not os.path.exists(t2) and not os.path.exists(t3)
+
+
+def test_getsize_failure_isolated(tmp_path):
+    """If os.path.getsize() raises for one attachment's tmp file (e.g. it
+    vanished / was never created), that attachment is skipped but the
+    others before and after it must still be saved and ingested."""
+    conn = db_module.init_db(str(tmp_path / "t.db"), snapshots_root=str(tmp_path / "s"))
+    conn.execute("INSERT INTO sessions (id,user_id,created_at,updated_at) VALUES ('s','u',1,1)"); conn.commit()
+    ddir = str(tmp_path / "DATA")
+    t1 = _mk_tmp(tmp_path, "a.txt", b"1")
+    bogus = str(tmp_path / "does-not-exist.bin")   # getsize() will raise FileNotFoundError
+    t3 = _mk_tmp(tmp_path, "c.txt", b"3")
+    atts = [InboundAttachment("a.txt", "text/plain", t1, 1),
+            InboundAttachment("bad.bin", "application/octet-stream", bogus, 1),
+            InboundAttachment("c.txt", "text/plain", t3, 1)]
+    ids, skipped = save_and_ingest(conn, str(tmp_path / "ad"), "s", ddir, atts,
+                                   max_file=100, max_total=1000, max_count=10)
+    assert len(ids) == 2 and skipped == ["bad.bin"]
+    assert os.path.isfile(os.path.join(ddir, "a.txt"))
+    assert os.path.isfile(os.path.join(ddir, "c.txt"))
+    assert not os.path.exists(t1) and not os.path.exists(t3)
+
+
+def test_running_total_not_charged_on_ingest_failure(tmp_path, monkeypatch):
+    """A move-succeeds/ingest-fails attachment must not consume the
+    per-message total-size budget: a later attachment that only fits if the
+    failed one's bytes are NOT counted must still be accepted."""
+    conn = db_module.init_db(str(tmp_path / "t.db"), snapshots_root=str(tmp_path / "s"))
+    conn.execute("INSERT INTO sessions (id,user_id,created_at,updated_at) VALUES ('s','u',1,1)"); conn.commit()
+    ddir = str(tmp_path / "DATA")
+    t1 = _mk_tmp(tmp_path, "a.txt", b"x" * 6)   # fails ingest, 6 bytes
+    t2 = _mk_tmp(tmp_path, "b.txt", b"y" * 6)   # only fits if a.txt's 6 bytes weren't charged
+
+    real_ingest = inbound_mod.ingest_external
+    calls = {"n": 0}
+
+    def flaky_ingest(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return real_ingest(*args, **kwargs)
+
+    monkeypatch.setattr(inbound_mod, "ingest_external", flaky_ingest)
+    atts = [InboundAttachment("a.txt", "text/plain", t1, 6),
+            InboundAttachment("b.txt", "text/plain", t2, 6)]
+    ids, skipped = save_and_ingest(conn, str(tmp_path / "ad"), "s", ddir, atts,
+                                   max_file=100, max_total=10, max_count=10)
+    assert skipped == ["a.txt"]
+    assert len(ids) == 1
+    assert os.path.isfile(os.path.join(ddir, "b.txt"))
+    assert not os.path.exists(t1) and not os.path.exists(t2)
