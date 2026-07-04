@@ -4,6 +4,7 @@ import json
 import os
 import httpx
 import pytest
+from channels import telegram as telegram_module
 from channels.telegram import TelegramAdapter
 
 
@@ -113,4 +114,111 @@ async def test_poll_extracts_document_attachment():
     att = got[0].attachments[0]
     assert att.filename == "f.txt" and os.path.exists(att.tmp_path)
     assert att.mime == "text/plain" and att.size == 3
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_poll_uses_caption_when_text_missing():
+    """A photo sent with a caption (no `text` field) must still carry the
+    user's instruction through as InboundMessage.text, plus its attachment."""
+    got = []
+
+    async def on_inbound(adapter, msg):
+        got.append(msg)
+
+    upd = {"update_id": 1, "message": {"message_id": 5,
+        "chat": {"id": 99, "type": "private"}, "from": {"id": 7, "username": "a"},
+        "caption": "summarize this receipt",
+        "photo": [{"file_id": "FID", "file_unique_id": "u1"}]}}
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, on_inbound,
+                        transport=_bot_api_with_file([upd]))
+    await a._poll_once()
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1
+    assert got[0].text == "summarize this receipt"
+    assert len(got[0].attachments) == 1
+    await a.stop()
+
+
+def _bot_api_getfile_fails(updates_holder):
+    """Mock transport whose getFile call reports failure, simulating a
+    single-attachment download error while getUpdates still works."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/getUpdates"):
+            batch, updates_holder[:] = list(updates_holder), []
+            return httpx.Response(200, json={"ok": True, "result": batch})
+        if path.endswith("/getFile"):
+            return httpx.Response(200, json={"ok": False, "error_code": 400,
+                                             "description": "file not found"})
+        return httpx.Response(404, json={"ok": False})
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_poll_download_failure_keeps_text_drops_attachment():
+    """A single attachment's download failure must be isolated: the message
+    is still dispatched with its text intact and zero attachments, rather
+    than being dropped entirely."""
+    got = []
+
+    async def on_inbound(adapter, msg):
+        got.append(msg)
+
+    upd = {"update_id": 1, "message": {"message_id": 5,
+        "text": "please check this",
+        "chat": {"id": 99, "type": "private"}, "from": {"id": 7, "username": "a"},
+        "document": {"file_id": "FID", "file_name": "f.txt",
+                     "mime_type": "text/plain"}}}
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, on_inbound,
+                        transport=_bot_api_getfile_fails([upd]))
+    await a._poll_once()
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1
+    assert got[0].text == "please check this"
+    assert got[0].attachments == []
+    await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_poll_document_over_cap_dropped_and_cleaned_up(monkeypatch):
+    """A document whose download exceeds the size cap must be skipped (zero
+    attachments, message still dispatched) and its temp file removed rather
+    than leaked on disk. A tiny injected cap stands in for the real 20MB
+    limit so the test doesn't need to transfer a huge payload."""
+    got = []
+
+    async def on_inbound(adapter, msg):
+        got.append(msg)
+
+    upd = {"update_id": 1, "message": {"message_id": 5,
+        "text": "here's a big file",
+        "chat": {"id": 99, "type": "private"}, "from": {"id": 7, "username": "a"},
+        "document": {"file_id": "FID", "file_name": "big.bin", "file_size": 100,
+                     "mime_type": "application/octet-stream"}}}
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, on_inbound,
+                        transport=_bot_api_with_file([upd]))
+
+    # Inject a 1-byte cap so the mock file body ("abc", 3 bytes) trips the
+    # existing cap-abort path in _download_tg_file without touching the
+    # real default (20MB) or the download URL scheme.
+    async def tiny_cap_download(file_id):
+        return await TelegramAdapter._download_tg_file(a, file_id, max_file=1)
+    a._download_tg_file = tiny_cap_download
+
+    created_paths = []
+    real_ntf = telegram_module.tempfile.NamedTemporaryFile
+
+    def spy_ntf(*args, **kwargs):
+        f = real_ntf(*args, **kwargs)
+        created_paths.append(f.name)
+        return f
+    monkeypatch.setattr(telegram_module.tempfile, "NamedTemporaryFile", spy_ntf)
+
+    await a._poll_once()
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1
+    assert got[0].attachments == []
+    assert len(created_paths) == 1
+    assert not os.path.exists(created_paths[0])
     await a.stop()

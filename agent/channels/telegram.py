@@ -87,7 +87,11 @@ class TelegramAdapter(ChannelAdapter):
         m = upd.get("message") or {}
         chat = m.get("chat") or {}
         frm = m.get("from") or {}
-        text = m.get("text") or ""
+        # Telegram puts the caption of a photo/document in `caption`, not
+        # `text` (which is only populated for pure-text messages). Fall back
+        # to it so a captioned attachment doesn't silently drop the user's
+        # instruction.
+        text = m.get("text") or m.get("caption") or ""
         if chat.get("type") != "private":
             return None
         attachments = await self._extract_attachments(m)
