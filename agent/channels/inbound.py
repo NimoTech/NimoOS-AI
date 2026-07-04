@@ -3,12 +3,15 @@ them as session attachments (via symlink). Enforces per-file / per-message
 count / per-message total-size caps. Temp files are always removed."""
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
 
 from attachments.ingest import ingest_external
 from attachments.paths import sanitize_filename
+
+_LOG = logging.getLogger("nimoos-agent.channels")
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_BYTES = 20 * 1024 * 1024
@@ -40,15 +43,25 @@ def save_and_ingest(conn: sqlite3.Connection, data_root: str, session_id: str,
     try:
         os.makedirs(download_dir, exist_ok=True)
         for idx, att in enumerate(attachments):
-            if idx >= max_count or att.size > max_file or running_total + att.size > max_total:
+            if idx >= max_count:
                 skipped.append(att.filename)
                 continue
-            dest = _unique_dest(download_dir, att.filename)
-            shutil.move(att.tmp_path, dest)      # tmp -> /DATA (real bytes)
-            running_total += att.size
-            aid = ingest_external(conn, data_root, session_id,
-                                  real_path=dest, filename=os.path.basename(dest))
-            ids.append(aid)
+            real_size = os.path.getsize(att.tmp_path)   # never trust caller-supplied att.size
+            if real_size > max_file or running_total + real_size > max_total:
+                skipped.append(att.filename)
+                continue
+            try:
+                dest = _unique_dest(download_dir, att.filename)
+                shutil.move(att.tmp_path, dest)      # tmp -> /DATA (real bytes)
+                running_total += real_size
+                aid = ingest_external(conn, data_root, session_id,
+                                      real_path=dest, filename=os.path.basename(dest))
+                ids.append(aid)
+            except Exception:
+                _LOG.warning("failed to save/ingest attachment %r", att.filename,
+                            exc_info=True)
+                skipped.append(att.filename)
+                continue
     finally:
         for att in attachments:                  # any leftover tmp (skipped / error)
             try:

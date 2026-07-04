@@ -294,3 +294,23 @@ async def test_inbound_attachment_passes_ids_and_placeholder(env, monkeypatch):
     await router.handle(a, m)
     sid, uid, message, creds, aids = _last_run_with_aids(calls)
     assert aids == ["att_x"] and message.strip() != ""            # placeholder non-empty
+
+
+@pytest.mark.asyncio
+async def test_all_attachments_skipped_and_no_text_does_not_start_run(env, monkeypatch):
+    conn, inst, router, calls = env
+    import channels.inbound as inbound_mod
+    monkeypatch.setattr(inbound_mod, "save_and_ingest",
+                        lambda *a, **k: ([], ["big.bin"]))
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    m = _msg("", instance=inst["id"])          # no text, attachment only, all skipped
+    m.attachments = [type("A", (), {"filename": "big.bin", "mime": "application/octet-stream",
+                                    "tmp_path": "/tmp/big.bin", "size": 999})()]
+    await router.handle(a, m)
+    assert calls["runs"] == []                                  # no run started
+    assert any("skipped" in t or "跳过" in t for _c, t in a.sent)  # skip notice sent

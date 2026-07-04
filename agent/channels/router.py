@@ -183,6 +183,11 @@ class ChannelRouter:
                 await self._send_text(adapter, msg.external_chat_id,
                                       f"部分文件超出限制已跳过 (skipped): {', '.join(skipped)}")
         run_text = msg.text
+        if not run_text and not attachment_ids:
+            # Nothing to run: no text, and no attachment was actually
+            # ingested (either none were sent, or all were skipped — the
+            # user already got the skip notice above).
+            return
         if not run_text and attachment_ids:
             run_text = ("[用户发来文件/图片,已存至 " + (binding.get("download_dir")
                         or f"/DATA/Downloads/{msg.channel_type}")
