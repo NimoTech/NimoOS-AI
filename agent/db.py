@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     recall_indexed_msgs INTEGER NOT NULL DEFAULT 0,
     recall_chunk_seq    INTEGER NOT NULL DEFAULT 0,
     rolling_summary       TEXT,
-    last_overhead_tokens  INTEGER NOT NULL DEFAULT 0
+    last_overhead_tokens  INTEGER NOT NULL DEFAULT 0,
+    source            TEXT NOT NULL DEFAULT 'web'
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -207,6 +208,51 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
     revoked      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
+
+CREATE TABLE IF NOT EXISTS channel_instances (
+    id           TEXT PRIMARY KEY,
+    channel_type TEXT NOT NULL,
+    scope        TEXT NOT NULL DEFAULT 'system',
+    name         TEXT,
+    config_json  TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_by   TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channel_bindings (
+    id                TEXT PRIMARY KEY,
+    instance_id       TEXT NOT NULL,
+    external_user_id  TEXT NOT NULL,
+    external_username TEXT,
+    user_id           TEXT NOT NULL,
+    default_model     TEXT,
+    revoked           INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    UNIQUE(instance_id, external_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_bindings_user ON channel_bindings(user_id);
+
+CREATE TABLE IF NOT EXISTS channel_pairing_codes (
+    id          TEXT PRIMARY KEY,
+    code_hash   TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS channel_chats (
+    id               TEXT PRIMARY KEY,
+    instance_id      TEXT NOT NULL,
+    external_chat_id TEXT NOT NULL,
+    binding_id       TEXT NOT NULL,
+    session_id       TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE(instance_id, external_chat_id)
+);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -284,6 +330,9 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "last_overhead_tokens" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "last_overhead_tokens INTEGER NOT NULL DEFAULT 0")
+    if "source" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN "
+                     "source TEXT NOT NULL DEFAULT 'web'")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}

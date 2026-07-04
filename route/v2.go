@@ -92,6 +92,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.POST("/mcp/register", mcp.RegisterInternal)
 	internal.GET("/mcp/list", mcp.ListInternal)
 	internal.POST("/mcp/remove", mcp.RemoveInternal)
+	internal.GET("/agent/provider-credentials", v2.ProviderCredentials(svc, runtimePath))
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -171,6 +172,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
+	// Channel instance management is system-scoped (bot config), gate on admin
+	// role before falling through to the general agent proxy wildcard below.
+	g.Any("/agent/channels/instances", agent.Proxy, v2.AdminOnly(runtimePath))
+	g.Any("/agent/channels/instances/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
