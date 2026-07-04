@@ -1,4 +1,5 @@
 import asyncio
+import os
 import types
 import httpx
 import pytest
@@ -7,12 +8,13 @@ from channels.model import OutboundMessage
 
 
 def _msg(content="hello", *, dm=True, from_bot=False, author_id=7,
-         author_name="alice", chan_id=99, msg_id=5):
+         author_name="alice", chan_id=99, msg_id=5, attachments=None):
     """Duck-typed stand-in for a discord.Message (no discord import needed)."""
     channel = types.SimpleNamespace(id=chan_id, is_dm=dm)
     author = types.SimpleNamespace(id=author_id, name=author_name, bot=from_bot)
     return types.SimpleNamespace(content=content, channel=channel,
-                                 author=author, id=msg_id)
+                                 author=author, id=msg_id,
+                                 attachments=attachments if attachments is not None else [])
 
 
 def _adapter(on_inbound=None, client=None, dm_check=None):
@@ -65,6 +67,52 @@ async def test_send_resolves_channel_and_sends():
     a = _adapter(client=FakeClient())
     mid = await a.send("99", OutboundMessage(text="pong"))
     assert sent["text"] == "pong" and sent["fetched"] == 99 and mid == "555"
+
+
+@pytest.mark.asyncio
+async def test_discord_extracts_attachment():
+    got = []
+    async def on_inbound(adapter, msg): got.append(msg)
+    class FakeAtt:
+        filename = "f.txt"; content_type = "text/plain"; size = 3
+        async def save(self, p): open(p, "wb").write(b"abc")
+    msg = _msg(content="", attachments=[FakeAtt()])   # pure attachment, no text
+    a = _adapter(on_inbound=on_inbound)
+    await a._handle_message(msg)
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1 and len(got[0].attachments) == 1
+    att = got[0].attachments[0]
+    assert os.path.exists(att.tmp_path)
+    assert (att.filename, att.mime, att.size) == ("f.txt", "text/plain", 3)
+
+
+@pytest.mark.asyncio
+async def test_discord_attachment_over_max_file_is_skipped():
+    got = []
+    async def on_inbound(adapter, msg): got.append(msg)
+    class HugeAtt:
+        filename = "big.bin"; content_type = "application/octet-stream"
+        size = 21 * 1024 * 1024
+        async def save(self, p): open(p, "wb").write(b"x")
+    msg = _msg(content="hi", attachments=[HugeAtt()])
+    a = _adapter(on_inbound=on_inbound)
+    await a._handle_message(msg)
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1 and got[0].attachments == []
+
+
+@pytest.mark.asyncio
+async def test_discord_attachment_download_failure_skips_only_that_attachment():
+    got = []
+    async def on_inbound(adapter, msg): got.append(msg)
+    class BadAtt:
+        filename = "bad.bin"; content_type = "application/octet-stream"; size = 5
+        async def save(self, p): raise RuntimeError("boom")
+    msg = _msg(content="hi", attachments=[BadAtt()])
+    a = _adapter(on_inbound=on_inbound)
+    await a._handle_message(msg)
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1 and got[0].text == "hi" and got[0].attachments == []
 
 
 @pytest.mark.asyncio
