@@ -103,3 +103,24 @@ def test_create_discord_rejects_bad_token(client, monkeypatch):
     r = client.post("/agent/channels/instances", headers=H, json={
         "channel_type": "discord", "config": {"bot_token": "nope"}})
     assert r.status_code == 422
+
+
+def test_binding_download_dir_default_and_set(client):
+    from channels import store
+    iid = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "telegram", "config": {"bot_token": "good:token"}}).json()["id"]
+    code, _ = store.create_pairing_code(main._conn, iid, "u1", now_ms=0)
+    b = store.redeem_pairing_code(main._conn, iid, code, "tg1", "a", now_ms=0)
+    # GET default value
+    rows = client.get("/agent/channels/bindings", headers=H).json()["bindings"]
+    assert rows[0]["download_dir"] == "/DATA/Downloads/telegram"
+    # valid set
+    assert client.put(f"/agent/channels/bindings/{b['id']}/download-dir", headers=H,
+                      json={"download_dir": "/DATA/Downloads/tg-custom"}).json() == {"ok": True}
+    rows = client.get("/agent/channels/bindings", headers=H).json()["bindings"]
+    assert rows[0]["download_dir"] == "/DATA/Downloads/tg-custom"
+    # rejected: outside /DATA
+    assert client.put(f"/agent/channels/bindings/{b['id']}/download-dir", headers=H,
+                      json={"download_dir": "/etc/x"}).status_code == 422
+    assert client.put(f"/agent/channels/bindings/{b['id']}/download-dir", headers=H,
+                      json={"download_dir": "/DATA/.system_data/x"}).status_code == 422
