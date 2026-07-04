@@ -287,7 +287,8 @@ _channel_manager = None
 
 
 def _channel_start_run(session_id: str, user_id: str, message: str,
-                       creds: dict, chat_username: str = ""):
+                       creds: dict, chat_username: str = "",
+                       *, attachment_ids: list[str] = ()):
     """Channel-side bridge into _start_run. Credentials come pre-resolved
     from the Go internal endpoint instead of X-Agent-Provider-* headers."""
     return _start_run(
@@ -295,6 +296,7 @@ def _channel_start_run(session_id: str, user_id: str, message: str,
         creds["api_key"], creds["base_url"], creds["model"],
         provider_type=creds.get("provider_type", "other"),
         chat_username=chat_username,
+        attachment_ids=attachment_ids,
     )
 
 

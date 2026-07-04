@@ -50,8 +50,10 @@ def env(tmp_path):
                                  "u1", 0)
     calls = {"runs": [], "cancels": []}
 
-    def start_run(session_id, user_id, message, creds, chat_username):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=()):
         calls["runs"].append((session_id, user_id, message, creds))
+        calls.setdefault("attachment_ids", []).append(attachment_ids)
         return FakeSink([{"type": "message", "content": "pong " + message},
                          {"type": "done"}])
 
@@ -68,6 +70,12 @@ def env(tmp_path):
     router = ChannelRouter(conn, start_run=start_run, cancel_run=cancel_run,
                            resolve_credentials=resolve_credentials)
     return conn, inst, router, calls
+
+
+def _last_run_with_aids(calls):
+    sid, uid, message, creds = calls["runs"][-1]
+    aids = calls["attachment_ids"][-1]
+    return sid, uid, message, creds, aids
 
 
 @pytest.mark.asyncio
@@ -189,7 +197,8 @@ class GatedSink:
 
 
 def _gated_router(conn, gate, started):
-    def start_run(session_id, user_id, message, creds, chat_username):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=()):
         started.append(message)
         return GatedSink(gate, message)
 
@@ -265,3 +274,23 @@ async def test_stranger_tracking_dicts_are_bounded(env, monkeypatch):
         await router.handle(a, _msg("hi", user=f"tg{i}", chat=f"c{i}",
                                     instance=inst["id"]))
     assert len(router._unpaired_last) <= 10
+
+
+@pytest.mark.asyncio
+async def test_inbound_attachment_passes_ids_and_placeholder(env, monkeypatch):
+    conn, inst, router, calls = env
+    import channels.inbound as inbound_mod
+    monkeypatch.setattr(inbound_mod, "save_and_ingest",
+                        lambda *a, **k: (["att_x"], []))
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+    m = _msg("", instance=inst["id"])          # no text, attachment only
+    m.attachments = [type("A", (), {"filename": "x.png", "mime": "image/png",
+                                    "tmp_path": "/tmp/x", "size": 3})()]
+    await router.handle(a, m)
+    sid, uid, message, creds, aids = _last_run_with_aids(calls)
+    assert aids == ["att_x"] and message.strip() != ""            # placeholder non-empty
