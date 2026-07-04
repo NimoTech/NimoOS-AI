@@ -192,9 +192,17 @@ class ChannelRouter:
             run_text = ("[用户发来文件/图片,已存至 " + (binding.get("download_dir")
                         or f"/DATA/Downloads/{msg.channel_type}")
                         + "。请分析,或询问希望如何处理。]")
+        send_cb = None
+        if getattr(adapter.capabilities, "supports_media", False):
+            async def send_cb(path, caption, _a=adapter, _c=msg.external_chat_id):
+                mid = await _a.send_file(_c, path, caption)
+                if mid is None:
+                    raise RuntimeError("send_file returned no id")
+                return mid
         sink = self._start_run(session_id, binding["user_id"], run_text,
                                creds, binding.get("external_username") or "",
-                               attachment_ids=attachment_ids)
+                               attachment_ids=attachment_ids,
+                               channel_send_file=send_cb)
         final, error = await collect_final(sink, timeout=self._run_timeout)
         reply = final or (f"出错了 (error): {error}" if error else "(无回复 / empty reply)")
         await self._send_text(adapter, msg.external_chat_id, reply)

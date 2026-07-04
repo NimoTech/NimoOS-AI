@@ -288,7 +288,8 @@ _channel_manager = None
 
 def _channel_start_run(session_id: str, user_id: str, message: str,
                        creds: dict, chat_username: str = "",
-                       *, attachment_ids: list[str] = ()):
+                       *, attachment_ids: list[str] = (),
+                       channel_send_file=None):
     """Channel-side bridge into _start_run. Credentials come pre-resolved
     from the Go internal endpoint instead of X-Agent-Provider-* headers."""
     return _start_run(
@@ -297,6 +298,7 @@ def _channel_start_run(session_id: str, user_id: str, message: str,
         provider_type=creds.get("provider_type", "other"),
         chat_username=chat_username,
         attachment_ids=attachment_ids,
+        channel_send_file=channel_send_file,
     )
 
 
@@ -1991,7 +1993,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                context_album=None,
                auth_header: str = "",
                user_lang: str = "",
-               mcp_servers: list | None = None) -> RunSink:
+               mcp_servers: list | None = None,
+               channel_send_file=None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -2026,6 +2029,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 auth_header=auth_header,
                 user_lang=user_lang,
                 mcp_servers=mcp_servers,
+                channel_send_file=channel_send_file,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean

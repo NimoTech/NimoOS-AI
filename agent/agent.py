@@ -521,6 +521,7 @@ class AgentRunner:
         auth_header: str = "",
         user_lang: str = "",
         mcp_servers: list | None = None,
+        channel_send_file=None,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -561,9 +562,9 @@ class AgentRunner:
             fs_access_request.clear_denied_for_session(session_id)
 
             from skills.send_attachment import SESSION_ID_VAR as _SA_SESSION_VAR
+            from skills.send_attachment import SEND_FILE_VAR as _SA_F
             _SA_SESSION_VAR.set(session_id)
-            # SEND_FILE_VAR is set only for channel runs — see Task B3 (run()
-            # gains a channel_send_file param threaded from _channel_start_run).
+            _SA_F.set(channel_send_file)   # None for web; a callable for channel runs
 
             shell_skills.SESSION_ID_VAR.set(session_id)
             shell_skills.DB_VAR.set(self._conn)
