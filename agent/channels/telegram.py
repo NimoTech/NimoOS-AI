@@ -7,17 +7,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 
 import httpx
 
 from channels.model import (ChannelAdapter, ChannelCapabilities,
-                            InboundMessage, OutboundMessage)
+                            InboundAttachment, InboundMessage, OutboundMessage)
 
 _LOG = logging.getLogger("nimoos-agent.channels.telegram")
 
 _API = "https://api.telegram.org/bot{token}/{method}"
+_FILE_URL = "https://api.telegram.org/file/bot{token}/{file_path}"
 _POLL_TIMEOUT = 50          # Telegram long-poll hold, seconds
 _ERROR_BACKOFF = 5.0        # sleep after a failed poll round
+_MAX_FILE = 20 * 1024 * 1024   # 20MB attachment download cap
 
 
 class TelegramAdapter(ChannelAdapter):
@@ -70,7 +74,7 @@ class TelegramAdapter(ChannelAdapter):
             raise RuntimeError(f"getUpdates not ok: {data}")
         for upd in data.get("result", []):
             self._offset = max(self._offset, int(upd["update_id"]) + 1)
-            im = self._to_inbound(upd)
+            im = await self._to_inbound(upd)
             if im is None:
                 continue
             # Dispatch without awaiting: a long agent run must not stall the
@@ -79,19 +83,78 @@ class TelegramAdapter(ChannelAdapter):
             self._inflight.add(t)
             t.add_done_callback(self._inflight.discard)
 
-    def _to_inbound(self, upd: dict) -> InboundMessage | None:
+    async def _to_inbound(self, upd: dict) -> InboundMessage | None:
         m = upd.get("message") or {}
         chat = m.get("chat") or {}
         frm = m.get("from") or {}
-        text = m.get("text")
-        if chat.get("type") != "private" or not text:
+        text = m.get("text") or ""
+        if chat.get("type") != "private":
+            return None
+        attachments = await self._extract_attachments(m)
+        if not text and not attachments:
             return None
         return InboundMessage(
             channel_type="telegram", instance_id=self.instance_id,
             external_chat_id=str(chat.get("id", "")),
             external_user_id=str(frm.get("id", "")),
             external_username=frm.get("username"),
-            message_id=str(m.get("message_id", "")), text=text, raw=upd)
+            message_id=str(m.get("message_id", "")), text=text, raw=upd,
+            attachments=attachments)
+
+    async def _extract_attachments(self, m: dict) -> list[InboundAttachment]:
+        """Look for a photo (largest variant) or document on the message and
+        download it. A single attachment's download failure is logged and
+        skipped rather than failing the whole inbound message."""
+        document = m.get("document")
+        photo = m.get("photo")  # list of sizes, smallest first
+        if document:
+            file_id = document.get("file_id")
+            filename = document.get("file_name") or f"{file_id}"
+            mime = document.get("mime_type") or "application/octet-stream"
+        elif photo:
+            largest = photo[-1]
+            file_id = largest.get("file_id")
+            filename = f"{largest.get('file_unique_id', file_id)}.jpg"
+            mime = "image/jpeg"
+        else:
+            return []
+        if not file_id:
+            return []
+        try:
+            tmp_path, size = await self._download_tg_file(file_id)
+        except Exception as e:
+            _LOG.warning("telegram attachment download failed (instance"
+                         " %s, file_id %s): %s", self.instance_id, file_id, e)
+            return []
+        return [InboundAttachment(filename=filename, mime=mime,
+                                  tmp_path=tmp_path, size=size)]
+
+    async def _download_tg_file(self, file_id: str, *,
+                                max_file: int = _MAX_FILE
+                                ) -> tuple[str, int]:
+        r = await self._client.get(self._url("getFile"),
+                                   params={"file_id": file_id})
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"getFile not ok: {data}")
+        file_path = data["result"]["file_path"]
+        url = _FILE_URL.format(token=self._token, file_path=file_path)
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        total = 0
+        try:
+            async with self._client.stream("GET", url) as resp:
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_file:
+                        raise ValueError(
+                            f"attachment exceeds max_file ({max_file} bytes)")
+                    tmp.write(chunk)
+            tmp.close()
+            return tmp.name, total
+        except Exception:
+            tmp.close()
+            os.remove(tmp.name)
+            raise
 
     async def send(self, external_chat_id: str,
                    msg: OutboundMessage) -> str | None:

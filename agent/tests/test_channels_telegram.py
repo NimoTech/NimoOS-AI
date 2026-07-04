@@ -1,6 +1,7 @@
 # NimoOS-AI/agent/tests/test_channels_telegram.py
 import asyncio
 import json
+import os
 import httpx
 import pytest
 from channels.telegram import TelegramAdapter
@@ -76,3 +77,40 @@ async def test_validate_token_rejects_bad_token():
     bad = httpx.MockTransport(
         lambda r: httpx.Response(401, json={"ok": False}))
     assert await TelegramAdapter.validate_token("bad", transport=bad) is None
+
+
+def _bot_api_with_file(updates_holder):
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/getUpdates"):
+            batch, updates_holder[:] = list(updates_holder), []
+            return httpx.Response(200, json={"ok": True, "result": batch})
+        if path.endswith("/getFile"):
+            return httpx.Response(200, json={"ok": True,
+                                             "result": {"file_path": "docs/f.txt"}})
+        if "/file/" in path:
+            return httpx.Response(200, content=b"abc")
+        return httpx.Response(404, json={"ok": False})
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_poll_extracts_document_attachment():
+    got = []
+
+    async def on_inbound(adapter, msg):
+        got.append(msg)
+
+    upd = {"update_id": 1, "message": {"message_id": 5,
+        "chat": {"id": 99, "type": "private"}, "from": {"id": 7, "username": "a"},
+        "document": {"file_id": "FID", "file_name": "f.txt", "file_size": 3,
+                     "mime_type": "text/plain"}}}
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, on_inbound,
+                        transport=_bot_api_with_file([upd]))
+    await a._poll_once()
+    await asyncio.gather(*a._inflight)
+    assert len(got) == 1 and len(got[0].attachments) == 1
+    att = got[0].attachments[0]
+    assert att.filename == "f.txt" and os.path.exists(att.tmp_path)
+    assert att.mime == "text/plain" and att.size == 3
+    await a.stop()
