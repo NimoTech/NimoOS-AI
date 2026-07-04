@@ -1,7 +1,8 @@
 """Discord channel adapter — official Bot API over the Gateway WebSocket
 (discord.py). Parity with the Telegram M1 adapter: DM-only, plain text.
-discord.py is imported lazily (only when constructing the real client) so
-message-mapping / validate-token / injected-client tests need not install it.
+discord.py is imported lazily (imported lazily inside methods, never at
+module scope) so message-mapping / validate-token / injected-client tests
+need not install it.
 Bots may only DM users who share a server with them; pairing therefore
 requires the user to join a server the bot is in (see spec)."""
 from __future__ import annotations
@@ -24,10 +25,9 @@ class DiscordAdapter(ChannelAdapter):
     capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True)
 
     def __init__(self, instance_id, config, on_inbound, *,
-                 client=None, transport: httpx.AsyncBaseTransport | None = None):
+                 client=None):
         super().__init__(instance_id, config, on_inbound)
         self._token = config["bot_token"]
-        self._transport = transport
         self._client = client            # injected in tests; else built in start()
         self._task: asyncio.Task | None = None
         self._inflight: set[asyncio.Task] = set()
@@ -95,8 +95,10 @@ class DiscordAdapter(ChannelAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _LOG.warning("discord client stopped (instance %s): %s",
-                         self.instance_id, e)
+            _LOG.error("discord client stopped (instance %s): %s — if this is "
+                       "PrivilegedIntentsRequired, enable the Message Content "
+                       "Intent for the bot in the Developer Portal",
+                       self.instance_id, e)
 
     async def stop(self) -> None:
         try:
