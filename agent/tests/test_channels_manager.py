@@ -11,7 +11,7 @@ class RecordingAdapter(ChannelAdapter):
     capabilities = ChannelCapabilities(max_text_len=10)
     events: list = []
 
-    def __init__(self, instance_id, config, on_inbound):
+    def __init__(self, instance_id, config, on_inbound, on_callback=None):
         super().__init__(instance_id, config, on_inbound)
         RecordingAdapter.events.append(("init", instance_id, config))
 
@@ -27,6 +27,9 @@ class RecordingAdapter(ChannelAdapter):
 
 class FakeRouter:
     async def handle(self, adapter, msg):
+        pass
+
+    async def handle_confirm(self, adapter, chat_id, callback_data):
         pass
 
 

@@ -327,6 +327,7 @@ async def _channels_startup():
             start_run=_channel_start_run,
             cancel_run=_channel_cancel_run,
             resolve_credentials=channel_credentials.resolve,
+            resolve_confirm=_confirm_mgr.resolve,
         )
         _channel_manager = ChannelManager(_conn, router)
         await _channel_manager.start_all()

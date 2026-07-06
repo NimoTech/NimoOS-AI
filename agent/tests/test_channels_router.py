@@ -9,6 +9,98 @@ from channels.model import ChannelCapabilities, InboundMessage
 from channels.router import ChannelRouter, MSG_BUSY
 
 
+class FakeConfirmAdapter:
+    """Fake adapter for confirm-lifecycle tests: records send_buttons /
+    edit_to_resolved calls and exposes instance_id + supports_buttons."""
+
+    def __init__(self, supports_buttons=True, instance_id="i1"):
+        self.instance_id = instance_id
+        self.capabilities = ChannelCapabilities(max_text_len=200,
+                                                supports_typing=True,
+                                                supports_media=False,
+                                                supports_buttons=supports_buttons)
+        self.buttons = []
+        self.edits = []
+
+    async def send_buttons(self, chat_id, text, buttons):
+        self.buttons.append((chat_id, text, buttons))
+        return "m1"
+
+    async def edit_to_resolved(self, chat_id, message_id, text):
+        self.edits.append((chat_id, message_id, text))
+
+
+def _confirm_router(conn, resolves):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=(), channel_send_file=None):
+        raise NotImplementedError
+
+    async def cancel_run(session_id):
+        return True
+
+    async def resolve_credentials(user_id, model):
+        return None
+
+    def resolve_confirm(confirm_id, confirmed, expected_session_id=None):
+        resolves.append((confirm_id, confirmed, expected_session_id))
+
+    return ChannelRouter(conn, start_run=start_run, cancel_run=cancel_run,
+                         resolve_credentials=resolve_credentials,
+                         resolve_confirm=resolve_confirm)
+
+
+@pytest.fixture
+def env_confirm(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    resolves = []
+    router = _confirm_router(conn, resolves)
+    adapter = FakeConfirmAdapter(supports_buttons=True)
+    return router, adapter, resolves, adapter.edits
+
+
+@pytest.fixture
+def env_confirm_no_buttons(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    resolves = []
+    router = _confirm_router(conn, resolves)
+    adapter = FakeConfirmAdapter(supports_buttons=False)
+    return router, adapter, resolves, adapter.edits
+
+
+@pytest.mark.asyncio
+async def test_surface_confirm_then_handle_allow(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    ev = {"type": "access_request", "confirm_id": "c1",
+          "path": "/DATA/x", "reason": "读取"}
+    await router._surface_confirm(adapter, "55", "s1", ev)
+    assert adapter.buttons and adapter.buttons[-1][2][0][1] == "cf:c1:a"  # callback_data
+    # user taps allow
+    await router.handle_confirm(adapter, "55", "cf:c1:a")
+    assert resolves == [("c1", True, "s1")]        # resolved True with expected_session_id
+    assert edits and "允许" in edits[-1][2]
+    assert "c1" not in router._confirms             # entry cleared
+
+
+@pytest.mark.asyncio
+async def test_handle_confirm_ownership_mismatch_ignored(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "access_request", "confirm_id": "c2",
+                                   "path": "/x", "reason": "r"})
+    await router.handle_confirm(adapter, "99", "cf:c2:a")   # wrong chat
+    assert resolves == [] and "c2" in router._confirms      # not resolved, entry kept
+
+
+@pytest.mark.asyncio
+async def test_no_button_capability_denies(env_confirm_no_buttons):
+    router, adapter, resolves, _ = env_confirm_no_buttons   # supports_buttons=False
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "confirmation_required", "confirm_id": "c3"})
+    assert resolves == [("c3", False, "s1")]                 # auto-denied
+
+
 class FakeAdapter:
     channel_type = "telegram"
 
