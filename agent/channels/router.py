@@ -339,3 +339,10 @@ class ChannelRouter:
                     if e["session_id"] == session_id]:
             entry = self._confirms.pop(cid)
             entry["timer"].cancel()
+            # Don't rely on the run task's cancellation propagating through
+            # mgr.wait() to resolve the confirm — /stop only waits up to 5s
+            # for that and swallows the timeout, which could leave the
+            # confirm dangling up to ConfirmManager's 24h default. Resolve
+            # it deterministically here too (idempotent: _deny swallows
+            # KeyError if already resolved).
+            self._deny(cid, entry["session_id"])

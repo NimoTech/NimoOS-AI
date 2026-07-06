@@ -94,6 +94,18 @@ async def test_handle_confirm_ownership_mismatch_ignored(env_confirm):
 
 
 @pytest.mark.asyncio
+async def test_handle_confirm_instance_id_mismatch_ignored(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "access_request", "confirm_id": "c9",
+                                   "path": "/x", "reason": "r"})
+    other_adapter = FakeConfirmAdapter(supports_buttons=True,
+                                       instance_id="i2")   # different instance
+    await router.handle_confirm(other_adapter, "55", "cf:c9:a")  # same chat_id
+    assert resolves == [] and "c9" in router._confirms      # not resolved, entry kept
+
+
+@pytest.mark.asyncio
 async def test_no_button_capability_denies(env_confirm_no_buttons):
     router, adapter, resolves, _ = env_confirm_no_buttons   # supports_buttons=False
     await router._surface_confirm(adapter, "55", "s1",
