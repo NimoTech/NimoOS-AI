@@ -11,7 +11,6 @@ import os
 import time
 
 from channels import store
-from channels.collector import collect_final
 from channels.driver import ChannelRunDriver
 from channels.model import InboundMessage, OutboundMessage, split_text
 
