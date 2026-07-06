@@ -14,6 +14,7 @@ observes the stream and forwards. This keeps it unit-testable with a fake sink.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 _CONFIRM_TYPES = ("access_request", "confirmation_required")
@@ -60,7 +61,14 @@ class ChannelRunDriver:
         elif t in ("tool_call", "function_call"):
             await self._flush()
         elif t in _CONFIRM_TYPES:
-            await self._flush()                  # conclusion before the ask
+            # Flush the pre-ask conclusion, but never let a send failure here
+            # kill the driver before the confirm is surfaced — that would leave
+            # the run hung on mgr.wait() until ConfirmManager's 24h default.
+            try:
+                await self._flush()              # conclusion before the ask
+            except Exception:
+                logging.getLogger("nimoos-agent.channels").exception(
+                    "pre-confirm flush failed; surfacing confirm anyway")
             if self._surface_confirm is not None and ev.get("confirm_id"):
                 await self._surface_confirm(ev)
         elif t == "error":

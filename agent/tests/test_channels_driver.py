@@ -80,3 +80,28 @@ async def test_confirm_event_flushes_then_forwards():
     assert sent == ["I need a file."]                 # conclusion flushed before the ask
     assert confirms == [{"type": "access_request", "confirm_id": "c1",
                          "path": "/DATA/x", "reason": "读取"}]
+
+
+@pytest.mark.asyncio
+async def test_pre_confirm_flush_failure_still_surfaces_confirm():
+    # If the pre-ask conclusion flush fails to send, the driver must NOT die —
+    # it must still surface the confirm (else the run hangs on mgr.wait()).
+    confirms = []
+    calls = {"n": 0}
+    async def send_text(text):
+        calls["n"] += 1
+        if calls["n"] == 1:                       # the pre-confirm flush fails
+            raise RuntimeError("transport down")
+    async def surface(ev):
+        confirms.append(ev)
+    async def no_sleep(_):
+        return None
+    d = ChannelRunDriver(send_text=send_text, surface_confirm=surface,
+                         sleep=no_sleep, now=lambda: 0.0)
+    sink = FakeSink(past=[
+        {"type": "message_delta", "content": "I need a file."},
+        {"type": "access_request", "confirm_id": "c1", "path": "/DATA/x", "reason": "读取"},
+        {"type": "done"}])
+    await d.drive(sink)   # must not raise despite send_text failing
+    assert confirms == [{"type": "access_request", "confirm_id": "c1",
+                         "path": "/DATA/x", "reason": "读取"}]
