@@ -187,6 +187,7 @@ async def test_discord_send_buttons_and_button_callback():
         def __init__(self): self.response = FakeResp()
     inter = FakeInteraction()
     await view.children[0].callback(inter)
+    await asyncio.gather(*a._inflight)
     assert seen == [("42", "cf:c1:a")] and inter.response.deferred is True
 
 

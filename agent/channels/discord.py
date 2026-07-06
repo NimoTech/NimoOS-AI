@@ -181,13 +181,15 @@ class DiscordAdapter(ChannelAdapter):
         for label, data in buttons:
             btn = discord.ui.Button(label=label, custom_id=data)
             async def _cb(interaction, _d=data):
-                chat_id = str(getattr(interaction, "channel_id", ""))
-                if self._on_callback is not None and chat_id:
-                    await self._on_callback(self, chat_id, _d)
                 try:
                     await interaction.response.defer()
                 except Exception:
                     pass
+                chat_id = str(getattr(interaction, "channel_id", ""))
+                if self._on_callback is not None and chat_id:
+                    t = asyncio.create_task(self._on_callback(self, chat_id, _d))
+                    self._inflight.add(t)
+                    t.add_done_callback(self._inflight.discard)
             btn.callback = _cb
             view.add_item(btn)
         return view
