@@ -341,6 +341,33 @@ async def test_media_capable_adapter_gets_bound_send_file_callback(env):
 
 
 @pytest.mark.asyncio
+async def test_progress_pushed_as_multiple_messages(env, monkeypatch):
+    conn, inst, router, calls = env
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+
+    # fake start_run returns a sink whose events are two conclusions split
+    # by a tool call: driver should flush at the boundary and at done,
+    # delivering both as separate messages instead of one merged reply.
+    sink = FakeSink([{"type": "message_delta", "content": "step one"},
+                     {"type": "tool_call"},
+                     {"type": "message_delta", "content": "step two (final)"},
+                     {"type": "done"}])
+    monkeypatch.setattr(router, "_start_run", lambda *a, **k: sink)
+
+    a.sent.clear()
+    await router.handle(a, _msg("do it", instance=inst["id"]))
+    texts = [t for _c, t in a.sent]
+    assert len(texts) >= 2
+    assert any("step one" in t for t in texts)
+    assert any("step two (final)" in t for t in texts)
+
+
+@pytest.mark.asyncio
 async def test_non_media_adapter_gets_no_send_file_callback(env):
     conn, inst, router, calls = env
     a = FakeAdapter(supports_media=False)

@@ -12,6 +12,7 @@ import time
 
 from channels import store
 from channels.collector import collect_final
+from channels.driver import ChannelRunDriver
 from channels.model import InboundMessage, OutboundMessage, split_text
 
 _LOG = logging.getLogger("nimoos-agent.channels.router")
@@ -203,9 +204,14 @@ class ChannelRouter:
                                creds, binding.get("external_username") or "",
                                attachment_ids=attachment_ids,
                                channel_send_file=send_cb)
-        final, error = await collect_final(sink, timeout=self._run_timeout)
-        reply = final or (f"出错了 (error): {error}" if error else "(无回复 / empty reply)")
-        await self._send_text(adapter, msg.external_chat_id, reply)
+
+        async def _send(text, _a=adapter, _c=msg.external_chat_id):
+            await self._send_text(_a, _c, text)
+
+        driver = ChannelRunDriver(send_text=_send,
+                                  surface_confirm=None,   # wired in Task B4
+                                  run_timeout=self._run_timeout)
+        await driver.drive(sink)
 
     # -- helpers ---------------------------------------------------------------
 
