@@ -430,6 +430,30 @@ async def channel_instance_list(
                           for r in channel_store.list_instances(_conn)]}
 
 
+@app.get("/agent/channels/pairable-instances")
+async def channel_pairable_instances(
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    """Enabled channel instances any NimoOS user can pair their own account
+    with. Unlike /instances (the admin bot-config view, which exposes the
+    token tail), this is a minimal, token-free list available to every user:
+    the bot serves every NimoOS user and each pairs their own account."""
+    from channels import store as channel_store
+    out = []
+    for r in channel_store.list_instances(_conn):
+        if not r["enabled"]:
+            continue
+        cfg = json.loads(r["config_json"])
+        item = {"id": r["id"], "channel_type": r["channel_type"],
+                "name": r["name"], "bot_username": cfg.get("bot_username", "")}
+        if r["channel_type"] == "discord" and cfg.get("application_id"):
+            item["invite_url"] = (
+                "https://discord.com/oauth2/authorize?client_id="
+                + str(cfg["application_id"])
+                + "&scope=bot&permissions=274877991936")
+        out.append(item)
+    return {"instances": out}
+
+
 @app.put("/agent/channels/instances/{iid}")
 async def channel_instance_update(
         iid: str, body: ChannelInstanceUpdate,

@@ -124,3 +124,19 @@ def test_binding_download_dir_default_and_set(client):
                       json={"download_dir": "/etc/x"}).status_code == 422
     assert client.put(f"/agent/channels/bindings/{b['id']}/download-dir", headers=H,
                       json={"download_dir": "/DATA/.system_data/x"}).status_code == 422
+
+
+def test_pairable_instances_lists_enabled_only_without_token(client):
+    # enabled instance shows up with a token-free, minimal shape
+    iid = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "telegram", "name": "family",
+        "config": {"bot_token": "good:token"}}).json()["id"]
+    rows = client.get("/agent/channels/pairable-instances", headers=H).json()["instances"]
+    item = next(i for i in rows if i["id"] == iid)   # isolation-robust: filter by id
+    assert item["bot_username"] == "nimo_bot"
+    assert item["channel_type"] == "telegram" and item["name"] == "family"
+    assert "token_tail" not in item and "bot_token" not in item  # token never leaked
+    # disabling the instance removes it from the pairable list
+    client.put(f"/agent/channels/instances/{iid}", headers=H, json={"enabled": False})
+    rows = client.get("/agent/channels/pairable-instances", headers=H).json()["instances"]
+    assert iid not in [i["id"] for i in rows]

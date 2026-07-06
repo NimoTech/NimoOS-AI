@@ -35,7 +35,27 @@ async def test_collects_from_live_queue_and_error():
                           {"type": "error", "content": "boom"},
                           {"type": "done"}])
     final, error = await collect_final(sink)
-    assert final == "" and error == "boom"
+    assert final == "x" and error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_accumulates_streamed_message_deltas():
+    # streaming models emit only deltas + done (no terminal 'message' event);
+    # the reply must be reassembled from the deltas, not come back empty.
+    sink = FakeSink(live=[{"type": "message_delta", "content": "Hel"},
+                          {"type": "message_delta", "content": "lo"},
+                          {"type": "message_delta", "content": " world"},
+                          {"type": "done"}])
+    assert await collect_final(sink) == ("Hello world", None)
+
+
+@pytest.mark.asyncio
+async def test_full_message_event_wins_over_deltas():
+    # if a full 'message' event is present it is authoritative.
+    sink = FakeSink(past=[{"type": "message_delta", "content": "partial"},
+                          {"type": "message", "content": "complete"},
+                          {"type": "done"}])
+    assert await collect_final(sink) == ("complete", None)
 
 
 @pytest.mark.asyncio
