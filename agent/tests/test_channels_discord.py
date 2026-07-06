@@ -155,6 +155,42 @@ def test_discord_capabilities_support_media():
 
 
 @pytest.mark.asyncio
+async def test_discord_send_buttons_and_button_callback():
+    import discord  # installed on this box
+
+    class FakeChannel:
+        def __init__(self): self.sent = None
+        async def send(self, content=None, view=None):
+            self.sent = (content, view)
+            return type("M", (), {"id": 909})()
+    ch = FakeChannel()
+
+    class FakeClient:
+        user = type("U", (), {"id": 1})()
+        def get_channel(self, cid): return ch
+    seen = []
+    async def on_cb(adapter, chat_id, data): seen.append((chat_id, data))
+
+    a = DiscordAdapter("i1", {"bot_token": "t"}, on_inbound=lambda *a: None,
+                       on_callback=on_cb, client=FakeClient())
+    mid = await a.send_buttons("42", "allow?", [("✅", "cf:c1:a"), ("❌", "cf:c1:d")])
+    assert mid == "909"
+    content, view = ch.sent
+    assert content == "allow?" and len(view.children) == 2
+
+    # simulate a click on the first button
+    class FakeResp:
+        def __init__(self): self.deferred = False
+        async def defer(self): self.deferred = True
+    class FakeInteraction:
+        channel_id = 42
+        def __init__(self): self.response = FakeResp()
+    inter = FakeInteraction()
+    await view.children[0].callback(inter)
+    assert seen == [("42", "cf:c1:a")] and inter.response.deferred is True
+
+
+@pytest.mark.asyncio
 async def test_validate_token_ok_and_bad():
     def handler(request):
         assert request.headers.get("Authorization") == "Bot good"
