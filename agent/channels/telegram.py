@@ -35,11 +35,11 @@ _MEDIA_METHODS = {
 class TelegramAdapter(ChannelAdapter):
     channel_type = "telegram"
     capabilities = ChannelCapabilities(max_text_len=4096, supports_typing=True,
-                                       supports_media=True)
+                                       supports_media=True, supports_buttons=True)
 
-    def __init__(self, instance_id, config, on_inbound, *,
+    def __init__(self, instance_id, config, on_inbound, on_callback=None, *,
                  transport: httpx.AsyncBaseTransport | None = None):
-        super().__init__(instance_id, config, on_inbound)
+        super().__init__(instance_id, config, on_inbound, on_callback)
         self._token = config["bot_token"]
         self._client = httpx.AsyncClient(transport=transport,
                                          timeout=_POLL_TIMEOUT + 15)
@@ -77,12 +77,16 @@ class TelegramAdapter(ChannelAdapter):
     async def _poll_once(self) -> None:
         r = await self._client.get(self._url("getUpdates"), params={
             "offset": self._offset, "timeout": _POLL_TIMEOUT,
-            "allowed_updates": '["message"]'})
+            "allowed_updates": '["message","callback_query"]'})
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"getUpdates not ok: {data}")
         for upd in data.get("result", []):
             self._offset = max(self._offset, int(upd["update_id"]) + 1)
+            cq = upd.get("callback_query")
+            if cq is not None:
+                await self._dispatch_callback(cq)
+                continue
             im = await self._to_inbound(upd)
             if im is None:
                 continue
@@ -208,6 +212,42 @@ class TelegramAdapter(ChannelAdapter):
         try:
             await self._client.post(self._url("sendChatAction"), json={
                 "chat_id": external_chat_id, "action": "typing"})
+        except httpx.HTTPError:
+            pass
+
+    async def _dispatch_callback(self, cq: dict) -> None:
+        data = cq.get("data") or ""
+        chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+        try:
+            await self._client.post(self._url("answerCallbackQuery"),
+                                    json={"callback_query_id": cq.get("id")})
+        except httpx.HTTPError:
+            pass
+        if self._on_callback is not None and chat_id:
+            t = asyncio.create_task(self._on_callback(self, chat_id, data))
+            self._inflight.add(t)
+            t.add_done_callback(self._inflight.discard)
+
+    async def send_buttons(self, external_chat_id: str, text: str,
+                           buttons) -> str | None:
+        keyboard = [[{"text": label, "callback_data": data}]
+                    for label, data in buttons]
+        r = await self._client.post(self._url("sendMessage"), json={
+            "chat_id": external_chat_id, "text": text,
+            "reply_markup": {"inline_keyboard": keyboard}})
+        d = r.json()
+        if not d.get("ok"):
+            _LOG.warning("sendMessage(buttons) failed (instance %s): %s",
+                         self.instance_id, d)
+            return None
+        return str(d["result"]["message_id"])
+
+    async def edit_to_resolved(self, external_chat_id: str, message_id: str,
+                               text: str) -> None:
+        try:
+            await self._client.post(self._url("editMessageText"), json={
+                "chat_id": external_chat_id, "message_id": int(message_id),
+                "text": text, "reply_markup": {"inline_keyboard": []}})
         except httpx.HTTPError:
             pass
 

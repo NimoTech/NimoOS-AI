@@ -330,3 +330,35 @@ async def test_send_file_http_error_raises(tmp_path):
 
 def test_telegram_capabilities_support_media():
     assert TelegramAdapter.capabilities.supports_media is True
+
+
+@pytest.mark.asyncio
+async def test_send_buttons_and_callback_query_dispatch():
+    seen = []
+    async def on_cb(adapter, chat_id, data): seen.append((chat_id, data))
+
+    # transport: sendMessage -> ok+message_id; answerCallbackQuery -> ok;
+    # getUpdates -> one callback_query update then empty
+    calls = {"answered": False}
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/sendMessage"):
+            body = json.loads(request.content)
+            assert "reply_markup" in body and body["reply_markup"]["inline_keyboard"]
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 77}})
+        if path.endswith("/answerCallbackQuery"):
+            calls["answered"] = True
+            return httpx.Response(200, json={"ok": True, "result": True})
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    a = TelegramAdapter("i1", {"bot_token": "123:abc"}, on_inbound=lambda *a: None,
+                        on_callback=on_cb,
+                        transport=httpx.MockTransport(handler))
+    mid = await a.send_buttons("55", "allow?", [("✅", "cf:c1:a"), ("❌", "cf:c1:d")])
+    assert mid == "77"
+    # dispatch a callback_query directly
+    await a._dispatch_callback({"id": "q1", "data": "cf:c1:a",
+                                "message": {"chat": {"id": 55}}})
+    await asyncio.gather(*a._inflight)
+    assert seen == [("55", "cf:c1:a")] and calls["answered"] is True
+    await a.stop()
