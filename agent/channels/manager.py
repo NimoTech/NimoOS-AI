@@ -46,7 +46,8 @@ class ChannelManager:
             cls = self._adapters[row["channel_type"]]
             try:
                 adapter = cls(iid, json.loads(row["config_json"]),
-                              self._router.handle)
+                              self._router.handle,
+                              on_callback=self._router.handle_confirm)
                 await adapter.start()
             except Exception:
                 _LOG.exception("failed starting channel instance %s", iid)

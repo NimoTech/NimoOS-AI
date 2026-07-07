@@ -54,10 +54,11 @@ class ChannelAdapter(ABC):
     capabilities: ClassVar[ChannelCapabilities]
 
     def __init__(self, instance_id: str, config: dict[str, Any],
-                 on_inbound: InboundHandler):
+                 on_inbound: InboundHandler, on_callback=None):
         self.instance_id = instance_id
         self._config = config
         self._on_inbound = on_inbound
+        self._on_callback = on_callback
 
     @abstractmethod
     async def start(self) -> None: ...
@@ -77,6 +78,21 @@ class ChannelAdapter(ABC):
         import logging
         logging.getLogger("nimoos-agent.channels").warning(
             "send_file not supported by %s", self.channel_type)
+        return None
+
+    async def send_buttons(self, external_chat_id: str, text: str,
+                           buttons: "list[tuple[str, str]]") -> str | None:
+        """buttons = [(label, callback_data), ...]. Default: unsupported →
+        warn + None (caller treats None as 'deny')."""
+        import logging
+        logging.getLogger("nimoos-agent.channels").warning(
+            "send_buttons not supported by %s", self.channel_type)
+        return None
+
+    async def edit_to_resolved(self, external_chat_id: str, message_id: str,
+                               text: str) -> None:
+        """Replace a button message with a plain resolution line and drop the
+        buttons. Default: no-op."""
         return None
 
 

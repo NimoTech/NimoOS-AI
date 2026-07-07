@@ -11,7 +11,7 @@ import os
 import time
 
 from channels import store
-from channels.collector import collect_final
+from channels.driver import ChannelRunDriver
 from channels.model import InboundMessage, OutboundMessage, split_text
 
 _LOG = logging.getLogger("nimoos-agent.channels.router")
@@ -49,16 +49,20 @@ MSG_STOP_NONE = "当前没有正在运行的任务。(Nothing to stop.)"
 
 class ChannelRouter:
     def __init__(self, conn, *, start_run, cancel_run, resolve_credentials,
-                 run_timeout: float = 600.0):
+                 resolve_confirm=None, run_timeout: float = 600.0,
+                 confirm_timeout: float = 300.0):
         self._conn = conn
         self._start_run = start_run
         self._cancel_run = cancel_run
         self._resolve_credentials = resolve_credentials
+        self._resolve_confirm = resolve_confirm
         self._run_timeout = run_timeout
+        self._confirm_timeout = confirm_timeout
         self._chat_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._pending: dict[tuple[str, str], int] = {}
         self._unpaired_last: dict[tuple[str, str], float] = {}
         self._pair_fails: dict[tuple[str, str], list[float]] = {}
+        self._confirms: dict[str, dict] = {}
 
     # -- entry point ---------------------------------------------------------
 
@@ -131,6 +135,7 @@ class ChannelRouter:
         cancelled = False
         if chat is not None:
             cancelled = await self._cancel_run(chat["session_id"])
+            self._clear_confirms_for_session(chat["session_id"])
         await self._send_text(adapter, msg.external_chat_id,
                               MSG_STOP_OK if cancelled else MSG_STOP_NONE)
 
@@ -203,9 +208,17 @@ class ChannelRouter:
                                creds, binding.get("external_username") or "",
                                attachment_ids=attachment_ids,
                                channel_send_file=send_cb)
-        final, error = await collect_final(sink, timeout=self._run_timeout)
-        reply = final or (f"出错了 (error): {error}" if error else "(无回复 / empty reply)")
-        await self._send_text(adapter, msg.external_chat_id, reply)
+
+        async def _send(text, _a=adapter, _c=msg.external_chat_id):
+            await self._send_text(_a, _c, text)
+
+        async def _surface(ev, _a=adapter, _c=msg.external_chat_id, _s=session_id):
+            await self._surface_confirm(_a, _c, _s, ev)
+
+        driver = ChannelRunDriver(send_text=_send,
+                                  surface_confirm=_surface,
+                                  run_timeout=self._run_timeout)
+        await driver.drive(sink)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -222,3 +235,113 @@ class ChannelRouter:
     async def _send_text(self, adapter, chat_id: str, text: str) -> None:
         for chunk in split_text(text, adapter.capabilities.max_text_len):
             await adapter.send(chat_id, OutboundMessage(text=chunk))
+
+    # -- interactive confirms -------------------------------------------------
+
+    def _format_confirm(self, ev: dict) -> str:
+        if ev.get("type") == "access_request":
+            return (f"🔐 权限请求:{ev.get('reason', '')}\n"
+                    f"路径:{ev.get('path', '')}")
+        row = self._conn.execute(
+            "SELECT action, description, command FROM pending_confirmations "
+            "WHERE confirm_id=?", (ev.get("confirm_id"),)).fetchone()
+        if row is not None:
+            text = f"⚠️ 确认:{row['description'] or row['action']}"
+            if row["command"]:
+                text += f"\n{row['command']}"
+            return text
+        return "⚠️ 需要你的确认 (confirm required)"
+
+    def _deny(self, confirm_id: str, session_id: str) -> None:
+        if self._resolve_confirm is None:
+            return
+        try:
+            self._resolve_confirm(confirm_id, False, expected_session_id=session_id)
+        except KeyError:
+            pass
+
+    async def _surface_confirm(self, adapter, chat_id: str, session_id: str,
+                               ev: dict) -> None:
+        confirm_id = ev.get("confirm_id")
+        if not confirm_id:
+            return
+        if not getattr(adapter.capabilities, "supports_buttons", False):
+            self._deny(confirm_id, session_id)
+            return
+        text = self._format_confirm(ev)
+        try:
+            mid = await adapter.send_buttons(chat_id, text,
+                [("✅ 允许", f"cf:{confirm_id}:a"), ("❌ 拒绝", f"cf:{confirm_id}:d")])
+        except Exception:
+            # Never let a send failure kill the driver and hang the run on
+            # mgr.wait — degrade to deny.
+            _LOG.exception("send_buttons failed for confirm %s", confirm_id)
+            self._deny(confirm_id, session_id)
+            return
+        if mid is None:
+            self._deny(confirm_id, session_id)
+            return
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(
+            self._confirm_timeout,
+            lambda: asyncio.create_task(self._on_confirm_timeout(confirm_id)))
+        self._confirms[confirm_id] = {
+            "adapter": adapter, "instance_id": adapter.instance_id,
+            "chat_id": chat_id, "message_id": mid, "session_id": session_id,
+            "timer": timer}
+
+    async def _on_confirm_timeout(self, confirm_id: str) -> None:
+        entry = self._confirms.pop(confirm_id, None)
+        if entry is None:
+            return
+        self._deny(confirm_id, entry["session_id"])
+        try:
+            await entry["adapter"].edit_to_resolved(
+                entry["chat_id"], entry["message_id"], "⏱ 已超时(视为拒绝)")
+        except Exception:
+            _LOG.exception("edit_to_resolved on timeout failed")
+
+    async def handle_confirm(self, adapter, chat_id: str,
+                             callback_data: str) -> None:
+        try:
+            parts = (callback_data or "").split(":")
+            if len(parts) != 3 or parts[0] != "cf":
+                return
+            confirm_id, suffix = parts[1], parts[2]
+            entry = self._confirms.get(confirm_id)
+            if entry is None:
+                return
+            if (entry["chat_id"] != chat_id
+                    or entry["instance_id"] != adapter.instance_id):
+                _LOG.warning("confirm ownership mismatch for %s", confirm_id)
+                return
+            allow = suffix == "a"
+            self._confirms.pop(confirm_id, None)
+            entry["timer"].cancel()
+            if self._resolve_confirm is not None:
+                try:
+                    self._resolve_confirm(confirm_id, allow,
+                                          expected_session_id=entry["session_id"])
+                except KeyError:
+                    pass
+            try:
+                await adapter.edit_to_resolved(
+                    chat_id, entry["message_id"],
+                    "✅ 已允许" if allow else "❌ 已拒绝")
+            except Exception:
+                _LOG.exception("edit_to_resolved failed")
+        except Exception:
+            _LOG.exception("handle_confirm failed")
+
+    def _clear_confirms_for_session(self, session_id: str) -> None:
+        for cid in [c for c, e in self._confirms.items()
+                    if e["session_id"] == session_id]:
+            entry = self._confirms.pop(cid)
+            entry["timer"].cancel()
+            # Don't rely on the run task's cancellation propagating through
+            # mgr.wait() to resolve the confirm — /stop only waits up to 5s
+            # for that and swallows the timeout, which could leave the
+            # confirm dangling up to ConfirmManager's 24h default. Resolve
+            # it deterministically here too (idempotent: _deny swallows
+            # KeyError if already resolved).
+            self._deny(cid, entry["session_id"])

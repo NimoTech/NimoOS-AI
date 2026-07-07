@@ -9,6 +9,110 @@ from channels.model import ChannelCapabilities, InboundMessage
 from channels.router import ChannelRouter, MSG_BUSY
 
 
+class FakeConfirmAdapter:
+    """Fake adapter for confirm-lifecycle tests: records send_buttons /
+    edit_to_resolved calls and exposes instance_id + supports_buttons."""
+
+    def __init__(self, supports_buttons=True, instance_id="i1"):
+        self.instance_id = instance_id
+        self.capabilities = ChannelCapabilities(max_text_len=200,
+                                                supports_typing=True,
+                                                supports_media=False,
+                                                supports_buttons=supports_buttons)
+        self.buttons = []
+        self.edits = []
+
+    async def send_buttons(self, chat_id, text, buttons):
+        self.buttons.append((chat_id, text, buttons))
+        return "m1"
+
+    async def edit_to_resolved(self, chat_id, message_id, text):
+        self.edits.append((chat_id, message_id, text))
+
+
+def _confirm_router(conn, resolves):
+    def start_run(session_id, user_id, message, creds, chat_username,
+                  attachment_ids=(), channel_send_file=None):
+        raise NotImplementedError
+
+    async def cancel_run(session_id):
+        return True
+
+    async def resolve_credentials(user_id, model):
+        return None
+
+    def resolve_confirm(confirm_id, confirmed, expected_session_id=None):
+        resolves.append((confirm_id, confirmed, expected_session_id))
+
+    return ChannelRouter(conn, start_run=start_run, cancel_run=cancel_run,
+                         resolve_credentials=resolve_credentials,
+                         resolve_confirm=resolve_confirm)
+
+
+@pytest.fixture
+def env_confirm(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    resolves = []
+    router = _confirm_router(conn, resolves)
+    adapter = FakeConfirmAdapter(supports_buttons=True)
+    return router, adapter, resolves, adapter.edits
+
+
+@pytest.fixture
+def env_confirm_no_buttons(tmp_path):
+    conn = db_module.init_db(str(tmp_path / "t.db"),
+                             snapshots_root=str(tmp_path / "snaps"))
+    resolves = []
+    router = _confirm_router(conn, resolves)
+    adapter = FakeConfirmAdapter(supports_buttons=False)
+    return router, adapter, resolves, adapter.edits
+
+
+@pytest.mark.asyncio
+async def test_surface_confirm_then_handle_allow(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    ev = {"type": "access_request", "confirm_id": "c1",
+          "path": "/DATA/x", "reason": "读取"}
+    await router._surface_confirm(adapter, "55", "s1", ev)
+    assert adapter.buttons and adapter.buttons[-1][2][0][1] == "cf:c1:a"  # callback_data
+    # user taps allow
+    await router.handle_confirm(adapter, "55", "cf:c1:a")
+    assert resolves == [("c1", True, "s1")]        # resolved True with expected_session_id
+    assert edits and "允许" in edits[-1][2]
+    assert "c1" not in router._confirms             # entry cleared
+
+
+@pytest.mark.asyncio
+async def test_handle_confirm_ownership_mismatch_ignored(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "access_request", "confirm_id": "c2",
+                                   "path": "/x", "reason": "r"})
+    await router.handle_confirm(adapter, "99", "cf:c2:a")   # wrong chat
+    assert resolves == [] and "c2" in router._confirms      # not resolved, entry kept
+
+
+@pytest.mark.asyncio
+async def test_handle_confirm_instance_id_mismatch_ignored(env_confirm):
+    router, adapter, resolves, edits = env_confirm
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "access_request", "confirm_id": "c9",
+                                   "path": "/x", "reason": "r"})
+    other_adapter = FakeConfirmAdapter(supports_buttons=True,
+                                       instance_id="i2")   # different instance
+    await router.handle_confirm(other_adapter, "55", "cf:c9:a")  # same chat_id
+    assert resolves == [] and "c9" in router._confirms      # not resolved, entry kept
+
+
+@pytest.mark.asyncio
+async def test_no_button_capability_denies(env_confirm_no_buttons):
+    router, adapter, resolves, _ = env_confirm_no_buttons   # supports_buttons=False
+    await router._surface_confirm(adapter, "55", "s1",
+                                  {"type": "confirmation_required", "confirm_id": "c3"})
+    assert resolves == [("c3", False, "s1")]                 # auto-denied
+
+
 class FakeAdapter:
     channel_type = "telegram"
 
@@ -338,6 +442,33 @@ async def test_media_capable_adapter_gets_bound_send_file_callback(env):
     mid = await send_cb("/DATA/x", "cap")
     assert mid == "file-msg-1"
     assert a.sent_files == [("c1", "/DATA/x", "cap")]
+
+
+@pytest.mark.asyncio
+async def test_progress_pushed_as_multiple_messages(env, monkeypatch):
+    conn, inst, router, calls = env
+    a = FakeAdapter()
+    code, _ = store.create_pairing_code(conn, inst["id"], "u1",
+                                        now_ms=int(time.time() * 1000))
+    await router.handle(a, _msg(f"/pair {code}", instance=inst["id"]))
+    b = store.get_binding(conn, inst["id"], "tg1")
+    store.set_binding_model(conn, "u1", b["id"], "qwen3")
+
+    # fake start_run returns a sink whose events are two conclusions split
+    # by a tool call: driver should flush at the boundary and at done,
+    # delivering both as separate messages instead of one merged reply.
+    sink = FakeSink([{"type": "message_delta", "content": "step one"},
+                     {"type": "tool_call"},
+                     {"type": "message_delta", "content": "step two (final)"},
+                     {"type": "done"}])
+    monkeypatch.setattr(router, "_start_run", lambda *a, **k: sink)
+
+    a.sent.clear()
+    await router.handle(a, _msg("do it", instance=inst["id"]))
+    texts = [t for _c, t in a.sent]
+    assert len(texts) >= 2
+    assert any("step one" in t for t in texts)
+    assert any("step two (final)" in t for t in texts)
 
 
 @pytest.mark.asyncio

@@ -26,11 +26,11 @@ _MAX_FILE = 20 * 1024 * 1024   # 20MB attachment download cap
 class DiscordAdapter(ChannelAdapter):
     channel_type = "discord"
     capabilities = ChannelCapabilities(max_text_len=2000, supports_typing=True,
-                                       supports_media=True)
+                                       supports_media=True, supports_buttons=True)
 
-    def __init__(self, instance_id, config, on_inbound, *,
+    def __init__(self, instance_id, config, on_inbound, on_callback=None, *,
                  client=None):
-        super().__init__(instance_id, config, on_inbound)
+        super().__init__(instance_id, config, on_inbound, on_callback)
         self._token = config["bot_token"]
         self._client = client            # injected in tests; else built in start()
         self._task: asyncio.Task | None = None
@@ -174,6 +174,47 @@ class DiscordAdapter(ChannelAdapter):
         sent = await channel.send(content=caption or None,
                                   file=discord.File(path))
         return str(getattr(sent, "id", "")) or None
+
+    def _make_view(self, buttons):
+        import discord
+        view = discord.ui.View(timeout=300)
+        for label, data in buttons:
+            btn = discord.ui.Button(label=label, custom_id=data)
+            async def _cb(interaction, _d=data):
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+                chat_id = str(getattr(interaction, "channel_id", ""))
+                if self._on_callback is not None and chat_id:
+                    t = asyncio.create_task(self._on_callback(self, chat_id, _d))
+                    self._inflight.add(t)
+                    t.add_done_callback(self._inflight.discard)
+            btn.callback = _cb
+            view.add_item(btn)
+        return view
+
+    async def send_buttons(self, external_chat_id: str, text: str,
+                           buttons) -> str | None:
+        cid = int(external_chat_id)
+        channel = self._client.get_channel(cid)
+        if channel is None:
+            channel = await self._client.fetch_channel(cid)
+        sent = await channel.send(content=text, view=self._make_view(buttons))
+        return str(getattr(sent, "id", "")) or None
+
+    async def edit_to_resolved(self, external_chat_id: str, message_id: str,
+                               text: str) -> None:
+        try:
+            cid = int(external_chat_id)
+            channel = self._client.get_channel(cid)
+            if channel is None:
+                channel = await self._client.fetch_channel(cid)
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(content=text, view=None)
+        except Exception:
+            _LOG.warning("discord edit_to_resolved failed (instance %s)",
+                         self.instance_id)
 
     async def send_typing(self, external_chat_id: str) -> None:
         try:

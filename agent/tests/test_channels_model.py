@@ -70,3 +70,22 @@ async def test_adapter_default_send_file_unsupported_returns_none(caplog):
     assert result is None
     assert any("send_file not supported by dummy" in rec.message
                for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_channeladapter_button_defaults_and_on_callback(caplog):
+    from channels.model import ChannelAdapter, ChannelCapabilities, OutboundMessage
+
+    class Dummy(ChannelAdapter):
+        channel_type = "dummy"
+        capabilities = ChannelCapabilities(max_text_len=100)
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, external_chat_id, msg): return "1"
+
+    seen = []
+    async def on_cb(adapter, chat_id, data): seen.append((chat_id, data))
+    d = Dummy("i", {}, on_inbound=None, on_callback=on_cb)
+    assert d._on_callback is on_cb
+    assert await d.send_buttons("c", "hi", [("ok", "cf:x:a")]) is None   # default: unsupported
+    assert await d.edit_to_resolved("c", "5", "done") is None            # default: no-op
