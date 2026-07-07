@@ -62,6 +62,7 @@ NimoOS-AI 由两个独立的系统进程组成:
 | GET / POST / DELETE | `/blacklist` | 硬黑名单(AI 永不可见的路径/模式) |
 | GET / POST / DELETE | `/mcp-tokens[/:id]` | 对外 MCP server 的长效 token 管理(JWT 保护) |
 | POST | `/mcp-rpc/` | **对外 MCP server** 数据端点(JSON-RPC over Streamable-HTTP)。**JWT 豁免**,改由 Python 侧 Bearer token 校验 → user_id。详见下文「对外 MCP server」 |
+| ANY | `/_internal/*` | 内部端点(chat/models/mcp runtime/**agent/provider-credentials**),**JWT 豁免 + LocalhostOnly**(`route/middleware.go`)。其中 `GET /_internal/agent/provider-credentials` 返回解密后的云密钥,额外要求 `X-Internal-Token` 共享密钥(见「Channels」) |
 
 **鉴权**:除 `/mcp-rpc/` 外所有路由强制 JWT 校验,**无 localhost 豁免**。这是有意为之 — 防止本机其他进程读到其他用户的云 API Key。校验后注入 `X-NimoOS-User-ID` / `X-NimoOS-User-Name` Header。`/mcp-rpc/` 是唯一例外:它面向外部 AI agent,用长效 MCP token 自行鉴权(见下)。
 
@@ -130,6 +131,7 @@ PrivacyPolicy {
       └── venv/                 # Python 虚拟环境
 /var/log/nimoos/                # 日志(zap → 文件,systemd 也走 journal)
 /var/run/nimoos/ai.url          # 服务发现地址
+/var/run/nimoos/ai_internal.token  # 启动时随机生成(0600),/_internal 秘密端点的共享密钥
 ```
 
 ### SQLite 表结构
@@ -184,8 +186,12 @@ OllamaURL = http://127.0.0.1:11434
 | `run_sink.py` | 运行事件落库与回放 |
 | `mcp_tokens.py` | 对外 MCP token 的 SQLite 存取(哈希存储、`last_used_at` 节流写) |
 | `mcp_server/` | 对外 MCP server(协议适配 + 工具白名单 + 路径门控,见下文) |
+| `channels/` | Telegram / Discord 聊天平台接入(adapter/router/manager/driver,见下文「Channels」) |
+| `attachments/` | 会话附件层(ingest / paths / extract / gc);channels 入站文件经 `ingest_external` 注册 |
+| `phoenix_tracing.py` | 可选 Phoenix(OTLP)tracing,开关门控(见下文「Phoenix tracing」) |
+| `observability/` | `phoenix_compose.yaml` — Phoenix 容器的 NimoOS 应用 compose 清单 |
 
-依赖见 `requirements.txt`:`fastapi`、`uvicorn`、`openai-agents`、`openai`、`httpx`、`pathspec`、`mcp`(MCP SDK)。
+依赖见 `agent/requirements.txt`:`fastapi`、`uvicorn`、`openai-agents`、`openai`、`httpx`、`pathspec`、`mcp`(MCP SDK)、`discord.py`(Discord channel)、`openinference-instrumentation-openai-agents` + `opentelemetry-sdk/-exporter-otlp-proto-http`(Phoenix tracing)、`pypdf`/`python-docx`/`openpyxl`/`python-pptx`(附件抽取)。
 
 Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+JSON),与 Go 侧硬黑名单配合形成两层过滤。
 
@@ -209,6 +215,67 @@ Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+J
 **模块**:`server.py`(ASGI/协议适配 + `_call` + `render_result`)、`tools.py`(白名单 `TOOL_SPECS` + 各 `_h_*` handler + `ImageResult`/`McpToolError`)、`fs_gate.py`(路径门控)。设计/计划见 `nimo_os_docs/docs/superpowers/specs/2026-06-*-nimoos-mcp-server-*` 及 `2026-06-30-mcp-*`、`2026-07-01-mcp-token-ui-*`。
 
 **caveat**:Photos 数据层当前无 per-user filter → 多用户下 `search_photos`/`list_albums` 暂不能宣称用户隔离(单用户 NAS 无影响)。
+
+---
+
+## Channels(Telegram / Discord 聊天接入)
+
+把 agent 接到外部聊天平台:用户在 Telegram / Discord 私聊 bot,即与自己的 NimoOS agent 对话。代码在 `agent/channels/`,全部跑在 Python agent 进程内;**纯出站连接**(Telegram 长轮询 `getUpdates`、Discord Gateway WebSocket),家用 NAT 后无需公网入口、无需新增 JWT 豁免路由。设计稿 `nimo_os_docs/docs/superpowers/specs/2026-07-02-nimoos-channels-design.md`(+ `2026-07-04-*-attachments-*`、`2026-07-05-*-interactive-*`)。
+
+### 分层架构(`agent/channels/`)
+
+| 文件 | 职责 |
+|---|---|
+| `model.py` | 平台无关消息模型:`InboundMessage` / `InboundAttachment` / `OutboundMessage`、`ChannelCapabilities`(长度上限/edit/buttons/typing/media)、抽象基类 `ChannelAdapter`、`split_text` 长文切分。平台怪癖只允许存在于 adapter 内 |
+| `telegram.py` | `TelegramAdapter` — httpx 直连 Bot API,长轮询;4096 字上限,支持 typing/media/**buttons**(inline keyboard) |
+| `discord.py` | `DiscordAdapter` — discord.py 走 Gateway WS,**DM-only**;2000 字上限,同样支持 buttons。discord.py 全部惰性 import(测试不必安装)。注意:bot 只能 DM 与其同服务器的用户 |
+| `manager.py` | `ChannelManager` — adapter 生命周期;`reload()` 对比 DB 与运行中实例(停掉被删/禁用/改配置的,启动新启用的),启动时与每次实例管理写操作后调用 |
+| `router.py` | `ChannelRouter` — 平台无关核心:外部身份 → NimoOS 用户(**deny-by-default 配对**)、chat → session 映射、命令处理(`/pair` `/whoami` `/new` `/stop`)、**每 chat 串行执行**(`asyncio.Lock` + `MAX_PENDING=3`)、确认按钮的展示与回调仲裁 |
+| `driver.py` | `ChannelRunDriver` — 实时消费 RunSink:攒 `message_delta`,在每个工具调用边界与终态 `done` 把缓冲作为一条「阶段结论」推送(带 1s 最小发送间隔);遇 `access_request` / `confirmation_required` 先 flush 再交给 router 出按钮 |
+| `collector.py` | `collect_final` — 只等终态、一次性回复的旧路径(M1;热路径已被 driver 取代) |
+| `inbound.py` | 入站附件落盘:存到绑定的 `download_dir`(默认 `/DATA/Downloads/<channel_type>`)+ 经 `attachments.ingest.ingest_external` **symlink 注册为会话附件**;单文件/单消息 20MB、10 个上限,超限跳过并提示 |
+| `credentials.py` | 凭据解析:调 Go 侧 localhost 内部端点 `GET /v1/ai/_internal/agent/provider-credentials?user_id&model`,带 `X-Internal-Token`(读 `/var/run/nimoos/ai_internal.token`)。云密钥只有 Go 层能解密,这是进程内消费者取密钥的唯一 sanctioned 途径(Go 侧 handler 在 `route/v2/channel_credentials.go`;裸模型名 = 本地 Ollama,`openvino:` 拒绝) |
+| `store.py` | SQLite 存取(下表) |
+
+### agent.db 中的表(`agent/db.py`)
+
+| 表 | 用途 |
+|---|---|
+| `channel_instances` | bot 实例(channel_type / name / `config_json` 含 bot token —— **不回传前端**,API 只返回脱敏视图 / enabled / created_by) |
+| `channel_bindings` | 外部账号 ↔ NimoOS 用户绑定(`UNIQUE(instance_id, external_user_id)`;per-binding `default_model`、`download_dir`、`revoked` 软删) |
+| `channel_pairing_codes` | 配对码:仿 mcp_tokens —— **只存 sha256**、一次性、10 分钟 TTL |
+| `channel_chats` | chat → agent session 映射(`/new` 换绑新 session) |
+
+`sessions` 表新增 `source` 列(默认 `'web'`;channel 会话写 `'telegram'` / `'discord'`),channel 会话照常出现在 Web 会话列表里;`send_attachment` 工具按 `source != 'web'` 门控注册。
+
+### 配对与安全
+
+- **deny-by-default**:未绑定的外部账号只会收到「未配对」提示(每 external user 600s 至多一次),不触达 agent。
+- 配对流:UI(`/#/ai/settings?section=channels`,`ChannelsSection.vue`)→ `POST /agent/channels/pairing-code` 生成 8 位数字码 → 用户在聊天里发 `/pair <code>`。爆破防护:每 external user 每小时 5 次失败后**静默**;stranger-keyed 限速字典有 4096 上限防 id 喷洒(`router._prune`)。
+- 管理端点(经 Go 反代,JWT 保护):`/agent/channels/instances`(CRUD+enable)、`/agent/channels/pairable-instances`(任意用户可见的脱敏实例列表,供配对页;#46 补齐)、`/agent/channels/pairing-code`、`/agent/channels/bindings[/{bid}]`(撤销 / `PUT .../model` / `PUT .../download-dir`)。
+
+### 附件收发(M2,#45)
+
+- **入站**:adapter 下载(≤20MB)到临时文件 → `inbound.save_and_ingest` 移入 download_dir、注册为会话附件;纯附件消息注入一段占位提示文本让模型知道文件已落盘。
+- **出站**:channel-only 工具 `send_attachment`(`agent/skills/send_attachment.py`)—— 经与 `read_document(path)` **同一条 fs 授权链**(`fs.ops._resolve_and_gate`:realpath + visible_resources 范围校验 + 黑名单)门控,但**不做交互式扩权**(越界直接拒);经 per-run 注入的 adapter `send_file` 回调**同步真发**,把真实成败返回给模型,绝不假报 "sent"。
+
+### 交互式运行(#47)
+
+- **进度推送**:`ChannelRunDriver` 取代 collect_final,长任务不再沉默到最后 —— 每个工具调用边界推一条阶段结论。
+- **按钮权限确认**:agent 的 `access_request` / `confirmation_required` 事件渲染成 Telegram/Discord 内联按钮(✅ 允许 / ❌ 拒绝),回调经 `router.handle_confirm` 校验 chat/instance 归属后 resolve;**超时(默认 300s)/ 不支持按钮 / 发送失败一律降级为拒绝**,并把按钮消息原地编辑为结果行。`/stop` 会同时取消运行并确定性地 deny 该 session 的悬挂确认(避免挂到 ConfirmManager 的 24h 默认)。
+
+启动接线在 `agent/main.py`:`_channels_startup()` 组装 `ChannelRouter`(start_run / cancel_run / credentials.resolve / confirm resolve)+ `ChannelManager.start_all()`,失败只告警不影响 agent 本体。
+
+---
+
+## Phoenix tracing(agent 可观测性,#41)
+
+用 [Arize Phoenix](https://phoenix.arize.com/) 收 agent 运行的 OTLP trace。代码 `agent/phoenix_tracing.py`;设计稿 `nimo_os_docs/docs/superpowers/specs/2026-06-30-agent-phoenix-tracing-design.md` / `*-tracing-productization-design.md`。
+
+- **安装一次、门控随开**:启动时(若 OpenInference/OTel 依赖可 import)装 `OpenAIAgentsInstrumentor` + `GatedSpanExporter`;是否真正导出由进程内 `_enabled` 标志决定,来自 `user_settings` 表的全局 `tracing_enabled`(保留 user_id `__global__`),UI 开关经 `GET/PUT /agent/user-settings/tracing` 即时生效、**无需重启**。关闭时 exporter 直接丢弃、不碰网络 —— 停掉 Phoenix 不会刷 OTLP 重试日志。任何 setup 失败都被吞掉,agent 照常跑。
+- **按 session 分组**:`build_trace_run_config` 给每次 run 一个 `RunConfig`(`workflow_name="nimoos-agent"`、`group_id=session_id`、metadata 带 user_id/model/agent_type);禁用时返回 `tracing_disabled=True`。
+- **环境变量**:`NIMOOS_AGENT_TRACING=0/off` 硬性退出;`PHOENIX_OTLP_ENDPOINT`(默认 `http://127.0.0.1:6006/v1/traces`)、`PHOENIX_PROJECT`(默认 `nimoos-agent`)。
+- **Phoenix 本体**以 NimoOS 应用形式跑:compose 清单 `agent/observability/phoenix_compose.yaml`(`arizephoenix/phoenix`,`:6006`,数据落 `/DATA/AppData/<AppID>`)。
 
 ---
 
@@ -257,6 +324,8 @@ bash nimo_os_docs/scripts/start-ai.sh
 - **依赖 Gateway**:启动时通过 `POST /v1/gateway/routes` 注册 `/v1/ai` 和 `/doc/v1/ai`。
 - **依赖 MessageBus**(规划/事件常量已声明):`AI:OllamaUnhealthy` / `AI:OllamaRecovered` 推送到前端。
 - **被 UI 调用**:NimoOS-UI 的 AI 对话/设置面板。
+- **出站连接外部聊天平台**(Channels):Telegram Bot API 长轮询、Discord Gateway WebSocket,均由 Python agent 主动外连,无入站暴露。
+- **对外被 AI agent 调用**(MCP server):Claude Desktop 等经 `/v1/ai/mcp-rpc/` 调只读工具。
 
 ---
 
