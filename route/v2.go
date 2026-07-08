@@ -12,6 +12,7 @@ import (
 	v2 "github.com/NimoTech/NimoOS-AI/route/v2"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/NimoTech/NimoOS-Common/external"
+	middleware "github.com/NimoTech/NimoOS-Common/middleware"
 	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/labstack/echo/v4"
 	echo_middleware "github.com/labstack/echo/v4/middleware"
@@ -50,6 +51,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 			if strings.HasPrefix(p, common.V2APIPath+"/_internal/") {
 				return true
 			}
+			if p == common.V2APIPath+"/version" {
+				return true
+			}
 			return v2.MCPDataPath(p) // /v1/ai/mcp[, /*] — token-authed in Python
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
@@ -82,6 +86,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	}))
 
 	g := e.Group(common.V2APIPath)
+
+	middleware.RegisterVersionRoute(e, common.V2APIPath+"/version", "AI", common.AIVersion)
 
 	// Internal endpoints: localhost-only, no JWT (e.g. wiki-summary worker)
 	internal := g.Group("/_internal", LocalhostOnly)
