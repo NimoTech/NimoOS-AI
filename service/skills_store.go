@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 )
 
 func slugify(s string) string {
@@ -34,6 +35,32 @@ func slugify(s string) string {
 }
 
 var ErrBadSkillID = errors.New("invalid skill id")
+
+var ErrBadDescription = errors.New("invalid skill description")
+
+// validateSkillDescription enforces the injection-safety rules from the
+// 2026-07-12 skills-index-injection spec: descriptions are rendered into
+// the agent's system prompt, so they must be a single line, contain no
+// angle brackets or control characters, and stay within 256 characters.
+func validateSkillDescription(d string) error {
+	if d == "" {
+		return fmt.Errorf("%w: description required", ErrBadDescription)
+	}
+	if utf8.RuneCountInString(d) > 256 {
+		return fmt.Errorf("%w: longer than 256 characters", ErrBadDescription)
+	}
+	for _, r := range d {
+		switch {
+		case r == '\n' || r == '\r':
+			return fmt.Errorf("%w: must be a single line", ErrBadDescription)
+		case r == '<' || r == '>':
+			return fmt.Errorf("%w: '<' and '>' are not allowed", ErrBadDescription)
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("%w: control characters are not allowed", ErrBadDescription)
+		}
+	}
+	return nil
+}
 
 // SkillsStore owns disk paths and writes for skill bundles.
 type SkillsStore struct {
@@ -195,8 +222,8 @@ func (s *SkillsStore) CreateFromForm(userID string, r CreateSkillReq) (*SkillMan
 	if err := ValidateSkillID(id); err != nil {
 		return nil, err
 	}
-	if r.Description == "" {
-		return nil, fmt.Errorf("description required")
+	if err := validateSkillDescription(r.Description); err != nil {
+		return nil, err
 	}
 	if len(r.MD) > MaxSkillMDBytes {
 		return nil, fmt.Errorf("SKILL.md exceeds %d bytes (got %d)", MaxSkillMDBytes, len(r.MD))
