@@ -1,7 +1,9 @@
-"""Skill discovery + read tools for the agent.
+"""Skill read tools + system-prompt index for the agent.
 
-`list_skills()` enumerates the user's enabled skills.
-`read_skill_file()` reads a file inside a skill bundle (SKILL.md by default).
+`render_index_block()` renders the <available-skills> index injected into
+the system prompt each run (L1 progressive disclosure).
+`read_skill_file()` reads a file inside a skill bundle (SKILL.md by
+default).
 
 Both scan /<root>/.runtime/<user_id>/, the symlink tree maintained by the
 Go service. They bypass the generic `read_file` fs policy on purpose:
@@ -85,16 +87,6 @@ def _scan_runtime_view() -> list[dict]:
     return out
 
 
-def _format_for_llm(skills: list[dict]) -> str:
-    """Filter to skills the LLM should know about by default.
-
-    `manual` skills are hidden — they only fire from the UI's "Try in chat"
-    button, which is handled by the Go layer pre-injecting SKILL.md.
-    """
-    visible = [s for s in skills if s.get("trigger") != "manual"]
-    return json.dumps(visible, ensure_ascii=False)
-
-
 def render_index_block() -> str:
     """Render the <available-skills> system-prompt block (L1 progressive
     disclosure). Empty string when the user has no visible (auto/slash)
@@ -129,19 +121,6 @@ def render_index_block() -> str:
     except Exception:
         _log.warning("render_index_block failed", exc_info=True)
         return ""
-
-
-@function_tool
-async def list_skills() -> str:
-    """List installed skills available to this user.
-
-    Use this when the user asks about a capability you might not directly
-    have, or when a `/<name>` slash command appears. The result is a JSON
-    list of {id, name, description, trigger, skill_id}. To read the
-    SKILL.md (full instructions) for a given skill, call
-    `read_skill_file(skill_id)`.
-    """
-    return _format_for_llm(_scan_runtime_view())
 
 
 def _read_skill_file(skill_id: str, path: str) -> str:
@@ -187,7 +166,8 @@ async def read_skill_file(skill_id: str, path: str = "SKILL.md") -> str:
     """Read a file from a skill bundle (defaults to SKILL.md).
 
     Use this to fetch the SKILL.md instructions or any other file shipped
-    with a skill. `skill_id` is the value returned by `list_skills`.
+    with a skill. `skill_id` is the id shown in the <available-skills>
+    index in your system prompt.
     `path` is relative to the bundle root and cannot escape the bundle.
 
     Returns the file contents as a string, or an `Error: ...` message on
@@ -196,4 +176,4 @@ async def read_skill_file(skill_id: str, path: str = "SKILL.md") -> str:
     return _read_skill_file(skill_id, path)
 
 
-ALL_TOOLS = [list_skills, read_skill_file]
+ALL_TOOLS = [read_skill_file]

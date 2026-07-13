@@ -6,7 +6,7 @@ import pytest
 
 from skills.skills_registry import (
     SKILLS_ROOT_VAR, USER_ID_VAR,
-    _scan_runtime_view, _format_for_llm, _read_skill_file,
+    _scan_runtime_view, _read_skill_file,
     render_index_block, _MAX_SKILL_FILE_BYTES,
 )
 
@@ -38,24 +38,6 @@ def test_scan_runtime_view(tmp_path):
     skills = _scan_runtime_view()
     assert len(skills) == 2
     assert {s["id"] for s in skills} == {"alpha", "beta"}
-
-
-def test_format_for_llm_skips_manual(tmp_path):
-    rt = tmp_path / ".runtime" / "42"
-    rt.mkdir(parents=True)
-    builtin = tmp_path / "builtin"
-    _make_skill(builtin, "auto-one", trigger="auto")
-    _make_skill(builtin, "manual-one", trigger="manual")
-    os.symlink(builtin / "auto-one",   rt / "auto-one")
-    os.symlink(builtin / "manual-one", rt / "manual-one")
-
-    SKILLS_ROOT_VAR.set(str(tmp_path))
-    USER_ID_VAR.set("42")
-    out = _format_for_llm(_scan_runtime_view())
-    parsed = json.loads(out)
-    ids = {s["id"] for s in parsed}
-    assert "auto-one" in ids
-    assert "manual-one" not in ids
 
 
 def _setup_read(tmp_path: Path, sid: str = "alpha", body: str = "hello\n"):
