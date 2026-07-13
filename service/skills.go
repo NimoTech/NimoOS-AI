@@ -98,7 +98,7 @@ func (s *skillsService) rebuildAfter(userID string) {
 
 // EnsureRuntimeView builds .runtime/<uid>/ if it's missing. A fresh user
 // (no skill_state rows) is skipped by the startup rebuild loop, so the
-// agent's list_skills tool would see an empty view until the user toggled
+// agent's skill index would render empty until the user toggled
 // something in the UI. Callers on hot paths (agent proxy, List) invoke
 // this lazily so the agent can always discover built-in skills.
 func (s *skillsService) EnsureRuntimeView(userID string) {
