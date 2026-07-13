@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -326,5 +327,47 @@ func TestSkillsService_DeleteRebuildsRuntimeView(t *testing.T) {
 	_ = svc.Delete("42", "my-skill")
 	if _, err := os.Lstat(filepath.Join(store.RuntimePath("42"), "my-skill")); !os.IsNotExist(err) {
 		t.Fatalf("symlink still present, err=%v", err)
+	}
+}
+
+func TestValidateSkillDescription(t *testing.T) {
+	cases := []struct {
+		name string
+		desc string
+		ok   bool
+	}{
+		{"valid", "Find duplicates via SHA-256 hashing.", true},
+		{"256 runes ok", strings.Repeat("a", 256), true},
+		{"empty", "", false},
+		{"newline", "line1\nline2", false},
+		{"carriage return", "line1\rline2", false},
+		{"angle brackets", "use <tag> here", false},
+		{"tab", "a\tb", false},
+		{"del control", "a\x7fb", false},
+		{"257 runes", strings.Repeat("很", 257), false},
+	}
+	for _, c := range cases {
+		err := validateSkillDescription(c.desc)
+		if c.ok && err != nil {
+			t.Errorf("%s: unexpected error: %v", c.name, err)
+		}
+		if !c.ok && !errors.Is(err, ErrBadDescription) {
+			t.Errorf("%s: want ErrBadDescription, got %v", c.name, err)
+		}
+	}
+}
+
+func TestSkillsStore_CreateFromForm_RejectsBadDescription(t *testing.T) {
+	s := &SkillsStore{Root: t.TempDir()}
+	_, err := s.CreateFromForm("42", CreateSkillReq{
+		Name:        "bad-desc",
+		Description: "first line\nsecond line",
+		Trigger:     "auto",
+	})
+	if !errors.Is(err, ErrBadDescription) {
+		t.Fatalf("want ErrBadDescription, got %v", err)
+	}
+	if _, statErr := os.Stat(s.UserPath("42", "bad-desc")); !os.IsNotExist(statErr) {
+		t.Fatalf("bundle dir must not be created on rejection")
 	}
 }

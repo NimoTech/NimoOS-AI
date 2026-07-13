@@ -95,6 +95,7 @@ func (h *SkillsHandler) Create(c echo.Context) error {
 		case errors.Is(err, service.ErrDuplicateSkill):
 			return echo.NewHTTPError(http.StatusConflict, err.Error())
 		case errors.Is(err, service.ErrBadSkillID),
+			errors.Is(err, service.ErrBadDescription),
 			errors.Is(err, service.ErrBadPath),
 			errors.Is(err, service.ErrBundleTooLarge):
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())

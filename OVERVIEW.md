@@ -351,7 +351,7 @@ Each bundle is a directory containing:
 - `scripts/` — optional executable scripts.
 - `resources/` — optional supporting files.
 
-LLM-visible tool: `list_skills()` returns the user's enabled skills (manual-trigger skills are hidden from the list and surface only via UI "Try in chat" injection).
+LLM-visible surface: an `<available-skills>` index (id + description of every enabled auto/slash skill, sanitized, 16 KiB cap) is injected into the system prompt on every run; the model loads a skill's instructions on demand via `read_skill_file(skill_id)`. Manual-trigger skills are hidden from the index and surface only via UI "Try in chat" injection (`X-Skill-Id` header). The former `list_skills` tool was removed as redundant.
 
 REST endpoints (`/v1/ai/skills/*`):
 - `GET /` — list all skills with state overlay
@@ -366,3 +366,8 @@ REST endpoints (`/v1/ai/skills/*`):
 Sandbox testing: `POST /v1/ai/skills/<id>/test` proxies to the Python agent's `POST /agent/sandbox-run` which runs a one-shot, no-DB session inside a fresh tmpfs sandbox with `--unshare-net`. The bundle is ro-mounted at `/skill/<id>/`. Per-request ContextVars (`SANDBOX_SKILLS_VAR`, `SANDBOX_SHELL_ROOT_VAR`) keep concurrent runs isolated.
 
 Bundle path safety: `ValidateSkillID` allows `[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`. `ReadFile` resolves symlinks with `EvalSymlinks` and opens with `O_NOFOLLOW`. The X-Skill-Id header (used by "Try in chat") is regex-validated on the Python side before any path-join.
+
+Caveats:
+- `manifest.json` `permissions` (`network` / `writable_paths`) is **declarative only** — nothing enforces it at runtime. Actual isolation comes from the sandbox (ro-bind `/skill` mount, offline-by-default netns, prlimit). Don't present it as a security boundary in UI copy.
+- Editing a builtin skill requires bumping `BuiltinSeedVersion` in `service/skills_seed.go`, otherwise the idempotent seeder skips extraction on deploy.
+- User skills must be created through the API/UI. Dropping files directly under `<root>/users/<uid>/` creates no DB row and never triggers a runtime-view rebuild, so the agent won't see them.

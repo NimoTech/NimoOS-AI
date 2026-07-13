@@ -587,7 +587,8 @@ class AgentRunner:
             wiki_skills.EVENT_QUEUE_VAR.set(sink)
             wiki_skills.USER_PATTERNS_VAR.set(user_patterns or [])
 
-            # Skills registry: tells list_skills() which user's runtime view to scan.
+            # Skills registry: tells render_index_block()/read_skill_file()
+            # which user's runtime view to scan.
             skills_registry.SKILLS_ROOT_VAR.set(os.environ.get(
                 "NIMOOS_SKILLS_ROOT", "/var/lib/nimoos/ai/skills"))
             skills_registry.USER_ID_VAR.set(str(user_id))
@@ -684,6 +685,15 @@ class AgentRunner:
                     full_prompt = full_prompt + "\n\n" + mem_block
             else:
                 full_prompt = base_with_wiki
+
+            # Skill index (L1 progressive disclosure): list installed
+            # auto/slash skills so the model can activate one by calling
+            # read_skill_file. Only for runs whose tool set includes
+            # read_skill_file, i.e. the general profile.
+            if profile.tools is None:
+                skills_block = skills_registry.render_index_block()
+                if skills_block:
+                    full_prompt = full_prompt + "\n\n" + skills_block
 
             if attachment_ids and profile.tools is None:
                 # Pinned-profile runs skip the attachment block: read_attachment

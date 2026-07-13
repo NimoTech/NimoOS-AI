@@ -1,7 +1,9 @@
-"""Skill discovery + read tools for the agent.
+"""Skill read tools + system-prompt index for the agent.
 
-`list_skills()` enumerates the user's enabled skills.
-`read_skill_file()` reads a file inside a skill bundle (SKILL.md by default).
+`render_index_block()` renders the <available-skills> index injected into
+the system prompt each run (L1 progressive disclosure).
+`read_skill_file()` reads a file inside a skill bundle (SKILL.md by
+default).
 
 Both scan /<root>/.runtime/<user_id>/, the symlink tree maintained by the
 Go service. They bypass the generic `read_file` fs policy on purpose:
@@ -13,6 +15,7 @@ current user's runtime view are allowed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from contextvars import ContextVar
@@ -27,6 +30,31 @@ USER_ID_VAR: ContextVar[str] = ContextVar("user_id", default="")
 
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_FILE_BYTES = 256 * 1024
+
+_log = logging.getLogger(__name__)
+
+_INDEX_HEADER = (
+    "<available-skills>\n"
+    "The user has installed the following skills — named procedures with\n"
+    "detailed instructions. When a request matches a skill's description,\n"
+    "FIRST call read_skill_file(skill_id) to load its SKILL.md instructions,\n"
+    "then follow them. Users may also invoke a skill explicitly by typing\n"
+    "/<skill-id> in their message.\n\n"
+)
+_INDEX_FOOTER = "</available-skills>"
+_MAX_INDEX_BYTES = 16 * 1024
+_MAX_DESC_CHARS = 256
+_WS_RE = re.compile(r"[\r\n\t]")
+_BAD_RE = re.compile(r"[\x00-\x1f\x7f<>]")
+
+
+def _sanitize_description(desc) -> str:
+    """Defense-in-depth cleaning for descriptions injected into the system
+    prompt. Covers builtin manifests and pre-existing bundles that never
+    went through the Go upload validation."""
+    text = _WS_RE.sub(" ", str(desc))
+    text = _BAD_RE.sub("", text)
+    return " ".join(text.split())[:_MAX_DESC_CHARS]
 
 
 def _runtime_root() -> Path:
@@ -59,27 +87,41 @@ def _scan_runtime_view() -> list[dict]:
     return out
 
 
-def _format_for_llm(skills: list[dict]) -> str:
-    """Filter to skills the LLM should know about by default.
-
-    `manual` skills are hidden — they only fire from the UI's "Try in chat"
-    button, which is handled by the Go layer pre-injecting SKILL.md.
-    """
-    visible = [s for s in skills if s.get("trigger") != "manual"]
-    return json.dumps(visible, ensure_ascii=False)
-
-
-@function_tool
-async def list_skills() -> str:
-    """List installed skills available to this user.
-
-    Use this when the user asks about a capability you might not directly
-    have, or when a `/<name>` slash command appears. The result is a JSON
-    list of {id, name, description, trigger, skill_id}. To read the
-    SKILL.md (full instructions) for a given skill, call
-    `read_skill_file(skill_id)`.
-    """
-    return _format_for_llm(_scan_runtime_view())
+def render_index_block() -> str:
+    """Render the <available-skills> system-prompt block (L1 progressive
+    disclosure). Empty string when the user has no visible (auto/slash)
+    skills or the runtime view is unreadable. Never raises: prompt
+    composition must not fail because of bad skill data."""
+    try:
+        visible = [s for s in _scan_runtime_view()
+                   if s.get("trigger") != "manual"
+                   and _SKILL_ID_RE.match(str(s.get("skill_id", "")))]
+        if not visible:
+            return ""
+        visible.sort(key=lambda s: s["skill_id"])
+        used = len(_INDEX_HEADER.encode()) + len(_INDEX_FOOTER.encode())
+        # Reserve worst-case room for the omitted-notice line so the final
+        # block never exceeds _MAX_INDEX_BYTES even when it is appended.
+        notice_reserve = len(
+            (f"[{len(visible)} more skills omitted — disable unused "
+             "skills in Settings]\n").encode())
+        lines: list[str] = []
+        omitted = 0
+        for i, s in enumerate(visible):
+            entry = (f"- {s['skill_id']}: "
+                     f"{_sanitize_description(s.get('description', ''))}\n")
+            if used + len(entry.encode()) > _MAX_INDEX_BYTES - notice_reserve:
+                omitted = len(visible) - i
+                break
+            lines.append(entry)
+            used += len(entry.encode())
+        if omitted:
+            lines.append(f"[{omitted} more skills omitted — disable unused "
+                         "skills in Settings]\n")
+        return _INDEX_HEADER + "".join(lines) + _INDEX_FOOTER
+    except Exception:
+        _log.warning("render_index_block failed", exc_info=True)
+        return ""
 
 
 def _read_skill_file(skill_id: str, path: str) -> str:
@@ -125,7 +167,8 @@ async def read_skill_file(skill_id: str, path: str = "SKILL.md") -> str:
     """Read a file from a skill bundle (defaults to SKILL.md).
 
     Use this to fetch the SKILL.md instructions or any other file shipped
-    with a skill. `skill_id` is the value returned by `list_skills`.
+    with a skill. `skill_id` is the id shown in the <available-skills>
+    index in your system prompt.
     `path` is relative to the bundle root and cannot escape the bundle.
 
     Returns the file contents as a string, or an `Error: ...` message on
@@ -134,4 +177,4 @@ async def read_skill_file(skill_id: str, path: str = "SKILL.md") -> str:
     return _read_skill_file(skill_id, path)
 
 
-ALL_TOOLS = [list_skills, read_skill_file]
+ALL_TOOLS = [read_skill_file]
