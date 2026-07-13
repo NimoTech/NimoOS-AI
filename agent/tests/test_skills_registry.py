@@ -170,3 +170,15 @@ def test_render_index_never_exceeds_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "_MAX_INDEX_BYTES", budget)
     block = render_index_block()
     assert len(block.encode()) <= budget
+
+
+def test_render_index_skips_invalid_skill_id(tmp_path):
+    _setup_view(tmp_path, [("good-one", "auto", None)])
+    # A maliciously-named bundle dropped straight into the runtime view,
+    # bypassing the Go layer's ID validation.
+    _make_skill(tmp_path / "builtin", "bad<x")
+    os.symlink(tmp_path / "builtin" / "bad<x",
+               tmp_path / ".runtime" / "42" / "bad<x")
+    block = render_index_block()
+    assert "- good-one:" in block
+    assert "bad" not in block and "<x" not in block

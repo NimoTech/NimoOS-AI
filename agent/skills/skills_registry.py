@@ -94,7 +94,8 @@ def render_index_block() -> str:
     composition must not fail because of bad skill data."""
     try:
         visible = [s for s in _scan_runtime_view()
-                   if s.get("trigger") != "manual"]
+                   if s.get("trigger") != "manual"
+                   and _SKILL_ID_RE.match(str(s.get("skill_id", "")))]
         if not visible:
             return ""
         visible.sort(key=lambda s: s["skill_id"])
