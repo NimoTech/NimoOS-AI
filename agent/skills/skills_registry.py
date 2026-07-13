@@ -13,6 +13,7 @@ current user's runtime view are allowed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from contextvars import ContextVar
@@ -27,6 +28,31 @@ USER_ID_VAR: ContextVar[str] = ContextVar("user_id", default="")
 
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_FILE_BYTES = 256 * 1024
+
+_log = logging.getLogger(__name__)
+
+_INDEX_HEADER = (
+    "<available-skills>\n"
+    "The user has installed the following skills — named procedures with\n"
+    "detailed instructions. When a request matches a skill's description,\n"
+    "FIRST call read_skill_file(skill_id) to load its SKILL.md instructions,\n"
+    "then follow them. Users may also invoke a skill explicitly by typing\n"
+    "/<skill-id> in their message.\n\n"
+)
+_INDEX_FOOTER = "</available-skills>"
+_MAX_INDEX_BYTES = 16 * 1024
+_MAX_DESC_CHARS = 256
+_WS_RE = re.compile(r"[\r\n\t]")
+_BAD_RE = re.compile(r"[\x00-\x1f\x7f<>]")
+
+
+def _sanitize_description(desc) -> str:
+    """Defense-in-depth cleaning for descriptions injected into the system
+    prompt. Covers builtin manifests and pre-existing bundles that never
+    went through the Go upload validation."""
+    text = _WS_RE.sub(" ", str(desc))
+    text = _BAD_RE.sub("", text)
+    return " ".join(text.split())[:_MAX_DESC_CHARS]
 
 
 def _runtime_root() -> Path:
@@ -67,6 +93,37 @@ def _format_for_llm(skills: list[dict]) -> str:
     """
     visible = [s for s in skills if s.get("trigger") != "manual"]
     return json.dumps(visible, ensure_ascii=False)
+
+
+def render_index_block() -> str:
+    """Render the <available-skills> system-prompt block (L1 progressive
+    disclosure). Empty string when the user has no visible (auto/slash)
+    skills or the runtime view is unreadable. Never raises: prompt
+    composition must not fail because of bad skill data."""
+    try:
+        visible = [s for s in _scan_runtime_view()
+                   if s.get("trigger") != "manual"]
+        if not visible:
+            return ""
+        visible.sort(key=lambda s: s["skill_id"])
+        used = len(_INDEX_HEADER.encode()) + len(_INDEX_FOOTER.encode())
+        lines: list[str] = []
+        omitted = 0
+        for i, s in enumerate(visible):
+            entry = (f"- {s['skill_id']}: "
+                     f"{_sanitize_description(s.get('description', ''))}\n")
+            if used + len(entry.encode()) > _MAX_INDEX_BYTES:
+                omitted = len(visible) - i
+                break
+            lines.append(entry)
+            used += len(entry.encode())
+        if omitted:
+            lines.append(f"[{omitted} more skills omitted — disable unused "
+                         "skills in Settings]\n")
+        return _INDEX_HEADER + "".join(lines) + _INDEX_FOOTER
+    except Exception:
+        _log.warning("render_index_block failed", exc_info=True)
+        return ""
 
 
 @function_tool
