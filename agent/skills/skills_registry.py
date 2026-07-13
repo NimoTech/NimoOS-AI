@@ -107,12 +107,17 @@ def render_index_block() -> str:
             return ""
         visible.sort(key=lambda s: s["skill_id"])
         used = len(_INDEX_HEADER.encode()) + len(_INDEX_FOOTER.encode())
+        # Reserve worst-case room for the omitted-notice line so the final
+        # block never exceeds _MAX_INDEX_BYTES even when it is appended.
+        notice_reserve = len(
+            (f"[{len(visible)} more skills omitted — disable unused "
+             "skills in Settings]\n").encode())
         lines: list[str] = []
         omitted = 0
         for i, s in enumerate(visible):
             entry = (f"- {s['skill_id']}: "
                      f"{_sanitize_description(s.get('description', ''))}\n")
-            if used + len(entry.encode()) > _MAX_INDEX_BYTES:
+            if used + len(entry.encode()) > _MAX_INDEX_BYTES - notice_reserve:
                 omitted = len(visible) - i
                 break
             lines.append(entry)

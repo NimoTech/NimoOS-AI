@@ -170,9 +170,21 @@ def test_render_index_truncates_whole_entries(tmp_path, monkeypatch):
                            ("ccc", "auto", "d" * 200)])
     import skills.skills_registry as sr
     budget = (len(sr._INDEX_HEADER.encode()) + len(sr._INDEX_FOOTER.encode())
-              + 250)  # room for exactly one 208-byte entry
+              + 300)  # room for one 208-byte entry plus the omitted-notice reserve
     monkeypatch.setattr(sr, "_MAX_INDEX_BYTES", budget)
     block = render_index_block()
     assert "- aaa:" in block
     assert "- bbb:" not in block and "- ccc:" not in block
     assert "[2 more skills omitted" in block
+
+
+def test_render_index_never_exceeds_budget(tmp_path, monkeypatch):
+    _setup_view(tmp_path, [("aaa", "auto", "d" * 200),
+                           ("bbb", "auto", "d" * 200),
+                           ("ccc", "auto", "d" * 200)])
+    import skills.skills_registry as sr
+    budget = (len(sr._INDEX_HEADER.encode()) + len(sr._INDEX_FOOTER.encode())
+              + 300)
+    monkeypatch.setattr(sr, "_MAX_INDEX_BYTES", budget)
+    block = render_index_block()
+    assert len(block.encode()) <= budget
