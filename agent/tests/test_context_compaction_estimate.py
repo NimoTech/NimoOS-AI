@@ -44,6 +44,24 @@ def test_resolve_window_map_then_default(tmp_path):
     conn.close()
 
 
+def test_resolve_window_glm_family(tmp_path):
+    # GLM was missing from the map: glm-5-2-260617 fell to the 8k default and
+    # tripped compaction on every turn (composio-sized tool overhead alone
+    # exceeded 70% of 8192), silently truncating chat history.
+    conn = init_db(str(tmp_path / "m.db"))
+    assert cc.resolve_window(conn, "u1", "glm-5-2-260617") == 128000
+    assert cc.resolve_window(conn, "u1", "glm-4-plus") == 128000
+    assert cc.resolve_window(conn, "u1", "GLM-4.5-Air") == 128000
+    conn.close()
+
+
+def test_default_window_is_modern():
+    # 8192 was an absurd fallback for 2026-era models: system prompt + one MCP
+    # server's tool schemas alone exceed 70% of it, so unknown models entered a
+    # truncate-every-turn death spiral.
+    assert cc.DEFAULT_CONTEXT_WINDOW >= 32768
+
+
 def test_resolve_window_short_key_boundary(tmp_path):
     conn = init_db(str(tmp_path / "m.db"))
     # real o1/o3 family names match → 128000

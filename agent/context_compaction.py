@@ -17,7 +17,11 @@ import memory_store
 _LOG = logging.getLogger("nimoos-agent.context_compaction")
 
 THRESHOLD = 0.70
-DEFAULT_CONTEXT_WINDOW = 8192
+# Fallback for models missing from MODEL_WINDOW_MAP. Must stay comfortably
+# above realistic system-prompt + tool-schema overhead (an MCP server alone
+# can add >15k tokens); a too-small fallback makes compaction fire on every
+# turn and degrade to hard truncation.
+DEFAULT_CONTEXT_WINDOW = 32768
 RECENT_TURNS = 6
 COMPACT_LLM_TIMEOUT = 60
 SAFETY_MARGIN = 1.15
@@ -34,6 +38,7 @@ MODEL_WINDOW_MAP = {
     "o3": 128000,
     "deepseek": 64000,
     "qwen": 32768,
+    "glm": 128000,
     "claude": 200000,
     "gemini-1.5": 1000000,
     "gemini-2": 1000000,
@@ -295,7 +300,7 @@ def _load_snapshot_history(conn, session_id) -> list:
     import json as _json
     row = conn.execute(
         "SELECT content FROM messages WHERE session_id=? "
-        "ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (session_id,)).fetchone()
     if not row:
         return []
     try:

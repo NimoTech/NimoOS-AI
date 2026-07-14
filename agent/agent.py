@@ -446,8 +446,11 @@ class AgentRunner:
         # (stream.to_input_list()), so only the most recent row is meaningful —
         # concatenating earlier rows would replay every turn's prefix again and
         # double the history on each run.
+        # rowid tiebreak: created_at is second-resolution, so two saves within
+        # the same second would otherwise make "latest" nondeterministic.
         row = self._conn.execute(
-            "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+            "SELECT content FROM messages WHERE session_id=? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (session_id,)
         ).fetchone()
         if not row:
@@ -771,14 +774,15 @@ class AgentRunner:
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,
                 model_name=model_name, provider_type=provider_type)
-            history = self._load_history(session_id)
+            stored_history = self._load_history(session_id)
             # Earlier turns' image blocks were stored in compact form
             # (attachment_id only) to keep the DB small. Re-inline the base64
             # data URL before re-feeding to the SDK — the chat-completions
             # adapter rejects the compact shape with "Only image URLs are
-            # supported for input_image".
+            # supported for input_image". (Same length/order as
+            # stored_history; items are copied, not mutated.)
             history = hydrate_image_blocks(
-                history, session_id=session_id, data_root=data_root)
+                stored_history, session_id=session_id, data_root=data_root)
 
             # --- P4 context compaction (main path; bypass/fail → no-op/truncate) ---
             _summarize_fn = _make_summarize_fn(client, model_name)
@@ -795,6 +799,16 @@ class AgentRunner:
                 summarize_fn=_summarize_fn, overhead_tokens=_overhead)
             if summary_block:
                 full_prompt = full_prompt + "\n\n" + summary_block
+            # Compaction only trims what is SENT to the model. The persisted
+            # history (the /messages data source) must keep the dropped
+            # prefix, or older turns silently vanish from the UI:
+            # to_input_list() below reflects only the (possibly truncated)
+            # input. send_history is always a tail slice of history, so the
+            # dropped prefix is stored_history[:len-diff] — kept in its
+            # compact (non-hydrated) stored form.
+            _dropped = len(history) - len(send_history)
+            persist_prefix = (stored_history[:_dropped]
+                              if 0 < _dropped <= len(stored_history) else [])
 
             agent = Agent(
                 name="NimoOS Agent",
@@ -890,7 +904,7 @@ class AgentRunner:
                     "source": "client_estimate",
                 })
 
-                final_history = self._finalize_history(
+                final_history = persist_prefix + self._finalize_history(
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
@@ -909,7 +923,7 @@ class AgentRunner:
                             stream, session_id=session_id,
                             attachment_ids=attachment_ids, data_root=data_root)
                         partial = _repair_dangling_tool_calls(partial)
-                        self._save_history(session_id, partial)
+                        self._save_history(session_id, persist_prefix + partial)
                 except Exception:
                     pass
                 await sink.put({
@@ -945,7 +959,7 @@ class AgentRunner:
                             stream, session_id=session_id,
                             attachment_ids=attachment_ids, data_root=data_root)
                         partial = _repair_dangling_tool_calls(partial)
-                        self._save_history(session_id, partial)
+                        self._save_history(session_id, persist_prefix + partial)
                 except Exception:
                     pass
                 await sink.put({"type": "error", "content": str(e)})
