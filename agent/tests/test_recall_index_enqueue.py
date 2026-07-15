@@ -1,6 +1,7 @@
 import pytest
 from db import init_db
 import recall_index as ri
+from recall_index import maybe_enqueue_index_job, IDLE_SECONDS
 
 
 @pytest.fixture
@@ -8,6 +9,15 @@ def conn(tmp_path):
     c = init_db(str(tmp_path / "m.db"))
     yield c
     c.close()
+
+
+def _conn(tmp_path):
+    conn = init_db(str(tmp_path / "m.db"))
+    # memory_enabled defaults on; insert explicitly so the gate never flakes
+    conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
+                 "VALUES('u1','memory_enabled','1',0)")
+    conn.commit()
+    return conn
 
 
 def test_sessions_has_recall_offset_columns(conn):
@@ -21,7 +31,7 @@ def test_enqueue_when_enabled_and_coalesces(conn):
     rows = conn.execute(
         "SELECT * FROM recall_index_jobs WHERE session_id='s1'").fetchall()
     assert len(rows) == 1                      # coalesced
-    assert rows[0]["enqueued_at"] == 2000      # refreshed
+    assert rows[0]["enqueued_at"] == 1000      # kept at earliest pending enqueue
     assert rows[0]["status"] == "pending"
 
 
@@ -50,3 +60,14 @@ def test_chunk_messages_skips_empty():
             {"role": "assistant", "content": "hi"}]
     chunks = ri.chunk_messages(msgs, start_chunk_no=0, now=1, max_chars=2000)
     assert len(chunks) == 1 and chunks[0]["chunk_no"] == 0
+
+
+def test_reenqueue_does_not_postpone_claimability(tmp_path):
+    # An active session re-enqueues on every run end. The job must become
+    # claimable IDLE_SECONDS after the FIRST enqueue, not be postponed forever.
+    conn = _conn(tmp_path)
+    assert maybe_enqueue_index_job(conn, "s1", "u1", now=1000)
+    assert maybe_enqueue_index_job(conn, "s1", "u1", now=1100)
+    row = conn.execute("SELECT enqueued_at FROM recall_index_jobs "
+                       "WHERE session_id='s1'").fetchone()
+    assert row["enqueued_at"] == 1000
