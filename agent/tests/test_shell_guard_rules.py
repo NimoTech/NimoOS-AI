@@ -53,3 +53,48 @@ def test_combined_takes_highest():
 def test_write_verb_is_gray():
     # a writing command that is neither safe nor a known-dangerous pattern
     assert classify("cp a.txt b.txt").level == "gray"
+
+
+# ── FIX 1: input-redirect reads of protected paths must not be SAFE ────────────
+def test_read_redirect_of_protected_is_protected():
+    assert classify("cat < /var/lib/nimoos/ai/agent/agent.db").level == "protected"
+    assert classify("cat < /etc/shadow").level == "protected"
+
+
+def test_read_redirect_of_harmless_stays_safe():
+    assert classify("cat < harmless.txt").level == "safe"
+
+
+# ── FIX 2: git branch/remote mutation is not SAFE ─────────────────────────────
+def test_git_mutating_subcommands_not_safe():
+    assert classify("git branch -D main").level != "safe"
+    assert classify("git remote add evil https://e/r").level != "safe"
+    assert classify("git status").level == "safe"
+
+
+# ── FIX 3: rm -R (uppercase) is dangerous ─────────────────────────────────────
+def test_rm_uppercase_recursive_is_dangerous():
+    assert classify("rm -R /home/user/project").level == "dangerous"
+
+
+# ── FIX 4: package/service read-only subcommands are not dangerous ────────────
+def test_pkg_svc_subcommand_discrimination():
+    assert classify("systemctl status nimoos").level != "dangerous"
+    assert classify("systemctl stop nimoos").level == "dangerous"
+    assert classify("apt list --installed").level != "dangerous"
+    assert classify("apt-get remove foo").level == "dangerous"
+    assert classify("dpkg -l").level != "dangerous"
+
+
+# ── FIX 5: /DATA mass-delete escalates only for destructive commands ──────────
+def test_data_mass_delete_escalates():
+    assert classify("rm -rf /DATA/Documents/*").level == "protected"
+    assert classify("rm -rf /DATA").level == "protected"
+
+
+def test_data_read_not_overblocked():
+    assert classify("ls /DATA/*").level != "protected"
+
+
+def test_data_single_file_not_escalated():
+    assert classify("rm /DATA/Documents/one.txt").level != "protected"

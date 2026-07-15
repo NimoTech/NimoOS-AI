@@ -10,14 +10,16 @@ import shlex
 from dataclasses import dataclass, field
 
 _OPERATORS = {"|", "||", "&&", ";", "&"}
-_REDIRECT_OPS = {">", ">>", "&>"}
-_ALL_REDIRECT = {">", ">>", "<", "<<", "&>"}
+_REDIRECT_OPS = {">", ">>", "&>"}     # write
+_READ_OPS = {"<", "<<"}               # read
+_ALL_REDIRECT = {">", ">>", "&>", "<", "<<"}
 
 
 @dataclass
 class Segment:
     argv: list[str] = field(default_factory=list)
-    redirect_targets: list[str] = field(default_factory=list)
+    redirect_targets: list[str] = field(default_factory=list)   # write
+    read_targets: list[str] = field(default_factory=list)       # read
 
 
 def _tokenize(command: str) -> list[str] | None:
@@ -44,7 +46,7 @@ def segments(command: str) -> list[Segment] | None:
     while i < len(toks):
         t = toks[i]
         if t in _OPERATORS:
-            if cur.argv or cur.redirect_targets:
+            if cur.argv or cur.redirect_targets or cur.read_targets:
                 segs.append(cur)
             cur = Segment()
             i += 1
@@ -53,11 +55,13 @@ def segments(command: str) -> list[Segment] | None:
             # next token is the redirect target
             if t in _REDIRECT_OPS and i + 1 < len(toks):
                 cur.redirect_targets.append(toks[i + 1])
+            elif t in _READ_OPS and i + 1 < len(toks):
+                cur.read_targets.append(toks[i + 1])
             i += 2
             continue
         cur.argv.append(t)
         i += 1
-    if cur.argv or cur.redirect_targets:
+    if cur.argv or cur.redirect_targets or cur.read_targets:
         segs.append(cur)
     return segs
 
@@ -70,4 +74,5 @@ def extract_paths(seg: Segment) -> list[str]:
         if tok.startswith("/") or "/" in tok:
             paths.append(tok)
     paths.extend(seg.redirect_targets)
+    paths.extend(seg.read_targets)
     return paths

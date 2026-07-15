@@ -29,6 +29,11 @@ def test_ampersand_redirect_target_captured():
     assert "/tmp/log" in segs[0].redirect_targets
 
 
+def test_read_redirect_target_captured():
+    segs = segments("cat < /etc/shadow")
+    assert "/etc/shadow" in segs[0].read_targets
+
+
 def test_unbalanced_quotes_unparseable():
     assert segments('echo "unterminated') is None
 

@@ -19,12 +19,17 @@ _SAFE_CMDS = {
     "date", "cksum", "sha256sum", "md5sum",
 }
 # git subcommands that are read-only
-_SAFE_GIT_SUB = {"status", "log", "diff", "show", "branch", "remote"}
+_SAFE_GIT_SUB = {"status", "log", "diff", "show"}
 
 # ── DANGEROUS verb/flag patterns ──────────────────────────────────────────────
 _SHELL_CMDS = {"sh", "bash", "zsh", "dash"}
 _DISK_CMDS = {"dd", "mkfs", "wipefs", "fdisk", "parted", "sgdisk", "shred"}
-_PKG_SVC_CMDS = {"systemctl", "apt", "apt-get", "dpkg", "yum", "dnf"}
+_SYSTEMCTL_MUTATE = {"start", "stop", "restart", "reload", "enable", "disable", "mask",
+                     "unmask", "kill", "isolate", "poweroff", "reboot", "halt",
+                     "suspend", "hibernate", "daemon-reload", "set-default"}
+_APT_MUTATE = {"install", "remove", "purge", "autoremove", "upgrade",
+               "full-upgrade", "dist-upgrade"}
+_YUM_MUTATE = {"install", "remove", "erase", "update", "upgrade", "downgrade"}
 
 
 def _cmd_name(seg: Segment) -> str:
@@ -36,7 +41,7 @@ def _is_dangerous_seg(seg: Segment, all_segs: list[Segment], idx: int) -> str | 
     flags = [a for a in seg.argv[1:] if a.startswith("-")]
     flagchars = "".join(f.lstrip("-") for f in flags)
 
-    if name == "rm" and ("r" in flagchars or "f" in flagchars):
+    if name == "rm" and ("r" in flagchars.lower() or "f" in flagchars.lower()):
         return "recursive/forced remove"
     if name == "find" and "-delete" in seg.argv:
         return "find -delete"
@@ -44,8 +49,22 @@ def _is_dangerous_seg(seg: Segment, all_segs: list[Segment], idx: int) -> str | 
         return f"disk/format command: {name}"
     if name in ("chmod", "chown") and "R" in flagchars:
         return f"recursive {name}"
-    if name in _PKG_SVC_CMDS:
-        return f"package/service management: {name}"
+    if name == "systemctl":
+        if any(a in _SYSTEMCTL_MUTATE for a in seg.argv[1:]):
+            return "systemctl mutating command"
+        return None
+    if name in ("apt", "apt-get"):
+        if any(a in _APT_MUTATE for a in seg.argv[1:]):
+            return f"{name} mutating command"
+        return None
+    if name in ("yum", "dnf"):
+        if any(a in _YUM_MUTATE for a in seg.argv[1:]):
+            return f"{name} mutating command"
+        return None
+    if name == "dpkg":
+        if any(f in seg.argv[1:] for f in ("-r", "-P", "-i", "--remove", "--purge", "--install")):
+            return "dpkg mutating command"
+        return None
     if name == "docker" and any(x in seg.argv for x in ("prune", "rm", "rmi")):
         return "docker destructive subcommand"
     # pipe-to-shell: this segment is a shell AND a previous segment fetches remotely
@@ -97,11 +116,18 @@ def _is_protected_path(raw: str) -> bool:
 
 
 def _is_data_mass(raw: str) -> bool:
-    # /DATA top-level or wildcard delete: /DATA, /DATA/, /DATA/*
-    rp = raw.rstrip("/")
-    if raw.endswith("*") and rp.rstrip("*").rstrip("/") in (_DATA_ROOT, ""):
+    if "*" in raw and (raw == "/DATA/*" or raw.startswith("/DATA/")):
         return True
-    return _resolve(rp) == _DATA_ROOT
+    return _resolve(raw.rstrip("/")) == _DATA_ROOT
+
+
+def _is_destructive(seg: Segment) -> bool:
+    name = _cmd_name(seg)
+    if name in ("rm", "shred"):
+        return True
+    if name == "find" and "-delete" in seg.argv:
+        return True
+    return False
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -120,20 +146,24 @@ def _worse(a: Decision, b: Decision) -> Decision:
 
 
 def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
-    if not seg.argv:
-        # pure redirection segment; treat targets for protection
-        pass
     name = _cmd_name(seg)
+    paths = extract_paths(seg)
 
-    # protected paths (checked regardless of verb)
-    hit_paths = [p for p in extract_paths(seg)
-                 if _is_protected_path(p) or _is_data_mass(p)]
-    if hit_paths:
-        return Decision("protected", f"touches protected path(s): {hit_paths}", hit_paths)
+    # sensitive prefixes/suffixes: reading OR writing always escalates
+    sensitive = [p for p in paths if _is_protected_path(p)]
+    if sensitive:
+        return Decision("protected", f"touches protected path(s): {sensitive}", sensitive)
 
     danger = _is_dangerous_seg(seg, all_segs, idx)
+
+    # /DATA mass op: escalate only for destructive commands (avoid over-blocking reads)
+    if _is_destructive(seg):
+        mass = [p for p in paths if _is_data_mass(p)]
+        if mass:
+            return Decision("protected", f"mass delete under /DATA: {mass}", mass)
+
     if danger:
-        return Decision("dangerous", danger, extract_paths(seg))
+        return Decision("dangerous", danger, paths)
 
     has_write_redirect = bool(seg.redirect_targets)
     if name in _SAFE_CMDS and not has_write_redirect:
@@ -142,7 +172,6 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
             and not has_write_redirect:
         return Decision("safe")
 
-    # everything else that isn't clearly safe or clearly dangerous
     return Decision("gray", f"unclassified command: {name or '(redirect)'}")
 
 
