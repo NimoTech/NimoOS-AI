@@ -42,3 +42,27 @@ def test_bad_regex_never_matches_never_raises():
     conn = _db()
     AL.add(conn, "regex", "([", "user")  # invalid regex
     assert AL.match(conn, "anything") is False
+
+
+def test_prefix_no_chaining_or_redirect_bypass():
+    conn = _db()
+    AL.add(conn, "prefix", "git pull", "user")
+    # A benign allowed prefix must NOT vouch for smuggled extra operations.
+    assert AL.match(conn, "git pull; rm -rf /DATA") is False
+    assert AL.match(conn, "git pull && rm -rf /x") is False
+    assert AL.match(conn, "git pull > /etc/passwd") is False
+
+
+def test_path_scope_requires_all_paths_in_scope():
+    conn = _db()
+    AL.add(conn, "path_scope", "/DATA/scratch", "user")
+    # Every path target must be in scope; one out-of-scope path fails closed.
+    assert AL.match(conn, "rm -rf /DATA/scratch/a /DATA/important") is False
+
+
+def test_unparseable_command_fails_closed():
+    conn = _db()
+    AL.add(conn, "prefix", "echo", "user")
+    AL.add(conn, "path_scope", "/DATA/scratch", "user")
+    # Command substitution / subshells are unparseable → never vouched.
+    assert AL.match(conn, "echo $(rm -rf /DATA)") is False

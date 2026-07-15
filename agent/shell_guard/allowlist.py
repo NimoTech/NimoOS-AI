@@ -7,6 +7,8 @@ import re
 import time
 import uuid
 
+from shell_guard.parse import segments, extract_paths
+
 
 def add(conn, match_type: str, value: str, created_by: str, note: str = "") -> str:
     if match_type not in ("prefix", "regex", "path_scope"):
@@ -35,26 +37,38 @@ def delete(conn, entry_id: str) -> bool:
     return cur.rowcount > 0
 
 
-def _entry_matches(command: str, match_type: str, value: str) -> bool:
+def _entry_matches(command: str, seg, match_type: str, value: str) -> bool:
     if match_type == "prefix":
         return command.strip().startswith(value)
     if match_type == "regex":
         try:
             return re.search(value, command) is not None
         except re.error:
-            return False  # invalid stored regex never matches
+            return False
     if match_type == "path_scope":
         scope = os.path.realpath(value)
-        for tok in command.split():
-            if tok.startswith("/") or "/" in tok:
-                rp = os.path.realpath(tok)
-                if rp == scope or rp.startswith(scope + "/"):
-                    return True
-        return False
+        paths = extract_paths(seg)
+        if not paths:
+            return False
+        # ALL path targets must be within scope — a single in-scope token must
+        # not vouch for a command that also touches out-of-scope paths.
+        return all(
+            os.path.realpath(p) == scope or os.path.realpath(p).startswith(scope + "/")
+            for p in paths
+        )
     return False
 
 
 def match(conn, command: str) -> bool:
-    rows = conn.execute(
-        "SELECT match_type, value FROM shell_allowlist").fetchall()
-    return any(_entry_matches(command, r["match_type"], r["value"]) for r in rows)
+    # The allowlist only vouches for a SINGLE simple command with no chaining
+    # (pipes, &&/||/;, subshells) and no redirection. Otherwise an attacker could
+    # smuggle extra operations past a benign allowed prefix
+    # (e.g. "git pull; rm -rf /DATA"). Anything else fails closed.
+    segs = segments(command)
+    if segs is None or len(segs) != 1:
+        return False
+    seg = segs[0]
+    if seg.redirect_targets or seg.read_targets:
+        return False
+    rows = conn.execute("SELECT match_type, value FROM shell_allowlist").fetchall()
+    return any(_entry_matches(command, seg, r["match_type"], r["value"]) for r in rows)
