@@ -199,9 +199,15 @@ def _write_summary_state(conn, session_id, summary, folded_upto) -> None:
     conn.commit()
 
 
-def summary_block(summary) -> str:
+RECALL_HINT = "(更早的对话原文可用 recall 工具按需检索)"
+
+
+def summary_block(summary, *, recall_hint=False) -> str:
     s = (summary or "").strip()
-    return f"{SUMMARY_HEADER}\n{s}" if s else ""
+    if not s:
+        return ""
+    block = f"{SUMMARY_HEADER}\n{s}"
+    return f"{block}\n{RECALL_HINT}" if recall_hint else block
 
 
 SUMMARIZE_INSTRUCTION = (
@@ -233,6 +239,7 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
         if not memory_store.is_compaction_enabled(conn, user_id):
             return "", history
         S, F = _read_summary_state(conn, session_id)
+        hint = memory_store.is_memory_enabled(conn, user_id)
         if F < 0 or F > len(history):
             # Stale cursor (manual restore / external edit): fall back to 0
             # rather than slicing history into nonsense.
@@ -247,7 +254,7 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
                  + estimate_messages_tokens(history[F:])
                  + estimate_tokens(current_text))
         if total <= line:
-            return summary_block(S), history[F:] if F else history
+            return summary_block(S, recall_hint=hint), history[F:] if F else history
 
         new_S, new_F = S, F
         send_history = history[F:]
@@ -309,7 +316,7 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
             except Exception:
                 _LOG.debug("immediate recall enqueue failed for %s",
                            session_id, exc_info=True)
-        return summary_block(new_S), send_history
+        return summary_block(new_S, recall_hint=hint), send_history
     except Exception as e:
         _LOG.warning("compaction error, bypassing (%s): %s", session_id, e)
         return "", history
