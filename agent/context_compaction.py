@@ -342,16 +342,20 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
         # non-existent OR not-owned session returns zeros (no cross-user
         # info leak — IDOR guard), mirroring other user-scoped agent endpoints.
         srow = conn.execute(
-            "SELECT rolling_summary, last_overhead_tokens FROM sessions "
-            "WHERE id=? AND user_id=?", (session_id, str(user_id))).fetchone()
+            "SELECT rolling_summary, last_overhead_tokens, folded_upto "
+            "FROM sessions WHERE id=? AND user_id=?",
+            (session_id, str(user_id))).fetchone()
         if srow is None:
             tokens = 0
         else:
             summary = srow["rolling_summary"] or ""
             overhead = srow["last_overhead_tokens"] or 0
+            fold_f = srow["folded_upto"] or 0
             history = _load_snapshot_history(conn, session_id)
+            if fold_f < 0 or fold_f > len(history):
+                fold_f = 0
             tokens = (overhead + estimate_tokens(summary)
-                      + estimate_messages_tokens(history))
+                      + estimate_messages_tokens(history[fold_f:]))
     except Exception as e:
         _LOG.warning("context usage compute failed for %s: %s", session_id, e)
         tokens = 0
