@@ -31,6 +31,11 @@ from agents import function_tool
 import db as dbmod
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
 
+import shell_guard
+from shell_guard import allowlist as guard_allowlist
+from shell_guard import backstop as guard_backstop
+from shell_guard.judge import judge_command
+
 # netns_client is imported lazily inside _run() to allow bwrap fallback to load
 # and operate even when the netns package is unavailable (e.g. during tests or
 # on systems without the executor installed).  Do NOT import it here.
@@ -208,8 +213,80 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     return bool(granted)
 
 
+async def _guard_command(command: str) -> str | None:
+    """Classify `command`; return a refusal string to block, or None to allow.
+
+    SAFE → allow. Allowlisted → allow (even unattended). DANGEROUS/PROTECTED, or
+    GRAY judged 'ask' → confirm; unattended without allowlist → fail-closed.
+    Before executing a confirmed destructive command, build the backstop.
+    """
+    session_id = SESSION_ID_VAR.get()
+    db = DB_VAR.get()
+
+    decision = shell_guard.classify(command)
+    if decision.level == "safe":
+        return None
+
+    # user-maintained allowlist wins (runs even unattended)
+    if db is not None and guard_allowlist.match(db, command):
+        # Allowlisted: skip confirmation, but still build the backstop for
+        # destructive commands (defense in depth — a pre-approved rm still
+        # gets a recoverable snapshot/trash).
+        if decision.level in ("dangerous", "protected"):
+            guard_backstop.prepare_backstop(decision.paths)
+        return None
+
+    # gray → judge; allow verdict passes through, else fall to confirm
+    if decision.level == "gray":
+        verdict = await judge_command(command)
+        if verdict == "allow":
+            return None
+        reason = "命令需人工确认(灰区判定)"
+    else:
+        reason = decision.reason
+
+    mgr = CONFIRM_MGR_VAR.get()
+    sink = EVENT_QUEUE_VAR.get()
+    if mgr is None or sink is None:
+        return ("此命令需人工批准(无确认通道),未执行。"
+                "请在面板确认,或将其加入 shell 白名单。")
+
+    # Build the backstop BEFORE asking, so the card can show undo status.
+    backstop = guard_backstop.prepare_backstop(decision.paths)
+    if backstop.undoable and backstop.kind == "snapshot":
+        undo = "已快照,可回滚"
+    elif backstop.undoable and backstop.kind == "trash":
+        undo = "已入回收站,可恢复"
+    else:
+        undo = "⚠ 此操作无法自动备份,执行后不可撤销"
+
+    confirm_id = mgr.register(session_id, "shell_command",
+                              f"Agent 请求执行命令:{reason}", command)
+    await sink.put({
+        "type": "confirmation_required",
+        "confirm_id": confirm_id,
+        "action": "shell_command",
+        "description": f"Agent 请求执行命令:{reason}",
+        "command": command,
+        "risk_level": decision.level,
+        "risk_reason": reason,
+        "undo_status": undo,
+    })
+    granted = await mgr.wait(confirm_id)
+    if not granted:
+        return "用户拒绝或未能确认该命令,未执行。"
+    if db is not None and mgr.consume_remember(confirm_id):
+        guard_allowlist.add(db, "prefix", command, "confirm-card")
+    return None
+
+
 async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> str:
     session_id = SESSION_ID_VAR.get()
+
+    # ── Command guardrail (L1): classify + confirm + backstop, both exec modes ──
+    _refusal = await _guard_command(command)
+    if _refusal is not None:
+        return _refusal
 
     if EXEC_MODE != "bwrap":
         # netns mode: network is always available (managed by egress proxy/DLP).
