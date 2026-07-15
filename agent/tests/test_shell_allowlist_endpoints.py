@@ -30,3 +30,27 @@ def test_bad_match_type_rejected():
                json={"match_type": "nope", "value": "x"},
                headers={"X-User-Id": "u1"})
     assert r.status_code == 400
+
+
+def test_malformed_json_body_rejected():
+    c = _client()
+    r = c.post("/agent/shell-allowlist",
+               content=b"not json at all",
+               headers={"X-User-Id": "u1", "Content-Type": "application/json"})
+    assert r.status_code == 400
+
+
+def test_null_value_rejected():
+    c = _client()
+    r = c.post("/agent/shell-allowlist",
+               json={"match_type": "prefix", "value": None},
+               headers={"X-User-Id": "u1"})
+    assert r.status_code == 400
+
+
+def test_whitespace_only_value_rejected():
+    c = _client()
+    r = c.post("/agent/shell-allowlist",
+               json={"match_type": "prefix", "value": "  "},
+               headers={"X-User-Id": "u1"})
+    assert r.status_code == 400
