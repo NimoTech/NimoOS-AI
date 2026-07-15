@@ -1,0 +1,44 @@
+import sqlite3
+import db as dbmod
+from shell_guard import allowlist as AL
+
+
+def _db():
+    conn = dbmod.init_db(":memory:")
+    return conn
+
+
+def test_prefix_match():
+    conn = _db()
+    AL.add(conn, "prefix", "git pull", "user")
+    assert AL.match(conn, "git pull origin main") is True
+    assert AL.match(conn, "git push") is False
+
+
+def test_regex_match():
+    conn = _db()
+    AL.add(conn, "regex", r"^rsync -a /DATA/ /backup/", "user")
+    assert AL.match(conn, "rsync -a /DATA/ /backup/ --delete") is True
+    assert AL.match(conn, "rm -rf /DATA") is False
+
+
+def test_path_scope_match():
+    conn = _db()
+    AL.add(conn, "path_scope", "/DATA/scratch", "user")
+    assert AL.match(conn, "rm -rf /DATA/scratch/tmp") is True
+    assert AL.match(conn, "rm -rf /DATA/important") is False
+
+
+def test_list_and_delete():
+    conn = _db()
+    eid = AL.add(conn, "prefix", "ls", "user", note="harmless")
+    rows = AL.list_entries(conn)
+    assert len(rows) == 1 and rows[0]["value"] == "ls"
+    assert AL.delete(conn, eid) is True
+    assert AL.list_entries(conn) == []
+
+
+def test_bad_regex_never_matches_never_raises():
+    conn = _db()
+    AL.add(conn, "regex", "([", "user")  # invalid regex
+    assert AL.match(conn, "anything") is False
