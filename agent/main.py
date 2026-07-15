@@ -1269,6 +1269,18 @@ async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
 
 @app.delete("/agent/sessions/{session_id}")
 async def delete_session(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    # Best-effort vector cleanup BEFORE dropping rows: a deleted session must
+    # not stay recallable. Soft-fail — deletion never depends on Parser being
+    # online; a missed cleanup only leaves orphan vectors (logged).
+    try:
+        import recall_index
+        await asyncio.wait_for(
+            recall_index._get_parser_client().agent_memory_delete(
+                x_user_id, session_id),
+            timeout=10)
+    except Exception as e:
+        _LOG.warning("agent-memory vector cleanup failed for %s: %s",
+                     session_id, e)
     _conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
     _conn.execute("DELETE FROM sessions WHERE id=? AND user_id=?", (session_id, x_user_id))
     _conn.commit()
