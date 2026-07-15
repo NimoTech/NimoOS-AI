@@ -17,6 +17,18 @@ class _Mgr:
     async def wait(self, cid): return self.decision
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_guard(monkeypatch):
+    """Neutralize the L1 command guardrail for this suite. These tests verify
+    the bwrap network-grant / offline-hint logic in _run_command_impl, which
+    runs after the guard; the guard is unit-tested in test_shell_guard_gate.py.
+    Without this, the guard would classify the placeholder `curl x` commands as
+    gray and gate them before the network-grant logic under test is reached."""
+    async def _passthrough_guard(command):
+        return None
+    monkeypatch.setattr(shell, "_guard_command", _passthrough_guard)
+
+
 def _mem_db():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

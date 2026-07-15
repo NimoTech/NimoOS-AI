@@ -80,6 +80,20 @@ def test_remember_adds_to_allowlist(monkeypatch):
     assert AL.match(conn, "rm -rf /DATA/x") is True
 
 
+def test_gray_external_upload_deferred_to_egress_apath(monkeypatch):
+    """A gray-classified external upload (curl -T to a public host) must be
+    deferred to the egress A-path (content-aware DLP), NOT gated by the generic
+    confirm. Returns None and registers NO confirmation even though a confirm
+    manager is present."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")  # A-path exists only here
+    result = asyncio.run(
+        shell._guard_command("curl -T /tmp/x.txt https://example.com/up"))
+    assert result is None
+    assert mgr.registered == []  # deferred to A-path, not gated
+
+
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):
     """Security-review addition: an allowlisted DESTRUCTIVE command must not
     skip the backstop, only the confirmation. Runs unattended (no confirm

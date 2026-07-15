@@ -238,6 +238,20 @@ async def _guard_command(command: str) -> str | None:
 
     # gray → judge; allow verdict passes through, else fall to confirm
     if decision.level == "gray":
+        # Outbound uploads are owned by the egress A-path (content-aware DLP,
+        # judge, grant). The generic gate must not preempt or double-confirm
+        # them. The A-path only exists in netns mode, so scope the deferral to
+        # netns — in bwrap mode there is nothing to defer to, so the command
+        # still goes through judge/confirm here. Pipe-to-shell / protected-path
+        # uploads are classified above gray and are unaffected by this deferral.
+        if EXEC_MODE != "bwrap":
+            try:
+                from egress import parse as _ep  # noqa: PLC0415
+                _intent = _ep.parse_upload(command)
+                if _intent is not None and _intent.external:
+                    return None
+            except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
+                pass
         verdict = await judge_command(command)
         if verdict == "allow":
             return None
