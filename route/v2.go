@@ -182,6 +182,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// role before falling through to the general agent proxy wildcard below.
 	g.Any("/agent/channels/instances", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/channels/instances/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Shell allowlist governs unattended command execution — admin only.
+	g.Any("/agent/shell-allowlist", agent.Proxy, v2.AdminOnly(runtimePath))
+	g.Any("/agent/shell-allowlist/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
