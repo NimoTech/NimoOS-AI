@@ -43,3 +43,37 @@ def test_prune_keeps_newest(tmp_path):
     removed = B.prune(str(root), keep=2)
     assert removed == 3
     assert sorted(p.name for p in root.iterdir()) == ["1003", "1004"]
+
+
+def test_makedirs_failure_never_raises(tmp_path, monkeypatch):
+    # Contract: prepare_backstop must NEVER raise — always return a
+    # BackstopResult, even when the trash dir cannot be created.
+    monkeypatch.setattr(B, "fs_type", lambda p: "ext2/ext3")
+
+    def raise_oserror(*args, **kwargs):
+        raise OSError("boom: no space left on device")
+
+    monkeypatch.setattr(B.os, "makedirs", raise_oserror)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    res = B.prepare_backstop([str(victim)], trash_root=str(tmp_path / ".trash"))
+    assert res.kind == "none"
+    assert res.undoable is False
+
+
+def test_mixed_mount_does_not_take_snapshot_shortcut(tmp_path, monkeypatch):
+    # One target on btrfs, one on ext4 → the snapshot shortcut (which would
+    # silently skip the non-btrfs target) must NOT be taken; fall through to
+    # the per-target hardlink path instead.
+    a = tmp_path / "a.txt"
+    a.write_text("aaa")
+    b = tmp_path / "b.txt"
+    b.write_text("bbb")
+
+    def fake_fs_type(p):
+        return "btrfs" if p == str(a) else "ext2/ext3"
+
+    monkeypatch.setattr(B, "fs_type", fake_fs_type)
+    trash = tmp_path / ".trash"
+    res = B.prepare_backstop([str(a), str(b)], trash_root=str(trash))
+    assert res.kind != "snapshot"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -45,9 +46,9 @@ def fs_type(path: str) -> str:
 def _snapshot_btrfs(target: str, trash_root: str) -> BackstopResult | None:
     stamp = str(int(time.time() * 1000))
     dest = os.path.join(trash_root, f"snap-{stamp}")
-    os.makedirs(trash_root, exist_ok=True)
     # Snapshot the enclosing mountpoint's subvolume; best-effort.
     try:
+        os.makedirs(trash_root, exist_ok=True)
         subprocess.run(
             ["btrfs", "subvolume", "snapshot", "-r", target, dest],
             capture_output=True, check=True, timeout=30,
@@ -61,7 +62,11 @@ def _snapshot_btrfs(target: str, trash_root: str) -> BackstopResult | None:
 def _hardlink_trash(paths: list[str], trash_root: str) -> BackstopResult:
     stamp = str(int(time.time() * 1000))
     dest_dir = os.path.join(trash_root, stamp)
-    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning("backstop: could not create trash dir %s: %s", dest_dir, exc)
+        return BackstopResult("none", "", False, "could not create trash dir")
     saved = 0
     for p in paths:
         if not os.path.exists(p):
@@ -87,13 +92,14 @@ def prepare_backstop(paths: list[str], trash_root: str | None = None) -> Backsto
     if not real:
         return BackstopResult("none", "", False, "no existing target to back up")
 
-    # btrfs branch: if any target is on btrfs, snapshot its volume.
-    for p in real:
-        if fs_type(p) == "btrfs":
-            snap = _snapshot_btrfs(p, root)
-            if snap is not None:
-                return snap
-            break  # snapshot failed → fall through to hardlink
+    # btrfs branch: only take the snapshot shortcut when ALL targets are on
+    # btrfs. A snapshot of one target's subvolume does not cover targets on
+    # other mounts, so a mixed set falls through to the per-target hardlink
+    # path (honest about what it actually saved).
+    if all(fs_type(p) == "btrfs" for p in real):
+        snap = _snapshot_btrfs(real[0], root)
+        if snap is not None:
+            return snap
 
     return _hardlink_trash(real, root)
 
@@ -107,7 +113,6 @@ def prune(trash_root: str, keep: int) -> int:
     )
     to_remove = entries[:-keep] if keep > 0 else entries
     removed = 0
-    import shutil
     for e in to_remove:
         shutil.rmtree(e.path, ignore_errors=True)
         removed += 1
