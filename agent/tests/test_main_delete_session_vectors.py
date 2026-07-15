@@ -40,3 +40,9 @@ async def test_delete_session_survives_parser_down(client_with_session):
         r = await client.delete(f"/agent/sessions/{session_id}",
                                 headers={"X-User-Id": "u1"})
     assert r.status_code == 200  # session deletion never fails on this
+    # Rows must be gone despite the failed vector cleanup.
+    import sys
+    main = sys.modules["main"]
+    row = main._conn.execute(
+        "SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    assert row is None
