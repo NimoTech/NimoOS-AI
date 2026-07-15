@@ -23,20 +23,26 @@ MAX_UPSERT_CHUNKS = 32
 UPSERT_TIMEOUT = 30
 
 
-def maybe_enqueue_index_job(conn, session_id, user_id, *, now=None) -> bool:
+def maybe_enqueue_index_job(conn, session_id, user_id, *, now=None,
+                            immediate=False) -> bool:
     """UPSERT a per-session recall-index job (coalescing) iff memory is enabled.
+    immediate=True backdates enqueued_at by IDLE_SECONDS so the worker claims
+    it on its next poll — used when compaction just pushed content out of the
+    model's context and it must become recallable right away.
     Returns True when (re)enqueued."""
     if not memory_store.is_memory_enabled(conn, user_id):
         return False
     now = now if now is not None else int(time.time())
+    enq_at = now - IDLE_SECONDS if immediate else now
     conn.execute(
         "INSERT INTO recall_index_jobs "
         "(session_id, user_id, status, attempts, last_error, enqueued_at, updated_at) "
         "VALUES (?,?, 'pending', 0, NULL, ?, ?) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         " status='pending', attempts=0, last_error=NULL, "
-        " enqueued_at=excluded.enqueued_at, updated_at=excluded.updated_at",
-        (session_id, str(user_id), now, now),
+        " enqueued_at=MIN(enqueued_at, excluded.enqueued_at), "
+        " updated_at=excluded.updated_at",
+        (session_id, str(user_id), enq_at, now),
     )
     conn.commit()
     return True

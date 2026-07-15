@@ -99,5 +99,13 @@ class ParserClient:
         r.raise_for_status()
         return r.json()
 
+    async def agent_memory_delete(self, user_id, session_id):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/agent-memory/delete",
+            json={"user_id": str(user_id), "session_id": session_id})
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()

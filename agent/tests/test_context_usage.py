@@ -78,3 +78,22 @@ def test_cross_user_session_returns_zero(conn):
     other = cc.compute_usage(conn, session_id="s1", user_id="u2", model="qwen")
     assert owner["tokens"] > 0
     assert other["tokens"] == 0 and other["pct"] == 0   # not owned → zeros
+
+
+def test_usage_excludes_folded_prefix(tmp_path):
+    conn = init_db(str(tmp_path / "m.db"))
+    conn.execute("INSERT INTO sessions(id,user_id,created_at,updated_at,"
+                 "rolling_summary,folded_upto,last_overhead_tokens) "
+                 "VALUES('s1','u1',0,0,'SUM',2,0)")
+    hist = [{"role": "user", "content": "a" * 400},
+            {"role": "assistant", "content": "b" * 400},
+            {"role": "user", "content": "c" * 40}]
+    conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) "
+                 "VALUES('m1','s1','history',?,1)", (json.dumps(hist),))
+    conn.commit()
+    out = cc.compute_usage(conn, session_id="s1", user_id="u1", model="m")
+    # folded first two messages (~800 chars) must NOT be counted
+    assert out["tokens"] < cc.estimate_messages_tokens(hist)
+    expected = (cc.estimate_tokens("SUM")
+                + cc.estimate_messages_tokens(hist[2:]))
+    assert abs(out["tokens"] - expected) <= 2
