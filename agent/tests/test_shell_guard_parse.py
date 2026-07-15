@@ -24,6 +24,11 @@ def test_append_redirect_captured():
     assert "/var/log/x" in segs[0].redirect_targets
 
 
+def test_ampersand_redirect_target_captured():
+    segs = segments("rm -rf /DATA/foo &> /tmp/log")
+    assert "/tmp/log" in segs[0].redirect_targets
+
+
 def test_unbalanced_quotes_unparseable():
     assert segments('echo "unterminated') is None
 

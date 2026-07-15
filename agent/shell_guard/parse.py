@@ -10,8 +10,8 @@ import shlex
 from dataclasses import dataclass, field
 
 _OPERATORS = {"|", "||", "&&", ";", "&"}
-_REDIRECT_OPS = {">", ">>"}
-_ALL_REDIRECT = {">", ">>", "<", "<<", "2>", "&>"}
+_REDIRECT_OPS = {">", ">>", "&>"}
+_ALL_REDIRECT = {">", ">>", "<", "<<", "&>"}
 
 
 @dataclass
