@@ -245,14 +245,19 @@ async def _guard_command(command: str) -> str | None:
         # still goes through judge/confirm here. Pipe-to-shell / protected-path
         # uploads are classified above gray and are unaffected by this deferral.
         if EXEC_MODE != "bwrap":
-            # Defer benign external uploads to the egress A-path — but ONLY when
-            # the command is cleanly parseable by our OWN parser. A command that
-            # is gray *because* it contains $()/backticks (segments()->None) must
-            # NOT be deferred: egress.parse_upload uses plain shlex.split and
-            # ignores substitutions, so it would wave through a destructive
-            # $(rm -rf ...). Those fall through to judge/confirm.
+            # Defer benign external uploads to the egress A-path — ONLY when the
+            # command is a SINGLE simple command (one segment, no redirects)
+            # whose sole purpose is the upload. A command that is gray *because*
+            # it contains $()/backticks (segments()->None) is unparseable and must
+            # NOT be deferred: egress.parse_upload uses plain shlex.split and would
+            # wave through a destructive $(rm -rf ...). Likewise a parseable-but-
+            # COMPOUND command (e.g. `curl -T f host ; rm -rf /DATA`) must NOT
+            # defer: parse_upload reads the whole string and would wave the
+            # destructive tail through. Those fall through to judge/confirm.
             from shell_guard.parse import segments as _seg  # noqa: PLC0415
-            if _seg(command) is not None:
+            _segs = _seg(command)
+            if (_segs is not None and len(_segs) == 1
+                    and not _segs[0].redirect_targets and not _segs[0].read_targets):
                 try:
                     from egress import parse as _ep  # noqa: PLC0415
                     _intent = _ep.parse_upload(command)
@@ -262,6 +267,11 @@ async def _guard_command(command: str) -> str | None:
                     pass
         verdict = await judge_command(command)
         if verdict == "allow":
+            # A judge-allowed gray command that writes to real paths still gets a
+            # cheap backstop — a small-model false-negative must not mean silent,
+            # unrecoverable data loss.
+            if decision.paths:
+                guard_backstop.prepare_backstop(decision.paths)
             return None
         reason = "命令需人工确认(灰区判定)"
     else:
@@ -298,7 +308,11 @@ async def _guard_command(command: str) -> str | None:
     if not granted:
         return "用户拒绝或未能确认该命令,未执行。"
     if db is not None and mgr.consume_remember(confirm_id):
-        guard_allowlist.add(db, "prefix", command, "confirm-card")
+        # Store an anchored EXACT-match regex, not an open prefix — otherwise a
+        # remembered `rm -rf /DATA/scratch` would also auto-run a later superset
+        # `rm -rf /DATA/scratch /DATA/important`, deleting an unapproved path.
+        import re as _re  # noqa: PLC0415
+        guard_allowlist.add(db, "regex", f"^{_re.escape(command)}$", "confirm-card")
     return None
 
 

@@ -22,6 +22,16 @@ def test_regex_match():
     assert AL.match(conn, "rm -rf /DATA") is False
 
 
+def test_anchored_exact_regex_rejects_superset():
+    """I2: 'remember' stores an anchored exact-match regex, not an open prefix,
+    so a superset command touching an unapproved extra path does NOT match."""
+    conn = _db()
+    import re
+    AL.add(conn, "regex", f"^{re.escape('rm -rf /DATA/scratch')}$", "confirm-card")
+    assert AL.match(conn, "rm -rf /DATA/scratch") is True
+    assert AL.match(conn, "rm -rf /DATA/scratch /DATA/important") is False
+
+
 def test_path_scope_match():
     conn = _db()
     AL.add(conn, "path_scope", "/DATA/scratch", "user")

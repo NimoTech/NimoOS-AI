@@ -80,6 +80,17 @@ def test_remember_adds_to_allowlist(monkeypatch):
     assert AL.match(conn, "rm -rf /DATA/x") is True
 
 
+def test_remember_stores_anchored_exact_not_open_prefix(monkeypatch):
+    """I2 IMPORTANT: 'remember' must store an anchored exact-match, not an open
+    prefix — otherwise a later SUPERSET command touching an unapproved extra
+    path (e.g. `rm -rf /DATA/scratch /DATA/important`) would auto-run."""
+    conn = _setup(monkeypatch, _Mgr(grant=True, remember=True), _Sink())
+    from shell_guard import allowlist as AL
+    asyncio.run(shell._guard_command("rm -rf /DATA/scratch"))
+    assert AL.match(conn, "rm -rf /DATA/scratch") is True
+    assert AL.match(conn, "rm -rf /DATA/scratch /DATA/important") is False
+
+
 def test_gray_external_upload_deferred_to_egress_apath(monkeypatch):
     """A gray-classified external upload (curl -T to a public host) must be
     deferred to the egress A-path (content-aware DLP), NOT gated by the generic
@@ -168,6 +179,76 @@ def test_guard_invoked_by_run_command_impl_short_circuits(monkeypatch):
     result = asyncio.run(shell._run_command_impl("rm -rf /x", 30, False))
     assert result == "REFUSED-BY-GUARD"
     assert ran == []  # command never executed
+
+
+def test_compound_upload_not_deferred_unattended(monkeypatch):
+    """C1 CRITICAL: a parseable-but-COMPOUND command whose first segment is a
+    benign external upload must NOT be deferred to the A-path — parse_upload
+    reads the whole string and would wave the destructive tail through.
+    Unattended (no confirm channel) → NON-None fail-closed refusal."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    shell.CONFIRM_MGR_VAR.set(None)  # unattended
+    shell.EVENT_QUEUE_VAR.set(None)
+    cmd = ("curl -T /DATA/ok.txt https://api.example.com/up ; "
+           "truncate -s0 /DATA/taxes.db")
+    result = asyncio.run(shell._guard_command(cmd))
+    assert result is not None  # NOT deferred; fail-closed refusal
+    assert "无确认通道" in result
+
+
+def test_compound_upload_gated_with_confirm(monkeypatch):
+    """C1: same compound command with a confirm channel present → gated
+    (registers a shell_command confirm), NOT deferred to the A-path."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    cmd = ("curl -T /DATA/ok.txt https://api.example.com/up ; "
+           "truncate -s0 /DATA/taxes.db")
+    result = asyncio.run(shell._guard_command(cmd))
+    assert mgr.registered != []  # gated, not deferred
+    assert mgr.registered[0][0] == "shell_command"
+
+
+def test_gray_allow_with_paths_gets_backstop(monkeypatch, tmp_path):
+    """I1 IMPORTANT: a judge-allowed GRAY command that writes to real paths
+    still gets a backstop — a small-model false-negative must not mean silent,
+    unrecoverable data loss. Returns None (allowed) AND prepare_backstop called."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+
+    async def _allow(_cmd):
+        return "allow"
+    monkeypatch.setattr(shell, "judge_command", _allow)
+
+    calls = []
+
+    def _fake_backstop(paths, trash_root=None):
+        calls.append(paths)
+        from shell_guard.backstop import BackstopResult
+        return BackstopResult("none", "", False, "")
+
+    monkeypatch.setattr("shell_guard.backstop.prepare_backstop", _fake_backstop)
+
+    # An existing real path target so decision.paths is non-empty.
+    target = tmp_path / "f.dat"
+    target.write_text("data")
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    result = asyncio.run(shell._guard_command(f"truncate -s0 {target}"))
+    assert result is None  # judge allowed
+    assert len(calls) == 1  # backstop still built for the path target
+    assert str(target) in calls[0]
 
 
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):

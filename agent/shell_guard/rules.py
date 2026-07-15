@@ -172,7 +172,7 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
             and not has_write_redirect:
         return Decision("safe")
 
-    return Decision("gray", f"unclassified command: {name or '(redirect)'}")
+    return Decision("gray", f"unclassified command: {name or '(redirect)'}", paths)
 
 
 def classify(command: str) -> Decision:
