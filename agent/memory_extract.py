@@ -257,7 +257,8 @@ async def _default_llm_call(job, prompt) -> str:
 def _default_history_loader(session_id) -> list:
     import db
     row = db.get_connection().execute(
-        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (session_id,),
     ).fetchone()
     if not row:

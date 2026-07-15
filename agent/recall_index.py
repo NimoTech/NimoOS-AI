@@ -168,7 +168,7 @@ def _read_history(conn, session_id) -> list:
     import json as _json
     row = conn.execute(
         "SELECT content FROM messages WHERE session_id=? "
-        "ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (session_id,)).fetchone()
     if not row:
         return []
     try:

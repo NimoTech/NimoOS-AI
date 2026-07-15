@@ -1284,7 +1284,8 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
         raise HTTPException(status_code=404, detail="session not found")
 
     last_row = _conn.execute(
-        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (session_id,)
     ).fetchone()
     if not last_row:
@@ -1632,7 +1633,8 @@ async def regenerate_title(
         raise HTTPException(status_code=404, detail="session not found")
 
     last_row = _conn.execute(
-        "SELECT content FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (session_id,),
     ).fetchone()
     history = []
