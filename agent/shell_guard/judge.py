@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import urllib.error
 import urllib.request
 from functools import partial
 
@@ -79,6 +78,8 @@ async def judge_command(command: str) -> str:
     except Exception as exc:  # noqa: BLE001 — fail-safe to ask
         logger.warning("shell_guard.judge: ollama error: %s", exc)
         return "ask"
+    if not isinstance(resp, dict):
+        return "ask"
     raw = resp.get("response", "")
     if not isinstance(raw, str) or not raw.strip():
         thinking = resp.get("thinking")
@@ -87,7 +88,9 @@ async def judge_command(command: str) -> str:
         return "ask"
     try:
         out = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
+        return "ask"
+    if not isinstance(out, dict):
         return "ask"
     verdict = out.get("verdict", "")
     return verdict if verdict in _VALID else "ask"
