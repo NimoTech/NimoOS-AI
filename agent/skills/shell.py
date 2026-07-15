@@ -213,6 +213,19 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     return bool(granted)
 
 
+_SHELL_META_CHARS = ";|&`()<>\n\r"
+
+
+def _argv_is_atomic(seg) -> bool:
+    """True only if no argv token carries a shell control metacharacter — a
+    belt-and-suspenders so the upload deferral can never wave through a compound
+    command even if _OPERATORS ever misses a separator."""
+    return not any(
+        ("$(" in tok) or any(ch in tok for ch in _SHELL_META_CHARS)
+        for tok in seg.argv
+    )
+
+
 async def _guard_command(command: str) -> str | None:
     """Classify `command`; return a refusal string to block, or None to allow.
 
@@ -257,7 +270,8 @@ async def _guard_command(command: str) -> str | None:
             from shell_guard.parse import segments as _seg  # noqa: PLC0415
             _segs = _seg(command)
             if (_segs is not None and len(_segs) == 1
-                    and not _segs[0].redirect_targets and not _segs[0].read_targets):
+                    and not _segs[0].redirect_targets and not _segs[0].read_targets
+                    and _argv_is_atomic(_segs[0])):
                 try:
                     from egress import parse as _ep  # noqa: PLC0415
                     _intent = _ep.parse_upload(command)

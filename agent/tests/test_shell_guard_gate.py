@@ -320,6 +320,47 @@ def test_gray_allow_compound_backstop_covers_tail(monkeypatch, tmp_path):
     assert str(target) in calls[0]  # destructive tail's target is backed up
 
 
+def test_extra_operator_compound_uploads_not_deferred_unattended(monkeypatch):
+    """C1 residual: `|&`, `;;`, `;&` are bash control operators. A command using
+    one to chain a destructive tail onto a benign upload must NOT be deferred —
+    unattended → NON-None fail-closed refusal for each."""
+    for op in ("|&", ";;", ";&"):
+        mgr, sink = _Mgr(grant=True), _Sink()
+        _setup(monkeypatch, mgr, sink)
+
+        async def _ask(_cmd):
+            return "ask"
+        monkeypatch.setattr(shell, "judge_command", _ask)
+
+        monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+        shell.CONFIRM_MGR_VAR.set(None)  # unattended
+        shell.EVENT_QUEUE_VAR.set(None)
+        cmd = (f"curl -T /DATA/ok.txt https://api.example.com/up {op} "
+               "truncate -s0 /DATA/db")
+        result = asyncio.run(shell._guard_command(cmd))
+        assert result is not None, f"op {op!r} should not defer"
+        assert "无确认通道" in result, f"op {op!r} should fail closed"
+
+
+def test_extra_operator_compound_uploads_gated_with_confirm(monkeypatch):
+    """C1 residual: same operator-compound uploads, with a confirm channel →
+    gated (register a shell_command confirm), NOT deferred."""
+    for op in ("|&", ";;", ";&"):
+        mgr, sink = _Mgr(grant=True), _Sink()
+        _setup(monkeypatch, mgr, sink)
+
+        async def _ask(_cmd):
+            return "ask"
+        monkeypatch.setattr(shell, "judge_command", _ask)
+
+        monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+        cmd = (f"curl -T /DATA/ok.txt https://api.example.com/up {op} "
+               "truncate -s0 /DATA/db")
+        result = asyncio.run(shell._guard_command(cmd))
+        assert mgr.registered != [], f"op {op!r} should be gated"
+        assert mgr.registered[0][0] == "shell_command"
+
+
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):
     """Security-review addition: an allowlisted DESTRUCTIVE command must not
     skip the backstop, only the confirmation. Runs unattended (no confirm

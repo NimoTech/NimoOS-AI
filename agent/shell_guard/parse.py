@@ -9,7 +9,10 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass, field
 
-_OPERATORS = {"|", "||", "&&", ";", "&"}
+# The complete set of bash control operators that separate commands. Keep this
+# complete — a missing operator lets a compound command collapse into one
+# segment and slip past single-segment guards (allowlist match / upload deferral).
+_OPERATORS = {"|", "||", "&&", ";", "&", "|&", ";;", ";&", ";;&"}
 _REDIRECT_OPS = {">", ">>", "&>"}     # write
 _READ_OPS = {"<", "<<"}               # read
 _ALL_REDIRECT = {">", ">>", "&>", "<", "<<"}

