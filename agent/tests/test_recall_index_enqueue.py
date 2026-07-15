@@ -71,3 +71,29 @@ def test_reenqueue_does_not_postpone_claimability(tmp_path):
     row = conn.execute("SELECT enqueued_at FROM recall_index_jobs "
                        "WHERE session_id='s1'").fetchone()
     assert row["enqueued_at"] == 1000
+
+
+def test_immediate_enqueue_is_claimable_now(tmp_path):
+    conn = _conn(tmp_path)
+    assert maybe_enqueue_index_job(conn, "s1", "u1", now=1000, immediate=True)
+    row = conn.execute("SELECT enqueued_at FROM recall_index_jobs "
+                       "WHERE session_id='s1'").fetchone()
+    assert row["enqueued_at"] == 1000 - IDLE_SECONDS
+
+
+def test_normal_reenqueue_keeps_immediate_backdate(tmp_path):
+    # A later normal enqueue must not push an immediate job back out.
+    conn = _conn(tmp_path)
+    maybe_enqueue_index_job(conn, "s1", "u1", now=1000, immediate=True)
+    maybe_enqueue_index_job(conn, "s1", "u1", now=1010)
+    row = conn.execute("SELECT enqueued_at FROM recall_index_jobs "
+                       "WHERE session_id='s1'").fetchone()
+    assert row["enqueued_at"] == 1000 - IDLE_SECONDS
+
+
+def test_disabled_memory_short_circuits_immediate(tmp_path):
+    conn = init_db(str(tmp_path / "m2.db"))
+    conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
+                 "VALUES('u1','memory_enabled','0',0)")
+    conn.commit()
+    assert not maybe_enqueue_index_job(conn, "s1", "u1", now=1000, immediate=True)
