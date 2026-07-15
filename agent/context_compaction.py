@@ -13,6 +13,7 @@ import logging
 import re
 
 import memory_store
+import recall_index
 
 _LOG = logging.getLogger("nimoos-agent.context_compaction")
 
@@ -182,17 +183,19 @@ def _prev_user_boundary(history, cut) -> int:
     return us[-1] if us else 0
 
 
-def _read_summary(conn, session_id) -> str:
-    row = conn.execute("SELECT rolling_summary FROM sessions WHERE id=?",
-                       (session_id,)).fetchone()
+def _read_summary_state(conn, session_id) -> tuple[str, int]:
+    row = conn.execute(
+        "SELECT rolling_summary, folded_upto FROM sessions WHERE id=?",
+        (session_id,)).fetchone()
     if not row:
-        return ""
-    return row["rolling_summary"] or ""
+        return "", 0
+    return (row["rolling_summary"] or ""), (row["folded_upto"] or 0)
 
 
-def _write_summary(conn, session_id, summary) -> None:
-    conn.execute("UPDATE sessions SET rolling_summary=? WHERE id=?",
-                 (summary, session_id))
+def _write_summary_state(conn, session_id, summary, folded_upto) -> None:
+    conn.execute(
+        "UPDATE sessions SET rolling_summary=?, folded_upto=? WHERE id=?",
+        (summary, folded_upto, session_id))
     conn.commit()
 
 
@@ -229,48 +232,57 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
     try:
         if not memory_store.is_compaction_enabled(conn, user_id):
             return "", history
-        S = _read_summary(conn, session_id)
+        S, F = _read_summary_state(conn, session_id)
+        if F < 0 or F > len(history):
+            # Stale cursor (manual restore / external edit): fall back to 0
+            # rather than slicing history into nonsense.
+            _LOG.warning("stale folded_upto=%d for %s (history=%d); using 0",
+                         F, session_id, len(history))
+            F = 0
         W = resolve_window(conn, user_id, model_name)
         line = int(THRESHOLD * W)
+        # history[:F] already lives inside S — count only the unfolded part,
+        # or a long session would stay "over the line" forever.
         total = (overhead_tokens + estimate_tokens(S)
-                 + estimate_messages_tokens(history)
+                 + estimate_messages_tokens(history[F:])
                  + estimate_tokens(current_text))
         if total <= line:
-            return summary_block(S), history
+            return summary_block(S), history[F:] if F else history
 
+        new_S, new_F = S, F
+        send_history = history[F:]
         cut = keepk_cut(history, RECENT_TURNS)
-        instr_overhead = estimate_tokens(SUMMARIZE_INSTRUCTION) + estimate_tokens(S)
-        # Build the TRUNCATED fold actually sent to the summarizer, shrinking cut
-        # until that truncated fold fits the summarizer window W. (Estimating the
-        # full history here would wrongly shrink cut to 0 for tool-heavy sessions
-        # and disable compaction — the fold we send is the truncated one.)
-        fold_text = ""
-        while cut > 0:
-            fold_text = "\n".join(
-                _message_text(m, max_output_chars=SUMMARY_OUTPUT_MAX_CHARS)
-                for m in history[:cut])
-            if instr_overhead + estimate_tokens(fold_text) <= W:
-                break
-            cut = _prev_user_boundary(history, cut)
+        if cut > F:
+            instr_overhead = estimate_tokens(SUMMARIZE_INSTRUCTION) + estimate_tokens(S)
+            # Fold only the [F:cut) delta, shrinking cut (floored at F) until
+            # the truncated fold fits the summarizer window W.
             fold_text = ""
-
-        new_S = S
-        send_history = history
-        if cut > 0:
-            out = None
-            try:
-                out = await asyncio.wait_for(
-                    summarize_fn(SUMMARIZE_INSTRUCTION, S, fold_text),
-                    timeout=COMPACT_LLM_TIMEOUT)
-            except Exception as e:
-                _LOG.warning("compaction summarize failed (%s): %s",
-                             session_id, e)
-            if (out and out.strip()
-                    and estimate_tokens(out) < estimate_tokens(fold_text)):
-                new_S = out.strip()
-                _write_summary(conn, session_id, new_S)
-                send_history = history[cut:]
-            # else: keep old S, send_history stays = history → terminal truncate
+            fold_cut = cut
+            while fold_cut > F:
+                fold_text = "\n".join(
+                    _message_text(m, max_output_chars=SUMMARY_OUTPUT_MAX_CHARS)
+                    for m in history[F:fold_cut])
+                if instr_overhead + estimate_tokens(fold_text) <= W:
+                    break
+                fold_cut = max(_prev_user_boundary(history, fold_cut), F)
+                fold_text = ""
+            if fold_cut > F and fold_text:
+                out = None
+                try:
+                    out = await asyncio.wait_for(
+                        summarize_fn(SUMMARIZE_INSTRUCTION, S, fold_text),
+                        timeout=COMPACT_LLM_TIMEOUT)
+                except Exception as e:
+                    _LOG.warning("compaction summarize failed (%s): %s",
+                                 session_id, e)
+                if (out and out.strip()
+                        and estimate_tokens(out) < estimate_tokens(fold_text)):
+                    new_S = out.strip()
+                    new_F = fold_cut
+                    _write_summary_state(conn, session_id, new_S, new_F)
+                    send_history = history[fold_cut:]
+                # else: cursor unchanged; send_history stays history[F:] →
+                # terminal truncate below decides what still fits.
 
         if (overhead_tokens + estimate_tokens(new_S)
                 + estimate_messages_tokens(send_history)
@@ -278,9 +290,6 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
             send_history = _truncate_to_fit(send_history, new_S,
                                             current_text, line,
                                             overhead=overhead_tokens)
-        # Defensive: if even the truncated payload still exceeds LINE (small
-        # window + big overhead + huge current input — nothing left to drop),
-        # log a warning but DO NOT raise (never break chat); best-effort send.
         if (overhead_tokens + estimate_tokens(new_S)
                 + estimate_messages_tokens(send_history)
                 + estimate_tokens(current_text)) > line:
@@ -288,6 +297,18 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
                 "context still over budget after compaction for %s "
                 "(overhead=%d, window-line=%d): input too long / too many tools",
                 session_id, overhead_tokens, line)
+
+        # Content left the model's context THIS run (new fold or truncation):
+        # make it recallable right away instead of waiting for a 120s idle gap
+        # that a busy session may never reach. Never blocks / never raises.
+        dropped = (new_F > F) or (len(send_history) < len(history) - new_F)
+        if dropped:
+            try:
+                recall_index.maybe_enqueue_index_job(
+                    conn, session_id, str(user_id), now=now, immediate=True)
+            except Exception:
+                _LOG.debug("immediate recall enqueue failed for %s",
+                           session_id, exc_info=True)
         return summary_block(new_S), send_history
     except Exception as e:
         _LOG.warning("compaction error, bypassing (%s): %s", session_id, e)
