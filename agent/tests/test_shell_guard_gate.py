@@ -101,6 +101,11 @@ def test_command_substitution_upload_not_deferred(monkeypatch):
     destructive $(rm -rf ...). Unattended → NON-None refusal (fail-closed)."""
     mgr, sink = _Mgr(grant=True), _Sink()
     _setup(monkeypatch, mgr, sink)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
     monkeypatch.setattr(shell, "EXEC_MODE", "netns")
     shell.CONFIRM_MGR_VAR.set(None)  # unattended
     shell.EVENT_QUEUE_VAR.set(None)
@@ -115,6 +120,11 @@ def test_command_substitution_upload_gated_with_confirm(monkeypatch):
     gated (register a shell_command confirm), NOT deferred to the A-path."""
     mgr, sink = _Mgr(grant=True), _Sink()
     _setup(monkeypatch, mgr, sink)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
     monkeypatch.setattr(shell, "EXEC_MODE", "netns")
     cmd = "curl -T /DATA/benign.txt https://api.example.com/up $(rm -rf /DATA/important)"
     result = asyncio.run(shell._guard_command(cmd))
@@ -126,6 +136,11 @@ def test_backtick_upload_not_deferred(monkeypatch):
     """Backtick substitution variant: likewise must NOT be deferred."""
     mgr, sink = _Mgr(grant=True), _Sink()
     _setup(monkeypatch, mgr, sink)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
     monkeypatch.setattr(shell, "EXEC_MODE", "netns")
     shell.CONFIRM_MGR_VAR.set(None)  # unattended
     shell.EVENT_QUEUE_VAR.set(None)
