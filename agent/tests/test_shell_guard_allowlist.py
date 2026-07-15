@@ -22,6 +22,14 @@ def test_regex_match():
     assert AL.match(conn, "rm -rf /DATA") is False
 
 
+def test_prefix_does_not_match_newline_smuggled_tail():
+    """A newline is a bash command separator, so `match()` (single-segment only)
+    must NOT vouch for `git pull\\nrm -rf /DATA` on a `git pull` prefix entry."""
+    conn = _db()
+    AL.add(conn, "prefix", "git pull", "user")
+    assert AL.match(conn, "git pull\nrm -rf /DATA") is False
+
+
 def test_anchored_exact_regex_rejects_superset():
     """I2: 'remember' stores an anchored exact-match regex, not an open prefix,
     so a superset command touching an unapproved extra path does NOT match."""

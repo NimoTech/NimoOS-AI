@@ -22,6 +22,37 @@ class Segment:
     read_targets: list[str] = field(default_factory=list)       # read
 
 
+def _split_unquoted_newlines(command: str) -> str:
+    """Bash treats an unquoted newline as a command separator. shlex would
+    swallow it as whitespace, collapsing multiple commands into one segment,
+    so normalize unquoted newlines/CRs to ';'. Newlines inside quotes are
+    preserved verbatim."""
+    out = []
+    quote = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(command[i + 1]); i += 2; continue
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c; out.append(c)
+        elif c in ("\n", "\r"):
+            out.append(";")
+            # Consume the rest of a newline/CR run so `\r\n` or blank lines do
+            # not emit `;;` — shlex would group consecutive punctuation into a
+            # single non-operator token, collapsing the split.
+            while i + 1 < n and command[i + 1] in ("\n", "\r"):
+                i += 1
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokenize(command: str) -> list[str] | None:
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
@@ -32,6 +63,7 @@ def _tokenize(command: str) -> list[str] | None:
 
 
 def segments(command: str) -> list[Segment] | None:
+    command = _split_unquoted_newlines(command)
     toks = _tokenize(command)
     if toks is None:
         return None

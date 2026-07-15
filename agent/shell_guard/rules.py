@@ -182,6 +182,12 @@ def classify(command: str) -> Decision:
     if not segs:
         return Decision("safe")
     result = Decision("safe")
+    all_paths: list[str] = []
     for idx, seg in enumerate(segs):
         result = _worse(result, _classify_seg(seg, segs, idx))
+        for p in extract_paths(seg):
+            if p not in all_paths:
+                all_paths.append(p)
+    if result.level != "safe":
+        result.paths = all_paths
     return result

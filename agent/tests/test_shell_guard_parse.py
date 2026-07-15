@@ -29,6 +29,29 @@ def test_ampersand_redirect_target_captured():
     assert "/tmp/log" in segs[0].redirect_targets
 
 
+def test_unquoted_newline_splits_segments():
+    """Bash treats an unquoted newline as a command separator; shlex would
+    swallow it as whitespace and collapse two commands into one segment."""
+    segs = segments("echo a\ntruncate -s0 /x")
+    assert segs is not None
+    assert [s.argv[0] for s in segs] == ["echo", "truncate"]
+    assert "/x" in segs[1].argv
+
+
+def test_newline_inside_quotes_preserved():
+    """A newline inside quotes is part of the argument, not a separator."""
+    segs = segments('echo "line1\nline2"')
+    assert segs is not None
+    assert len(segs) == 1
+    assert segs[0].argv == ["echo", "line1\nline2"]
+
+
+def test_crlf_splits_segments():
+    segs = segments("echo a\r\ntruncate -s0 /x")
+    assert segs is not None
+    assert [s.argv[0] for s in segs] == ["echo", "truncate"]
+
+
 def test_read_redirect_target_captured():
     segs = segments("cat < /etc/shadow")
     assert "/etc/shadow" in segs[0].read_targets
