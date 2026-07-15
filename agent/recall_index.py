@@ -35,7 +35,8 @@ def maybe_enqueue_index_job(conn, session_id, user_id, *, now=None) -> bool:
         "VALUES (?,?, 'pending', 0, NULL, ?, ?) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         " status='pending', attempts=0, last_error=NULL, "
-        " enqueued_at=excluded.enqueued_at, updated_at=excluded.updated_at",
+        " enqueued_at=MIN(enqueued_at, excluded.enqueued_at), "
+        " updated_at=excluded.updated_at",
         (session_id, str(user_id), now, now),
     )
     conn.commit()
