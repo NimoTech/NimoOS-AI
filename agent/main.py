@@ -2384,6 +2384,41 @@ async def confirm_session(
     return {"ok": True}
 
 
+@app.get("/agent/shell-allowlist")
+async def shell_allowlist_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from shell_guard import allowlist as _al
+    import db as _db
+    return {"entries": _al.list_entries(_db.get_connection())}
+
+
+@app.post("/agent/shell-allowlist")
+async def shell_allowlist_add(
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    from shell_guard import allowlist as _al
+    import db as _db
+    import json as _json
+    data = _json.loads(await request.body() or b"{}")
+    match_type = str(data.get("match_type", ""))
+    value = str(data.get("value", ""))
+    note = str(data.get("note", ""))
+    if match_type not in ("prefix", "regex", "path_scope") or not value:
+        raise HTTPException(status_code=400, detail="bad_match_type_or_value")
+    entry_id = _al.add(_db.get_connection(), match_type, value, x_user_id, note)
+    return {"id": entry_id}
+
+
+@app.delete("/agent/shell-allowlist/{entry_id}")
+async def shell_allowlist_delete(
+    entry_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    from shell_guard import allowlist as _al
+    import db as _db
+    return {"ok": _al.delete(_db.get_connection(), entry_id)}
+
+
 @app.post("/agent/sandbox-run")
 async def sandbox_run_endpoint(
     req: SandboxRunRequest,
