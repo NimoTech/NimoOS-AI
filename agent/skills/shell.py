@@ -245,13 +245,21 @@ async def _guard_command(command: str) -> str | None:
         # still goes through judge/confirm here. Pipe-to-shell / protected-path
         # uploads are classified above gray and are unaffected by this deferral.
         if EXEC_MODE != "bwrap":
-            try:
-                from egress import parse as _ep  # noqa: PLC0415
-                _intent = _ep.parse_upload(command)
-                if _intent is not None and _intent.external:
-                    return None
-            except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
-                pass
+            # Defer benign external uploads to the egress A-path — but ONLY when
+            # the command is cleanly parseable by our OWN parser. A command that
+            # is gray *because* it contains $()/backticks (segments()->None) must
+            # NOT be deferred: egress.parse_upload uses plain shlex.split and
+            # ignores substitutions, so it would wave through a destructive
+            # $(rm -rf ...). Those fall through to judge/confirm.
+            from shell_guard.parse import segments as _seg  # noqa: PLC0415
+            if _seg(command) is not None:
+                try:
+                    from egress import parse as _ep  # noqa: PLC0415
+                    _intent = _ep.parse_upload(command)
+                    if _intent is not None and _intent.external:
+                        return None
+                except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
+                    pass
         verdict = await judge_command(command)
         if verdict == "allow":
             return None

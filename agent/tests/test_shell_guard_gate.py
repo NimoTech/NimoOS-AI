@@ -94,6 +94,67 @@ def test_gray_external_upload_deferred_to_egress_apath(monkeypatch):
     assert mgr.registered == []  # deferred to A-path, not gated
 
 
+def test_command_substitution_upload_not_deferred(monkeypatch):
+    """CRITICAL: a command that is gray *because* it contains $()/backticks
+    (unparseable by our own parser) must NOT be deferred to the egress A-path —
+    egress.parse_upload ignores substitutions and would wave through a
+    destructive $(rm -rf ...). Unattended → NON-None refusal (fail-closed)."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    shell.CONFIRM_MGR_VAR.set(None)  # unattended
+    shell.EVENT_QUEUE_VAR.set(None)
+    cmd = "curl -T /DATA/benign.txt https://api.example.com/up $(rm -rf /DATA/important)"
+    result = asyncio.run(shell._guard_command(cmd))
+    assert result is not None  # NOT deferred; fail-closed refusal
+    assert "无确认通道" in result
+
+
+def test_command_substitution_upload_gated_with_confirm(monkeypatch):
+    """Same obfuscated upload, but with a confirm channel present: it must be
+    gated (register a shell_command confirm), NOT deferred to the A-path."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    cmd = "curl -T /DATA/benign.txt https://api.example.com/up $(rm -rf /DATA/important)"
+    result = asyncio.run(shell._guard_command(cmd))
+    assert mgr.registered != []  # gated, not deferred
+    assert mgr.registered[0][0] == "shell_command"
+
+
+def test_backtick_upload_not_deferred(monkeypatch):
+    """Backtick substitution variant: likewise must NOT be deferred."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    shell.CONFIRM_MGR_VAR.set(None)  # unattended
+    shell.EVENT_QUEUE_VAR.set(None)
+    cmd = "curl -T /DATA/benign.txt https://api.example.com/up `rm -rf /DATA/important`"
+    result = asyncio.run(shell._guard_command(cmd))
+    assert result is not None  # NOT deferred; fail-closed refusal
+    assert "无确认通道" in result
+
+
+def test_guard_invoked_by_run_command_impl_short_circuits(monkeypatch):
+    """Integration: _run_command_impl must actually invoke the guard and a
+    refusal must short-circuit execution (netns mode, the default)."""
+    monkeypatch.setattr(shell, "EXEC_MODE", "netns")
+    ran = []
+
+    async def _fake_guard(command):
+        return "REFUSED-BY-GUARD"
+
+    async def _fake_run(cmd, timeout_sec, use_net, view):
+        ran.append(cmd)
+        return "[exit 0]\n"
+
+    monkeypatch.setattr(shell, "_guard_command", _fake_guard)
+    monkeypatch.setattr(shell, "_run", _fake_run)
+    result = asyncio.run(shell._run_command_impl("rm -rf /x", 30, False))
+    assert result == "REFUSED-BY-GUARD"
+    assert ran == []  # command never executed
+
+
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):
     """Security-review addition: an allowlisted DESTRUCTIVE command must not
     skip the backstop, only the confirmation. Runs unattended (no confirm
