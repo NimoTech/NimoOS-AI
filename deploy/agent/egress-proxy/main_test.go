@@ -427,6 +427,19 @@ func TestUnknownHostTOFU(t *testing.T) {
 	//  because isConfirmed returns true.)
 }
 
+func TestTOFUExpires(t *testing.T) {
+	resetConfirmedHosts()
+	tofuTTL = 50 * time.Millisecond
+	markConfirmed("example.com")
+	if !isConfirmed("example.com") {
+		t.Fatal("host should be confirmed immediately after markConfirmed")
+	}
+	time.Sleep(70 * time.Millisecond)
+	if isConfirmed("example.com") {
+		t.Fatal("TOFU confirmation should expire after tofuTTL")
+	}
+}
+
 // TestExternalUploadOverThresholdAsks: upload > T_UPLOAD with deny confirm → connection closed.
 // We simulate this by exercising the counting logic and confirm callback directly.
 func TestExternalUploadOverThresholdAsks(t *testing.T) {

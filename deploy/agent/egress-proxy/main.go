@@ -122,35 +122,48 @@ const T_UPLOAD = 65536 // bytes threshold before asking confirm
 
 var confirmURL string // set from -confirm-url flag
 
-// confirmedHosts is the TOFU allowlist (process-global).
+// confirmedHosts is the TOFU allowlist (process-global). Each entry carries an
+// expiry: an auto-remembered host must NOT be trusted forever — a single
+// injection that wins one confirm would otherwise get a permanent silent
+// egress channel. Expired entries require a fresh first-connection confirm.
 var confirmedHosts struct {
 	sync.Mutex
-	m map[string]bool
+	m map[string]time.Time // host -> expiry
 }
+
+// tofuTTL is how long an auto-TOFU confirmation lasts. Configurable via
+// -tofu-ttl; default 1h (short enough to bound a stolen confirm, long enough
+// not to nag during a normal session).
+var tofuTTL = time.Hour
 
 func init() {
-	confirmedHosts.m = make(map[string]bool)
+	confirmedHosts.m = make(map[string]time.Time)
 }
 
-// isConfirmed returns true if host has been TOFU-confirmed.
 func isConfirmed(host string) bool {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	return confirmedHosts.m[host]
+	exp, ok := confirmedHosts.m[host]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(confirmedHosts.m, host)
+		return false
+	}
+	return true
 }
 
-// markConfirmed adds host to the TOFU allowlist.
 func markConfirmed(host string) {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	confirmedHosts.m[host] = true
+	confirmedHosts.m[host] = time.Now().Add(tofuTTL)
 }
 
-// resetConfirmedHosts clears the TOFU allowlist (used in tests).
 func resetConfirmedHosts() {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	confirmedHosts.m = make(map[string]bool)
+	confirmedHosts.m = make(map[string]time.Time)
 }
 
 // ─── Egress confirm callback ──────────────────────────────────────────────────
@@ -754,9 +767,11 @@ func main() {
 	upstream := flag.String("upstream", "", "DNS upstream (default: first non-169.254 nameserver from /etc/resolv.conf with :53)")
 	confirmURLFlag := flag.String("confirm-url", "http://127.0.0.1:8282/internal/egress-confirm", "URL for TOFU/threshold confirmation callbacks")
 	grantListen := flag.String("grant-listen", "127.0.0.1:8889", "Grant control server listen address")
+	tofuTTLFlag := flag.Duration("tofu-ttl", time.Hour, "TTL for auto-TOFU host confirmations")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
+	tofuTTL = *tofuTTLFlag
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream
