@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "desktop-app-builder",
+  "name": "desktop-app-builder",
+  "title": "Desktop app builder",
+  "description": "Build apps and widgets for the NimoOS web desktop: Docker containers with nimoos.* labels plus contract-compliant widget pages that auto-appear on the desktop. Use when the user wants to create, modify, or debug a desktop app, icon, or widget.",
+  "color": "blue",
+  "icon": "grid",
+  "trigger": "auto",
+  "examples": [
+    "Make an app that shows up on my NimoOS desktop",
+    "Build me a desktop widget that shows download progress"
+  ],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}
