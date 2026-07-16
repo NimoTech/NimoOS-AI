@@ -119,7 +119,7 @@ async def test_cold_stdio_self_heals_not_inline(monkeypatch, _clear_cache):
     metas = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
     assert metas == []
     assert scheduled["n"] == 1
-    assert warns and ("初始化" in warns[-1][1] or "下载" in warns[-1][1])
+    assert warns and ("initializing" in warns[-1][1] or "background" in warns[-1][1])
 
 
 @pytest.mark.asyncio

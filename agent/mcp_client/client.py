@@ -390,7 +390,7 @@ async def _metas_for_server(server: dict):
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
         await _emit_warning(server.get("name", "mcp"),
-                            "stdio 工具首次使用正在后台下载初始化,稍后重试")
+                            "stdio tools are initializing in the background for first use; retry shortly")
         return []
     try:
         return await _cold_fetch(server)        # http/sse:内联快取(短超时,不阻塞 run 启动)
