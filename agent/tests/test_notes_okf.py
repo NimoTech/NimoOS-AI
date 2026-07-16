@@ -57,3 +57,11 @@ def test_serialize_minimal_meta():
     out = serialize_note_text({"type": "note", "id": "x"}, "b\n")
     meta, body = parse_note_text(out)
     assert meta == {"type": "note", "id": "x"} and body == "b\n"
+
+
+def test_timestamp_stays_string_and_roundtrips_literally():
+    meta, _ = parse_note_text(SAMPLE)
+    assert isinstance(meta["timestamp"], str)
+    assert meta["timestamp"] == "2026-07-16T10:00:00+08:00"
+    out = serialize_note_text(meta, "b\n")
+    assert "2026-07-16T10:00:00+08:00" in out

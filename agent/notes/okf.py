@@ -17,6 +17,19 @@ _KEY_ORDER = ("type", "title", "description", "tags", "timestamp",
 _DELIM = "---"
 
 
+class _StrTimestampLoader(yaml.SafeLoader):
+    """SafeLoader minus implicit timestamp resolution — frontmatter values
+    like `timestamp: 2026-07-16T10:00:00+08:00` must stay strings (OKF/ISO
+    8601 on disk; json-serializable in memory)."""
+
+
+_StrTimestampLoader.yaml_implicit_resolvers = {
+    key: [(tag, regexp) for tag, regexp in resolvers
+          if tag != "tag:yaml.org,2002:timestamp"]
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
 def parse_note_text(text: str) -> tuple[dict, str]:
     lines = text.split("\n")
     if not lines or lines[0].strip() != _DELIM:
@@ -29,7 +42,7 @@ def parse_note_text(text: str) -> tuple[dict, str]:
     raw = "\n".join(lines[1:end])
     body = "\n".join(lines[end + 1:])
     try:
-        meta = yaml.safe_load(raw)
+        meta = yaml.load(raw, Loader=_StrTimestampLoader)
     except yaml.YAMLError:
         return {}, text
     if not isinstance(meta, dict):
