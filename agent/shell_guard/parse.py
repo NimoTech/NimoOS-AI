@@ -70,9 +70,12 @@ def segments(command: str) -> list[Segment] | None:
     toks = _tokenize(command)
     if toks is None:
         return None
-    # Subshell / command-substitution markers we won't statically resolve:
-    # surface conservatively as unparseable so the classifier sends to GRAY.
-    if any(ch in command for ch in ("$(", "`")):
+    # Subshell / command- and process-substitution markers we won't statically
+    # resolve: surface conservatively as unparseable so the classifier sends to
+    # GRAY. `<(`/`>(` (process substitution) run their inner command even when
+    # the outer verb is a SAFE reader (`cat <(rm -rf /DATA)`), so they MUST be
+    # here alongside `$(`/backtick command substitution.
+    if any(ch in command for ch in ("$(", "`", "<(", ">(")):
         return None
 
     segs: list[Segment] = []

@@ -249,7 +249,7 @@ func init() {
 	grantStore.m = make(map[string]*ticket)
 }
 
-const grantHeadroom = 1 << 20 // 1 MiB headroom over the observed upload size
+var grantHeadroom int64 = 1 << 20 // 1 MiB headroom over the observed upload size
 
 // grantTTL bounds how long a synthetic post-confirm grant stays valid.
 // Configurable via -grant-ttl; default 10m (was a hardcoded 24h).
@@ -477,70 +477,88 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For external targets: count upload bytes and enforce threshold.
-	// uploadAuthorized is a per-connection latch: once this connection has been
-	// authorized (via grant or confirm), subsequent chunks are forwarded without
-	// calling confirm again.
-	uploadAuthorized := false
-	var uploadTotal int64
+	// For external targets: enforce the per-connection upload byte gate.
 	uploadDone := make(chan struct{})
-
 	go func() {
 		defer close(uploadDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := cli.Read(buf)
-			if n > 0 {
-				chunk := int64(n)
-
-				// Pre-write gate: if this chunk would push us over the threshold
-				// and the connection is not yet authorized, we must authorize
-				// BEFORE writing any data to dst.
-				if !uploadAuthorized && uploadTotal+chunk > uploadThreshold {
-					if hasGrant(host) {
-						// Grant covers it; deduct and latch.
-						if !consumeGrant(host, chunk, cli) {
-							// Budget exhausted; consumeGrant already RST the conn.
-							break
-						}
-						uploadAuthorized = true
-					} else {
-						// No grant — ask confirm BEFORE writing the chunk.
-						if !callConfirm(host, uploadTotal+chunk, "upload_over_threshold") {
-							// Deny: RST; the over-limit chunk is never written.
-							if tc, ok := cli.(*net.TCPConn); ok {
-								tc.SetLinger(0)
-							}
-							cli.Close()
-							dst.Close()
-							break
-						}
-						// Allowed: latch for this connection and register a
-						// BOUNDED synthetic grant (observed size + headroom,
-						// grantTTL) so a stolen confirm can't become unlimited
-						// long-lived egress.
-						uploadAuthorized = true
-						registerSyntheticGrant(host, uploadTotal+chunk)
-					}
-				}
-
-				// Write chunk — only reached if authorized or still under threshold.
-				_, werr := dst.Write(buf[:n])
-				if werr != nil {
-					break
-				}
-				uploadTotal += chunk
-			}
-			if rerr != nil {
-				break
-			}
-		}
-		dst.Close()
+		pumpUploadGated(cli, dst, host)
 	}()
 
 	io.Copy(cli, dst)
 	<-uploadDone
 	cli.Close()
+}
+
+// pumpUploadGated copies the client→target (upload) side of an EXTERNAL CONNECT
+// tunnel while enforcing the upload byte gate. The gate is bounded PER
+// CONNECTION: the first chunk that crosses uploadThreshold requires a grant or
+// a confirm (and registers a bounded synthetic grant for future connections);
+// every over-threshold byte AFTER that draws down a per-connection budget of
+// grantHeadroom, and once that budget is spent the tunnel is RST. This is the
+// fix for the 2026-07-16 finding that a single confirm latched the connection
+// open for unbounded upload — the latch alone bounded nothing on the tunnel
+// that earned it.
+func pumpUploadGated(cli net.Conn, dst net.Conn, host string) {
+	defer dst.Close()
+	rstClient := func() {
+		if tc, ok := cli.(*net.TCPConn); ok {
+			tc.SetLinger(0) // RST rather than graceful FIN
+		}
+		cli.Close()
+	}
+
+	buf := make([]byte, 32*1024)
+	var uploadTotal int64
+	uploadAuthorized := false
+	var authorizedRemaining int64 // post-authorization headroom for THIS conn
+
+	for {
+		n, rerr := cli.Read(buf)
+		if n > 0 {
+			chunk := int64(n)
+
+			// Pre-write gate: any chunk that keeps the connection over the
+			// threshold must be covered before a single byte reaches dst.
+			if uploadTotal+chunk > uploadThreshold {
+				if !uploadAuthorized {
+					if hasGrant(host) {
+						// Grant covers the crossing chunk; deduct and latch.
+						if !consumeGrant(host, chunk, cli) {
+							return // budget exhausted; consumeGrant RST cli, defer closes dst
+						}
+					} else if !callConfirm(host, uploadTotal+chunk, "upload_over_threshold") {
+						// Deny: RST; the over-limit chunk is never written.
+						rstClient()
+						return
+					} else {
+						// Allowed: register a bounded synthetic grant (for future
+						// connections) and open a bounded per-connection budget.
+						registerSyntheticGrant(host, uploadTotal+chunk)
+					}
+					uploadAuthorized = true
+					authorizedRemaining = grantHeadroom
+				} else {
+					// Already authorized on THIS connection: spend the bounded
+					// budget. Exhausted → RST, so one confirm can never become an
+					// unbounded long-lived upload on the same tunnel.
+					authorizedRemaining -= chunk
+					if authorizedRemaining < 0 {
+						rstClient()
+						return
+					}
+				}
+			}
+
+			// Write chunk — only reached if authorized or still under threshold.
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			uploadTotal += chunk
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // ─── proxyPlainHTTP ───────────────────────────────────────────────────────────

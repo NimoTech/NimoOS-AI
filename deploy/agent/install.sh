@@ -35,6 +35,18 @@ echo "==> [2/4] 部署 compose 到 ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${DATA_DIR}"
 cp "${HERE}/docker-compose.yml" "${APP_DIR}/docker-compose.yml"
 
+# L4 审计日志防篡改:置为 append-only。容器与宿主共享该 inode(bind mount)且容器内
+# 进程即使是 root 也只能追加、不能截断/删除/改写——这是审计日志"agent 改不了"承诺的
+# 唯一 OS 级支撑(否则仅靠 L1 shell 分类器,一旦放宽即失守)。尽力而为:文件系统不支持
+# +a(部分 btrfs/overlay)时仅告警不阻断。⚠ 日志轮转前须先 `chattr -a`。
+AUDIT_LOG="${DATA_DIR}/audit.log"
+touch "${AUDIT_LOG}" 2>/dev/null || true
+if chattr +a "${AUDIT_LOG}" 2>/dev/null; then
+  echo "    审计日志已设为 append-only:${AUDIT_LOG}"
+else
+  echo "    ⚠ 无法为审计日志设置 append-only(文件系统可能不支持 chattr +a),已跳过。" >&2
+fi
+
 echo "==> [3/4] 启动 ${APP_ID} ..."
 docker compose -p "${APP_ID}" -f "${APP_DIR}/docker-compose.yml" up -d
 
