@@ -442,7 +442,7 @@ func TestTOFUExpires(t *testing.T) {
 	}
 }
 
-// TestExternalUploadOverThresholdAsks: upload > T_UPLOAD with deny confirm → connection closed.
+// TestExternalUploadOverThresholdAsks: upload > uploadThreshold with deny confirm → connection closed.
 // We simulate this by exercising the counting logic and confirm callback directly.
 func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	resetConfirmedHosts()
@@ -507,12 +507,12 @@ func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	// upload threshold logic directly by calling the relevant functions.
 
 	// Direct unit test of threshold logic:
-	// Simulate: external host confirmed (TOFU done), no grant, upload > T_UPLOAD.
+	// Simulate: external host confirmed (TOFU done), no grant, upload > uploadThreshold.
 	host := "threshold-test.example.com"
 	markConfirmed(host) // pre-confirm so TOFU is skipped.
 
 	// The confirm denies upload_over_threshold.
-	denied := !callConfirm(host, T_UPLOAD+1, "upload_over_threshold")
+	denied := !callConfirm(host, uploadThreshold+1, "upload_over_threshold")
 	if !denied {
 		t.Fatal("confirm should deny upload_over_threshold")
 	}
@@ -521,7 +521,7 @@ func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	}
 }
 
-// TestGrantedSilent: with a valid grant, upload > T_UPLOAD does NOT call confirm.
+// TestGrantedSilent: with a valid grant, upload > uploadThreshold does NOT call confirm.
 func TestGrantedSilent(t *testing.T) {
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
@@ -573,7 +573,7 @@ func TestGrantedSilent(t *testing.T) {
 
 	// Simulate upload over threshold — should NOT call confirm.
 	markConfirmed(host)
-	overThreshold := int64(T_UPLOAD + 1024)
+	overThreshold := int64(uploadThreshold + 1024)
 	if hasGrant(host) {
 		// Grant covers it — no confirm needed.
 		// Deduct bytes from grant.
@@ -950,7 +950,7 @@ func TestProxyPlainHTTPInternal(t *testing.T) {
 
 // TestUploadGateDenyNoDataLeak verifies C1: when the confirm server denies an
 // upload_over_threshold request, the over-limit chunk is never written to dst.
-// The dst-side received byte count must be ≤ T_UPLOAD (the threshold) at the
+// The dst-side received byte count must be ≤ uploadThreshold (the threshold) at the
 // point the connection is closed; the denied chunk must not have leaked.
 func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	resetConfirmedHosts()
@@ -1040,7 +1040,7 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 			n, rerr := cliR.Read(buf)
 			if n > 0 {
 				chunk := int64(n)
-				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
+				if !uploadAuthorized && uploadTotal+chunk > uploadThreshold {
 					if hasGrant(host) {
 						if !consumeGrant(host, chunk, cliR) {
 							break
@@ -1077,8 +1077,8 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 		}
 	}()
 
-	// Send exactly T_UPLOAD bytes (at threshold, not yet over).
-	belowThreshold := make([]byte, T_UPLOAD)
+	// Send exactly uploadThreshold bytes (at threshold, not yet over).
+	belowThreshold := make([]byte, uploadThreshold)
 	for i := range belowThreshold {
 		belowThreshold[i] = 0xAB
 	}
@@ -1089,7 +1089,7 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	// Give the goroutine time to flush the below-threshold bytes.
 	time.Sleep(50 * time.Millisecond)
 
-	// Now send 1 extra byte — this chunk puts total over T_UPLOAD.
+	// Now send 1 extra byte — this chunk puts total over uploadThreshold.
 	// The goroutine must call confirm (which denies) and NOT write this byte.
 	overChunk := []byte{0xFF}
 	cliW.Write(overChunk) //nolint:errcheck — pipe may be closed by deny path
@@ -1108,13 +1108,13 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	case <-time.After(2 * time.Second):
 	}
 
-	// Verify: dst must have received at most T_UPLOAD bytes (the denied chunk leaked = bug).
+	// Verify: dst must have received at most uploadThreshold bytes (the denied chunk leaked = bug).
 	dstMu.Lock()
 	received := int64(len(dstReceived))
 	dstMu.Unlock()
 
-	if received > T_UPLOAD {
-		t.Errorf("C1 data-leak: dst received %d bytes, want ≤ %d (T_UPLOAD); denied chunk leaked", received, T_UPLOAD)
+	if received > uploadThreshold {
+		t.Errorf("C1 data-leak: dst received %d bytes, want ≤ %d (uploadThreshold); denied chunk leaked", received, uploadThreshold)
 	}
 
 	// Verify confirm was called with reason=upload_over_threshold.
@@ -1149,5 +1149,17 @@ func TestSyntheticGrantIsBounded(t *testing.T) {
 	}
 	if tk.Expiry.After(time.Now().Add(grantTTL + time.Second)) {
 		t.Fatal("grant expiry exceeds grantTTL")
+	}
+}
+
+func TestMetadataEndpointDenied(t *testing.T) {
+	for _, ips := range []string{"169.254.169.254", "169.254.170.2"} {
+		if !isMetadataIP(net.ParseIP(ips)) {
+			t.Fatalf("%s must be classified as metadata (deny)", ips)
+		}
+	}
+	// a normal link-local (the proxy's own plumbing) must NOT be metadata
+	if isMetadataIP(net.ParseIP("169.254.7.1")) {
+		t.Fatal("proxy plumbing IP 169.254.7.1 must not be denied as metadata")
 	}
 }

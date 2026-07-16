@@ -90,6 +90,29 @@ func isInternal(ip net.IP) bool {
 	return false
 }
 
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"), // AWS/GCP/Azure IMDS
+	net.ParseIP("169.254.170.2"),   // ECS task metadata
+	net.ParseIP("fd00:ec2::254"),   // IPv6 IMDS
+}
+
+// isMetadataIP reports whether ip is a cloud metadata endpoint. These are
+// link-local (thus "internal") but must be DENIED — they are the classic
+// SSRF credential-exfil target. The proxy's own plumbing (169.254.7.1) is
+// NOT in this list.
+func isMetadataIP(ip net.IP) bool {
+	ip = normalizeIP(ip)
+	if ip == nil {
+		return false
+	}
+	for _, m := range metadataIPs {
+		if ip.Equal(m) {
+			return true
+		}
+	}
+	return false
+}
+
 // ─── Hop-by-hop headers (RFC 7230 §6.1) ─────────────────────────────────────
 
 var hopByHopHeaders = map[string]bool{
@@ -118,7 +141,7 @@ func removeHopByHop(h http.Header) {
 
 // ─── Global state ─────────────────────────────────────────────────────────────
 
-const T_UPLOAD = 65536 // bytes threshold before asking confirm
+var uploadThreshold int64 = 65536 // -upload-threshold; bytes before an external upload asks confirm
 
 var confirmURL string // set from -confirm-url flag
 
@@ -390,6 +413,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isMetadataIP(normIP) {
+		http.Error(w, "blocked: cloud metadata endpoint", http.StatusForbidden)
+		return
+	}
+
 	internal := isInternal(normIP)
 
 	// Port policy: external targets only on 80/443.
@@ -458,7 +486,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 				// Pre-write gate: if this chunk would push us over the threshold
 				// and the connection is not yet authorized, we must authorize
 				// BEFORE writing any data to dst.
-				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
+				if !uploadAuthorized && uploadTotal+chunk > uploadThreshold {
 					if hasGrant(host) {
 						// Grant covers it; deduct and latch.
 						if !consumeGrant(host, chunk, cli) {
@@ -784,11 +812,13 @@ func main() {
 	grantListen := flag.String("grant-listen", "127.0.0.1:8889", "Grant control server listen address")
 	tofuTTLFlag := flag.Duration("tofu-ttl", time.Hour, "TTL for auto-TOFU host confirmations")
 	grantTTLFlag := flag.Duration("grant-ttl", 10*time.Minute, "TTL for synthetic post-confirm upload grants")
+	uploadThreshFlag := flag.Int64("upload-threshold", 65536, "bytes before an external upload asks confirm")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
 	tofuTTL = *tofuTTLFlag
 	grantTTL = *grantTTLFlag
+	uploadThreshold = *uploadThreshFlag
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream

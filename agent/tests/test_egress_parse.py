@@ -95,6 +95,18 @@ class TestIsExternalHost:
         # fc00::/7 is ULA (internal); zone id suffix must not break parsing.
         assert _is_external_host("fc00::1%eth0") is False
 
+    def test_metadata_ip_is_external(self):
+        """169.254.169.254 (cloud IMDS) is link-local but must be treated as
+        external so the A-path blocks it — the classic SSRF credential-exfil
+        target must not get a free pass via the 169.254.0.0/16 internal rule."""
+        assert _is_external_host("169.254.169.254") is True
+
+    def test_metadata_ip_ecs_is_external(self):
+        assert _is_external_host("169.254.170.2") is True
+
+    def test_metadata_ip_ipv6_is_external(self):
+        assert _is_external_host("fd00:ec2::254") is True
+
 
 # ─── parse_upload positive tests ──────────────────────────────────────────────
 
