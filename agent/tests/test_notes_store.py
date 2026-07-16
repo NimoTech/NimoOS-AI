@@ -90,3 +90,18 @@ def test_source_refs_persist(conn):
     row = conn.execute("SELECT source_refs_json FROM notes WHERE id=?",
                        (n["id"],)).fetchone()
     assert json.loads(row["source_refs_json"]) == refs
+
+
+_CONTRACT_KEYS = {"id", "user_id", "path", "title", "description", "type",
+                  "status", "tags", "source_refs", "created_by", "revision",
+                  "created_at", "updated_at"}
+
+
+def test_read_paths_return_only_contract_keys(conn):
+    n = store.create_note(conn, "1", title="t", body="b", tags=["x"])
+    got = store.get_note(conn, "1", n["id"])
+    assert set(got.keys()) - {"body", "file_missing"} == _CONTRACT_KEYS
+    listed = store.list_notes(conn, "1")[0]
+    assert set(listed.keys()) == _CONTRACT_KEYS
+    updated = store.update_note(conn, "1", n["id"], expected_revision=1, body="b2")
+    assert set(updated.keys()) - {"body"} == _CONTRACT_KEYS

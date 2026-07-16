@@ -59,9 +59,14 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+_CONTRACT_COLS = ("id", "user_id", "path", "title", "description", "type",
+                  "status", "created_by", "revision", "created_at",
+                  "updated_at")
+
+
 def _row_to_dict(row) -> dict:
-    d = {k: row[k] for k in row.keys()}
-    d["source_refs"] = json.loads(d.pop("source_refs_json") or "[]")
+    d = {k: row[k] for k in _CONTRACT_COLS}
+    d["source_refs"] = json.loads(row["source_refs_json"] or "[]")
     return d
 
 
