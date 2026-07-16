@@ -107,6 +107,14 @@ def test_disk_delete_soft_deletes_and_deindexes(conn):
     assert ("deindex", n["id"]) in conn._test_index_calls
 
 
+def test_echo_suppressed_for_newline_terminated_body(conn):
+    store.create_note(conn, "1", title="t", body="line1\nline2\n")
+    stats = _run(sync.scan_once(conn))
+    assert stats == {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
+    stats2 = _run(sync.scan_once(conn))   # 第二轮也必须静止
+    assert stats2 == {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
+
+
 def test_reserved_files_skipped(conn):
     root = store.get_notes_root(conn)
     os.makedirs(f"{root}/1", exist_ok=True)

@@ -47,6 +47,12 @@ def note_abs_path(conn, note: dict) -> str:
 
 
 def _hash(body: str) -> str:
+    # Canonicalize to the on-disk form: serialize_note_text always
+    # newline-terminates the body, so hash that form here too — sync.py's
+    # _hash must stay byte-identical to this one (echo suppression compares
+    # the two across store-writes vs. scanner-reads).
+    if not body.endswith("\n"):
+        body += "\n"
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 

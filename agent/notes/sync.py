@@ -27,14 +27,13 @@ _RESERVED = {"index.md", "log.md"}
 
 
 def _hash(body: str) -> str:
-    # store.create_note/update_note hash the raw caller-supplied body
-    # (notes/store.py:_hash), but serialize_note_text always guarantees a
-    # trailing "\n" on disk. parse_note_text's round-trip therefore hands
-    # us that enforced newline back even when the original body lacked
-    # one. Strip at most one to stay hash-compatible with store.py's own
-    # writes, so our own writes don't bounce back as false "updated".
-    if body.endswith("\n"):
-        body = body[:-1]
+    # Must stay byte-identical to notes/store.py:_hash — both canonicalize
+    # to the on-disk form (serialize_note_text always newline-terminates)
+    # before hashing, so store-side writes and scanner-side reads of the
+    # same file always agree, regardless of whether the original caller
+    # body already ended in "\n".
+    if not body.endswith("\n"):
+        body += "\n"
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
