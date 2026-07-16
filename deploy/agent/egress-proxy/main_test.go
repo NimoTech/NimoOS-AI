@@ -1136,3 +1136,18 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 
 	cliW.Close()
 }
+
+func TestSyntheticGrantIsBounded(t *testing.T) {
+	grantStore.Lock(); grantStore.m = make(map[string]*ticket); grantStore.Unlock()
+	grantTTL = 10 * time.Minute
+	// Simulate what handleConnect registers after a threshold confirm:
+	registerSyntheticGrant("h1", 100_000) // helper introduced by this task
+	grantStore.Lock(); tk := grantStore.m["h1"]; grantStore.Unlock()
+	if tk == nil { t.Fatal("grant not registered") }
+	if tk.MaxBytes > 100_000+grantHeadroom {
+		t.Fatalf("grant budget unbounded: %d", tk.MaxBytes)
+	}
+	if tk.Expiry.After(time.Now().Add(grantTTL + time.Second)) {
+		t.Fatal("grant expiry exceeds grantTTL")
+	}
+}

@@ -225,6 +225,24 @@ func init() {
 	grantStore.m = make(map[string]*ticket)
 }
 
+const grantHeadroom = 1 << 20 // 1 MiB headroom over the observed upload size
+
+// grantTTL bounds how long a synthetic post-confirm grant stays valid.
+// Configurable via -grant-ttl; default 10m (was a hardcoded 24h).
+var grantTTL = 10 * time.Minute
+
+// registerSyntheticGrant records a bounded grant after a user confirms an
+// over-threshold upload: budget = observed bytes + headroom (NOT unlimited),
+// expiry = grantTTL. Prevents "one confirm -> unlimited 24h egress".
+func registerSyntheticGrant(host string, observedBytes int64) {
+	grantStore.Lock()
+	grantStore.m[host] = &ticket{
+		MaxBytes: observedBytes + grantHeadroom,
+		Expiry:   time.Now().Add(grantTTL),
+	}
+	grantStore.Unlock()
+}
+
 type grantReq struct {
 	Host     string `json:"host"`
 	MaxBytes int64  `json:"max_bytes"`
@@ -460,14 +478,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 							break
 						}
 						// Allowed: latch for this connection and register a
-						// synthetic large grant to silence future calls.
+						// BOUNDED synthetic grant (observed size + headroom,
+						// grantTTL) so a stolen confirm can't become unlimited
+						// long-lived egress.
 						uploadAuthorized = true
-						grantStore.Lock()
-						grantStore.m[host] = &ticket{
-							MaxBytes: 1<<62 - 1,
-							Expiry:   time.Now().Add(24 * time.Hour),
-						}
-						grantStore.Unlock()
+						registerSyntheticGrant(host, uploadTotal+chunk)
 					}
 				}
 
@@ -768,10 +783,12 @@ func main() {
 	confirmURLFlag := flag.String("confirm-url", "http://127.0.0.1:8282/internal/egress-confirm", "URL for TOFU/threshold confirmation callbacks")
 	grantListen := flag.String("grant-listen", "127.0.0.1:8889", "Grant control server listen address")
 	tofuTTLFlag := flag.Duration("tofu-ttl", time.Hour, "TTL for auto-TOFU host confirmations")
+	grantTTLFlag := flag.Duration("grant-ttl", 10*time.Minute, "TTL for synthetic post-confirm upload grants")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
 	tofuTTL = *tofuTTLFlag
+	grantTTL = *grantTTLFlag
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream
