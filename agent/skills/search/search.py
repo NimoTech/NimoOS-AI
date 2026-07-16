@@ -102,7 +102,8 @@ async def _read_document_impl(file_id: Optional[str] = None,
         except httpx.HTTPError as e:
             return json.dumps({"error": f"read_document failed: {e}"},
                               ensure_ascii=False)
-        return json.dumps(result, ensure_ascii=False)
+        _doc = json.dumps(result, ensure_ascii=False)
+        return fence_untrusted("document", _doc, cap=max_chars + 8000) or _doc
 
     # path (or forced ocr) → on-demand extraction via Parser, gated by the
     # same per-session filesystem authorization read_file uses.
@@ -128,7 +129,8 @@ async def _read_document_impl(file_id: Optional[str] = None,
     except Exception as e:
         return json.dumps({"error": f"document extraction failed: {e}"},
                           ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+    _doc = json.dumps(result, ensure_ascii=False)
+    return fence_untrusted("document", _doc, cap=max_chars + 8000) or _doc
 
 
 @function_tool
@@ -226,7 +228,10 @@ async def _view_document_page_impl(path: str, page: int = 1,
     desc, err = await _photos.describe_image(pages[0]["png_b64"], prompt)
     if err:
         return json.dumps({"error": f"vision failed: {err}"}, ensure_ascii=False)
-    return json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+    # The description is the vision model reading attacker-influenceable page
+    # content — fence it as data, like every other external-content result.
+    _out = json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+    return fence_untrusted("document-page", _out, cap=len(_out) + 4000) or _out
 
 
 @function_tool

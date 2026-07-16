@@ -7,6 +7,7 @@ unparseable   -> BackstopResult(kind="none", undoable=False) — caller warns.
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import shutil
@@ -86,9 +87,25 @@ def _hardlink_trash(paths: list[str], trash_root: str) -> BackstopResult:
     return BackstopResult("none", "", False, "no target could be backed up")
 
 
+def _expand_targets(paths: list[str]) -> list[str]:
+    """Expand shell glob patterns to the paths bash would actually delete.
+    Without this, a token like '/DATA/Documents/*' fails os.path.exists and
+    gets NO backup while bash expands and removes the real files. Non-glob
+    tokens pass through; glob.glob only returns existing matches."""
+    out: list[str] = []
+    for p in paths:
+        if not p:
+            continue
+        if any(ch in p for ch in "*?["):
+            out.extend(glob.glob(p))
+        else:
+            out.append(p)
+    return out
+
+
 def prepare_backstop(paths: list[str], trash_root: str | None = None) -> BackstopResult:
     root = trash_root or _DEFAULT_TRASH_ROOT
-    real = [p for p in paths if p and os.path.exists(p)]
+    real = [p for p in _expand_targets(paths) if os.path.exists(p)]
     if not real:
         return BackstopResult("none", "", False, "no existing target to back up")
 
