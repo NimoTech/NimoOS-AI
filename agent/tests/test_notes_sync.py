@@ -123,3 +123,103 @@ def test_reserved_files_skipped(conn):
             f.write("reserved\n")
     stats = _run(sync.scan_once(conn))
     assert stats["adopted"] == 0
+
+
+def test_resurrected_note_gets_reindexed(conn):
+    n = store.create_note(conn, "1", title="t", body="b")
+    p = store.note_abs_path(conn, n)
+    with open(p) as f:
+        meta, body = parse_note_text(f.read())
+    os.remove(p)
+    stats = _run(sync.scan_once(conn))
+    assert stats["deleted"] == 1
+    conn._test_index_calls.clear()
+
+    # File re-appears with the SAME content/id → resurrect, not a no-op.
+    with open(p, "w") as f:
+        f.write(serialize_note_text(meta, body))
+    _run(sync.scan_once(conn))
+
+    row = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                       (n["id"],)).fetchone()
+    assert row["deleted_at"] is None
+    assert ("index", n["id"]) in conn._test_index_calls
+
+
+def test_failed_index_is_retried_next_pass(conn, monkeypatch):
+    n = store.create_note(conn, "1", title="t", body="v1")
+    p = store.note_abs_path(conn, n)
+    with open(p) as f:
+        meta, _ = parse_note_text(f.read())
+    with open(p, "w") as f:
+        f.write(serialize_note_text(meta, "v2 external"))
+
+    results = [False, True]
+
+    async def _flaky_index(note, body):
+        conn._test_index_calls.append(("index", note["id"]))
+        return results.pop(0)
+
+    monkeypatch.setattr(sync, "index_note", _flaky_index)
+
+    stats1 = _run(sync.scan_once(conn))
+    assert stats1["updated"] == 1
+    row1 = conn.execute("SELECT content_hash FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()
+    assert row1["content_hash"] == ""
+
+    stats2 = _run(sync.scan_once(conn))
+    assert stats2["updated"] == 1
+    row2 = conn.execute("SELECT content_hash FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()
+    assert row2["content_hash"] != ""
+    index_calls = [c for c in conn._test_index_calls if c == ("index", n["id"])]
+    assert len(index_calls) == 2
+
+    stats3 = _run(sync.scan_once(conn))
+    assert stats3 == {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
+
+
+def test_failed_deindex_keeps_row_for_retry(conn, monkeypatch):
+    n = store.create_note(conn, "1", title="t", body="b")
+    os.remove(store.note_abs_path(conn, n))
+
+    results = [False, True]
+
+    async def _flaky_deindex(user_id, note_id):
+        conn._test_index_calls.append(("deindex", note_id))
+        return results.pop(0)
+
+    monkeypatch.setattr(sync, "deindex_note", _flaky_deindex)
+
+    stats1 = _run(sync.scan_once(conn))
+    assert stats1["deleted"] == 0
+    row1 = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()
+    assert row1["deleted_at"] is None
+
+    stats2 = _run(sync.scan_once(conn))
+    assert stats2["deleted"] == 1
+    row2 = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()
+    assert row2["deleted_at"] is not None
+
+
+def test_non_utf8_file_does_not_abort_scan(conn):
+    n = store.create_note(conn, "1", title="t", body="b")
+    good = store.create_note(conn, "1", title="t2", body="b2")
+    os.remove(store.note_abs_path(conn, good))  # legit deletion
+    # Corrupt n's own on-disk file to be non-UTF8: unreadable, NOT deleted.
+    with open(store.note_abs_path(conn, n), "wb") as f:
+        f.write(b"\xff\xfe broken")
+
+    stats = _run(sync.scan_once(conn))
+
+    assert stats["deleted"] == 1     # only the legit deletion counted
+    assert stats["adopted"] == 0     # bad file wasn't adopted
+    row_n = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()
+    assert row_n["deleted_at"] is None  # unreadable != deleted
+    row_good = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                            (good["id"],)).fetchone()
+    assert row_good["deleted_at"] is not None

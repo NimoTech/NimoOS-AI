@@ -5,7 +5,23 @@ is no separate 6h fallback because every pass IS the fallback.
 
 Echo suppression: a file whose body sha256 equals notes.content_hash is
 our own write — skipped. Reserved OKF files (index.md/log.md) are never
-adopted. Identity: frontmatter `id`; a moved file keeps its row."""
+adopted. Identity: frontmatter `id`; a moved file keeps its row.
+
+Self-healing invariants:
+- content_hash='' is a pending-index sentinel, never a real hash. Any row
+  with an empty hash is picked up by the mismatch branch next pass and
+  retried — used both for resurrect-after-soft-delete (file content is
+  unchanged so the real hash would already "match" and skip reindexing)
+  and for a failed index_note() call (so the write isn't silently lost).
+  A retry may bump `revision` again even though content didn't change
+  again — acceptable, it's just a signal that indexing was attempted.
+- deindex_note() is called BEFORE a row is marked deleted_at; if it
+  returns False the row is left alive (still absent on disk) so the next
+  pass retries the deindex instead of leaving orphaned vectors forever.
+- Per-file processing is fully isolated: an unreadable/corrupt file
+  (e.g. non-UTF8 bytes) is logged and skipped without aborting the walk
+  or the vanished-file soft-delete pass. Its path is remembered for this
+  pass so the vanished-file pass never treats "unreadable" as "deleted"."""
 from __future__ import annotations
 
 import asyncio
@@ -75,89 +91,115 @@ async def scan_once(conn) -> dict:
     stats = {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
     root = store.get_notes_root(conn)
     seen_ids: set[str] = set()
+    failed_paths: set[str] = set()
 
     for uid, rel, ap in _walk_md(root):
         try:
             with open(ap, encoding="utf-8") as f:
                 meta, body = parse_note_text(f.read())
-        except OSError:
-            continue
-        nid = str(meta.get("id") or "").strip()
-        row = conn.execute(
-            "SELECT * FROM notes WHERE id=? AND user_id=?",
-            (nid, uid)).fetchone() if nid else None
+            nid = str(meta.get("id") or "").strip()
+            row = conn.execute(
+                "SELECT * FROM notes WHERE id=? AND user_id=?",
+                (nid, uid)).fetchone() if nid else None
 
-        if row is None:
-            # Adoption: hand-created file (or unknown id from elsewhere).
-            f = _meta_note_fields(meta)
-            now = int(time.time())
-            nid = nid or str(uuid.uuid4())
-            title = f["title"] or os.path.splitext(
-                os.path.basename(rel))[0]
-            meta.update({"id": nid, "type": f["type"], "title": title,
-                         "status": f["status"],
-                         "created_by": f["created_by"]})
-            tmp = ap + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(serialize_note_text(meta, body))
-            os.replace(tmp, ap)
-            conn.execute(
-                "INSERT OR IGNORE INTO notes(id, user_id, path, title, "
-                "description, type, status, content_hash, source_refs_json, "
-                "created_by, revision, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (nid, uid, rel, title, f["description"], f["type"],
-                 f["status"], _hash(body),
-                 json.dumps(f["source_refs"], ensure_ascii=False),
-                 f["created_by"], 1, now, now))
-            store._sync_tags(conn, uid, nid, f["tags"])
-            conn.commit()
+            if row is None:
+                # Adoption: hand-created file (or unknown id from elsewhere).
+                f = _meta_note_fields(meta)
+                now = int(time.time())
+                nid = nid or str(uuid.uuid4())
+                title = f["title"] or os.path.splitext(
+                    os.path.basename(rel))[0]
+                meta.update({"id": nid, "type": f["type"], "title": title,
+                             "status": f["status"],
+                             "created_by": f["created_by"]})
+                tmp = ap + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(serialize_note_text(meta, body))
+                os.replace(tmp, ap)
+                conn.execute(
+                    "INSERT OR IGNORE INTO notes(id, user_id, path, title, "
+                    "description, type, status, content_hash, "
+                    "source_refs_json, created_by, revision, created_at, "
+                    "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (nid, uid, rel, title, f["description"], f["type"],
+                     f["status"], _hash(body),
+                     json.dumps(f["source_refs"], ensure_ascii=False),
+                     f["created_by"], 1, now, now))
+                store._sync_tags(conn, uid, nid, f["tags"])
+                conn.commit()
+                seen_ids.add(nid)
+                stats["adopted"] += 1
+                ok = await index_note(
+                    {"id": nid, "user_id": uid, "type": f["type"],
+                     "status": f["status"], "created_by": f["created_by"],
+                     "updated_at": now, "title": title}, body)
+                if not ok:
+                    # Pending-index sentinel: next pass's hash-mismatch
+                    # branch retries the index instead of losing the write.
+                    conn.execute(
+                        "UPDATE notes SET content_hash='' WHERE id=?",
+                        (nid,))
+                    conn.commit()
+                continue
+
             seen_ids.add(nid)
-            stats["adopted"] += 1
-            await index_note({"id": nid, "user_id": uid, "type": f["type"],
-                              "status": f["status"],
-                              "created_by": f["created_by"],
-                              "updated_at": now, "title": title}, body)
+            db_content_hash = row["content_hash"]
+            if row["deleted_at"] is not None:
+                # File re-appeared after soft delete → resurrect. Content
+                # may be byte-identical to what was last indexed (it was
+                # deindexed on delete), so force a reindex via the
+                # pending-index sentinel rather than relying on hash
+                # mismatch, which would otherwise never fire.
+                conn.execute(
+                    "UPDATE notes SET deleted_at=NULL, content_hash='' "
+                    "WHERE id=?", (nid,))
+                conn.commit()
+                db_content_hash = ""
+            if row["path"] != rel:
+                conn.execute("UPDATE notes SET path=? WHERE id=?",
+                             (rel, nid))
+                conn.commit()
+                stats["moved"] += 1
+            if db_content_hash != _hash(body):
+                f = _meta_note_fields(meta)
+                now = int(time.time())
+                ok = await index_note(
+                    {"id": nid, "user_id": uid, "type": f["type"],
+                     "status": f["status"],
+                     "created_by": row["created_by"], "updated_at": now,
+                     "title": f["title"] or row["title"]}, body)
+                new_hash = _hash(body) if ok else ""
+                conn.execute(
+                    "UPDATE notes SET title=?, description=?, type=?, "
+                    "status=?, content_hash=?, revision=revision+1, "
+                    "updated_at=? WHERE id=?",
+                    (f["title"] or row["title"], f["description"],
+                     f["type"], f["status"], new_hash, now, nid))
+                store._sync_tags(conn, uid, nid, f["tags"])
+                conn.commit()
+                stats["updated"] += 1
+        except Exception:
+            _LOG.warning("notes sync: failed to process %s", ap,
+                        exc_info=True)
+            failed_paths.add(rel)
             continue
 
-        seen_ids.add(nid)
-        if row["deleted_at"] is not None:
-            # File re-appeared after soft delete → resurrect.
-            conn.execute("UPDATE notes SET deleted_at=NULL WHERE id=?",
-                         (nid,))
-            conn.commit()
-        if row["path"] != rel:
-            conn.execute("UPDATE notes SET path=? WHERE id=?", (rel, nid))
-            conn.commit()
-            stats["moved"] += 1
-        if row["content_hash"] != _hash(body):
-            f = _meta_note_fields(meta)
-            now = int(time.time())
-            conn.execute(
-                "UPDATE notes SET title=?, description=?, type=?, status=?, "
-                "content_hash=?, revision=revision+1, updated_at=? "
-                "WHERE id=?",
-                (f["title"] or row["title"], f["description"], f["type"],
-                 f["status"], _hash(body), now, nid))
-            store._sync_tags(conn, uid, nid, f["tags"])
-            conn.commit()
-            stats["updated"] += 1
-            await index_note({"id": nid, "user_id": uid, "type": f["type"],
-                              "status": f["status"],
-                              "created_by": row["created_by"],
-                              "updated_at": now,
-                              "title": f["title"] or row["title"]}, body)
-
-    # Rows whose file vanished → soft delete + deindex.
+    # Rows whose file vanished → soft delete + deindex. An unreadable file
+    # (in failed_paths) is NOT a deleted file — skip it so it isn't wrongly
+    # soft-deleted while it's merely unparsable this pass.
     for row in conn.execute(
-            "SELECT id, user_id FROM notes WHERE deleted_at IS NULL"):
-        if row["id"] in seen_ids:
+            "SELECT id, user_id, path FROM notes WHERE deleted_at IS NULL"):
+        if row["id"] in seen_ids or row["path"] in failed_paths:
+            continue
+        ok = await deindex_note(row["user_id"], row["id"])
+        if not ok:
+            _LOG.warning("notes sync: deindex failed for %s, will retry",
+                        row["id"])
             continue
         conn.execute("UPDATE notes SET deleted_at=? WHERE id=?",
                      (int(time.time()), row["id"]))
         conn.commit()
         stats["deleted"] += 1
-        await deindex_note(row["user_id"], row["id"])
     return stats
 
 
