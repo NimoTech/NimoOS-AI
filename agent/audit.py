@@ -3,9 +3,12 @@
 Records security-relevant events (dangerous shell commands + verdicts,
 confirmation approvals, egress grants, file write/delete). Writes JSON lines
 with O_APPEND only — never seeks or truncates — so a running agent cannot
-rewrite history through this module. (A root-compromised agent could still
-tamper with the file directly; deploy-time `chattr +a` mitigates that but is
-not absolute — see the plan's deploy note.)
+rewrite history through this module. A root-compromised agent could still
+tamper with the file directly, so install.sh / deploy-agent.sh set `chattr +a`
+on this log at deploy time — the kernel then permits append-only opens even
+from inside the container, blocking truncate/delete/rewrite. (Not absolute:
+filesystems without +a support fall back to module-level O_APPEND only; log
+rotation must `chattr -a` first.)
 
 audit() NEVER raises: auditing is a side-channel and must not break the
 operation being audited.

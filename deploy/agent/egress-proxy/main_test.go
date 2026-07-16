@@ -1209,3 +1209,121 @@ func TestMetadataEndpointDenied(t *testing.T) {
 		t.Fatal("proxy plumbing IP 169.254.7.1 must not be denied as metadata")
 	}
 }
+
+// ─── per-connection upload bound (2026-07-16 latch fix) ───────────────────────
+
+// scriptedConn is a net.Conn double whose Read yields a preset sequence of
+// chunks then blocks forever (until Close), and whose Close is observable.
+type scriptedConn struct {
+	chunks [][]byte
+	idx    int
+	closed bool
+	block  chan struct{}
+}
+
+func newScriptedConn(chunks [][]byte) *scriptedConn {
+	return &scriptedConn{chunks: chunks, block: make(chan struct{})}
+}
+func (c *scriptedConn) Read(b []byte) (int, error) {
+	if c.idx >= len(c.chunks) {
+		<-c.block // no more scripted data; block until Close
+		return 0, io.EOF
+	}
+	n := copy(b, c.chunks[c.idx])
+	c.idx++
+	return n, nil
+}
+func (c *scriptedConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *scriptedConn) Close() error {
+	if !c.closed {
+		c.closed = true
+		close(c.block)
+	}
+	return nil
+}
+func (c *scriptedConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *scriptedConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *scriptedConn) SetDeadline(t time.Time) error      { return nil }
+func (c *scriptedConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *scriptedConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// countingConn is a net.Conn double that counts bytes written to it.
+type countingConn struct {
+	written int64
+	closed  bool
+}
+
+func (c *countingConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func (c *countingConn) Write(b []byte) (int, error) {
+	c.written += int64(len(b))
+	return len(b), nil
+}
+func (c *countingConn) Close() error                       { c.closed = true; return nil }
+func (c *countingConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *countingConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *countingConn) SetDeadline(t time.Time) error      { return nil }
+func (c *countingConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *countingConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "127.0.0.1:0" }
+
+// TestUploadBoundedOnSameConnection: after ONE confirm on the crossing chunk,
+// a connection may upload at most grantHeadroom more bytes, then it is RST —
+// it can NOT stream unbounded data by keeping the same tunnel open.
+func TestUploadBoundedOnSameConnection(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	// confirm always allows
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+	oldURL := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = oldURL }()
+
+	oldThresh, oldHead := uploadThreshold, grantHeadroom
+	uploadThreshold = 100
+	grantHeadroom = 200
+	defer func() { uploadThreshold = oldThresh; grantHeadroom = oldHead }()
+
+	host := "bound.example.com"
+	markConfirmed(host) // TOFU already done
+
+	// 40 chunks of 50 bytes = 2000 bytes offered. Bound should cut it far short.
+	chunks := make([][]byte, 40)
+	for i := range chunks {
+		chunks[i] = make([]byte, 50)
+	}
+	cli := newScriptedConn(chunks)
+	dst := &countingConn{}
+
+	done := make(chan struct{})
+	go func() { pumpUploadGated(cli, dst, host); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pumpUploadGated did not terminate — connection not bounded")
+	}
+
+	// Crossing chunk lands at uploadTotal=150 (observed). Allowed extra =
+	// grantHeadroom=200. So the tunnel forwards exactly 150+200=350 bytes then RST.
+	const wantMax = int64(350)
+	if dst.written > wantMax {
+		t.Errorf("forwarded %d bytes, exceeds per-connection bound %d — latch is unbounded",
+			dst.written, wantMax)
+	}
+	if dst.written < uploadThreshold {
+		t.Errorf("forwarded only %d bytes, expected at least the pre-threshold traffic", dst.written)
+	}
+	if !cli.closed {
+		t.Error("client connection was not RST after budget exhaustion")
+	}
+}
