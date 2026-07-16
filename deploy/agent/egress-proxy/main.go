@@ -90,6 +90,30 @@ func isInternal(ip net.IP) bool {
 	return false
 }
 
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"), // AWS/GCP/Azure IMDS
+	net.ParseIP("169.254.170.2"),   // ECS task metadata
+	net.ParseIP("fd00:ec2::254"),   // IPv6 IMDS
+	net.ParseIP("100.100.100.200"), // Alibaba Cloud metadata (in 100.64/10 CGN, not an internal range)
+}
+
+// isMetadataIP reports whether ip is a cloud metadata endpoint. These are
+// link-local (thus "internal") but must be DENIED — they are the classic
+// SSRF credential-exfil target. The proxy's own plumbing (169.254.7.1) is
+// NOT in this list.
+func isMetadataIP(ip net.IP) bool {
+	ip = normalizeIP(ip)
+	if ip == nil {
+		return false
+	}
+	for _, m := range metadataIPs {
+		if ip.Equal(m) {
+			return true
+		}
+	}
+	return false
+}
+
 // ─── Hop-by-hop headers (RFC 7230 §6.1) ─────────────────────────────────────
 
 var hopByHopHeaders = map[string]bool{
@@ -118,39 +142,52 @@ func removeHopByHop(h http.Header) {
 
 // ─── Global state ─────────────────────────────────────────────────────────────
 
-const T_UPLOAD = 65536 // bytes threshold before asking confirm
+var uploadThreshold int64 = 65536 // -upload-threshold; bytes before an external upload asks confirm
 
 var confirmURL string // set from -confirm-url flag
 
-// confirmedHosts is the TOFU allowlist (process-global).
+// confirmedHosts is the TOFU allowlist (process-global). Each entry carries an
+// expiry: an auto-remembered host must NOT be trusted forever — a single
+// injection that wins one confirm would otherwise get a permanent silent
+// egress channel. Expired entries require a fresh first-connection confirm.
 var confirmedHosts struct {
 	sync.Mutex
-	m map[string]bool
+	m map[string]time.Time // host -> expiry
 }
+
+// tofuTTL is how long an auto-TOFU confirmation lasts. Configurable via
+// -tofu-ttl; default 1h (short enough to bound a stolen confirm, long enough
+// not to nag during a normal session).
+var tofuTTL = time.Hour
 
 func init() {
-	confirmedHosts.m = make(map[string]bool)
+	confirmedHosts.m = make(map[string]time.Time)
 }
 
-// isConfirmed returns true if host has been TOFU-confirmed.
 func isConfirmed(host string) bool {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	return confirmedHosts.m[host]
+	exp, ok := confirmedHosts.m[host]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(confirmedHosts.m, host)
+		return false
+	}
+	return true
 }
 
-// markConfirmed adds host to the TOFU allowlist.
 func markConfirmed(host string) {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	confirmedHosts.m[host] = true
+	confirmedHosts.m[host] = time.Now().Add(tofuTTL)
 }
 
-// resetConfirmedHosts clears the TOFU allowlist (used in tests).
 func resetConfirmedHosts() {
 	confirmedHosts.Lock()
 	defer confirmedHosts.Unlock()
-	confirmedHosts.m = make(map[string]bool)
+	confirmedHosts.m = make(map[string]time.Time)
 }
 
 // ─── Egress confirm callback ──────────────────────────────────────────────────
@@ -210,6 +247,24 @@ var grantStore struct {
 
 func init() {
 	grantStore.m = make(map[string]*ticket)
+}
+
+const grantHeadroom = 1 << 20 // 1 MiB headroom over the observed upload size
+
+// grantTTL bounds how long a synthetic post-confirm grant stays valid.
+// Configurable via -grant-ttl; default 10m (was a hardcoded 24h).
+var grantTTL = 10 * time.Minute
+
+// registerSyntheticGrant records a bounded grant after a user confirms an
+// over-threshold upload: budget = observed bytes + headroom (NOT unlimited),
+// expiry = grantTTL. Prevents "one confirm -> unlimited 24h egress".
+func registerSyntheticGrant(host string, observedBytes int64) {
+	grantStore.Lock()
+	grantStore.m[host] = &ticket{
+		MaxBytes: observedBytes + grantHeadroom,
+		Expiry:   time.Now().Add(grantTTL),
+	}
+	grantStore.Unlock()
 }
 
 type grantReq struct {
@@ -285,6 +340,15 @@ func secureDialer(classifiedInternal bool) *net.Dialer {
 			if ip == nil {
 				return fmt.Errorf("rebinding-check: rejected IP %s (unspecified/multicast/NAT64)", host)
 			}
+			// Metadata endpoints must be denied at dial time regardless of the
+			// pre-dial classification: a multi-A-record / DNS-rebinding answer
+			// (e.g. [dead-internal, 169.254.169.254]) classifies as internal and
+			// the isInternal consistency check below would pass, letting the dial
+			// land on the metadata endpoint. Covers both dispatch paths, since
+			// handleConnect and proxyPlainHTTP both dial via secureDialer.
+			if isMetadataIP(ip) {
+				return fmt.Errorf("rebinding-check: metadata endpoint %s denied", ip)
+			}
 			reallyInternal := isInternal(ip)
 			if reallyInternal != classifiedInternal {
 				return fmt.Errorf("rebinding-check: IP %s classification mismatch (pre=%v now=%v)", ip, classifiedInternal, reallyInternal)
@@ -359,6 +423,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isMetadataIP(normIP) {
+		http.Error(w, "blocked: cloud metadata endpoint", http.StatusForbidden)
+		return
+	}
+
 	internal := isInternal(normIP)
 
 	// Port policy: external targets only on 80/443.
@@ -427,7 +496,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 				// Pre-write gate: if this chunk would push us over the threshold
 				// and the connection is not yet authorized, we must authorize
 				// BEFORE writing any data to dst.
-				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
+				if !uploadAuthorized && uploadTotal+chunk > uploadThreshold {
 					if hasGrant(host) {
 						// Grant covers it; deduct and latch.
 						if !consumeGrant(host, chunk, cli) {
@@ -447,14 +516,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 							break
 						}
 						// Allowed: latch for this connection and register a
-						// synthetic large grant to silence future calls.
+						// BOUNDED synthetic grant (observed size + headroom,
+						// grantTTL) so a stolen confirm can't become unlimited
+						// long-lived egress.
 						uploadAuthorized = true
-						grantStore.Lock()
-						grantStore.m[host] = &ticket{
-							MaxBytes: 1<<62 - 1,
-							Expiry:   time.Now().Add(24 * time.Hour),
-						}
-						grantStore.Unlock()
+						registerSyntheticGrant(host, uploadTotal+chunk)
 					}
 				}
 
@@ -500,6 +566,11 @@ func proxyPlainHTTP(w http.ResponseWriter, r *http.Request) {
 	normIP := normalizeIP(resolvedIP)
 	if normIP == nil {
 		http.Error(w, "blocked: rejected IP", http.StatusForbidden)
+		return
+	}
+
+	if isMetadataIP(normIP) {
+		http.Error(w, "blocked: cloud metadata endpoint", http.StatusForbidden)
 		return
 	}
 
@@ -754,9 +825,15 @@ func main() {
 	upstream := flag.String("upstream", "", "DNS upstream (default: first non-169.254 nameserver from /etc/resolv.conf with :53)")
 	confirmURLFlag := flag.String("confirm-url", "http://127.0.0.1:8282/internal/egress-confirm", "URL for TOFU/threshold confirmation callbacks")
 	grantListen := flag.String("grant-listen", "127.0.0.1:8889", "Grant control server listen address")
+	tofuTTLFlag := flag.Duration("tofu-ttl", time.Hour, "TTL for auto-TOFU host confirmations")
+	grantTTLFlag := flag.Duration("grant-ttl", 10*time.Minute, "TTL for synthetic post-confirm upload grants")
+	uploadThreshFlag := flag.Int64("upload-threshold", 65536, "bytes before an external upload asks confirm")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
+	tofuTTL = *tofuTTLFlag
+	grantTTL = *grantTTLFlag
+	uploadThreshold = *uploadThreshFlag
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream

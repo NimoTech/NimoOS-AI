@@ -34,6 +34,17 @@ _INTERNAL_V6 = [
     ipaddress.ip_network("fe80::/10"),
 ]
 
+# Cloud metadata endpoints (mirrors egress-proxy metadataIPs). These fall
+# inside the "internal" link-local/ULA ranges above but are the classic
+# SSRF credential-exfil target, so they must be treated as external
+# (blockable) rather than silently allowed through as internal.
+_METADATA_IPS = {
+    ipaddress.ip_address("169.254.169.254"),  # AWS/GCP/Azure IMDS
+    ipaddress.ip_address("169.254.170.2"),    # ECS task metadata
+    ipaddress.ip_address("fd00:ec2::254"),    # IPv6 IMDS
+    ipaddress.ip_address("100.100.100.200"),  # Alibaba Cloud metadata (100.64/10 CGN, not internal)
+}
+
 
 # ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -107,6 +118,9 @@ def _is_external_host(host: str) -> bool:
         # Unwrap IPv4-mapped IPv6 (::ffff:x.x.x.x)
         if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
             ip_obj = ip_obj.ipv4_mapped
+
+        if ip_obj in _METADATA_IPS:
+            return True  # metadata endpoint — treat as external so the A-path blocks it
 
         internal = False
         if isinstance(ip_obj, ipaddress.IPv4Address):
