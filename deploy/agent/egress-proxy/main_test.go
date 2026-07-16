@@ -874,6 +874,23 @@ func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
 	}
 }
 
+// TestAntiRebindingCheckMetadata: even when classified as internal (169.254/16
+// IS internal, so the isInternal consistency check would pass), the Control hook
+// must reject a dial to a cloud metadata IP. This closes the multi-A-record /
+// DNS-rebinding bypass where the first resolved IP is a dead internal address and
+// the actual dial lands on the metadata endpoint.
+func TestAntiRebindingCheckMetadata(t *testing.T) {
+	dialer := secureDialer(true) // classified internal (169.254/16 is internal)
+
+	_, err := dialer.Dial("tcp", "169.254.169.254:80")
+	if err == nil {
+		t.Fatal("expected Control hook to reject metadata IP, but Dial succeeded")
+	}
+	if !strings.Contains(err.Error(), "metadata") {
+		t.Errorf("expected error to mention metadata (got: %v)", err)
+	}
+}
+
 // TestConfirmURLDeny: callConfirm returns false when server denies.
 func TestConfirmURLDeny(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1165,6 +1182,8 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 }
 
 func TestSyntheticGrantIsBounded(t *testing.T) {
+	old := grantTTL
+	defer func() { grantTTL = old }()
 	grantStore.Lock(); grantStore.m = make(map[string]*ticket); grantStore.Unlock()
 	grantTTL = 10 * time.Minute
 	// Simulate what handleConnect registers after a threshold confirm:
@@ -1180,7 +1199,7 @@ func TestSyntheticGrantIsBounded(t *testing.T) {
 }
 
 func TestMetadataEndpointDenied(t *testing.T) {
-	for _, ips := range []string{"169.254.169.254", "169.254.170.2"} {
+	for _, ips := range []string{"169.254.169.254", "169.254.170.2", "100.100.100.200"} {
 		if !isMetadataIP(net.ParseIP(ips)) {
 			t.Fatalf("%s must be classified as metadata (deny)", ips)
 		}

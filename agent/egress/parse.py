@@ -42,6 +42,7 @@ _METADATA_IPS = {
     ipaddress.ip_address("169.254.169.254"),  # AWS/GCP/Azure IMDS
     ipaddress.ip_address("169.254.170.2"),    # ECS task metadata
     ipaddress.ip_address("fd00:ec2::254"),    # IPv6 IMDS
+    ipaddress.ip_address("100.100.100.200"),  # Alibaba Cloud metadata (100.64/10 CGN, not internal)
 }
 
 

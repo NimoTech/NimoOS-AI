@@ -94,6 +94,7 @@ var metadataIPs = []net.IP{
 	net.ParseIP("169.254.169.254"), // AWS/GCP/Azure IMDS
 	net.ParseIP("169.254.170.2"),   // ECS task metadata
 	net.ParseIP("fd00:ec2::254"),   // IPv6 IMDS
+	net.ParseIP("100.100.100.200"), // Alibaba Cloud metadata (in 100.64/10 CGN, not an internal range)
 }
 
 // isMetadataIP reports whether ip is a cloud metadata endpoint. These are
@@ -338,6 +339,15 @@ func secureDialer(classifiedInternal bool) *net.Dialer {
 			ip = normalizeIP(ip)
 			if ip == nil {
 				return fmt.Errorf("rebinding-check: rejected IP %s (unspecified/multicast/NAT64)", host)
+			}
+			// Metadata endpoints must be denied at dial time regardless of the
+			// pre-dial classification: a multi-A-record / DNS-rebinding answer
+			// (e.g. [dead-internal, 169.254.169.254]) classifies as internal and
+			// the isInternal consistency check below would pass, letting the dial
+			// land on the metadata endpoint. Covers both dispatch paths, since
+			// handleConnect and proxyPlainHTTP both dial via secureDialer.
+			if isMetadataIP(ip) {
+				return fmt.Errorf("rebinding-check: metadata endpoint %s denied", ip)
 			}
 			reallyInternal := isInternal(ip)
 			if reallyInternal != classifiedInternal {

@@ -107,6 +107,11 @@ class TestIsExternalHost:
     def test_metadata_ip_ipv6_is_external(self):
         assert _is_external_host("fd00:ec2::254") is True
 
+    def test_metadata_ip_aliyun_is_external(self):
+        # 100.100.100.200 is in 100.64.0.0/10 (CGN) — NOT an internal range,
+        # so it would otherwise be reachable on :80 behind one TOFU confirm.
+        assert _is_external_host("100.100.100.200") is True
+
 
 # ─── parse_upload positive tests ──────────────────────────────────────────────
 
