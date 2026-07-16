@@ -20,6 +20,7 @@ from parser_client import ParserClient
 from skills import filesystem as _fsskill
 from skills import photos as _photos
 from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
+from fences import fence_untrusted
 
 _client = SearchClient()
 _parser_client = ParserClient()
@@ -61,7 +62,12 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
     except httpx.HTTPError as e:
         return json.dumps({"error": f"search request failed: {e}"},
                           ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+    result_text = json.dumps(result, ensure_ascii=False)
+    # Search hits are external content the model reads — fence them so any
+    # injected instructions inside a filename/preview read as data, not
+    # commands. fence_untrusted returns "" for empty/whitespace content; fall
+    # back to the unfenced text so the no-results UX is unchanged.
+    return fence_untrusted("search-results", result_text) or result_text
 
 
 async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
