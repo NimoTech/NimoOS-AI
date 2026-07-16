@@ -78,7 +78,8 @@ async def test_invoke_rejected_returns_text():
 
     asyncio.create_task(reject())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
-    assert "拒绝" in out
+    assert out.startswith("[MCP error]")
+    assert "denied" in out
 
 
 @pytest.mark.asyncio
@@ -109,7 +110,8 @@ async def test_blacklist_blocks_path_arg():
                          {"name": "read", "description": "",
                           "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}})
     out = await tool.on_invoke_tool(None, '{"path":"/etc/shadow"}')
-    assert "黑名单" in out or "blacklist" in out.lower()
+    assert out.startswith("[MCP error]")
+    assert "blacklist" in out.lower()
 
 
 @pytest.mark.asyncio
@@ -127,4 +129,5 @@ async def test_connect_failure_message_distinct(monkeypatch):
 
     asyncio.create_task(approve())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
-    assert "无法连接" in out and "勿改参数" in out
+    assert out.startswith("[MCP error]")
+    assert "cannot connect" in out and "do NOT retry" in out

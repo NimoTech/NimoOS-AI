@@ -54,7 +54,7 @@ async def test_register_approved(monkeypatch):
     out = await ma.mcp_register_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
     await task
-    assert "已注册" in out
+    assert "Registered MCP server" in out
     assert fake_register.called[1] == "7"
     assert fake_register.called[2] == "npx -y @pkg"
     assert fake_register.called[3] == "pkg"  # display_name = suggested_name when name omitted
@@ -70,7 +70,7 @@ async def test_register_denied(monkeypatch):
     out = await ma.mcp_register_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
     await task
-    assert "拒绝" in out
+    assert "declined" in out
     assert fake_register.called is None
 
 
@@ -82,7 +82,7 @@ async def test_register_parse_error(monkeypatch):
     monkeypatch.setattr(ma, "_parse", boom_parse)
     out = await ma.mcp_register_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "   "}))
-    assert "解析失败" in out
+    assert "Parse failed" in out
 
 
 @pytest.mark.asyncio
@@ -90,4 +90,4 @@ async def test_register_no_ai_base(monkeypatch):
     monkeypatch.setattr(ma, "_read_ai_base", lambda: None)
     out = await ma.mcp_register_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
-    assert "无法" in out or "系统错误" in out
+    assert "cannot locate" in out or "System error" in out
