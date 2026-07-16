@@ -43,4 +43,7 @@ func TestDesktopAppBuilderSkillEmbedded(t *testing.T) {
 
 	_, err = builtinSkillsFS.ReadFile("builtin-skills/desktop-app-builder/SKILL.md")
 	require.NoError(t, err)
+
+	_, err = builtinSkillsFS.ReadFile("builtin-skills/desktop-app-builder/references/app-contract.md")
+	require.NoError(t, err)
 }
