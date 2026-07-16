@@ -59,10 +59,11 @@ contract.
 - **Keep the container name stable.** A renamed container is a new app
   to the desktop, and apps the user manually removed from the desktop
   do NOT come back automatically while the same-named container keeps
-  existing (tracked by container name). That deletion memory clears
-  once the container has been gone past the ~45 s grace period, after
-  which re-running it auto-returns it to the desktop; meanwhile it can
-  be re-added from the desktop's add panel.
+  running (tracked by container name). That deletion memory clears as
+  soon as the container is reported stopped (next poll, ≤30 s) or has
+  been absent past the ~45 s grace period, after which re-running it
+  auto-returns it to the desktop; meanwhile it can be re-added from
+  the desktop's add panel.
 - **Never invent `nimoos.*` labels** beyond the contract table — they
   are not read by anything.
 - Widget pages MUST be reachable without auth and MUST NOT set their

@@ -34,19 +34,22 @@ MUST NOT:
 
 - A new container lands on the desktop within ≤30 s: the icon takes
   the first free slot, and a declared widget auto-places too.
-- `docker stop` or `docker rm` → the entry is removed from the desktop
-  within ~1 minute (a 45 s absence grace period absorbs transient
-  restarts/Docker blips first, so a restart within that window is
-  invisible — nothing changes on the desktop).
+- `docker stop` → the entry is removed on the next desktop poll
+  (≤30 s): the backend positively reports the stopped state, so no
+  grace period applies.
+- `docker rm` → the entry is removed within ~1 minute (a 45 s absence
+  grace period absorbs transient Docker enumeration blips first, so a
+  brief blip inside that window leaves the desktop unchanged).
 - Re-running a container with the same name (`docker start` /
   `docker run`) → back on the desktop within ≤30 s, position
   reassigned.
 - Apps the user manually deleted from the desktop do NOT come back
   automatically while the container still exists (tracked by container
-  name — keep names stable). That deletion memory clears once the
-  container has been gone past the grace period; re-running it after
-  that auto-returns it to the desktop. Meanwhile, it can be re-added
-  anytime from the desktop's add panel.
+  name — keep names stable). That deletion memory clears as soon as
+  the container is reported stopped (next poll) or has been absent
+  past the grace period; re-running it after that auto-returns it to
+  the desktop. Meanwhile, it can be re-added anytime from the
+  desktop's add panel.
 
 ### Project skeleton
 
