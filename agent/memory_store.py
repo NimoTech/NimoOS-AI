@@ -182,7 +182,7 @@ def get_context_window(conn, user_id) -> "int | None":
 
 
 def supersede_memory(conn, old_id, user_id, text, kind, *, priority=0,
-                     origin_session_id=None, now=None):
+                     trust="normal", origin_session_id=None, now=None):
     """Replace an active memory with a successor that inherits the family
     (lineage_id) and recall_count; mark the predecessor 'superseded'. Returns
     the new id, or None if old_id is not an active row for user_id."""
@@ -194,7 +194,7 @@ def supersede_memory(conn, old_id, user_id, text, kind, *, priority=0,
     ).fetchone()
     if pred is None:
         return None
-    new_id = add_memory(conn, user_id, text, kind, source="auto",
+    new_id = add_memory(conn, user_id, text, kind, source="auto", trust=trust,
                         priority=priority, origin_session_id=origin_session_id,
                         lineage_id=pred["lineage_id"], now=now)
     conn.execute(
