@@ -23,7 +23,7 @@ func TestFileReaderSkillEmbedded(t *testing.T) {
 }
 
 func TestBuiltinSeedVersionBumped(t *testing.T) {
-	require.Equal(t, "7", service.BuiltinSeedVersion)
+	require.Equal(t, "8", service.BuiltinSeedVersion)
 }
 
 func TestDesktopAppBuilderSkillEmbedded(t *testing.T) {
@@ -49,4 +49,20 @@ func TestDesktopAppBuilderSkillEmbedded(t *testing.T) {
 
 	_, err = builtinSkillsFS.ReadFile("builtin-skills/desktop-app-builder/references/widget-contract.md")
 	require.NoError(t, err)
+}
+
+func TestAllBuiltinBundlesPassValidation(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, service.SeedBuiltinSkills(root, builtinSkillsFS))
+	store := &service.SkillsStore{Root: root}
+	ms, err := store.ListBuiltin()
+	require.NoError(t, err)
+	ids := make([]string, 0, len(ms))
+	for _, m := range ms {
+		ids = append(ids, m.ID)
+	}
+	require.Contains(t, ids, "desktop-app-builder")
+	// 7 pre-existing bundles + desktop-app-builder. A silently-skipped
+	// (invalid) bundle would make this count drop.
+	require.Len(t, ms, 8)
 }
