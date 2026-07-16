@@ -797,6 +797,10 @@ async def egress_confirm(req: _EgressConfirmRequest):
             "description": description,
         })
         granted = await _confirm_mgr.wait(cid)
+        from audit import audit as _audit  # noqa: PLC0415
+        _audit("egress_grant", session_id=session_id, host=req.host,
+               bytes=req.bytes, reason=req.reason,
+               decision="approved" if granted else "denied")
         return {"allow": bool(granted)}
     except Exception as exc:
         _LOG.error("egress-confirm error for session %s: %s — fail-closed", session_id, exc)
