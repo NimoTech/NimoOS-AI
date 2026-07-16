@@ -16,6 +16,7 @@ import stat
 import time
 from typing import Optional
 
+from audit import audit as _audit
 from fs import paths, ignore, ownership, staging, access_request
 from fs.snapshots import SnapshotTooLarge
 
@@ -111,6 +112,12 @@ async def _emit_staged(ctx, seq: int, op: str, path: str, *,
         "dst_path": dst_path,
         "size_bytes": size_bytes,
     })
+    try:
+        _audit("fs_change", user_id=ctx.get("user_id"),
+               session_id=ctx.get("session_id"), op=op, path=path,
+               dst_path=dst_path)
+    except Exception:  # noqa: BLE001 — audit must never break the fs op
+        pass
 
 
 def _binary_marker(abs_path: str) -> Optional[str]:
