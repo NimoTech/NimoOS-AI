@@ -107,5 +107,34 @@ class ParserClient:
         r.raise_for_status()
         return r.json()
 
+    async def notes_upsert(self, user_id, note_id, note_type, status,
+                           created_by, updated_at, chunks):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/notes/upsert",
+            json={"user_id": str(user_id), "note_id": note_id,
+                  "note_type": note_type, "status": status,
+                  "created_by": created_by, "updated_at": updated_at,
+                  "chunks": chunks})
+        r.raise_for_status()
+        return r.json()
+
+    async def notes_query(self, user_id, query, top_k=10, statuses=None):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/notes/query",
+            json={"user_id": str(user_id), "query": query,
+                  "top_k": top_k, "statuses": statuses})
+        r.raise_for_status()
+        return r.json()
+
+    async def notes_delete(self, user_id, note_id):
+        base = self._resolve_base_url()
+        r = await self._client.post(
+            f"{base}/v1/parser/notes/delete",
+            json={"user_id": str(user_id), "note_id": note_id})
+        r.raise_for_status()
+        return r.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()
