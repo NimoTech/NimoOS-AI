@@ -573,7 +573,7 @@ func TestGrantedSilent(t *testing.T) {
 
 	// Simulate upload over threshold — should NOT call confirm.
 	markConfirmed(host)
-	overThreshold := int64(uploadThreshold + 1024)
+	overThreshold := uploadThreshold + 1024
 	if hasGrant(host) {
 		// Grant covers it — no confirm needed.
 		// Deduct bytes from grant.
@@ -945,6 +945,33 @@ func TestProxyPlainHTTPInternal(t *testing.T) {
 	}
 	if !strings.Contains(rw.Body.String(), "hello from internal") {
 		t.Errorf("unexpected body: %s", rw.Body.String())
+	}
+}
+
+// TestProxyPlainHTTPMetadataDenied verifies the SSRF-credential-exfil vector is
+// closed on the plain-HTTP path too: cloud metadata services are queried over
+// plain HTTP by design (never TLS), so a non-CONNECT request to 169.254.169.254
+// must be denied with 403 even though it is link-local ("internal").
+func TestProxyPlainHTTPMetadataDenied(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	old := confirmURL
+	confirmURL = "" // must be denied before any confirm/dial
+	defer func() { confirmURL = old }()
+
+	req := httptest.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data/iam/security-credentials/", nil)
+	req.Host = "169.254.169.254:80"
+	req.RequestURI = ""
+	rw := httptest.NewRecorder()
+
+	proxyPlainHTTP(rw, req)
+
+	if rw.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for metadata endpoint over plain HTTP, got %d body=%s", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "cloud metadata endpoint") {
+		t.Errorf("expected metadata-block message, got body=%s", rw.Body.String())
 	}
 }
 

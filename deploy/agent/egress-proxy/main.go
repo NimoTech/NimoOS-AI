@@ -559,6 +559,11 @@ func proxyPlainHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isMetadataIP(normIP) {
+		http.Error(w, "blocked: cloud metadata endpoint", http.StatusForbidden)
+		return
+	}
+
 	internal := isInternal(normIP)
 
 	if !internal {
