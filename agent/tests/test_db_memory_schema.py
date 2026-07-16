@@ -13,7 +13,7 @@ def test_memory_entries_columns(tmp_path):
     conn = init_db(str(tmp_path / "m.db"))
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(memory_entries)")}
     assert cols == {
-        "id", "user_id", "kind", "text", "source", "priority", "status",
+        "id", "user_id", "kind", "text", "source", "trust", "priority", "status",
         "lineage_id", "supersedes", "recall_count", "last_recalled_at",
         "created_at", "updated_at", "expires_at", "origin_session_id",
     }
