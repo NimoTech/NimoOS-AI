@@ -27,6 +27,12 @@ skill 渐进式披露机制按需加载,给 agent 提供"AI coding 桌面应用/
 - 不在 bundle 内建 `templates/` 真实代码文件(方案 3 被否):模板以代码块形式
   留在契约文档中,紧邻解释文字,避免 bundle 内部出现第二份需同步的拷贝。
 
+## 2.5 语言约定(2026-07-16 用户补充)
+
+bundle 内**全部英文**(manifest description/title/examples、SKILL.md、两个
+references),与现有 7 个内置 skill 一致;仅示例代码中面向最终用户的界面文案
+(如 widget 演示页上的"下载任务")保留中文。agent 与用户对话仍用用户的语言。
+
 ## 3. Bundle 结构
 
 ```
