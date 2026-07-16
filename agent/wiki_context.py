@@ -15,6 +15,7 @@ import time
 
 import pathspec
 
+from fences import fence_untrusted
 from wiki_client import WikiClient
 
 
@@ -129,7 +130,7 @@ class WikiContextBuilder:
                 body = (body[:USER_NOTES_PER_NODE_CHAR_CAP]
                         + f"\n…(更多见 wiki_get_node('{n['path']}'))")
             lines.append(f"### {n['path']}")
-            lines.append(body)
+            lines.append(fence_untrusted(f"wiki:{n['path']}", body))
             lines.append("")
             total += len(body)
             appended += 1
