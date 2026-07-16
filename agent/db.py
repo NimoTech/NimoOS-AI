@@ -255,6 +255,15 @@ CREATE TABLE IF NOT EXISTS channel_chats (
     updated_at       INTEGER NOT NULL,
     UNIQUE(instance_id, external_chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS shell_allowlist (
+    id          TEXT PRIMARY KEY,
+    match_type  TEXT NOT NULL CHECK(match_type IN ('prefix','regex','path_scope')),
+    value       TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL
+);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"

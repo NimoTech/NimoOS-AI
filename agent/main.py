@@ -2384,6 +2384,50 @@ async def confirm_session(
     return {"ok": True}
 
 
+@app.get("/agent/shell-allowlist")
+async def shell_allowlist_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from shell_guard import allowlist as _al
+    import db as _db
+    return {"entries": _al.list_entries(_db.get_connection())}
+
+
+@app.post("/agent/shell-allowlist")
+async def shell_allowlist_add(
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    from shell_guard import allowlist as _al
+    import db as _db
+    import json as _json
+    try:
+        data = _json.loads(await request.body() or b"{}")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="invalid_json")
+    match_type = data.get("match_type")
+    value = data.get("value")
+    note = data.get("note") or ""
+    if match_type not in ("prefix", "regex", "path_scope"):
+        raise HTTPException(status_code=400, detail="bad_match_type")
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail="empty_value")
+    if not isinstance(note, str):
+        note = ""
+    entry_id = _al.add(_db.get_connection(), match_type, value, x_user_id, note)
+    return {"id": entry_id}
+
+
+@app.delete("/agent/shell-allowlist/{entry_id}")
+async def shell_allowlist_delete(
+    entry_id: str,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    from shell_guard import allowlist as _al
+    import db as _db
+    return {"ok": _al.delete(_db.get_connection(), entry_id)}
+
+
 @app.post("/agent/sandbox-run")
 async def sandbox_run_endpoint(
     req: SandboxRunRequest,

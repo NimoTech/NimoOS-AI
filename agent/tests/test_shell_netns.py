@@ -24,6 +24,18 @@ class _DummyView:
     """Minimal SandboxView stand-in."""
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_guard(monkeypatch):
+    """Neutralize the L1 command guardrail for this suite. These tests verify
+    _run_command_impl's execution-mode routing / network-grant logic, which
+    runs after the guard; the guard is unit-tested in test_shell_guard_gate.py.
+    Without this, the guard would classify the placeholder `curl x` commands as
+    gray and gate them before the routing logic under test is reached."""
+    async def _passthrough_guard(command):
+        return None
+    monkeypatch.setattr(shell, "_guard_command", _passthrough_guard)
+
+
 def _mem_db():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

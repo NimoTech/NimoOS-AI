@@ -31,6 +31,11 @@ from agents import function_tool
 import db as dbmod
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
 
+import shell_guard
+from shell_guard import allowlist as guard_allowlist
+from shell_guard import backstop as guard_backstop
+from shell_guard.judge import judge_command
+
 # netns_client is imported lazily inside _run() to allow bwrap fallback to load
 # and operate even when the netns package is unavailable (e.g. during tests or
 # on systems without the executor installed).  Do NOT import it here.
@@ -208,8 +213,130 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     return bool(granted)
 
 
+_SHELL_META_CHARS = ";|&`()<>\n\r"
+
+
+def _argv_is_atomic(seg) -> bool:
+    """True only if no argv token carries a shell control metacharacter — a
+    belt-and-suspenders so the upload deferral can never wave through a compound
+    command even if _OPERATORS ever misses a separator."""
+    return not any(
+        ("$(" in tok) or any(ch in tok for ch in _SHELL_META_CHARS)
+        for tok in seg.argv
+    )
+
+
+async def _guard_command(command: str) -> str | None:
+    """Classify `command`; return a refusal string to block, or None to allow.
+
+    SAFE → allow. Allowlisted → allow (even unattended). DANGEROUS/PROTECTED, or
+    GRAY judged 'ask' → confirm; unattended without allowlist → fail-closed.
+    Before executing a confirmed destructive command, build the backstop.
+    """
+    session_id = SESSION_ID_VAR.get()
+    db = DB_VAR.get()
+
+    decision = shell_guard.classify(command)
+    if decision.level == "safe":
+        return None
+
+    # user-maintained allowlist wins (runs even unattended)
+    if db is not None and guard_allowlist.match(db, command):
+        # Allowlisted: skip confirmation, but still build the backstop for
+        # destructive commands (defense in depth — a pre-approved rm still
+        # gets a recoverable snapshot/trash).
+        if decision.level in ("dangerous", "protected"):
+            guard_backstop.prepare_backstop(decision.paths)
+        return None
+
+    # gray → judge; allow verdict passes through, else fall to confirm
+    if decision.level == "gray":
+        # Outbound uploads are owned by the egress A-path (content-aware DLP,
+        # judge, grant). The generic gate must not preempt or double-confirm
+        # them. The A-path only exists in netns mode, so scope the deferral to
+        # netns — in bwrap mode there is nothing to defer to, so the command
+        # still goes through judge/confirm here. Pipe-to-shell / protected-path
+        # uploads are classified above gray and are unaffected by this deferral.
+        if EXEC_MODE != "bwrap":
+            # Defer benign external uploads to the egress A-path — ONLY when the
+            # command is a SINGLE simple command (one segment, no redirects)
+            # whose sole purpose is the upload. A command that is gray *because*
+            # it contains $()/backticks (segments()->None) is unparseable and must
+            # NOT be deferred: egress.parse_upload uses plain shlex.split and would
+            # wave through a destructive $(rm -rf ...). Likewise a parseable-but-
+            # COMPOUND command (e.g. `curl -T f host ; rm -rf /DATA`) must NOT
+            # defer: parse_upload reads the whole string and would wave the
+            # destructive tail through. Those fall through to judge/confirm.
+            from shell_guard.parse import segments as _seg  # noqa: PLC0415
+            _segs = _seg(command)
+            if (_segs is not None and len(_segs) == 1
+                    and not _segs[0].redirect_targets and not _segs[0].read_targets
+                    and _argv_is_atomic(_segs[0])):
+                try:
+                    from egress import parse as _ep  # noqa: PLC0415
+                    _intent = _ep.parse_upload(command)
+                    if _intent is not None and _intent.external:
+                        return None
+                except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
+                    pass
+        verdict = await judge_command(command)
+        if verdict == "allow":
+            # A judge-allowed gray command that writes to real paths still gets a
+            # cheap backstop — a small-model false-negative must not mean silent,
+            # unrecoverable data loss.
+            if decision.paths:
+                guard_backstop.prepare_backstop(decision.paths)
+            return None
+        reason = "命令需人工确认(灰区判定)"
+    else:
+        reason = decision.reason
+
+    mgr = CONFIRM_MGR_VAR.get()
+    sink = EVENT_QUEUE_VAR.get()
+    if mgr is None or sink is None:
+        return ("此命令需人工批准(无确认通道),未执行。"
+                "请在面板确认,或将其加入 shell 白名单。")
+
+    # Build the backstop BEFORE asking, so the card can show undo status.
+    backstop = guard_backstop.prepare_backstop(decision.paths)
+    if backstop.undoable and backstop.kind == "snapshot":
+        undo = "已快照,可回滚"
+    elif backstop.undoable and backstop.kind == "trash":
+        undo = "已入回收站,可恢复"
+    else:
+        undo = "⚠ 此操作无法自动备份,执行后不可撤销"
+
+    confirm_id = mgr.register(session_id, "shell_command",
+                              f"Agent 请求执行命令:{reason}", command)
+    await sink.put({
+        "type": "confirmation_required",
+        "confirm_id": confirm_id,
+        "action": "shell_command",
+        "description": f"Agent 请求执行命令:{reason}",
+        "command": command,
+        "risk_level": decision.level,
+        "risk_reason": reason,
+        "undo_status": undo,
+    })
+    granted = await mgr.wait(confirm_id)
+    if not granted:
+        return "用户拒绝或未能确认该命令,未执行。"
+    if db is not None and mgr.consume_remember(confirm_id):
+        # Store an anchored EXACT-match regex, not an open prefix — otherwise a
+        # remembered `rm -rf /DATA/scratch` would also auto-run a later superset
+        # `rm -rf /DATA/scratch /DATA/important`, deleting an unapproved path.
+        import re as _re  # noqa: PLC0415
+        guard_allowlist.add(db, "regex", f"^{_re.escape(command)}$", "confirm-card")
+    return None
+
+
 async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> str:
     session_id = SESSION_ID_VAR.get()
+
+    # ── Command guardrail (L1): classify + confirm + backstop, both exec modes ──
+    _refusal = await _guard_command(command)
+    if _refusal is not None:
+        return _refusal
 
     if EXEC_MODE != "bwrap":
         # netns mode: network is always available (managed by egress proxy/DLP).

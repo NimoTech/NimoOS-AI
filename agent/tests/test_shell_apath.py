@@ -67,6 +67,14 @@ def _netns_mode(monkeypatch):
     shell.SESSION_ID_VAR.set("s1")
     shell.CONFIRM_MGR_VAR.set(None)
     shell.EVENT_QUEUE_VAR.set(None)
+    # Neutralize the L1 command guardrail here: this suite unit-tests the egress
+    # A-path (parse/rules/judge/grant) inside _run_command_impl, which runs
+    # *after* the guard. The guard itself is unit-tested in
+    # test_shell_guard_gate.py. In production the guard defers uploads to this
+    # A-path (returns None), so a pass-through stub faithfully models that hand-off.
+    async def _passthrough_guard(command):
+        return None
+    monkeypatch.setattr(shell, "_guard_command", _passthrough_guard)
 
 
 def _patch_netns_client(monkeypatch) -> list:
