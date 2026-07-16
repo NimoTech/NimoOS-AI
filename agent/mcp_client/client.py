@@ -180,7 +180,7 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     session_id = SESSION_ID_VAR.get()
     confirm_id = mgr.register(
         session_id, f"mcp_call:{key}",
-        f"调用 MCP server「{server['name']}」的工具 {tool_name}",
+        f'Call tool {tool_name} on MCP server "{server["name"]}"',
         json.dumps(args, ensure_ascii=False)[:500])
     await queue.put({
         "type": "confirmation_required", "confirm_id": confirm_id,
