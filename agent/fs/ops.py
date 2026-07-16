@@ -87,7 +87,7 @@ async def _resolve_and_gate_or_request(ctx, raw: str, op: str) -> str:
             raise  # no interactive channel; behave as before
         granted = await access_request.request_access(ctx, abs_, kind, op)
         if not granted:
-            raise paths.PermissionDenied(f"用户拒绝了对 {abs_} 的访问")
+            raise paths.PermissionDenied(f"The user denied access to {abs_}")
         return _resolve_and_gate(ctx, raw)
 
 

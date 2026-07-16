@@ -52,7 +52,7 @@ async def test_network_denied_returns_message_without_running(monkeypatch):
         nonlocal called; called = True; return "[exit 0]\n"
     monkeypatch.setattr(shell, "_run", _fake_run)
     out = await shell._run_command_impl("curl x", 30, True)
-    assert "拒绝" in out
+    assert "denied" in out
     assert called is False
 
 

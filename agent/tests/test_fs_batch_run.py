@@ -37,7 +37,7 @@ def test_run_batch_blocked_aborts_with_zero_writes(ctx, tmp_path):
            {"op": "rename", "path": str(root / "a.jpg"),
             "dst": str(root / "b.jpg"), "parents": False, "recursive": False}]
     out = _run(batch.run_batch(ctx, ops))
-    assert "受保护" in out
+    assert "Protected" in out
     assert (root / "a.jpg").exists()
     assert not (root / "b.jpg").exists()
     assert ctx["conn"].execute(
@@ -49,7 +49,7 @@ def test_run_batch_errors_aborts(ctx, tmp_path):
     ops = [{"op": "rename", "path": str(root / "missing"),
             "dst": str(root / "x"), "parents": False, "recursive": False}]
     out = _run(batch.run_batch(ctx, ops))
-    assert "未做任何改动" in out or "失败" in out
+    assert "nothing was changed" in out or "failed" in out.lower()
     assert ctx["conn"].execute(
         "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 0
 
@@ -75,7 +75,7 @@ def test_run_batch_rejects_symlink_target(ctx, tmp_path):
     out = _run(batch.run_batch(ctx, [
         {"op": "delete", "path": str(link), "dst": None,
          "parents": False, "recursive": True}]))
-    assert "符号链接" in out
+    assert "symlink" in out
     assert os.path.islink(str(link))    # untouched
     assert ctx["conn"].execute(
         "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 0

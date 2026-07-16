@@ -393,7 +393,7 @@ async def test_bwrap_mode_unaffected(monkeypatch):
 
     assert not parse_called, "parse_upload must NOT be called in bwrap mode"
     # bwrap denial message
-    assert "拒绝" in result
+    assert "denied" in result
 
 
 # ---------------------------------------------------------------------------
@@ -421,4 +421,4 @@ async def test_apath_unexpected_exception_fail_closed(monkeypatch):
     assert not nc_calls, "netns_client.run_command must NOT be called on A-path exception"
     assert result, "must return a non-empty refusal message"
     # Message should indicate failure/refusal (not an empty string or traceback)
-    assert any(kw in result for kw in ["内部错误", "无法评估", "人工处理", "error", "未执行"])
+    assert any(kw in result for kw in ["internal error", "evaluated", "manually", "error", "NOT executed"])
