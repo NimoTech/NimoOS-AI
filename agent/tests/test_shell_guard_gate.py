@@ -361,6 +361,31 @@ def test_extra_operator_compound_uploads_gated_with_confirm(monkeypatch):
         assert mgr.registered[0][0] == "shell_command"
 
 
+def test_exec_confirm_event_carries_i18n_keys(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    asyncio.run(shell._guard_command("rm -rf /DATA/x"))
+    ev = next(e for e in sink.events if e["type"] == "confirmation_required")
+    assert ev["description_key"] == "shell_exec"
+    assert ev["description_params"]["reason"] == ev["risk_reason"]
+    assert "Agent requests to run a command" in ev["description"]
+    # rules.py reasons are English pass-through → no reason_key
+    assert ev["reason_key"] is None
+
+
+def test_gray_zone_confirm_sets_reason_key(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    # Force the gray path: classify → gray, judge → ask
+    async def _judge(cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _judge)
+    asyncio.run(shell._guard_command("some-unknown-binary --flag"))
+    ev = next(e for e in sink.events if e["type"] == "confirmation_required")
+    assert ev["reason_key"] == "gray_zone"
+    assert ev["description_params"]["reason"] == ev["risk_reason"]
+
+
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):
     """Security-review addition: an allowlisted DESTRUCTIVE command must not
     skip the backstop, only the confirmation. Runs unattended (no confirm

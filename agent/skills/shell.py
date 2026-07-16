@@ -200,12 +200,13 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     if mgr is None or sink is None:
         return False  # headless: cannot confirm → stay offline
     confirm_id = mgr.register(session_id, "shell_network",
-                              "Agent 请求联网执行命令", command)
+                              "Agent requests network access for a command", command)
     await sink.put({
         "type": "confirmation_required",
         "confirm_id": confirm_id,
         "action": "shell_network",
-        "description": "Agent 请求联网执行命令",
+        "description": "Agent requests network access for a command",
+        "description_key": "shell_network",
         "command": command,
     })
     granted = await mgr.wait(confirm_id)
@@ -300,9 +301,11 @@ async def _guard_command(command: str) -> str | None:
                 guard_backstop.prepare_backstop(decision.paths)
             _rec("allowed_gray", "gray", "judge-allow")
             return None
-        reason = "命令需人工确认(灰区判定)"
+        reason = "needs manual confirmation (gray-zone verdict)"
+        reason_key = "gray_zone"
     else:
         reason = decision.reason
+        reason_key = None
 
     mgr = CONFIRM_MGR_VAR.get()
     sink = EVENT_QUEUE_VAR.get()
@@ -314,19 +317,22 @@ async def _guard_command(command: str) -> str | None:
     # Build the backstop BEFORE asking, so the card can show undo status.
     backstop = guard_backstop.prepare_backstop(decision.paths)
     if backstop.undoable and backstop.kind == "snapshot":
-        undo = "已快照,可回滚"
+        undo = "snapshot taken; can be rolled back"
     elif backstop.undoable and backstop.kind == "trash":
-        undo = "已入回收站,可恢复"
+        undo = "moved to trash; can be restored"
     else:
-        undo = "⚠ 此操作无法自动备份,执行后不可撤销"
+        undo = "⚠ cannot be backed up automatically; irreversible once executed"
 
     confirm_id = mgr.register(session_id, "shell_command",
-                              f"Agent 请求执行命令:{reason}", command)
+                              f"Agent requests to run a command: {reason}", command)
     await sink.put({
         "type": "confirmation_required",
         "confirm_id": confirm_id,
         "action": "shell_command",
-        "description": f"Agent 请求执行命令:{reason}",
+        "description": f"Agent requests to run a command: {reason}",
+        "description_key": "shell_exec",
+        "description_params": {"reason": reason},
+        "reason_key": reason_key,
         "command": command,
         "risk_level": decision.level,
         "risk_reason": reason,
@@ -416,14 +422,16 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         confirm_id = mgr.register(
                             session_id,
                             "egress_upload",
-                            f"Agent 请求上传文件到外部主机 {intent.host}",
+                            f"Agent requests to upload files to external host {intent.host}",
                             command,
                         )
                         await sink.put({
                             "type": "confirmation_required",
                             "confirm_id": confirm_id,
                             "action": "egress_upload",
-                            "description": f"Agent 请求上传文件到外部主机 {intent.host}",
+                            "description": f"Agent requests to upload files to external host {intent.host}",
+                            "description_key": "egress_upload",
+                            "description_params": {"host": intent.host},
                             "host": intent.host,
                             "files": intent.files,
                             "reason": v.reason,

@@ -11,12 +11,13 @@ def _mk_conn(tmp_path, name):
     return conn
 
 
-def _add_req(conn, confirm_id, run_id, path, decision, created_at):
+def _add_req(conn, confirm_id, run_id, path, decision, created_at, reason_key="list"):
     conn.execute(
         "INSERT INTO access_requests "
-        "(confirm_id,session_id,run_id,path,kind,reason,decision,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (confirm_id, "s1", run_id, path, "folder", "需要浏览该文件夹", decision, created_at))
+        "(confirm_id,session_id,run_id,path,kind,reason,reason_key,decision,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (confirm_id, "s1", run_id, path, "folder", "Needs to browse this folder",
+         reason_key, decision, created_at))
     conn.commit()
 
 
@@ -34,7 +35,18 @@ def test_inject_attaches_resolved_card_to_assistant_turn(tmp_path):
     c = cards[0]
     assert c["decided"] is True and c["granted"] is True
     assert c["path"] == "/DATA/Docs" and c["confirmId"] == "c1"
-    assert c["kind"] == "folder" and c["reason"] == "需要浏览该文件夹"
+    assert c["kind"] == "folder" and c["reason"] == "Needs to browse this folder"
+    assert c["reasonKey"] == "list"
+
+
+def test_inject_legacy_null_reason_key_becomes_empty_string(tmp_path):
+    conn = _mk_conn(tmp_path, "legacy.db")
+    _add_req(conn, "c1", "r1", "/DATA/Legacy", "granted", 1001, reason_key=None)
+    messages = [{"role": "assistant", "blocks": []}]
+    out = main_module._inject_access_request_cards(messages, "s1", conn)
+    cards = [b for m in out if m.get("role") == "assistant"
+             for b in m.get("blocks", []) if b.get("type") == "access_request"]
+    assert len(cards) == 1 and cards[0]["reasonKey"] == ""
 
 
 def test_inject_denied_card_granted_false(tmp_path):

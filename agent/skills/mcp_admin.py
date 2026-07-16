@@ -75,7 +75,7 @@ async def mcp_register_server(command_line: str, name: str = "") -> str:
 
     confirm_id = mgr.register(
         session_id, f"mcp_install:{display_name}",
-        f"注册 MCP server「{display_name}」({transport})",
+        f'Register MCP server "{display_name}" ({transport})',
         command_line)
     await queue.put({
         "type": "confirmation_required", "confirm_id": confirm_id,
