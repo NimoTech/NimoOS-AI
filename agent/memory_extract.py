@@ -125,8 +125,15 @@ def _current(conn, mem_id, user_id):
     ).fetchone()
 
 
-def apply_extraction(conn, user_id, snapshot, result, *, now=None) -> dict:
+def apply_extraction(conn, user_id, snapshot, result, *, now=None,
+                     session_source="web") -> dict:
     now = now if now is not None else int(time.time())
+    # Memory auto-extracted from a channel-sourced session (Telegram, Discord,
+    # ...) may have been shaped by untrusted external content the user relayed
+    # into the chat. Such memory is marked low-trust so it never gets
+    # re-injected into future system prompts, while still being stored and
+    # visible in the memory-management UI. Computed once, shared by ADD/UPDATE.
+    session_trust = "low" if (session_source and session_source != "web") else "normal"
     counts = {"added": 0, "updated": 0, "noop": 0, "referenced": 0, "skipped": 0}
     for a in result.get("actions", []):
         op = a["op"]
@@ -135,7 +142,8 @@ def apply_extraction(conn, user_id, snapshot, result, *, now=None) -> dict:
                 counts["skipped"] += 1
                 continue
             memory_store.add_memory(conn, user_id, a["text"], a["kind"],
-                                    source="auto", priority=a.get("priority", 0),
+                                    source="auto", trust=session_trust,
+                                    priority=a.get("priority", 0),
                                     now=now)
             counts["added"] += 1
         elif op in ("UPDATE", "NOOP"):
@@ -146,9 +154,16 @@ def apply_extraction(conn, user_id, snapshot, result, *, now=None) -> dict:
                 counts["skipped"] += 1
                 continue
             if op == "UPDATE":
+                # conservative: a low-trust predecessor can NEVER be upgraded to
+                # normal by re-processing (from any session), and a channel
+                # session always downgrades to low.
+                prev = conn.execute(
+                    "SELECT trust FROM memory_entries WHERE id=?", (mid,)).fetchone()
+                prev_trust = prev["trust"] if prev else "normal"
+                upd_trust = "low" if (session_trust == "low" or prev_trust == "low") else "normal"
                 new_id = memory_store.supersede_memory(
                     conn, mid, user_id, a["text"], a["kind"],
-                    priority=a.get("priority", 0), now=now)
+                    priority=a.get("priority", 0), trust=upd_trust, now=now)
                 counts["updated" if new_id else "skipped"] += 1
             else:  # NOOP — touch updated_at so it sorts as recently seen
                 conn.execute(
@@ -218,8 +233,12 @@ async def process_pending_once(conn, *, llm_call, history_loader, now=None):
         return session_id
 
     # 3) apply under the lock (short), then delete the job row
+    srow = conn.execute("SELECT source FROM sessions WHERE id=?",
+                        (session_id,)).fetchone()
+    session_source = srow["source"] if srow else "web"
     async with lock:
-        mx_counts = apply_extraction(conn, user_id, snapshot, result, now=now)
+        mx_counts = apply_extraction(conn, user_id, snapshot, result, now=now,
+                                     session_source=session_source)
     conn.execute("DELETE FROM memory_extract_jobs "
                  "WHERE session_id=? AND status='running'", (session_id,))
     conn.commit()

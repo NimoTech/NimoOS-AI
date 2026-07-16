@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     kind              TEXT NOT NULL,              -- 'preference' | 'fact' | 'goal'
     text              TEXT NOT NULL,
     source            TEXT NOT NULL,              -- 'auto' | 'tool' | 'user'
+    trust             TEXT NOT NULL DEFAULT 'normal', -- 'normal' | 'low'
     priority          INTEGER NOT NULL DEFAULT 0,
     status            TEXT NOT NULL DEFAULT 'active', -- 'active'|'disabled'|'superseded'
     lineage_id        TEXT NOT NULL,
@@ -356,6 +357,11 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     cb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channel_bindings)")}
     if "download_dir" not in cb_cols:
         conn.execute("ALTER TABLE channel_bindings ADD COLUMN download_dir TEXT")
+    # Idempotent ALTER for existing databases without the trust column.
+    mem_cols = {r["name"] for r in conn.execute("PRAGMA table_info(memory_entries)")}
+    if "trust" not in mem_cols:
+        conn.execute("ALTER TABLE memory_entries ADD COLUMN "
+                     "trust TEXT NOT NULL DEFAULT 'normal'")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

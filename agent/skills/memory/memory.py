@@ -12,6 +12,7 @@ from agents import function_tool
 
 import db as db_module
 import memory_store
+from fences import fence_untrusted
 from memory_lock import get_user_lock
 
 # Set per-run by AgentRunner.run; read at tool-call time.
@@ -35,9 +36,17 @@ async def _remember_impl(text: str, kind: str = "fact", priority: int = 0) -> st
         if dup:
             return json.dumps({"status": "duplicate", "id": dup}, ensure_ascii=False)
         sid = SESSION_ID_VAR.get() or None
+        # Mirror the extraction low-trust gate: memory recorded via the
+        # explicit remember() tool while serving a channel-sourced session
+        # (Telegram/Discord/...) may have been shaped by untrusted external
+        # content the user relayed in. Mark it low-trust so it is stored and
+        # visible in the UI but never re-injected into future system prompts.
+        _srow = conn.execute(
+            "SELECT source FROM sessions WHERE id=?", (sid,)).fetchone() if sid else None
+        _trust = "low" if (_srow and _srow["source"] and _srow["source"] != "web") else "normal"
         mem_id = memory_store.add_memory(
-            conn, uid, text, kind, source="tool", priority=priority,
-            origin_session_id=sid)
+            conn, uid, text, kind, source="tool", trust=_trust,
+            priority=priority, origin_session_id=sid)
     return json.dumps({"status": "added", "id": mem_id}, ensure_ascii=False)
 
 
@@ -83,7 +92,13 @@ async def _recall_impl(query: str, top_k: int = 5) -> str:
         res = await _query_agent_memory(uid, query, top_k=top_k)
     except Exception:
         return json.dumps({"status": "unavailable"}, ensure_ascii=False)
-    return json.dumps({"hits": res.get("hits", [])}, ensure_ascii=False)
+    # Episodic hits re-surface content from PAST conversations that may have
+    # carried injected instructions (esp. channel sessions). Fence them as
+    # untrusted data before handing back to the model. fence_untrusted returns
+    # "" for empty/whitespace payloads, so fall back to the raw JSON to
+    # preserve the no-hits UX.
+    payload = json.dumps({"hits": res.get("hits", [])}, ensure_ascii=False)
+    return fence_untrusted("recall", payload, cap=60000) or payload
 
 
 @function_tool
