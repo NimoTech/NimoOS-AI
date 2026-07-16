@@ -34,13 +34,19 @@ MUST NOT:
 
 - A new container lands on the desktop within ≤30 s: the icon takes
   the first free slot, and a declared widget auto-places too.
-- `docker stop` → icon dims, widget shows "app not running";
-  `docker start` restores both.
-- `docker rm` → the desktop entry disappears; re-running a container
-  with the same name puts it back automatically.
+- `docker stop` or `docker rm` → the entry is removed from the desktop
+  within ~1 minute (a 45 s absence grace period absorbs transient
+  restarts/Docker blips first, so a restart within that window is
+  invisible — nothing changes on the desktop).
+- Re-running a container with the same name (`docker start` /
+  `docker run`) → back on the desktop within ≤30 s, position
+  reassigned.
 - Apps the user manually deleted from the desktop do NOT come back
-  automatically (by design; tracked by container name — keep names
-  stable). They can be re-added from the desktop's add panel.
+  automatically while the container still exists (tracked by container
+  name — keep names stable). That deletion memory clears once the
+  container has been gone past the grace period; re-running it after
+  that auto-returns it to the desktop. Meanwhile, it can be re-added
+  anytime from the desktop's add panel.
 
 ### Project skeleton
 
@@ -151,6 +157,7 @@ services:
 |---|---|
 | nothing on the desktop after 30 s | label typo (self-check 1) / `enable` is not the string `"true"` / container not running (`docker ps`) |
 | icon is a letter tile, not the real icon | `nimoos.icon` is a relative path but `nimoos.port` is missing, or the icon path 404s |
-| a previously deleted app does not reappear | by design (the desktop remembers user deletions) → re-add from the desktop's add panel |
+| a previously deleted app does not reappear | deletion memory persists while the container still exists → re-add from the desktop's add panel, or remove the container, wait >45 s, then run it again |
+| my app vanished from the desktop | container stopped or removed (by design) → `docker start`/`docker run` brings it back within ≤30 s |
 | label changes have no effect | labels cannot be hot-edited → `docker rm -f <name>`, then run/up again |
 | widget problems ("cannot connect", white-on-white) | see `references/widget-contract.md` troubleshooting |
