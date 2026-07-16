@@ -11,6 +11,7 @@ unavailable" on demand.
 from __future__ import annotations
 
 import os
+import re as _re
 import time
 
 import pathspec
@@ -23,6 +24,18 @@ PROJECT_CAP = 15
 USER_NOTES_ACTIVE_DAYS = 30
 USER_NOTES_PER_NODE_CHAR_CAP = 500
 USER_NOTES_TOTAL_CHAR_CAP = 2000
+
+# Registered wiki node names (paths / labels) are attacker-influenceable — a
+# maliciously named directory could carry `<`, `>`, or newlines and smuggle a
+# stray `</untrusted-data>` close tag or an extra instruction line into the
+# scaffold (which is emitted OUTSIDE the per-note fence). Strip control chars +
+# angle brackets and collapse newlines before interpolating these structural
+# bits. Mirrors the fences charset; used for headers/labels, not fenced bodies.
+_SCAF_RE = _re.compile(r"[\x00-\x1f\x7f<>]")
+
+
+def _scaf(s) -> str:
+    return _SCAF_RE.sub("", str(s)).replace("\n", " ")
 
 
 class WikiContextBuilder:
@@ -72,7 +85,7 @@ class WikiContextBuilder:
         for space in spaces:
             sp = space["path"]
             label = space.get("ai_label") or os.path.basename(sp) or sp
-            lines.append(f"- **{sp}** (space) — {label}")
+            lines.append(f"- **{_scaf(sp)}** (space) — {_scaf(label)}")
             projects = [
                 n for n in tree
                 if n.get("level") == "project" and n["path"].startswith(sp + "/")
@@ -82,12 +95,12 @@ class WikiContextBuilder:
                 lbl = n.get("ai_label")
                 if not lbl:
                     lbl = os.path.basename(n["path"]) + " (未生成摘要)"
-                lines.append(f"  - {n['path']} — {lbl}")
+                lines.append(f"  - {_scaf(n['path'])} — {_scaf(lbl)}")
             if len(projects) > PROJECT_CAP:
                 extra = len(projects) - PROJECT_CAP
                 lines.append(
                     f"  - ... 还有 {extra} 个项目,"
-                    f"用 wiki_list_full_tree(root_id='{sp}') 查看完整列表"
+                    f"用 wiki_list_full_tree(root_id='{_scaf(sp)}') 查看完整列表"
                 )
         return "\n".join(lines)
 
@@ -114,7 +127,7 @@ class WikiContextBuilder:
             if total >= USER_NOTES_TOTAL_CHAR_CAP:
                 remaining = len(active) - appended
                 lines.append(
-                    f"\n_(余 {remaining} 条笔记略;用 wiki_get_node('{n['path']}') 等查看)_"
+                    f"\n_(余 {remaining} 条笔记略;用 wiki_get_node('{_scaf(n['path'])}') 等查看)_"
                 )
                 break
             try:
@@ -128,8 +141,8 @@ class WikiContextBuilder:
                 continue
             if len(body) > USER_NOTES_PER_NODE_CHAR_CAP:
                 body = (body[:USER_NOTES_PER_NODE_CHAR_CAP]
-                        + f"\n…(更多见 wiki_get_node('{n['path']}'))")
-            lines.append(f"### {n['path']}")
+                        + f"\n…(更多见 wiki_get_node('{_scaf(n['path'])}'))")
+            lines.append(f"### {_scaf(n['path'])}")
             lines.append(fence_untrusted(f"wiki:{n['path']}", body))
             lines.append("")
             total += len(body)
