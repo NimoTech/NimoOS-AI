@@ -429,6 +429,8 @@ func TestUnknownHostTOFU(t *testing.T) {
 
 func TestTOFUExpires(t *testing.T) {
 	resetConfirmedHosts()
+	old := tofuTTL
+	defer func() { tofuTTL = old }()
 	tofuTTL = 50 * time.Millisecond
 	markConfirmed("example.com")
 	if !isConfirmed("example.com") {
