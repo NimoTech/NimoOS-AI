@@ -29,7 +29,7 @@ def test_index_note_sends_payload(monkeypatch):
     note = {"id": "n1", "user_id": "1", "type": "insight",
             "status": "draft", "created_by": "pipeline",
             "updated_at": 9, "title": "T"}
-    ok = asyncio.get_event_loop().run_until_complete(
+    ok = asyncio.run(
         indexer.index_note(note, "body"))
     assert ok is True
     kind, kw = fake.calls[0]
@@ -43,7 +43,7 @@ def test_index_note_swallows_errors(monkeypatch):
         async def notes_upsert(self, **kw):
             raise RuntimeError("down")
     monkeypatch.setattr(indexer, "_CLIENT", _Boom())
-    ok = asyncio.get_event_loop().run_until_complete(
+    ok = asyncio.run(
         indexer.index_note({"id": "n", "user_id": "1", "type": "note",
                             "status": "draft", "created_by": "agent",
                             "updated_at": 0, "title": "t"}, "b"))
@@ -55,7 +55,7 @@ def test_index_note_never_raises_even_on_malformed_note(monkeypatch):
         async def notes_upsert(self, **kw):
             raise RuntimeError("down")
     monkeypatch.setattr(indexer, "_CLIENT", _Boom())
-    ok = asyncio.get_event_loop().run_until_complete(
+    ok = asyncio.run(
         indexer.index_note({}, "b"))     # 完全缺 id/type 等键也不许抛
     assert ok is False
 
@@ -63,6 +63,6 @@ def test_index_note_never_raises_even_on_malformed_note(monkeypatch):
 def test_deindex(monkeypatch):
     fake = _FakeParser()
     monkeypatch.setattr(indexer, "_CLIENT", fake)
-    ok = asyncio.get_event_loop().run_until_complete(
+    ok = asyncio.run(
         indexer.deindex_note("1", "n1"))
     assert ok is True and fake.calls[0] == ("delete", "1", "n1")

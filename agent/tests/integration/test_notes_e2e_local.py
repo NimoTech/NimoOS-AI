@@ -50,8 +50,7 @@ def test_full_note_lifecycle(tmp_path, monkeypatch):
     notes_skills.CONFIRM_MGR_VAR.set(_Yes())
     notes_skills.EVENT_QUEUE_VAR.set(_Sink())
 
-    loop = asyncio.get_event_loop()
-    out = json.loads(loop.run_until_complete(notes_skills._write_note_impl(
+    out = json.loads(asyncio.run(notes_skills._write_note_impl(
         "NAS 选型结论", "选 X 型号,理由……", "note", ["hardware"], [])))
     assert out["ok"] and out["status"] == "curated"
 
@@ -67,7 +66,7 @@ def test_full_note_lifecycle(tmp_path, monkeypatch):
         meta, _ = parse_note_text(f.read())
     with open(p, "w", encoding="utf-8") as f:
         f.write(serialize_note_text(meta, "人工修订后的内容"))
-    stats = loop.run_until_complete(sync.scan_once(conn))
+    stats = asyncio.run(sync.scan_once(conn))
     assert stats["updated"] == 1
     assert len(cap.upserts) == 2
     row = conn.execute("SELECT revision FROM notes WHERE id=?",

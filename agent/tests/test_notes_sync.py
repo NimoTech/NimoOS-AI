@@ -43,7 +43,7 @@ def conn(tmp_path, monkeypatch):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_adopts_file_without_id(conn):
