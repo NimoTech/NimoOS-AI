@@ -1,5 +1,7 @@
 # agent/tests/test_search_fence.py
 import asyncio
+import json
+
 import skills.search.search as S
 
 
@@ -36,3 +38,20 @@ def test_fence_untrusted_empty_falls_back_to_unfenced_text(monkeypatch):
     out = asyncio.run(S._nimoos_search_impl("q"))
     assert out == '{}'
     assert "<untrusted-data" not in out
+
+
+def test_realistic_large_result_not_truncated(monkeypatch):
+    # A realistic aggregated blob (many hits × ~200-char previews) exceeds
+    # fence_untrusted's default cap=4000 and would be cut mid-JSON with
+    # "…(truncated)". The seam must pass a generous cap so normal-sized
+    # results survive intact, while still bounding pathological cases.
+    hits = [{"file_id": str(i), "preview": "x" * 200 + f"-END{i}"}
+            for i in range(40)]
+    big = {"semantic": hits}
+    assert len(json.dumps(big, ensure_ascii=False)) > 8000  # >> 4000 cap
+    monkeypatch.setattr(S, "_client", _FakeClient(big))
+    out = asyncio.run(S._nimoos_search_impl("q"))
+    assert "…(truncated)" not in out
+    # last item's content survives (not cut off) and the fence closes
+    assert "-END39" in out
+    assert out.rstrip().endswith("</untrusted-data>")

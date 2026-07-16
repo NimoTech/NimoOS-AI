@@ -65,9 +65,12 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
     result_text = json.dumps(result, ensure_ascii=False)
     # Search hits are external content the model reads — fence them so any
     # injected instructions inside a filename/preview read as data, not
-    # commands. fence_untrusted returns "" for empty/whitespace content; fall
+    # commands. Use a generous cap (60000): a realistic aggregated blob
+    # (~3 sources × 20 hits × ~200-char previews + JSON overhead ≈ ≤~30k)
+    # must never be truncated mid-JSON, but keep the backstop for pathological
+    # sizes. fence_untrusted returns "" for empty/whitespace content; fall
     # back to the unfenced text so the no-results UX is unchanged.
-    return fence_untrusted("search-results", result_text) or result_text
+    return fence_untrusted("search-results", result_text, cap=60000) or result_text
 
 
 async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
