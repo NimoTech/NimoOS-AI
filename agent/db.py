@@ -266,6 +266,81 @@ CREATE TABLE IF NOT EXISTS shell_allowlist (
     note        TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL
 );
+
+-- Knowledge notes (M1). Files under <notes_root>/<user_id>/ are the CONTENT
+-- authority; these rows are the METADATA authority, joined by the immutable
+-- frontmatter UUID (= notes.id). Soft-delete only: hard deletes would orphan
+-- mentions/edges once phase-2 graph extraction lands.
+CREATE TABLE IF NOT EXISTS notes (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    path          TEXT NOT NULL,          -- relative to <notes_root>
+    title         TEXT NOT NULL DEFAULT '',
+    description   TEXT NOT NULL DEFAULT '',
+    type          TEXT NOT NULL DEFAULT 'note'
+                   CHECK(type IN ('note','summary','insight','digest')),
+    status        TEXT NOT NULL DEFAULT 'draft'
+                   CHECK(status IN ('draft','curated','archived')),
+    content_hash  TEXT NOT NULL,
+    source_refs_json TEXT,
+    created_by    TEXT NOT NULL DEFAULT 'human'
+                   CHECK(created_by IN ('human','agent','pipeline')),
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    deleted_at    INTEGER,
+    extraction_status TEXT NOT NULL DEFAULT 'none'
+                   CHECK(extraction_status IN ('none','pending','done','failed')),
+    extracted_at  INTEGER,
+    content_hash_at_extraction TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user_status
+    ON notes(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_user_path ON notes(user_id, path);
+
+CREATE TABLE IF NOT EXISTS note_links (
+    src_note_id  TEXT NOT NULL REFERENCES notes(id),
+    dst_kind     TEXT NOT NULL CHECK(dst_kind IN ('note','file','url')),
+    dst_ref      TEXT NOT NULL,
+    anchor_text  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (src_note_id, dst_kind, dst_ref)
+);
+
+-- Phase-2 knowledge-graph placeholders. M1 writes ONLY type='topic' entities
+-- (frontmatter tags) + their mentions; extraction workers fill the rest later.
+CREATE TABLE IF NOT EXISTS entities (
+    id             TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    type           TEXT NOT NULL DEFAULT 'topic',
+    aliases_json   TEXT,
+    description    TEXT NOT NULL DEFAULT '',
+    qdrant_point_id TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    deleted_at     INTEGER,
+    UNIQUE(user_id, type, name)
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    src_entity       TEXT NOT NULL REFERENCES entities(id),
+    dst_entity       TEXT NOT NULL REFERENCES entities(id),
+    rel_type         TEXT NOT NULL,
+    weight           REAL NOT NULL DEFAULT 1.0,
+    description      TEXT NOT NULL DEFAULT '',
+    source_refs_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mentions (
+    entity_id  TEXT NOT NULL REFERENCES entities(id),
+    note_id    TEXT NOT NULL REFERENCES notes(id),
+    chunk_ref  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (entity_id, note_id, chunk_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_entity ON mentions(entity_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_note ON mentions(note_id);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
