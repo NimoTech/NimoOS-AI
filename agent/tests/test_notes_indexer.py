@@ -50,6 +50,16 @@ def test_index_note_swallows_errors(monkeypatch):
     assert ok is False
 
 
+def test_index_note_never_raises_even_on_malformed_note(monkeypatch):
+    class _Boom:
+        async def notes_upsert(self, **kw):
+            raise RuntimeError("down")
+    monkeypatch.setattr(indexer, "_CLIENT", _Boom())
+    ok = asyncio.get_event_loop().run_until_complete(
+        indexer.index_note({}, "b"))     # 完全缺 id/type 等键也不许抛
+    assert ok is False
+
+
 def test_deindex(monkeypatch):
     fake = _FakeParser()
     monkeypatch.setattr(indexer, "_CLIENT", fake)

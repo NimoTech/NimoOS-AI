@@ -37,7 +37,7 @@ async def index_note(note: dict, body: str) -> bool:
             chunks=chunk_note(note.get("title", ""), body))
         return True
     except Exception as e:
-        _LOG.warning("index_note failed for %s: %s", note["id"], e)
+        _LOG.warning("index_note failed for %s: %s", note.get("id", "?"), e)
         return False
 
 
