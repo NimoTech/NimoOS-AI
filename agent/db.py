@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS access_requests (
     path        TEXT NOT NULL,
     kind        TEXT NOT NULL,
     reason      TEXT NOT NULL,
+    reason_key  TEXT,
     decision    TEXT,
     created_at  INTEGER NOT NULL,
     resolved_at INTEGER
@@ -348,6 +349,10 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "source" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "source TEXT NOT NULL DEFAULT 'web'")
+    # Idempotent ALTER for existing databases without the reason_key column.
+    ar_cols = {row["name"] for row in conn.execute("PRAGMA table_info(access_requests)")}
+    if ar_cols and "reason_key" not in ar_cols:
+        conn.execute("ALTER TABLE access_requests ADD COLUMN reason_key TEXT")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}

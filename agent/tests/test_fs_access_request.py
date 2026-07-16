@@ -62,11 +62,25 @@ def test_grant_writes_visible_resource_and_emits_event(ctx):
     assert granted is True
     ev = [e for e in ctx["sink"].events if e["type"] == "access_request"][0]
     assert ev["path"] == "/DATA/Documents" and ev["kind"] == "folder"
-    assert ev["reason"] == "需要浏览该文件夹"
+    assert ev["reason"] == "Needs to browse this folder"
+    assert ev["reason_key"] == "list"
     row = ctx["conn"].execute(
         "SELECT kind FROM visible_resources WHERE session_id='s1' AND path='/DATA/Documents'"
     ).fetchone()
     assert row is not None and row["kind"] == "folder"
+
+
+def test_unknown_op_gets_default_reason_key(ctx):
+    async def go():
+        task = asyncio.ensure_future(
+            access_request.request_access(ctx, "/DATA/Stat", "folder", "stat"))
+        await _resolve_after_event(ctx, True)
+        return await task
+    granted = asyncio.get_event_loop().run_until_complete(go())
+    assert granted is True
+    ev = [e for e in ctx["sink"].events if e["type"] == "access_request"][0]
+    assert ev["reason"] == "Needs access to this path to complete your request"
+    assert ev["reason_key"] == "default"
 
 
 def test_deny_does_not_write_and_remembers(ctx):

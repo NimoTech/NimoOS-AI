@@ -1558,7 +1558,7 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
     turn). Only granted/denied are shown; pending/cancelled are skipped.
     """
     rows = conn.execute(
-        "SELECT confirm_id, run_id, path, kind, reason, decision "
+        "SELECT confirm_id, run_id, path, kind, reason, reason_key, decision "
         "FROM access_requests "
         "WHERE session_id=? AND decision IN ('granted','denied') "
         "ORDER BY created_at ASC",
@@ -1593,6 +1593,7 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
             "path": r["path"],
             "kind": r["kind"],
             "reason": r["reason"],
+            "reasonKey": r["reason_key"] or "",
             "decided": True,
             "granted": r["decision"] == "granted",
         } for r in group]
