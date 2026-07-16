@@ -77,7 +77,15 @@ async def _write_note_impl(title: str, content: str, note_type: str,
                              note_type=note_type, tags=list(tags or []),
                              source_refs=refs, created_by="agent",
                              status="curated")
-    await index_note(note, content)
+    ok = await index_note(note, content)
+    if not ok:
+        # Pending-index sentinel (mirrors notes/sync.py): the note is saved
+        # regardless, but content_hash='' forces the sync scanner's
+        # hash-mismatch branch to retry indexing next pass instead of
+        # treating the (already-hashed) body as up to date.
+        conn.execute("UPDATE notes SET content_hash='' WHERE id=? AND user_id=?",
+                     (note["id"], uid))
+        conn.commit()
     return json.dumps({"ok": True, "id": note["id"],
                        "status": note["status"]}, ensure_ascii=False)
 
@@ -108,7 +116,13 @@ async def _update_note_impl(note_id: str, expected_revision: int,
                            "current_revision": e.current_revision,
                            "hint": "re-read with read_note and retry"},
                           ensure_ascii=False)
-    await index_note(note, note["body"])
+    ok = await index_note(note, note["body"])
+    if not ok:
+        # Pending-index sentinel (mirrors notes/sync.py): keep the update,
+        # but force the sync scanner to retry indexing next pass.
+        conn.execute("UPDATE notes SET content_hash='' WHERE id=? AND user_id=?",
+                     (note["id"], uid))
+        conn.commit()
     return json.dumps({"ok": True, "revision": note["revision"]},
                       ensure_ascii=False)
 

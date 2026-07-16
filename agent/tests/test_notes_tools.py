@@ -102,6 +102,30 @@ def test_no_user_context_refuses(conn):
     assert "error" in out
 
 
+def test_write_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
+    _ctx(approve=True)
+    async def _fail(note, body):
+        return False
+    monkeypatch.setattr(notes_skills, "index_note", _fail)
+    out = json.loads(_run(notes_skills._write_note_impl("T", "c", "note", [], [])))
+    assert out["ok"] is True                      # 笔记照常保存
+    row = conn.execute("SELECT content_hash FROM notes").fetchone()
+    assert row["content_hash"] == ""              # 待索引哨兵,交给 sync 重试
+
+
+def test_update_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
+    _ctx(approve=True)
+    n = store.create_note(conn, "1", title="t", body="v1")
+    async def _fail(note, body):
+        return False
+    monkeypatch.setattr(notes_skills, "index_note", _fail)
+    out = json.loads(_run(notes_skills._update_note_impl(
+        n["id"], expected_revision=1, content="v2")))
+    assert out["ok"] is True
+    row = conn.execute("SELECT content_hash FROM notes WHERE id=?", (n["id"],)).fetchone()
+    assert row["content_hash"] == ""
+
+
 def test_registry_contains_notes_category():
     from skills.tool_registry import CATEGORY_TOOLS, CATEGORY_DESCRIPTIONS
     assert "notes" in CATEGORY_TOOLS and "notes" in CATEGORY_DESCRIPTIONS
