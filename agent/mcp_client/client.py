@@ -25,6 +25,35 @@ MCP_SESSION_TIMEOUT = 60  # seconds
 
 STDIO_CONNECT_TIMEOUT = 90  # 秒;stdio 首次 npx/uvx 下包可能很慢(下完本地缓存,后续快)
 
+# ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
+# A registered stdio MCP server spawns command+args directly in the netns
+# executor, bypassing the shell guard. Without this, a user tricked into
+# approving `mcp_register_server("bash -c 'rm -rf /DATA'")` would run an
+# arbitrary destructive command on the next turn. Deny-by-default by BASENAME:
+# only known MCP launchers may spawn, at any path (`/usr/bin/npx` ok). A path
+# allow-by-directory rule was rejected — /bin, /usr/bin contain bash/rm/dd, so
+# "any binary in a standard bin dir" would defeat the gate. Servers shipped as
+# a bare binary must be launched via a launcher (uvx/npx/python -m …).
+_MCP_STDIO_ALLOWED_CMDS = {
+    "npx", "uvx", "uv", "node", "nodejs", "python", "python3",
+    "deno", "bun", "bunx",
+}
+
+
+class McpCommandNotAllowed(Exception):
+    """A stdio MCP server's launch command is not on the allow-list."""
+
+
+def _assert_stdio_command_allowed(command: str) -> None:
+    cmd = (command or "").strip()
+    if not cmd:
+        raise McpCommandNotAllowed("empty MCP stdio command")
+    if os.path.basename(cmd) in _MCP_STDIO_ALLOWED_CMDS:
+        return
+    raise McpCommandNotAllowed(
+        f"MCP stdio launch command not allowed: {cmd!r}. Launch the server via "
+        f"an MCP launcher (npx/uvx/uv/node/python …).")
+
 # 透传给 stdio 子进程的运行时变量(缺了会乱码/时区/临时目录出错)
 _ENV_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 
@@ -249,6 +278,9 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             name=server.get("name", "mcp"),
         )
     elif transport == "stdio":
+        # Deny-by-default gate: the stdio command spawns directly in the netns
+        # executor, bypassing the shell guard — never spawn an off-list command.
+        _assert_stdio_command_allowed(server.get("command", ""))
         from mcp_client.netns_stdio import MCPServerNetnsStdio
         import netns.client as netns_client
         socket_path = await netns_client.start_mcp_stdio(

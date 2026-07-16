@@ -370,6 +370,9 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                 v = _er.assess(intent.files, inline_payload=None)
 
                 if v.level == "block":
+                    _audit("egress_block", session_id=session_id,
+                           host=intent.host, files=intent.files,
+                           stage="rules", reason=v.reason)
                     return (
                         "该上传被隐私策略拦截,未执行。"
                         f"原因:{v.reason}。"
@@ -393,6 +396,9 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                     verdict = await _ej.judge(content, intent.host)
 
                     if verdict == "block":
+                        _audit("egress_block", session_id=session_id,
+                               host=intent.host, files=intent.files,
+                               stage="judge", reason=v.reason)
                         return (
                             "该上传被内容审查拦截,未执行。"
                             "上传内容被判断为含有敏感/隐私数据。"
@@ -453,6 +459,11 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         intent.host, max_bytes=total_bytes, ttl_sec=60
                     ),
                 )
+                # L4: a granted outbound upload is a security-relevant egress
+                # decision — audit it (level records rules clean vs judge-allow).
+                _audit("egress_grant", session_id=session_id,
+                       host=intent.host, files=intent.files,
+                       max_bytes=total_bytes, level=v.level)
         except Exception as _apath_exc:  # noqa: BLE001 — I2: fail-closed skeleton guard
             # An unexpected error in the A-path evaluation (e.g. pathspec version
             # mismatch, import failure after lazy load, etc.).  Log it and refuse

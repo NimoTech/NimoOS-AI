@@ -7,6 +7,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 
+from audit import audit as _audit
 from fs import staging, validators, access_request
 from fs.vtree import VTree, VTreeError
 
@@ -188,6 +189,18 @@ async def commit(ctx, result) -> str:
                 summary["delete"] += 1
                 items.append({"id": row_id, "seq": seq, "op": del_op, "path": target})
     finally:
+        # L4: audit every batch operation with the same fs_change event single
+        # ops use (fs/ops.py) — batch_fs is the system-prompt-preferred path for
+        # multi-file changes and must NOT be an audit blind spot. audit() never
+        # raises, but keep it defensive so a logging fault can't abort the batch.
+        for it in items:
+            try:
+                _audit("fs_change", user_id=ctx.get("user_id"),
+                       session_id=ctx.get("session_id"), op=it["op"],
+                       path=it["path"], dst_path=it.get("dst_path"),
+                       batch_id=batch_id)
+            except Exception:  # noqa: BLE001
+                pass
         if items:
             await ctx["sink"].put({
                 "type": "staged_batch", "run_id": ctx["run_id"],

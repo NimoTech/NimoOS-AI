@@ -77,3 +77,31 @@ def test_mixed_mount_does_not_take_snapshot_shortcut(tmp_path, monkeypatch):
     trash = tmp_path / ".trash"
     res = B.prepare_backstop([str(a), str(b)], trash_root=str(trash))
     assert res.kind != "snapshot"
+
+
+def test_glob_target_is_expanded_and_backed_up(tmp_path, monkeypatch):
+    # 2026-07-16 review: `rm -rf /DATA/Documents/*` reached prepare_backstop
+    # with the literal token '/DATA/Documents/*'; os.path.exists('.../*') is
+    # False, so NO backup was taken while bash expanded and deleted for real.
+    # The backstop must expand globs the same way the shell would.
+    monkeypatch.setattr(B, "fs_type", lambda p: "ext2/ext3")
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    (docs / "a.txt").write_text("A")
+    (docs / "b.txt").write_text("B")
+    res = B.prepare_backstop([str(docs / "*")], trash_root=str(tmp_path / "trash"))
+    assert res.undoable is True
+    assert res.kind == "trash"
+    # both expanded files were preserved in the trash
+    import os
+    saved = []
+    for root, _dirs, files in os.walk(res.location):
+        saved.extend(files)
+    assert "a.txt" in saved and "b.txt" in saved
+
+
+def test_nonmatching_glob_reports_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "fs_type", lambda p: "ext2/ext3")
+    res = B.prepare_backstop([str(tmp_path / "empty" / "*")],
+                             trash_root=str(tmp_path / "trash"))
+    assert res.undoable is False

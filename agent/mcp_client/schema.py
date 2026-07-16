@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from fences import fence_untrusted
+
 
 def sanitize_schema(input_schema: Any) -> dict:
     """Return a JSON-Schema object safe to hand to FunctionTool as
@@ -33,5 +35,7 @@ def flatten_result(result: Any) -> str:
                 parts.append(str(block))
     body = "\n".join(parts)
     if getattr(result, "isError", False):
-        return f"[tool error] {body}".strip()
-    return body
+        body = f"[tool error] {body}".strip()
+    # Third-party MCP server output is untrusted external content — fence it as
+    # data so an injected instruction in a tool result can't drive the agent.
+    return fence_untrusted("mcp-result", body, cap=60000) or body
