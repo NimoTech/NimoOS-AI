@@ -29,6 +29,7 @@ from pathlib import Path
 from agents import function_tool
 
 import db as dbmod
+from audit import audit as _audit
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
 
 import shell_guard
@@ -236,6 +237,15 @@ async def _guard_command(command: str) -> str | None:
     session_id = SESSION_ID_VAR.get()
     db = DB_VAR.get()
 
+    def _rec(outcome: str, level: str, reason: str = ""):
+        try:
+            uid_row = db.execute("SELECT user_id FROM sessions WHERE id=?", (session_id,)).fetchone() if db is not None else None
+            _uid = uid_row["user_id"] if uid_row else None
+        except Exception:  # noqa: BLE001
+            _uid = None
+        _audit("shell_command", user_id=_uid, session_id=session_id,
+               command=command, level=level, reason=reason, outcome=outcome)
+
     decision = shell_guard.classify(command)
     if decision.level == "safe":
         return None
@@ -247,6 +257,7 @@ async def _guard_command(command: str) -> str | None:
         # gets a recoverable snapshot/trash).
         if decision.level in ("dangerous", "protected"):
             guard_backstop.prepare_backstop(decision.paths)
+        _rec("allowlisted", decision.level, "allowlist")
         return None
 
     # gray → judge; allow verdict passes through, else fall to confirm
@@ -276,6 +287,7 @@ async def _guard_command(command: str) -> str | None:
                     from egress import parse as _ep  # noqa: PLC0415
                     _intent = _ep.parse_upload(command)
                     if _intent is not None and _intent.external:
+                        _rec("deferred_upload", "gray", "egress-apath")
                         return None
                 except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
                     pass
@@ -286,6 +298,7 @@ async def _guard_command(command: str) -> str | None:
             # unrecoverable data loss.
             if decision.paths:
                 guard_backstop.prepare_backstop(decision.paths)
+            _rec("allowed_gray", "gray", "judge-allow")
             return None
         reason = "命令需人工确认(灰区判定)"
     else:
@@ -294,6 +307,7 @@ async def _guard_command(command: str) -> str | None:
     mgr = CONFIRM_MGR_VAR.get()
     sink = EVENT_QUEUE_VAR.get()
     if mgr is None or sink is None:
+        _rec("refused_unattended", decision.level, reason)
         return ("此命令需人工批准(无确认通道),未执行。"
                 "请在面板确认,或将其加入 shell 白名单。")
 
@@ -320,6 +334,7 @@ async def _guard_command(command: str) -> str | None:
     })
     granted = await mgr.wait(confirm_id)
     if not granted:
+        _rec("refused_user", decision.level, reason)
         return "用户拒绝或未能确认该命令,未执行。"
     if db is not None and mgr.consume_remember(confirm_id):
         # Store an anchored EXACT-match regex, not an open prefix — otherwise a
@@ -327,6 +342,7 @@ async def _guard_command(command: str) -> str | None:
         # `rm -rf /DATA/scratch /DATA/important`, deleting an unapproved path.
         import re as _re  # noqa: PLC0415
         guard_allowlist.add(db, "regex", f"^{_re.escape(command)}$", "confirm-card")
+    _rec("confirmed", decision.level, reason)
     return None
 
 
