@@ -105,3 +105,17 @@ def test_read_paths_return_only_contract_keys(conn):
     assert set(listed.keys()) == _CONTRACT_KEYS
     updated = store.update_note(conn, "1", n["id"], expected_revision=1, body="b2")
     assert set(updated.keys()) - {"body"} == _CONTRACT_KEYS
+
+
+def test_atomic_write_preserves_mode_and_chown(monkeypatch, conn):
+    chowns = []
+    monkeypatch.setattr(store.os, "chown",
+                        lambda p, u, g: chowns.append((p, u, g)))
+    n = store.create_note(conn, "1", title="t", body="v1")
+    p = store.note_abs_path(conn, n)
+    os.chmod(p, 0o640)
+    st_before = os.stat(p)
+    store.update_note(conn, "1", n["id"], expected_revision=1, body="v2")
+    st_after = os.stat(p)
+    assert (st_after.st_mode & 0o777) == 0o640          # 覆盖保留原 mode
+    assert chowns and chowns[-1][1] == st_before.st_uid  # 覆盖回写原属主

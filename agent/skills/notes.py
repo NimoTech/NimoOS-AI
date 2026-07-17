@@ -69,6 +69,10 @@ async def _write_note_impl(title: str, content: str, note_type: str,
             ensure_ascii=False)
     description = f"Create knowledge note: {title}"
     command = f"write_note type={note_type} tags={tags}\n→ {_preview(content)}"
+    if CONFIRM_MGR_VAR.get() is None or EVENT_QUEUE_VAR.get() is None \
+            or not SESSION_ID_VAR.get():
+        return json.dumps({"error": "confirm channel unavailable"},
+                          ensure_ascii=False)
     if not await _request_confirm("notes_write", description, command):
         return json.dumps({"error": "user declined"}, ensure_ascii=False)
     conn = db_module.get_connection()
@@ -103,6 +107,10 @@ async def _update_note_impl(note_id: str, expected_revision: int,
     description = f"Update knowledge note: {cur['title']}"
     command = (f"update_note id={note_id} rev={expected_revision}\n"
                f"→ {_preview(content or '(meta only)')}")
+    if CONFIRM_MGR_VAR.get() is None or EVENT_QUEUE_VAR.get() is None \
+            or not SESSION_ID_VAR.get():
+        return json.dumps({"error": "confirm channel unavailable"},
+                          ensure_ascii=False)
     if not await _request_confirm("notes_update", description, command):
         return json.dumps({"error": "user declined"}, ensure_ascii=False)
     conn = db_module.get_connection()

@@ -137,13 +137,14 @@ async def _read_document_impl(file_id: Optional[str] = None,
 async def nimoos_search(query: str, sources: Optional[str] = None,
                         filters: Optional[str] = None, top_k: int = 5) -> str:
     """Unified search over the user's NAS: by content (semantic), by filename,
-    and photos. Returns grouped candidates {semantic, filenames, images} for the
-    user to choose from.
+    photos, and notes. Returns grouped candidates {semantic, filenames, images,
+    notes} for the user to choose from.
 
     Args:
         query: The search query string.
         sources: Optional comma-separated subset of "semantic", "filenames",
-            "images" (e.g. "images" to search photos only). Omit to search all.
+            "images", "notes" (e.g. "images" to search photos only). Omit for
+            all four.
         filters: Optional JSON-encoded filter object (applies to the semantic
             source only): root_ids, mime_prefix, kind_in, lang_in, mtime_after_ms.
         top_k: Max hits per source (default 5, max 20).

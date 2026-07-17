@@ -77,11 +77,28 @@ def _row_to_dict(row) -> dict:
 
 
 def _atomic_write(abs_path: str, text: str) -> None:
+    """tmp+rename, preserving prior owner/mode (or inheriting the parent's
+    for brand-new files) so human editors keep write access after our
+    rewrites — mirrors fs/staging semantics; chown is best-effort off-root."""
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    try:
+        prior = os.stat(abs_path)
+    except FileNotFoundError:
+        prior = None
     tmp = abs_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, abs_path)
+    try:
+        if prior is not None:
+            os.chown(abs_path, prior.st_uid, prior.st_gid)
+            os.chmod(abs_path, prior.st_mode & 0o777)
+        else:
+            par = os.stat(os.path.dirname(abs_path))
+            os.chown(abs_path, par.st_uid, par.st_gid)
+            os.chmod(abs_path, par.st_mode & 0o666)
+    except PermissionError:
+        pass
 
 
 def _write_note_file(conn, note: dict, body: str) -> None:
@@ -157,6 +174,7 @@ def create_note(conn, user_id: str, *, title: str, body: str,
          _hash(body), json.dumps(note["source_refs"], ensure_ascii=False),
          created_by, 1, now, now))
     _sync_tags(conn, str(user_id), nid, note["tags"])
+    sync_links(conn, nid, body)
     conn.commit()
     return note
 
@@ -199,6 +217,7 @@ def update_note(conn, user_id: str, note_id: str, *, expected_revision: int,
          _hash(body), note["revision"], note["updated_at"],
          note_id, str(user_id)))
     _sync_tags(conn, str(user_id), note_id, note["tags"])
+    sync_links(conn, note_id, body)
     conn.commit()
     return note
 
@@ -252,3 +271,28 @@ def soft_delete_note(conn, user_id: str, note_id: str) -> bool:
     conn.execute("DELETE FROM mentions WHERE note_id=?", (note_id,))
     conn.commit()
     return True
+
+
+def sync_links(conn, note_id: str, body: str) -> None:
+    from notes.links import extract_links
+    conn.execute("DELETE FROM note_links WHERE src_note_id=?", (note_id,))
+    for l in extract_links(body):
+        conn.execute(
+            "INSERT OR IGNORE INTO note_links(src_note_id, dst_kind, "
+            "dst_ref, anchor_text) VALUES (?,?,?,?)",
+            (note_id, l["dst_kind"], l["dst_ref"], l["anchor_text"]))
+
+
+def get_backlinks(conn, user_id: str, note_id: str) -> list[dict]:
+    row = _get_row(conn, user_id, note_id)
+    if row is None:
+        return []
+    rel = row["path"]
+    base = os.path.splitext(os.path.basename(rel))[0]
+    refs = (rel, "/" + rel, base, base + ".md", row["title"])
+    q = ("SELECT DISTINCT n.id, n.title, n.type, n.status, n.updated_at "
+         "FROM note_links l JOIN notes n ON n.id = l.src_note_id "
+         "WHERE l.dst_kind='note' AND n.user_id=? AND n.deleted_at IS NULL "
+         "AND n.id != ? AND l.dst_ref IN (?,?,?,?,?) "
+         "ORDER BY n.updated_at DESC")
+    return [dict(r) for r in conn.execute(q, (str(user_id), note_id, *refs))]

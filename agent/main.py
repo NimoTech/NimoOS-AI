@@ -2534,6 +2534,185 @@ async def get_observability_compose():
         return PlainTextResponse(f.read(), media_type="application/yaml")
 
 
+# ---------------------------------------------------------------------------
+# Knowledge notes API (M2). Files are the content authority; these endpoints
+# are the UI's metadata/CRUD surface. Identity via X-User-Id (Go proxy strips
+# JWT and injects it). Settings is admin-gated at the Go layer (route/v2.go).
+# ---------------------------------------------------------------------------
+from notes import reserved as notes_reserved
+from notes import store as notes_store
+from notes.indexer import index_note as notes_index_note
+from notes.indexer import deindex_note as notes_deindex_note
+
+
+class NoteCreatePayload(BaseModel):
+    title: str
+    content: str
+    note_type: str = "note"
+    tags: list[str] = []
+    source_refs: list[dict] = []
+    description: str = ""
+
+
+class NoteUpdatePayload(BaseModel):
+    expected_revision: int
+    content: str | None = None
+    title: str | None = None
+    status: str | None = None
+    tags: list[str] | None = None
+    description: str | None = None
+
+
+class NotesSettingsPayload(BaseModel):
+    notes_root: str
+    mode: str = "adopt"          # adopt | migrate
+
+
+def _notes_uid(request: Request) -> str:
+    uid = request.headers.get("X-User-Id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    return uid
+
+
+async def _notes_post_write(conn, uid: str, note: dict, body: str) -> None:
+    ok = await notes_index_note(note, body)
+    if not ok:
+        conn.execute("UPDATE notes SET content_hash='' WHERE id=? AND user_id=?",
+                     (note["id"], uid))
+        conn.commit()
+    try:
+        notes_reserved.render_for_user(conn, uid)
+    except Exception:
+        logging.getLogger("nimoos-agent").exception("reserved render failed")
+
+
+@app.get("/agent/notes/settings")
+async def get_notes_settings(request: Request):
+    _notes_uid(request)
+    return {"notes_root": notes_store.get_notes_root(_db())}
+
+
+@app.put("/agent/notes/settings")
+async def put_notes_settings(request: Request, body: NotesSettingsPayload):
+    _notes_uid(request)
+    if body.mode not in ("adopt", "migrate"):
+        raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
+    conn = _db()
+    old = notes_store.get_notes_root(conn)
+    new = os.path.abspath(body.notes_root)
+    if new == old:
+        return {"notes_root": old}
+    if body.mode == "migrate":
+        if os.path.isdir(new) and os.listdir(new):
+            raise HTTPException(status_code=400,
+                                detail="migrate target is not empty — choose an "
+                                       "empty directory or use mode=adopt")
+        os.makedirs(new, exist_ok=True)
+        for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
+            shutil.move(os.path.join(old, entry), os.path.join(new, entry))
+    notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
+    return {"notes_root": new}
+
+
+@app.get("/agent/notes")
+async def list_notes_api(request: Request, type: str = "", status: str = "",
+                         limit: int = 50):
+    uid = _notes_uid(request)
+    rows = notes_store.list_notes(_db(), uid, note_type=type or None,
+                                  status=status or None,
+                                  limit=max(1, min(limit, 200)))
+    return {"notes": rows}
+
+
+@app.post("/agent/notes", status_code=201)
+async def create_note_api(request: Request, body: NoteCreatePayload):
+    uid = _notes_uid(request)
+    conn = _db()
+    try:
+        note = notes_store.create_note(
+            conn, uid, title=body.title, body=body.content,
+            note_type=body.note_type, tags=body.tags,
+            source_refs=body.source_refs, created_by="human",
+            description=body.description)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await _notes_post_write(conn, uid, note, body.content)
+    return note
+
+
+@app.get("/agent/notes/{note_id}")
+async def get_note_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    note = notes_store.get_note(_db(), uid, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return note
+
+
+@app.put("/agent/notes/{note_id}")
+async def update_note_api(note_id: str, request: Request,
+                          body: NoteUpdatePayload):
+    uid = _notes_uid(request)
+    conn = _db()
+    try:
+        note = notes_store.update_note(
+            conn, uid, note_id, expected_revision=body.expected_revision,
+            title=body.title, body=body.content, status=body.status,
+            tags=body.tags, description=body.description)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    except notes_store.RevisionConflict as e:
+        return JSONResponse(status_code=409, content={
+            "detail": "revision conflict",
+            "current_revision": e.current_revision})
+    await _notes_post_write(conn, uid, note, note["body"])
+    return note
+
+
+@app.delete("/agent/notes/{note_id}")
+async def delete_note_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    conn = _db()
+    if not notes_store.soft_delete_note(conn, uid, note_id):
+        raise HTTPException(status_code=404, detail="not found")
+    await notes_deindex_note(uid, note_id)
+    try:
+        notes_reserved.render_for_user(conn, uid)
+    except Exception:
+        pass
+    return {"status": "deleted", "id": note_id}
+
+
+async def _set_status(note_id: str, request: Request, status: str):
+    uid = _notes_uid(request)
+    conn = _db()
+    cur = notes_store.get_note(conn, uid, note_id)
+    if cur is None:
+        raise HTTPException(status_code=404, detail="not found")
+    note = notes_store.update_note(conn, uid, note_id,
+                                   expected_revision=cur["revision"],
+                                   status=status)
+    await _notes_post_write(conn, uid, note, note["body"])
+    return note
+
+
+@app.post("/agent/notes/{note_id}/curate")
+async def curate_note_api(note_id: str, request: Request):
+    return await _set_status(note_id, request, "curated")
+
+
+@app.post("/agent/notes/{note_id}/archive")
+async def archive_note_api(note_id: str, request: Request):
+    return await _set_status(note_id, request, "archived")
+
+
+@app.get("/agent/notes/{note_id}/backlinks")
+async def note_backlinks_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    return {"backlinks": notes_store.get_backlinks(_db(), uid, note_id)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8282)

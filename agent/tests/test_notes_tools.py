@@ -126,6 +126,16 @@ def test_update_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
     assert row["content_hash"] == ""
 
 
+def test_misconfigured_runtime_error_is_distinct(conn):
+    notes_skills.USER_ID_VAR.set("1")
+    notes_skills.SESSION_ID_VAR.set("s1")
+    notes_skills.CONFIRM_MGR_VAR.set(None)      # 误配:无确认通道
+    notes_skills.EVENT_QUEUE_VAR.set(None)
+    out = json.loads(_run(notes_skills._write_note_impl("T", "c", "note", [], [])))
+    assert out["error"] == "confirm channel unavailable"   # 不再冒充 user declined
+    assert store.list_notes(conn, "1") == []
+
+
 def test_registry_contains_notes_category():
     from skills.tool_registry import CATEGORY_TOOLS, CATEGORY_DESCRIPTIONS
     assert "notes" in CATEGORY_TOOLS and "notes" in CATEGORY_DESCRIPTIONS

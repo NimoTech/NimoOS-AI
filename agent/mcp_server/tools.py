@@ -143,12 +143,13 @@ _INT = {"type": "integer"}
 
 TOOL_SPECS = [
     {"name": "nimoos_search",
-     "description": ("Search the user's NAS: semantic content, filenames, and "
-                     "photos. Returns grouped candidates with file_id values you "
-                     "pass to read_document/read_file_chunk. top_k max 20."),
+     "description": ("Search the user's NAS: semantic content, filenames, "
+                     "photos, and notes. Returns grouped candidates with "
+                     "file_id values you pass to read_document/read_file_chunk. "
+                     "top_k max 20."),
      "inputSchema": {"type": "object", "required": ["query"], "properties": {
          "query": _STR,
-         "sources": {**_STR, "description": "comma list of semantic,filenames,images"},
+         "sources": {**_STR, "description": "comma list of semantic,filenames,images,notes"},
          "filters": {**_STR, "description": "JSON filter for the semantic source"},
          "top_k": {**_INT, "description": "hits per source, max 20"}}},
      "handler": _h_search},
