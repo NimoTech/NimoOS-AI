@@ -185,6 +185,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// Shell allowlist governs unattended command execution — admin only.
 	g.Any("/agent/shell-allowlist", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/shell-allowlist/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Notes settings moves the system-wide notes root — admin only.
+	g.Any("/agent/notes/settings", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
