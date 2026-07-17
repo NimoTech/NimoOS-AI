@@ -92,6 +92,7 @@ async def scan_once(conn) -> dict:
     root = store.get_notes_root(conn)
     seen_ids: set[str] = set()
     failed_paths: set[str] = set()
+    touched_users: set[str] = set()
 
     for uid, rel, ap in _walk_md(root):
         try:
@@ -137,6 +138,7 @@ async def scan_once(conn) -> dict:
                 conn.commit()
                 seen_ids.add(nid)
                 stats["adopted"] += 1
+                touched_users.add(uid)
                 ok = await index_note(
                     {"id": nid, "user_id": uid, "type": f["type"],
                      "status": f["status"], "created_by": f["created_by"],
@@ -168,6 +170,7 @@ async def scan_once(conn) -> dict:
                              (rel, nid))
                 conn.commit()
                 stats["moved"] += 1
+                touched_users.add(uid)
             if db_content_hash != _hash(body):
                 f = _meta_note_fields(meta)
                 now = int(time.time())
@@ -187,6 +190,7 @@ async def scan_once(conn) -> dict:
                 store.sync_links(conn, nid, body)
                 conn.commit()
                 stats["updated"] += 1
+                touched_users.add(uid)
         except Exception:
             _LOG.warning("notes sync: failed to process %s", ap,
                         exc_info=True)
@@ -209,6 +213,15 @@ async def scan_once(conn) -> dict:
                      (int(time.time()), row["id"]))
         conn.commit()
         stats["deleted"] += 1
+        touched_users.add(row["user_id"])
+
+    if any(stats.values()):
+        from notes import reserved
+        for u in touched_users:
+            try:
+                reserved.render_for_user(conn, u)
+            except Exception:
+                _LOG.exception("reserved-files render failed for %s", u)
     return stats
 
 
