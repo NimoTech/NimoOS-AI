@@ -160,12 +160,13 @@ def _claim_idle_job(conn, now):
 
 def _fail_job(conn, session_id, attempts, err, now):
     if attempts >= MAX_ATTEMPTS:
-        conn.execute("DELETE FROM notes_extract_jobs WHERE session_id=?",
-                     (session_id,))
+        conn.execute("DELETE FROM notes_extract_jobs "
+                     "WHERE session_id=? AND status='running'", (session_id,))
     else:
         conn.execute(
             "UPDATE notes_extract_jobs SET status='pending', last_error=?, "
-            "updated_at=? WHERE session_id=?", (str(err)[:500], now, session_id))
+            "updated_at=? WHERE session_id=? AND status='running'",
+            (str(err)[:500], now, session_id))
     conn.commit()
 
 

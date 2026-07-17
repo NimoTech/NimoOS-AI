@@ -122,6 +122,38 @@ def test_worker_respects_idle_gate(tmp_path):
     assert ran is False  # still idle-gated; llm_call must not be touched
 
 
+def test_fail_job_guards_against_concurrent_reenqueue(tmp_path):
+    """Race: a job is in-flight on its final attempt (status='running',
+    attempts=MAX_ATTEMPTS) when a concurrent _start_run finally-block
+    re-enqueue coalesces it back to pending/attempts=0 for a fresh run.
+    The in-flight attempt's failure must NOT delete that fresh row —
+    the status='running' guard on _fail_job makes the delete a no-op."""
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+    conn.execute("UPDATE notes_extract_jobs SET status='running', attempts=? "
+                 "WHERE session_id='s1'", (notes_extract.MAX_ATTEMPTS,))
+    conn.commit()
+
+    # Concurrent re-enqueue lands while the in-flight attempt is still
+    # running, coalescing the row back to pending/attempts=0.
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=200, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+
+    # The stale in-flight attempt now fails on its final attempt.
+    notes_extract._fail_job(conn, "s1", notes_extract.MAX_ATTEMPTS, "boom", 300)
+
+    row = conn.execute("SELECT * FROM notes_extract_jobs WHERE session_id='s1'").fetchone()
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["attempts"] == 0
+
+
 def test_worker_retries_then_gives_up(tmp_path):
     conn = _conn(tmp_path)
     conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
