@@ -282,6 +282,9 @@ async def _recall_worker_startup():
     import recall_index
     recall_index.start_worker(_db())
 
+    from notes.sync import start_notes_sync
+    _notes_sync_task, _notes_sync_stop = start_notes_sync(_db())
+
 
 _channel_manager = None
 

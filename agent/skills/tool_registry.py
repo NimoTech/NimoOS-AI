@@ -15,6 +15,7 @@ from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills import WIKI_TOOLS
+from skills.notes import NOTES_TOOLS
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "run_command", "read_file", "list_dir",
@@ -44,6 +45,7 @@ CATEGORY_TOOLS: dict[str, list] = {
     "documents": _DOCUMENTS,              # 3
     "system": _SYSTEM,                     # 5
     "events": list(MESSAGEBUS_TOOLS),      # 3
+    "notes": list(NOTES_TOOLS),
     "mcp": list(MCP_ADMIN_TOOLS),          # 1(+ 运行时动态 MCP 工具)
 }
 
@@ -55,6 +57,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "documents": "chunked document reading, docling parsing, page views",
     "system": "service/port health, system logs, disks and mounts",
     "events": "message-bus event types, action types, trigger actions",
+    "notes": "knowledge notes: save/update/consult long-term conclusions and summaries (writes require user confirmation)",
     "mcp": "register and use tools from connected MCP servers",
 }
 

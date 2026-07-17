@@ -610,6 +610,12 @@ class AgentRunner:
             memory_skills.USER_ID_VAR.set(str(user_id))
             memory_skills.SESSION_ID_VAR.set(str(session_id))
 
+            from skills import notes as notes_skills
+            notes_skills.USER_ID_VAR.set(str(user_id))
+            notes_skills.SESSION_ID_VAR.set(session_id)
+            notes_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
+            notes_skills.EVENT_QUEUE_VAR.set(sink)
+
             # Photos service auth: album endpoints validate the user JWT, so
             # forward the caller's Authorization header to the photo tools.
             photos_skills.AUTH_HEADER_VAR.set(auth_header or "")
