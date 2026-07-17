@@ -201,6 +201,23 @@ CREATE TABLE IF NOT EXISTS recall_index_jobs (
 CREATE INDEX IF NOT EXISTS idx_recall_jobs_status
     ON recall_index_jobs(status, enqueued_at);
 
+CREATE TABLE IF NOT EXISTS notes_extract_jobs (
+    session_id  TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    provider_url  TEXT,
+    provider_key  TEXT,
+    provider_type TEXT,
+    model_name    TEXT,
+    last_error    TEXT,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_extract_jobs_status
+    ON notes_extract_jobs(status, enqueued_at);
+
 CREATE TABLE IF NOT EXISTS mcp_tokens (
     id           TEXT PRIMARY KEY,
     user_id      TEXT NOT NULL,
@@ -442,6 +459,15 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "trust" not in mem_cols:
         conn.execute("ALTER TABLE memory_entries ADD COLUMN "
                      "trust TEXT NOT NULL DEFAULT 'normal'")
+    # Idempotent ALTER for existing databases predating the M3 extraction
+    # columns on notes (pipeline auto-precipitation status).
+    notes_cols = {r[1] for r in conn.execute("PRAGMA table_info(notes)")}
+    if "extraction_status" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN extraction_status TEXT DEFAULT 'none'")
+    if "extracted_at" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN extracted_at INTEGER")
+    if "content_hash_at_extraction" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN content_hash_at_extraction TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

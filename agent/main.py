@@ -286,6 +286,12 @@ async def _recall_worker_startup():
     _notes_sync_task, _notes_sync_stop = start_notes_sync(_db())
 
 
+@app.on_event("startup")
+async def _notes_extract_worker_startup():
+    import notes_extract
+    notes_extract.start_worker(_db())
+
+
 _channel_manager = None
 
 
@@ -2123,6 +2129,14 @@ def _start_run(session_id: str, user_id: str, message: str,
                 recall_index.maybe_enqueue_index_job(_conn, session_id, user_id)
             except Exception:
                 pass
+            try:
+                import notes_extract
+                notes_extract.maybe_enqueue_notes_job(
+                    _conn, session_id, user_id,
+                    provider_url=provider_url, provider_key=provider_key,
+                    provider_type=provider_type, model_name=model)
+            except Exception:
+                _LOG.exception("notes-extract enqueue failed")
             # Don't leave references to a finished task pinned in _active_runs;
             # the sink is still kept (so very-late subscribers can replay) but
             # the task ref is cleared so GC can reclaim its frames.
@@ -2564,8 +2578,9 @@ class NoteUpdatePayload(BaseModel):
 
 
 class NotesSettingsPayload(BaseModel):
-    notes_root: str
+    notes_root: str | None = None
     mode: str = "adopt"          # adopt | migrate
+    auto_extract: bool | None = None
 
 
 def _notes_uid(request: Request) -> str:
@@ -2589,30 +2604,35 @@ async def _notes_post_write(conn, uid: str, note: dict, body: str) -> None:
 
 @app.get("/agent/notes/settings")
 async def get_notes_settings(request: Request):
-    _notes_uid(request)
-    return {"notes_root": notes_store.get_notes_root(_db())}
+    uid = _notes_uid(request)
+    conn = _db()
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
 
 
 @app.put("/agent/notes/settings")
 async def put_notes_settings(request: Request, body: NotesSettingsPayload):
-    _notes_uid(request)
-    if body.mode not in ("adopt", "migrate"):
-        raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
+    uid = _notes_uid(request)
     conn = _db()
-    old = notes_store.get_notes_root(conn)
-    new = os.path.abspath(body.notes_root)
-    if new == old:
-        return {"notes_root": old}
-    if body.mode == "migrate":
-        if os.path.isdir(new) and os.listdir(new):
-            raise HTTPException(status_code=400,
-                                detail="migrate target is not empty — choose an "
-                                       "empty directory or use mode=adopt")
-        os.makedirs(new, exist_ok=True)
-        for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
-            shutil.move(os.path.join(old, entry), os.path.join(new, entry))
-    notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
-    return {"notes_root": new}
+    if body.auto_extract is not None:
+        notes_store.set_auto_extract(conn, uid, body.auto_extract)
+    if body.notes_root:
+        if body.mode not in ("adopt", "migrate"):
+            raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
+        old = notes_store.get_notes_root(conn)
+        new = os.path.abspath(body.notes_root)
+        if new != old:
+            if body.mode == "migrate":
+                if os.path.isdir(new) and os.listdir(new):
+                    raise HTTPException(status_code=400,
+                                        detail="migrate target is not empty — choose an "
+                                               "empty directory or use mode=adopt")
+                os.makedirs(new, exist_ok=True)
+                for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
+                    shutil.move(os.path.join(old, entry), os.path.join(new, entry))
+            notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
 
 
 @app.get("/agent/notes")
