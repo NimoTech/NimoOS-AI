@@ -71,6 +71,7 @@ async def test_list_full_tree_error_passthrough(monkeypatch):
 
 
 from skills import photos as sphotos
+import skills.notes as snotes
 
 
 def test_whitelist_now_has_eight_including_photos():
@@ -110,6 +111,11 @@ async def test_call_list_albums_dispatches(monkeypatch):
 def test_setup_user_context_sets_photos_uid():
     tools.setup_user_context("42")
     assert sphotos.USER_ID_VAR.get() == "42"
+
+
+def test_setup_user_context_sets_notes_uid():
+    tools.setup_user_context("42")
+    assert snotes.USER_ID_VAR.get() == "42"
 
 
 import asyncio
