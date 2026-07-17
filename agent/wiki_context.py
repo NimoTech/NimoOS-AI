@@ -1,8 +1,8 @@
 """Build the Wiki context block prepended to every chat turn's system prompt.
 
 Two markdown blocks:
-  ## NimoOS 存储空间地图  — space/project skeleton, top-15 projects per root
-  ## 用户笔记           — user_notes for nodes updated in the last 30 days,
+  ## NimoOS storage map — space/project skeleton, top-15 projects per root
+  ## User notes         — user_notes for nodes updated in the last 30 days,
                           per-node truncated to 500 chars, total 2000 chars
 
 Wiki unreachable → return placeholder; the tools still answer "wiki service
@@ -46,7 +46,7 @@ class WikiContextBuilder:
         try:
             tree = await self.client.list_full_tree()
         except Exception:
-            return "## NimoOS 存储空间地图\n_(Wiki 服务暂不可用)_\n"
+            return "## NimoOS storage map\n_(Wiki service temporarily unavailable)_\n"
 
         tree = self._filter(tree, user_patterns)
         map_block = self._render_map(tree)
@@ -65,20 +65,21 @@ class WikiContextBuilder:
         # children are projects under it.
         spaces = [n for n in tree if n.get("level") == "space"]
         spaces.sort(key=lambda n: n["path"])
-        lines = ["## NimoOS 存储空间地图", ""]
+        lines = ["## NimoOS storage map", ""]
 
         if not spaces:
             lines.append(
-                "_(暂无注册的 Wiki 空间。Wiki 不会自动扫描文件树 —— "
-                "若用户希望某个目录被纳入,主动建议调用 `wiki_register_root` "
-                "登记。)_"
+                "_(No registered wiki spaces yet. The wiki does not scan the file tree "
+                "automatically — if the user wants a directory included, proactively "
+                "suggest calling `wiki_register_root` to register it.)_"
             )
             return "\n".join(lines)
 
         lines.append(
-            "_(下面是用户已显式登记到 Wiki 的空间/项目。Wiki 不会自动扫描文件树 —— "
-            "若用户提到的路径不在下面,你应主动询问是否调用 `wiki_register_root` "
-            "把它登记进来。)_"
+            "_(Below are the spaces/projects the user has explicitly registered into "
+            "the wiki. The wiki does not scan the file tree automatically — if a path "
+            "the user mentions is not listed below, proactively ask whether to "
+            "register it via `wiki_register_root`.)_"
         )
         lines.append("")
 
@@ -94,7 +95,7 @@ class WikiContextBuilder:
             for n in projects[:PROJECT_CAP]:
                 lbl = n.get("ai_label")
                 if not lbl:
-                    lbl = os.path.basename(n["path"]) + " (未生成摘要)"
+                    lbl = os.path.basename(n["path"]) + " (no summary yet)"
                 lines.append(f"  - {_scaf(n['path'])} — {_scaf(lbl)}")
             if len(projects) > PROJECT_CAP:
                 extra = len(projects) - PROJECT_CAP
@@ -116,9 +117,9 @@ class WikiContextBuilder:
             reverse=True,
         )
 
-        lines = ["## 用户笔记", ""]
+        lines = ["## User notes", ""]
         if not active:
-            lines.append("_(最近 30 天无活跃笔记)_")
+            lines.append("_(no active notes in the last 30 days)_")
             return "\n".join(lines)
 
         total = 0
