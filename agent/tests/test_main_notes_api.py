@@ -103,3 +103,15 @@ async def test_settings_roundtrip_and_delete(app_ctx, tmp_path):
         assert d.json()["status"] == "deleted"
         r2 = await ac.get("/agent/notes", headers={"X-User-Id": "1"})
         assert r2.json()["notes"] == []
+
+
+@pytest.mark.asyncio
+async def test_settings_migrate_refuses_nonempty_target(app_ctx, tmp_path):
+    target = tmp_path / "NewNotes"
+    (target / "1").mkdir(parents=True)
+    (target / "1" / "existing.md").write_text("x")
+    async with _client() as ac:
+        r = await ac.put("/agent/notes/settings", headers={"X-User-Id": "1"},
+                         json={"notes_root": str(target), "mode": "migrate"})
+    assert r.status_code == 400
+    assert "not empty" in r.json()["detail"]

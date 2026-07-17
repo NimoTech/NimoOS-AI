@@ -2604,6 +2604,10 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
     if new == old:
         return {"notes_root": old}
     if body.mode == "migrate":
+        if os.path.isdir(new) and os.listdir(new):
+            raise HTTPException(status_code=400,
+                                detail="migrate target is not empty — choose an "
+                                       "empty directory or use mode=adopt")
         os.makedirs(new, exist_ok=True)
         for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
             shutil.move(os.path.join(old, entry), os.path.join(new, entry))
