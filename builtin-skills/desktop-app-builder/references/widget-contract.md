@@ -73,9 +73,9 @@ cannot flex (e.g. a fixed board); otherwise stay responsive — users like
 resizing. Partial ranges work too: e.g. `nimoos.widget.maxh: "2"` keeps the
 widget short while width stays flexible.
 
-Users can drag-resize every app widget between 2×1 and 4×4 grid
-cells; `nimoos.widget.w/h` set only the INITIAL size and there is no
-way to lock it. Grid cells are 58–92px depending on the user's
+Unless locked via the min/max labels above, users can drag-resize the
+widget within its declared range (global bounds 2×1..4×4);
+`nimoos.widget.w`/`h` set only the INITIAL size. Grid cells are 58–92px depending on the user's
 screen, so after card padding and header the iframe viewport ranges
 roughly **100–385px wide × 26–355px tall** (an h=1 card is a thin
 strip). The iframe viewport IS the card interior: `vw`/`vh`/`vmin`
