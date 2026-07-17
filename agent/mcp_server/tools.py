@@ -12,6 +12,7 @@ from mcp_server import fs_gate
 from skills.search import search as _search
 from skills import wiki as _wiki
 from skills import photos as _photos
+from skills import notes as _notes
 from wiki_client import WikiClient
 
 MAX_TREE_NODES = 500
@@ -35,6 +36,7 @@ def setup_user_context(user_id: str) -> None:
     _search.USER_ID_VAR.set(str(user_id))
     _wiki.WIKI_CLIENT_VAR.set(WikiClient(user_id=str(user_id)))
     _photos.USER_ID_VAR.set(str(user_id))
+    _notes.USER_ID_VAR.set(str(user_id))
 
 
 async def _h_search(args: dict) -> str:
@@ -138,6 +140,19 @@ async def _h_view_document_page(args: dict):
     return ImageResult(png_b64, "image/png")
 
 
+async def _h_list_notes(args: dict) -> str:
+    return await _notes._list_notes_impl(
+        str(args.get("type") or ""), str(args.get("status") or ""),
+        int(args.get("limit") or 20))
+
+
+async def _h_read_note(args: dict) -> str:
+    note_id = str(args.get("note_id") or "")
+    if not note_id:
+        raise McpToolError("note_id is required")
+    return await _notes._read_note_impl(note_id)
+
+
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 
@@ -215,6 +230,28 @@ TOOL_SPECS = [
                      "assetCount, dateStart, dateEnd}]} (capped at 100)."),
      "inputSchema": {"type": "object", "properties": {}},
      "handler": _h_list_albums},
+    {
+        "name": "list_notes",
+        "description": "List knowledge notes from the NimoOS knowledge base "
+                       "(title/description/tags/status metadata), newest first.",
+        "inputSchema": {"type": "object", "properties": {
+            "type": {"type": "string",
+                     "description": "Filter by type: note|summary|insight|digest"},
+            "status": {"type": "string",
+                       "description": "Filter by status: draft|curated|archived"},
+            "limit": {"type": "integer", "description": "Max results (1-100), default 20"},
+        }},
+        "handler": _h_list_notes,
+    },
+    {
+        "name": "read_note",
+        "description": "Read one knowledge note by id — metadata plus full Markdown body.",
+        "inputSchema": {"type": "object", "properties": {
+            "note_id": {"type": "string",
+                        "description": "Note id from list_notes or nimoos_search"},
+        }, "required": ["note_id"]},
+        "handler": _h_read_note,
+    },
 ]
 
 _BY_NAME = {s["name"]: s for s in TOOL_SPECS}
