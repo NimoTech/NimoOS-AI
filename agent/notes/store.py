@@ -77,11 +77,28 @@ def _row_to_dict(row) -> dict:
 
 
 def _atomic_write(abs_path: str, text: str) -> None:
+    """tmp+rename, preserving prior owner/mode (or inheriting the parent's
+    for brand-new files) so human editors keep write access after our
+    rewrites — mirrors fs/staging semantics; chown is best-effort off-root."""
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    try:
+        prior = os.stat(abs_path)
+    except FileNotFoundError:
+        prior = None
     tmp = abs_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, abs_path)
+    try:
+        if prior is not None:
+            os.chown(abs_path, prior.st_uid, prior.st_gid)
+            os.chmod(abs_path, prior.st_mode & 0o777)
+        else:
+            par = os.stat(os.path.dirname(abs_path))
+            os.chown(abs_path, par.st_uid, par.st_gid)
+            os.chmod(abs_path, par.st_mode & 0o666)
+    except PermissionError:
+        pass
 
 
 def _write_note_file(conn, note: dict, body: str) -> None:

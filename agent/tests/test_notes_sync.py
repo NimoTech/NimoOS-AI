@@ -223,3 +223,22 @@ def test_non_utf8_file_does_not_abort_scan(conn):
     row_good = conn.execute("SELECT deleted_at FROM notes WHERE id=?",
                             (good["id"],)).fetchone()
     assert row_good["deleted_at"] is not None
+
+
+def test_adoption_skips_foreign_id(conn):
+    n = store.create_note(conn, "1", title="t", body="b")
+    root = store.get_notes_root(conn)
+    os.makedirs(f"{root}/2", exist_ok=True)
+    with open(store.note_abs_path(conn, n)) as f:
+        content = f.read()
+    with open(f"{root}/2/stolen.md", "w") as f:
+        f.write(content)                          # user2 目录里出现 user1 的 id
+    calls_before = list(conn._test_index_calls)
+    stats = _run(sync.scan_once(conn))
+    assert stats["adopted"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM notes WHERE user_id='2'").fetchone()[0] == 0
+    assert conn.execute("SELECT deleted_at FROM notes WHERE id=?",
+                        (n["id"],)).fetchone()[0] is None   # user1 行不受影响
+    # 不为 user2 的冒名文件做索引
+    assert not [c for c in conn._test_index_calls[len(calls_before):]
+                if c[0] == "index" and c[1] == n["id"]]

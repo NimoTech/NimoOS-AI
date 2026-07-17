@@ -103,6 +103,13 @@ async def scan_once(conn) -> dict:
                 (nid, uid)).fetchone() if nid else None
 
             if row is None:
+                if nid:
+                    foreign = conn.execute(
+                        "SELECT user_id FROM notes WHERE id=?", (nid,)).fetchone()
+                    if foreign is not None and foreign["user_id"] != uid:
+                        _LOG.warning("notes sync: %s carries id owned by another "
+                                     "user — skipped", rel)
+                        continue
                 # Adoption: hand-created file (or unknown id from elsewhere).
                 f = _meta_note_fields(meta)
                 now = int(time.time())
