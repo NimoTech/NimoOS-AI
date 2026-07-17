@@ -47,3 +47,51 @@ def test_notes_extraction_columns_backfilled(tmp_path):
     conn = init_db(p)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(notes)")}
     assert {"extraction_status", "extracted_at", "content_hash_at_extraction"} <= cols
+
+
+def _mk_session(conn, sid, uid, source="web"):
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+        "VALUES (?,?,?,0,0)", (sid, uid, source))
+    conn.commit()
+
+
+ENQ = dict(provider_url="http://x", provider_key="k",
+           provider_type="openai", model_name="m")
+
+
+def test_enqueue_web_session(tmp_path):
+    import notes_extract
+    conn = _conn(tmp_path)
+    _mk_session(conn, "s1", "1")
+    assert notes_extract.maybe_enqueue_notes_job(conn, "s1", "1", **ENQ) is True
+    row = conn.execute("SELECT * FROM notes_extract_jobs").fetchone()
+    assert row["session_id"] == "s1" and row["status"] == "pending"
+
+
+def test_enqueue_skips_when_disabled(tmp_path):
+    import notes_extract
+    conn = _conn(tmp_path)
+    _mk_session(conn, "s1", "1")
+    notes_store.set_auto_extract(conn, "1", False)
+    assert notes_extract.maybe_enqueue_notes_job(conn, "s1", "1", **ENQ) is False
+    assert conn.execute("SELECT COUNT(*) c FROM notes_extract_jobs").fetchone()["c"] == 0
+
+
+def test_enqueue_skips_channel_sessions(tmp_path):
+    import notes_extract
+    conn = _conn(tmp_path)
+    _mk_session(conn, "s1", "1", source="telegram")
+    assert notes_extract.maybe_enqueue_notes_job(conn, "s1", "1", **ENQ) is False
+
+
+def test_enqueue_coalesces(tmp_path):
+    import notes_extract
+    conn = _conn(tmp_path)
+    _mk_session(conn, "s1", "1")
+    notes_extract.maybe_enqueue_notes_job(conn, "s1", "1", now=100, **ENQ)
+    conn.execute("UPDATE notes_extract_jobs SET status='running', attempts=2")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(conn, "s1", "1", now=200, **ENQ)
+    row = conn.execute("SELECT * FROM notes_extract_jobs").fetchone()
+    assert (row["status"], row["attempts"], row["enqueued_at"]) == ("pending", 0, 200)

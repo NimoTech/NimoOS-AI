@@ -286,6 +286,12 @@ async def _recall_worker_startup():
     _notes_sync_task, _notes_sync_stop = start_notes_sync(_db())
 
 
+@app.on_event("startup")
+async def _notes_extract_worker_startup():
+    import notes_extract
+    notes_extract.start_worker(_db())
+
+
 _channel_manager = None
 
 
@@ -2123,6 +2129,14 @@ def _start_run(session_id: str, user_id: str, message: str,
                 recall_index.maybe_enqueue_index_job(_conn, session_id, user_id)
             except Exception:
                 pass
+            try:
+                import notes_extract
+                notes_extract.maybe_enqueue_notes_job(
+                    _conn, session_id, user_id,
+                    provider_url=provider_url, provider_key=provider_key,
+                    provider_type=provider_type, model_name=model)
+            except Exception:
+                _LOG.exception("notes-extract enqueue failed")
             # Don't leave references to a finished task pinned in _active_runs;
             # the sink is still kept (so very-late subscribers can replay) but
             # the task ref is cleared so GC can reclaim its frames.

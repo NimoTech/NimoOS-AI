@@ -115,3 +115,136 @@ async def apply_extraction(conn, user_id, session_id, notes, *,
                 (note["id"], str(user_id)))
             conn.commit()
     return created
+
+
+def maybe_enqueue_notes_job(conn, session_id, user_id, *, provider_url,
+                            provider_key, provider_type, model_name,
+                            now=None) -> bool:
+    """Coalescing upsert into notes_extract_jobs; called from the run
+    loop's finally block. Skips when the user disabled auto-extract, and
+    skips non-web (channel) sessions entirely — notes have no trust tier
+    below draft, so low-trust demotion means: never auto-precipitate."""
+    if not notes_store.is_auto_extract_enabled(conn, user_id):
+        return False
+    srow = conn.execute("SELECT source FROM sessions WHERE id=?",
+                        (session_id,)).fetchone()
+    source = (srow["source"] if srow and srow["source"] else "web")
+    if source != "web":
+        return False
+    now = int(time.time()) if now is None else now
+    conn.execute(
+        """INSERT INTO notes_extract_jobs
+             (session_id, user_id, status, attempts, provider_url,
+              provider_key, provider_type, model_name, enqueued_at, updated_at)
+           VALUES (?,?,'pending',0,?,?,?,?,?,?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             status='pending', attempts=0, last_error=NULL,
+             provider_url=excluded.provider_url,
+             provider_key=excluded.provider_key,
+             provider_type=excluded.provider_type,
+             model_name=excluded.model_name,
+             enqueued_at=excluded.enqueued_at,
+             updated_at=excluded.updated_at""",
+        (session_id, str(user_id), provider_url, provider_key,
+         provider_type, model_name, now, now))
+    conn.commit()
+    return True
+
+
+def _claim_idle_job(conn, now):
+    return conn.execute(
+        "SELECT * FROM notes_extract_jobs WHERE status='pending' "
+        "AND enqueued_at <= ? ORDER BY enqueued_at ASC LIMIT 1",
+        (now - IDLE_SECONDS,)).fetchone()
+
+
+def _fail_job(conn, session_id, attempts, err, now):
+    if attempts >= MAX_ATTEMPTS:
+        conn.execute("DELETE FROM notes_extract_jobs WHERE session_id=?",
+                     (session_id,))
+    else:
+        conn.execute(
+            "UPDATE notes_extract_jobs SET status='pending', last_error=?, "
+            "updated_at=? WHERE session_id=?", (str(err)[:500], now, session_id))
+    conn.commit()
+
+
+async def process_pending_once(conn, *, llm_call, history_loader,
+                               note_indexer=index_note, now=None) -> bool:
+    now = int(time.time()) if now is None else now
+    job = _claim_idle_job(conn, now)
+    if job is None:
+        return False
+    session_id, user_id = job["session_id"], job["user_id"]
+    attempts = job["attempts"] + 1
+    conn.execute("UPDATE notes_extract_jobs SET status='running', attempts=?, "
+                 "updated_at=? WHERE session_id=?", (attempts, now, session_id))
+    conn.commit()
+    try:
+        async with memory_lock.get_user_lock(str(user_id)):
+            existing = _session_note_titles(conn, user_id, session_id)
+        history = history_loader(session_id)
+        prompt = build_extraction_prompt(history, sorted(existing))
+        text = await asyncio.wait_for(llm_call(job, prompt), timeout=LLM_TIMEOUT)
+        parsed = parse_extraction(text)
+        if parsed is None:
+            raise ValueError("unparseable extraction output")
+        if parsed:
+            await apply_extraction(conn, user_id, session_id, parsed,
+                                   note_indexer=note_indexer, now=now)
+        conn.execute("DELETE FROM notes_extract_jobs "
+                     "WHERE session_id=? AND status='running'", (session_id,))
+        conn.commit()
+        return True
+    except Exception as e:          # noqa: BLE001 — worker must never die
+        logger.warning("notes-extract failed for %s: %s", session_id, e)
+        _fail_job(conn, session_id, attempts, e, now)
+        return True
+
+
+async def _default_llm_call(job, prompt) -> str:
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"])
+    resp = await client.chat.completions.create(
+        model=job["model_name"],
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _default_history_loader(session_id) -> list:
+    import db
+    row = db.get_connection().execute(
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        return []
+    try:
+        h = json.loads(row["content"])
+        return h if isinstance(h, list) else []
+    except (ValueError, KeyError):
+        return []
+
+
+async def worker_loop(conn, *, stop_event):
+    """Poll loop; one job per tick (sequential, CPU-NAS friendly)."""
+    while not stop_event.is_set():
+        try:
+            await process_pending_once(conn, llm_call=_default_llm_call,
+                                       history_loader=_default_history_loader)
+        except Exception as e:          # never let the loop die
+            logger.exception("notes-extract worker tick error: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+def start_worker(conn):
+    """Launch the background worker; returns (task, stop_event)."""
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
+    return task, stop_event

@@ -84,3 +84,57 @@ def test_apply_index_failure_sets_sentinel(tmp_path):
     row = conn.execute("SELECT content_hash FROM notes WHERE id=?",
                        (created[0]["id"],)).fetchone()
     assert row["content_hash"] == ""
+
+
+def test_worker_end_to_end_creates_draft(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+
+    async def llm(job, prompt):
+        assert "Conversation" in prompt
+        return json.dumps({"notes": [{"title": "结论", "description": "d",
+                                      "body": "买 64G", "tags": []}]})
+
+    ran = asyncio.run(notes_extract.process_pending_once(
+        conn, llm_call=llm, history_loader=lambda sid: [{"role": "user", "content": "hi"}],
+        note_indexer=_fake_indexer_ok, now=100 + notes_extract.IDLE_SECONDS + 1))
+    assert ran is True
+    row = conn.execute("SELECT status, type FROM notes WHERE user_id='1'").fetchone()
+    assert (row["status"], row["type"]) == ("draft", "insight")
+    assert conn.execute("SELECT COUNT(*) c FROM notes_extract_jobs").fetchone()["c"] == 0
+
+
+def test_worker_respects_idle_gate(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+    ran = asyncio.run(notes_extract.process_pending_once(
+        conn, llm_call=None, history_loader=None, now=100 + 30))
+    assert ran is False  # still idle-gated; llm_call must not be touched
+
+
+def test_worker_retries_then_gives_up(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=0, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+
+    async def boom(job, prompt):
+        raise RuntimeError("llm down")
+
+    for attempt in range(notes_extract.MAX_ATTEMPTS):
+        asyncio.run(notes_extract.process_pending_once(
+            conn, llm_call=boom, history_loader=lambda sid: [], now=1000))
+    assert conn.execute("SELECT COUNT(*) c FROM notes_extract_jobs").fetchone()["c"] == 0
