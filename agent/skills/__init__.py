@@ -13,6 +13,7 @@ from skills.skills_registry import ALL_TOOLS as SKILLS_REGISTRY_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills.memory import MEMORY_TOOLS
+from skills.notes import NOTES_TOOLS
 
 # Wiki tools — write tools added in Task 7.
 WIKI_TOOLS = [
@@ -23,4 +24,4 @@ WIKI_TOOLS = [
 ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
              + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
              + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS + SEARCH_TOOLS + MCP_ADMIN_TOOLS
-             + MEMORY_TOOLS)
+             + MEMORY_TOOLS + NOTES_TOOLS)
