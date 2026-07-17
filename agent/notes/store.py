@@ -42,6 +42,27 @@ def set_notes_root(conn, path: str) -> None:
     conn.commit()
 
 
+AUTO_EXTRACT_KEY = "notes_auto_extract"
+
+
+def is_auto_extract_enabled(conn, user_id: str) -> bool:
+    """Per-user auto-precipitation toggle; missing row means enabled."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key=?",
+        (str(user_id), AUTO_EXTRACT_KEY)).fetchone()
+    return row is None or row["value"] != "0"
+
+
+def set_auto_extract(conn, user_id: str, enabled: bool) -> None:
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(user_id, key) DO UPDATE SET "
+        "value=excluded.value, updated_at=excluded.updated_at",
+        (str(user_id), AUTO_EXTRACT_KEY, "1" if enabled else "0",
+         int(time.time())))
+    conn.commit()
+
+
 def note_abs_path(conn, note: dict) -> str:
     return os.path.join(get_notes_root(conn), note["path"])
 
