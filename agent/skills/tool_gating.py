@@ -42,7 +42,7 @@ def _name(tool) -> str:
 
 
 def categories_overview() -> str:
-    lines = ["可解锁的工具类别(调用 expand_tools 解锁后,工具会在下一步出现):"]
+    lines = ["Unlockable tool categories (call expand_tools; unlocked tools appear on the next step):"]
     for cat, desc in _reg.CATEGORY_DESCRIPTIONS.items():
         lines.append(f"- {cat}: {desc}")
     return "\n".join(lines)
@@ -63,8 +63,8 @@ def expand_categories(categories: list[str]) -> str:
     valid = set(_reg.CATEGORY_TOOLS.keys())
     unknown = [c for c in categories if c not in valid]
     if unknown:
-        return (f"未知类别 {unknown}。合法类别:" + ", ".join(sorted(valid)) +
-                "。请用这些类别名重试。")
+        return (f"Unknown categories {unknown}. Valid categories: " + ", ".join(sorted(valid)) +
+                ". Retry with these category names.")
     cur = current_unlocked()
     if not isinstance(cur, set):     # 兜底:确保可原地修改
         cur = set(cur)
@@ -72,12 +72,12 @@ def expand_categories(categories: list[str]) -> str:
     newly = [c for c in categories if c not in cur]
     cur.update(categories)
     _persist(sorted(cur))
-    lines = [f"已解锁:{', '.join(categories)}。现在可用以下工具:"]
+    lines = [f"Unlocked: {', '.join(categories)}. The following tools are now available:"]
     for c in categories:
         for t in _reg.CATEGORY_TOOLS[c]:
             lines.append(f"- {_name(t)}")
     if not newly:
-        lines.append("(这些类别此前已解锁)")
+        lines.append("(these categories were already unlocked)")
     return "\n".join(lines)
 
 

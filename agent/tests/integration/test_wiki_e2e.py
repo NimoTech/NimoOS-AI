@@ -369,8 +369,8 @@ async def test_register_then_get_then_append_then_context(running_wiki, tmp_path
         # renders the map block.  The registered root should appear.
         c.reset_cache()
         block = await WikiContextBuilder(c).build(user_patterns=[])
-        assert "NimoOS 存储空间地图" in block
-        assert "用户笔记" in block
+        assert "NimoOS storage map" in block
+        assert "User notes" in block
         assert str(target) in block, (
             f"registered root path {str(target)!r} missing from builder block:\n{block}"
         )

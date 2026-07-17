@@ -138,7 +138,7 @@ def _revert_rows(conn, store, rows) -> dict:
         except OSError as e:
             if getattr(e, "errno", None) == errno.ENOTEMPTY:
                 return {"status": "conflict",
-                        "reason": "目录非空,请先撤销移入的文件", "row_id": r["id"]}
+                        "reason": "directory not empty; revert the files moved into it first", "row_id": r["id"]}
             failed.append({"id": r["id"], "op": r["op"], "error": str(e)})
     if failed:
         return {"status": "partial", "failed": failed}

@@ -164,7 +164,7 @@ def test_unauthorized_deny_returns_error(ctx, tmp_path):
         await _resolve_event(ctx, False)
         return await task
     out = _run(go())
-    assert "用户拒绝" in out
+    assert "The user denied access to" in out
 
 
 def test_hard_blacklist_never_prompts(ctx):

@@ -2086,7 +2086,7 @@ def _start_run(session_id: str, user_id: str, message: str,
             cancelled = True
             error_msg = "cancelled"
             try:
-                await sink.put({"type": "error", "content": "已停止"})
+                await sink.put({"type": "error", "content": "Stopped"})
                 await sink.put({"type": "done"})
             except asyncio.CancelledError:
                 pass

@@ -194,9 +194,9 @@ class ChannelRouter:
             # user already got the skip notice above).
             return
         if not run_text and attachment_ids:
-            run_text = ("[用户发来文件/图片,已存至 " + (binding.get("download_dir")
+            run_text = ("[The user sent a file/image, saved to " + (binding.get("download_dir")
                         or f"/DATA/Downloads/{msg.channel_type}")
-                        + "。请分析,或询问希望如何处理。]")
+                        + ". Analyze it, or ask how they would like to proceed.]")
         send_cb = None
         if getattr(adapter.capabilities, "supports_media", False):
             async def send_cb(path, caption, _a=adapter, _c=msg.external_chat_id):
@@ -240,13 +240,13 @@ class ChannelRouter:
 
     def _format_confirm(self, ev: dict) -> str:
         if ev.get("type") == "access_request":
-            return (f"🔐 权限请求:{ev.get('reason', '')}\n"
-                    f"路径:{ev.get('path', '')}")
+            return (f"🔐 权限请求 (permission request): {ev.get('reason', '')}\n"
+                    f"路径 (path): {ev.get('path', '')}")
         row = self._conn.execute(
             "SELECT action, description, command FROM pending_confirmations "
             "WHERE confirm_id=?", (ev.get("confirm_id"),)).fetchone()
         if row is not None:
-            text = f"⚠️ 确认:{row['description'] or row['action']}"
+            text = f"⚠️ 确认 (confirm): {row['description'] or row['action']}"
             if row["command"]:
                 text += f"\n{row['command']}"
             return text
@@ -271,7 +271,7 @@ class ChannelRouter:
         text = self._format_confirm(ev)
         try:
             mid = await adapter.send_buttons(chat_id, text,
-                [("✅ 允许", f"cf:{confirm_id}:a"), ("❌ 拒绝", f"cf:{confirm_id}:d")])
+                [("✅ 允许 Allow", f"cf:{confirm_id}:a"), ("❌ 拒绝 Deny", f"cf:{confirm_id}:d")])
         except Exception:
             # Never let a send failure kill the driver and hang the run on
             # mgr.wait — degrade to deny.
@@ -297,7 +297,7 @@ class ChannelRouter:
         self._deny(confirm_id, entry["session_id"])
         try:
             await entry["adapter"].edit_to_resolved(
-                entry["chat_id"], entry["message_id"], "⏱ 已超时(视为拒绝)")
+                entry["chat_id"], entry["message_id"], "⏱ 已超时,视为拒绝 (timed out → denied)")
         except Exception:
             _LOG.exception("edit_to_resolved on timeout failed")
 
@@ -327,7 +327,7 @@ class ChannelRouter:
             try:
                 await adapter.edit_to_resolved(
                     chat_id, entry["message_id"],
-                    "✅ 已允许" if allow else "❌ 已拒绝")
+                    "✅ 已允许 (allowed)" if allow else "❌ 已拒绝 (denied)")
             except Exception:
                 _LOG.exception("edit_to_resolved failed")
         except Exception:

@@ -67,8 +67,8 @@ WORK_ROOT = Path(os.environ.get(
     str(Path.home() / ".nimoos" / "agent"),
 ))
 
-_NETWORK_HINT = ("\n(System Hint: 命令可能因沙箱默认断网而失败。"
-                 "若确需联网,请以 network=true 重试,会请用户确认。)")
+_NETWORK_HINT = ("\n(System hint: the command may have failed because the sandbox is offline by default. "
+                 "If network access is genuinely needed, retry with network=true — the user will be asked to confirm.)")
 
 
 def _work_dir(session_id: str) -> Path:
@@ -311,8 +311,8 @@ async def _guard_command(command: str) -> str | None:
     sink = EVENT_QUEUE_VAR.get()
     if mgr is None or sink is None:
         _rec("refused_unattended", decision.level, reason)
-        return ("此命令需人工批准(无确认通道),未执行。"
-                "请在面板确认,或将其加入 shell 白名单。")
+        return ("This command requires manual approval (no confirmation channel available); it was NOT executed. "
+                "Confirm it in the panel, or add it to the shell allowlist.")
 
     # Build the backstop BEFORE asking, so the card can show undo status.
     backstop = guard_backstop.prepare_backstop(decision.paths)
@@ -341,7 +341,7 @@ async def _guard_command(command: str) -> str | None:
     granted = await mgr.wait(confirm_id)
     if not granted:
         _rec("refused_user", decision.level, reason)
-        return "用户拒绝或未能确认该命令,未执行。"
+        return "The user denied or failed to confirm the command; it was NOT executed."
     if db is not None and mgr.consume_remember(confirm_id):
         # Store an anchored EXACT-match regex, not an open prefix — otherwise a
         # remembered `rm -rf /DATA/scratch` would also auto-run a later superset
@@ -380,9 +380,9 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                            host=intent.host, files=intent.files,
                            stage="rules", reason=v.reason)
                     return (
-                        "该上传被隐私策略拦截,未执行。"
-                        f"原因:{v.reason}。"
-                        "如确需外发请人工处理。"
+                        "This upload was blocked by privacy policy and NOT executed. "
+                        f"Reason: {v.reason}. "
+                        "If it truly must be sent out, handle it manually."
                     )
 
                 elif v.level == "clean":
@@ -406,9 +406,9 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                                host=intent.host, files=intent.files,
                                stage="judge", reason=v.reason)
                         return (
-                            "该上传被内容审查拦截,未执行。"
-                            "上传内容被判断为含有敏感/隐私数据。"
-                            "如确需外发请人工处理。"
+                            "This upload was blocked by content inspection and NOT executed. "
+                            "The upload content was judged to contain sensitive/private data. "
+                            "If it truly must be sent out, handle it manually."
                         )
                     elif verdict == "ask":
                         mgr = CONFIRM_MGR_VAR.get()
@@ -416,8 +416,8 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         if mgr is None or sink is None:
                             # No confirm channel available — fail safe: refuse.
                             return (
-                                "无法确认上传操作(无确认通道),未执行。"
-                                "请通过界面确认后重试,或人工处理。"
+                                "Cannot confirm the upload (no confirmation channel); NOT executed. "
+                                "Retry after confirming via the UI, or handle it manually."
                             )
                         confirm_id = mgr.register(
                             session_id,
@@ -440,7 +440,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         granted = await mgr.wait(confirm_id)
                         if not granted:
                             return (
-                                "用户拒绝或未能确认上传操作,未执行。"
+                                "The user denied or failed to confirm the upload; it was NOT executed."
                             )
                     # verdict == "allow" OR user confirmed → fall through to grant + execute
 
@@ -483,7 +483,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                 _apath_exc,
             )
             return (
-                "上传操作因内部错误无法评估,未执行,请人工处理。"
+                "The upload could not be evaluated due to an internal error; NOT executed. Handle it manually."
             )
         # ── end A-path ────────────────────────────────────────────────────────
 
@@ -496,7 +496,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
     # bwrap mode: original network-grant + offline-hint logic — do not modify.
     use_net = await _maybe_grant_network(session_id, command) if network else False
     if network and not use_net:
-        return "联网请求被拒绝(用户拒绝或当前会话无法确认)。可去掉 network 离线执行。"
+        return "Network access was denied (user declined or this session cannot confirm). You can drop network=true and run offline."
 
     result = await _run(command, timeout_sec, use_net, view)
 

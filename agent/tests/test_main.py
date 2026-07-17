@@ -118,7 +118,7 @@ async def test_cancel_running_task_releases_lock(client):
                 await _asyncio.Event().wait()
             except _asyncio.CancelledError:
                 # Surface a clean termination like the real wrapper does.
-                await sink.put({"type": "error", "content": "已停止"})
+                await sink.put({"type": "error", "content": "Stopped"})
                 await sink.put({"type": "done"})
                 raise
 

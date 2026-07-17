@@ -168,7 +168,7 @@ def _gate_args(args: dict, patterns: list[str]) -> None:
             continue
         for pat in patterns:
             if pat and pat in v:
-                raise ValueError(f"参数 {k} 命中黑名单({pat})")
+                raise ValueError(f"argument {k} hit the blacklist ({pat})")
 
 
 async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
@@ -209,19 +209,19 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
         try:
             _gate_args(args, USER_PATTERNS_VAR.get([]))
         except ValueError as e:
-            return f"已被黑名单拦截: {e}"
+            return f"[MCP error] blocked by blacklist: {e}"
         if not await _ensure_confirmed(server, tool_name, args):
-            return "用户拒绝了该 MCP 工具调用"
+            return "[MCP error] the user denied this MCP tool call"
         try:
             conn = await _get_run_conn(server)          # lazy connect (connection layer)
         except Exception as e:
-            return (f"系统错误:无法连接到 MCP 服务方「{server['name']}」({e})。"
-                    f"这是连接/服务端故障,与调用参数无关——请勿改参数重试,"
-                    f"告知用户检查该 MCP 服务状态。")
+            return (f'[MCP error] cannot connect to MCP server "{server["name"]}" ({e}). '
+                    "This is a connection/server failure unrelated to the call arguments — "
+                    "do NOT retry with different arguments; tell the user to check that MCP server.")
         try:
             result = await conn.call_tool(tool_name, args)   # tool execution layer
         except Exception as e:
-            return f"MCP 工具 {tool_name} 执行出错: {e}"
+            return f"[MCP error] MCP tool {tool_name} failed: {e}"
         return flatten_result(result)
 
     return FunctionTool(
@@ -390,7 +390,7 @@ async def _metas_for_server(server: dict):
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
         await _emit_warning(server.get("name", "mcp"),
-                            "stdio 工具首次使用正在后台下载初始化,稍后重试")
+                            "stdio tools are initializing in the background for first use; retry shortly")
         return []
     try:
         return await _cold_fetch(server)        # http/sse:内联快取(短超时,不阻塞 run 启动)
@@ -434,7 +434,7 @@ async def test_server(server: dict) -> dict:
     try:
         return await asyncio.wait_for(_test_server_inner(server), timeout=timeout)
     except asyncio.TimeoutError:
-        return {"ok": False, "error": "探测超时"}
+        return {"ok": False, "error": "Probe timed out", "error_key": "probe_timeout"}
 
 
 async def _test_server_inner(server: dict) -> dict:
@@ -445,15 +445,15 @@ async def _test_server_inner(server: dict) -> dict:
     try:
         conn = await _connect(server, connect_timeout=budget)
     except Exception as e:
-        return {"ok": False, "error": f"连接失败: {e}"}
+        return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
     try:
         tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=budget)
     except asyncio.TimeoutError:
         await conn.aclose()
-        return {"ok": False, "error": "列工具超时"}
+        return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
     except Exception as e:
         await conn.aclose()
-        return {"ok": False, "error": f"列工具失败: {e}"}
+        return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed", "detail": str(e)}
     await conn.aclose()
     metas = [_extract_meta(t) for t in tools]
     if "id" in server:
