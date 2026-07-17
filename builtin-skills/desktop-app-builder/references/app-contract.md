@@ -20,6 +20,9 @@ contract: `references/widget-contract.md`.
 | `nimoos.widget.path` | required for widgets | path starting with `/` | none | **setting it = declaring a widget**. The desktop iframe loads `scheme://<NAS>:port<path>` |
 | `nimoos.widget.w` | MAY | integer string | `2` | INITIAL width in grid cells; clamped to 2..4, invalid values become 2. Users can resize afterwards — the page must be responsive (see widget-contract.md) |
 | `nimoos.widget.h` | MAY | integer string | `2` | INITIAL height in grid cells; clamped to 1..4, invalid values become 2. Same resize caveat as `w` |
+| `nimoos.widget.minw` / `nimoos.widget.minh` | MAY | integer string | global `2` / `1` | min resizable width/height in grid cells, clamped into the global 2..4 / 1..4 range. Omit all four range labels = today's behavior (freely resizable within the global range) |
+| `nimoos.widget.maxw` / `nimoos.widget.maxh` | MAY | integer string | global `4` / `4` | max resizable width/height in grid cells, clamped the same way; if min > max, min wins. **min == max locks the size — the desktop hides the resize handle**. The initial `w`/`h` is clamped into this range too |
+| `nimoos.widget.resize` | MAY | `"false"` | resizable | sugar for `min=max=initial w/h` (locks the size; defaults to 2×2 when `w`/`h` are omitted). Explicit min/max labels take precedence |
 
 MUST NOT:
 

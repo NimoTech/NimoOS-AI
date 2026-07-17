@@ -65,6 +65,14 @@ templated load fails.
 
 ### The card resizes — the page MUST be written responsive
 
+Exception — fixed-size widgets: declare `nimoos.widget.resize: "false"` (or
+`minw`/`minh`/`maxw`/`maxh` with min == max) to lock the card size. A locked
+widget never resizes, so the responsive rules below relax to just "look right
+at the one locked size". Prefer a locked size only when the layout genuinely
+cannot flex (e.g. a fixed board); otherwise stay responsive — users like
+resizing. Partial ranges work too: e.g. `nimoos.widget.maxh: "2"` keeps the
+widget short while width stays flexible.
+
 Users can drag-resize every app widget between 2×1 and 4×4 grid
 cells; `nimoos.widget.w/h` set only the INITIAL size and there is no
 way to lock it. Grid cells are 58–92px depending on the user's
