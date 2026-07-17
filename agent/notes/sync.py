@@ -133,6 +133,7 @@ async def scan_once(conn) -> dict:
                      json.dumps(f["source_refs"], ensure_ascii=False),
                      f["created_by"], 1, now, now))
                 store._sync_tags(conn, uid, nid, f["tags"])
+                store.sync_links(conn, nid, body)
                 conn.commit()
                 seen_ids.add(nid)
                 stats["adopted"] += 1
@@ -183,6 +184,7 @@ async def scan_once(conn) -> dict:
                     (f["title"] or row["title"], f["description"],
                      f["type"], f["status"], new_hash, now, nid))
                 store._sync_tags(conn, uid, nid, f["tags"])
+                store.sync_links(conn, nid, body)
                 conn.commit()
                 stats["updated"] += 1
         except Exception:
