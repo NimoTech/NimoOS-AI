@@ -18,8 +18,8 @@ contract: `references/widget-contract.md`.
 | `nimoos.port` | see meaning | numeric string | none | **host port** (the host side of `-p host:container`). Clicking the icon opens `scheme://<NAS>:port<index>`. **MUST be set when a widget or a relative icon is declared**, otherwise the widget shows "cannot connect" forever |
 | `nimoos.index` | MAY | path | `/` | web UI entry path |
 | `nimoos.widget.path` | required for widgets | path starting with `/` | none | **setting it = declaring a widget**. The desktop iframe loads `scheme://<NAS>:port<path>` |
-| `nimoos.widget.w` | MAY | integer string | `2` | initial width in grid cells; clamped to 2..4, invalid values become 2 |
-| `nimoos.widget.h` | MAY | integer string | `2` | initial height in grid cells; clamped to 1..4, invalid values become 2 |
+| `nimoos.widget.w` | MAY | integer string | `2` | INITIAL width in grid cells; clamped to 2..4, invalid values become 2. Users can resize afterwards — the page must be responsive (see widget-contract.md) |
+| `nimoos.widget.h` | MAY | integer string | `2` | INITIAL height in grid cells; clamped to 1..4, invalid values become 2. Same resize caveat as `w` |
 
 MUST NOT:
 

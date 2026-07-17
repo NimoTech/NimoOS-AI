@@ -63,6 +63,42 @@ Optional offline hardening: vendor a copy of the NAS's
 `/app/widget-kit.css` into the app and fall back to it when the
 templated load fails.
 
+### The card resizes — the page MUST be written responsive
+
+Users can drag-resize every app widget between 2×1 and 4×4 grid
+cells; `nimoos.widget.w/h` set only the INITIAL size and there is no
+way to lock it. Grid cells are 58–92px depending on the user's
+screen, so after card padding and header the iframe viewport ranges
+roughly **100–385px wide × 26–355px tall** (an h=1 card is a thin
+strip). The iframe viewport IS the card interior: `vw`/`vh`/`vmin`
+units, `@media` queries, and `resize` events all track the card live
+while the user drags — plain CSS is enough, no desktop API involved.
+
+Three rules (violating rule 1 is the #1 cause of clipped widgets):
+
+1. **Flex skeleton filling `100vh`, never fixed pixel heights.**
+   The scrollable middle area absorbs all size changes:
+
+```css
+body { height: 100vh; margin: 0; display: flex; flex-direction: column; }
+.content { flex: 1; min-height: 0; overflow-y: auto; }  /* NOT max-height: 180px */
+```
+
+2. **Scale numbers/type with `clamp()` + `vmin`** (this is how the
+   kit's `.nk-stat` behaves): `font-size: clamp(14px, 12vmin, 32px)`.
+
+3. **Degrade content with media queries** — a small card is not a
+   shrunken big card, it shows less:
+
+```css
+@media (max-height: 90px)  { .input-row, .content { display: none; } } /* 2×1 strip: title + stat only */
+@media (max-width: 140px)  { .nk-label, .secondary { display: none; } }
+```
+
+Debug without the desktop: open the widget URL directly in a browser
+tab (`http://<host>:<port><widget.path>?theme=dark&home=http://<host>`)
+and resize the window — the window is the iframe viewport.
+
 ### Complete example page (copy whole, then change the business content)
 
 `html/widget/index.html`:
@@ -76,11 +112,16 @@ templated load fails.
   const l = document.createElement('link'); l.rel = 'stylesheet'
   l.href = (q.get('home') || '') + '/app/widget-kit.css?v=2'; document.head.appendChild(l)
 </script>
+<style>
+  body { height: 100vh; display: flex; flex-direction: column; }
+  .rows { flex: 1; min-height: 0; overflow-y: auto; }
+  @media (max-height: 90px) { .rows, .nk-progress { display: none; } }
+</style>
 </head><body>
   <p class="nk-title">演示任务</p>
   <div class="nk-stat">3<small>个进行中</small></div>
   <div class="nk-progress" style="margin:8px 0"><i style="width:62%"></i></div>
-  <ul class="nk-list">
+  <ul class="nk-list rows">
     <li class="nk-row"><span>速度</span><span class="nk-value nk-accent">2.1 MB/s</span></li>
     <li class="nk-row"><span>状态</span><span class="nk-badge good">健康</span></li>
   </ul>
