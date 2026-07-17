@@ -125,7 +125,7 @@ def render_user_block(conn, user_id, *, now=None,
         used += len(line)
     if not lines:
         return ""
-    return "## 关于这位用户\n\n" + "\n".join(lines)
+    return "## About this user\n\n" + "\n".join(lines)
 
 
 def bump_recall(conn, ids, *, now=None) -> None:

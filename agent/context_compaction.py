@@ -45,7 +45,7 @@ MODEL_WINDOW_MAP = {
     "gemini-2": 1000000,
 }
 
-SUMMARY_HEADER = "[对话历史摘要(较早内容已压缩)]"
+SUMMARY_HEADER = "[Conversation history summary (earlier content compacted)]"
 
 
 def _is_cjk(ch: str) -> bool:
@@ -101,7 +101,7 @@ def _message_text(m, *, max_output_chars=None) -> str:
         if not isinstance(out, str):
             out = json.dumps(out, ensure_ascii=False) if out is not None else ""
         if max_output_chars is not None and len(out) > max_output_chars:
-            out = out[:max_output_chars] + f"…[+{len(out) - max_output_chars}字]"
+            out = out[:max_output_chars] + f"…[+{len(out) - max_output_chars} chars]"
         return out
     if t == "reasoning":
         summ = m.get("summary")
@@ -199,7 +199,7 @@ def _write_summary_state(conn, session_id, summary, folded_upto) -> None:
     conn.commit()
 
 
-RECALL_HINT = "(更早的对话原文可用 recall 工具按需检索)"
+RECALL_HINT = "(full earlier conversation text can be retrieved on demand via the recall tool)"
 
 
 def summary_block(summary, *, recall_hint=False) -> str:
@@ -211,9 +211,10 @@ def summary_block(summary, *, recall_hint=False) -> str:
 
 
 SUMMARIZE_INSTRUCTION = (
-    "你是对话历史压缩器。把【已有摘要】和【更早的对话片段】融合成一段更紧凑、"
-    "信息无损的滚动摘要:保留关键事实、用户偏好、已做的决定、未决问题、实体与"
-    "结论;去掉寒暄与冗余。只输出摘要正文,不要解释、不要前后缀。"
+    "You are a conversation-history compactor. Merge the [Existing summary] and the [Earlier conversation excerpts] "
+    "into one tighter, information-lossless rolling summary: keep key facts, user preferences, decisions made, "
+    "open questions, entities and conclusions; drop pleasantries and redundancy. Write the summary in the "
+    "conversation's language. Output only the summary text — no explanations, no prefix or suffix."
 )
 
 

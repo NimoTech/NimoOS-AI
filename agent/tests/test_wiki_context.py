@@ -97,7 +97,7 @@ async def test_build_caps_projects_to_top_15():
         assert f"/DATA/p{i:02d}" in out
     for i in range(15, 25):
         assert f"/DATA/p{i:02d}" not in out
-    assert "还有 10 个项目" in out
+    assert "plus 10 more items" in out
 
 
 @pytest.mark.asyncio
@@ -152,7 +152,7 @@ async def test_build_truncates_long_notes():
     # Per-node cap: 500 chars
     assert "Y" * 500 in out
     assert "Y" * 501 not in out
-    assert "更多见 wiki_get_node" in out
+    assert "more via wiki_get_node" in out
 
 
 @pytest.mark.asyncio

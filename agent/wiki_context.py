@@ -99,8 +99,8 @@ class WikiContextBuilder:
             if len(projects) > PROJECT_CAP:
                 extra = len(projects) - PROJECT_CAP
                 lines.append(
-                    f"  - ... 还有 {extra} 个项目,"
-                    f"用 wiki_list_full_tree(root_id='{_scaf(sp)}') 查看完整列表"
+                    f"  - ... plus {extra} more items; "
+                    f"use wiki_list_full_tree(root_id='{_scaf(sp)}') for the full list"
                 )
         return "\n".join(lines)
 
@@ -127,7 +127,7 @@ class WikiContextBuilder:
             if total >= USER_NOTES_TOTAL_CHAR_CAP:
                 remaining = len(active) - appended
                 lines.append(
-                    f"\n_(余 {remaining} 条笔记略;用 wiki_get_node('{_scaf(n['path'])}') 等查看)_"
+                    f"\n_({remaining} more notes omitted; use wiki_get_node('{_scaf(n['path'])}') etc. to view)_"
                 )
                 break
             try:
@@ -141,7 +141,7 @@ class WikiContextBuilder:
                 continue
             if len(body) > USER_NOTES_PER_NODE_CHAR_CAP:
                 body = (body[:USER_NOTES_PER_NODE_CHAR_CAP]
-                        + f"\n…(更多见 wiki_get_node('{_scaf(n['path'])}'))")
+                        + f"\n…(more via wiki_get_node('{_scaf(n['path'])}'))")
             lines.append(f"### {_scaf(n['path'])}")
             lines.append(fence_untrusted(f"wiki:{n['path']}", body))
             lines.append("")
