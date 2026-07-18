@@ -187,6 +187,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.Any("/agent/shell-allowlist/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	// Notes settings moves the system-wide notes root — admin only.
 	g.Any("/agent/notes/settings", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Dir-info probes candidate notes folders for the settings UI — same gate.
+	g.Any("/agent/notes/dir-info", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})

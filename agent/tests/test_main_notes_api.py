@@ -133,3 +133,40 @@ async def test_settings_migrate_refuses_nonempty_target(app_ctx, tmp_path):
                          json={"notes_root": str(target), "mode": "migrate"})
     assert r.status_code == 400
     assert "not empty" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_dir_info_probe(app_ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_NOTES_PROBE_ROOT", str(tmp_path))
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    (full_dir / ".hidden").write_text("x")  # dotfiles count, like the migrate guard
+
+    async with _client() as ac:
+        r = await ac.get("/agent/notes/dir-info", headers={"X-User-Id": "1"},
+                         params={"path": str(empty_dir)})
+        assert r.status_code == 200
+        assert r.json() == {"exists": True, "empty": True}
+
+        r = await ac.get("/agent/notes/dir-info", headers={"X-User-Id": "1"},
+                         params={"path": str(full_dir)})
+        assert r.json() == {"exists": True, "empty": False}
+
+        # Missing dir is migratable — migrate mkdirs it.
+        r = await ac.get("/agent/notes/dir-info", headers={"X-User-Id": "1"},
+                         params={"path": str(tmp_path / "nope")})
+        assert r.json() == {"exists": False, "empty": True}
+
+        # Outside the probe root → 400; no header → 401.
+        r = await ac.get("/agent/notes/dir-info", headers={"X-User-Id": "1"},
+                         params={"path": "/etc"})
+        assert r.status_code == 400
+        r = await ac.get("/agent/notes/dir-info", params={"path": str(empty_dir)})
+        assert r.status_code == 401
+
+        # Not captured by the /agent/notes/{note_id} route.
+        r = await ac.get("/agent/notes/dir-info", headers={"X-User-Id": "1"},
+                         params={"path": str(empty_dir)})
+        assert "exists" in r.json()

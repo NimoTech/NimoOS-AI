@@ -178,17 +178,20 @@ func TestNotesSettingsGateRoutePrecedence(t *testing.T) {
 	e := echo.New()
 	proxied := 0
 	proxy := func(c echo.Context) error { proxied++; return c.String(http.StatusOK, "proxied") }
-	// Mirror route/v2.go registration order: gated route first, wildcard last.
+	// Mirror route/v2.go registration order: gated routes first, wildcard last.
 	e.Any("/agent/notes/settings", proxy, AdminOnly(dir))
+	e.Any("/agent/notes/dir-info", proxy, AdminOnly(dir))
 	e.Any("/agent/*", proxy)
 
-	for _, m := range []string{http.MethodGet, http.MethodPut} {
-		req := httptest.NewRequest(m, "/agent/notes/settings", nil)
-		req.Header.Set("Authorization", "Bearer tok")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
-		require.Equalf(t, http.StatusForbidden, rec.Code,
-			"%s /agent/notes/settings must hit the gated route, not the wildcard", m)
+	for _, path := range []string{"/agent/notes/settings", "/agent/notes/dir-info"} {
+		for _, m := range []string{http.MethodGet, http.MethodPut} {
+			req := httptest.NewRequest(m, path, nil)
+			req.Header.Set("Authorization", "Bearer tok")
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+			require.Equalf(t, http.StatusForbidden, rec.Code,
+				"%s %s must hit the gated route, not the wildcard", m, path)
+		}
 	}
 
 	// Sibling notes endpoints must fall through to the wildcard ungated.

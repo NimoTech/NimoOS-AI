@@ -2635,6 +2635,33 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
             "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
 
 
+# Probes are confined to the user-visible data root (tests monkeypatch this).
+_NOTES_PROBE_ROOT = "/DATA"
+
+
+# Registered before /agent/notes/{note_id} so "dir-info" is not captured as an id.
+@app.get("/agent/notes/dir-info")
+async def notes_dir_info(request: Request, path: str = ""):
+    """Probe a candidate notes folder for the settings UI: same emptiness
+    semantics as the migrate guard in put_notes_settings (any entry counts,
+    dotfiles included). A missing directory is migratable (migrate mkdirs it)."""
+    _notes_uid(request)
+    p = os.path.abspath(path or "")
+    if p != _NOTES_PROBE_ROOT and not p.startswith(_NOTES_PROBE_ROOT + "/"):
+        raise HTTPException(status_code=400,
+                            detail=f"path must be under {_NOTES_PROBE_ROOT}")
+    exists = os.path.isdir(p)
+    if not exists:
+        return {"exists": False, "empty": True}
+    try:
+        empty = not os.listdir(p)
+    except OSError:
+        # Unreadable: report non-empty so the UI doesn't promise a migrate
+        # the backend guard would then reject.
+        empty = False
+    return {"exists": True, "empty": empty}
+
+
 @app.get("/agent/notes")
 async def list_notes_api(request: Request, type: str = "", status: str = "",
                          limit: int = 50):
