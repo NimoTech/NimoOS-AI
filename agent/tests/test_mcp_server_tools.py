@@ -143,6 +143,12 @@ async def test_call_list_notes_dispatches(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_call_list_notes_non_integer_limit_raises_clean_error():
+    with pytest.raises(tools.McpToolError):
+        await tools.call("list_notes", {"limit": "abc"})
+
+
+@pytest.mark.asyncio
 async def test_call_read_note_requires_id():
     with pytest.raises(Exception):
         await tools.call("read_note", {})

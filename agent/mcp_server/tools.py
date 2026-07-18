@@ -1,8 +1,8 @@
 # NimoOS-AI/agent/mcp_server/tools.py
-"""Adapter: re-expose 6 read-only skills as MCP tools. tools/call routes to
-each skill's existing _impl; tools/list uses curated inputSchemas (so e.g.
-read_document never exposes the Plan-2 path/ocr params). No capability logic
-is reimplemented here."""
+"""Adapter: re-expose 11 read-only tools backed by the search/wiki/photos/notes
+skills as MCP tools. tools/call routes to each skill's existing _impl;
+tools/list uses curated inputSchemas (so e.g. read_document never exposes the
+Plan-2 path/ocr params). No capability logic is reimplemented here."""
 from __future__ import annotations
 
 import asyncio
@@ -141,9 +141,12 @@ async def _h_view_document_page(args: dict):
 
 
 async def _h_list_notes(args: dict) -> str:
+    try:
+        limit = int(args.get("limit") or 20)
+    except (TypeError, ValueError):
+        raise McpToolError("limit must be an integer")
     return await _notes._list_notes_impl(
-        str(args.get("type") or ""), str(args.get("status") or ""),
-        int(args.get("limit") or 20))
+        str(args.get("type") or ""), str(args.get("status") or ""), limit)
 
 
 async def _h_read_note(args: dict) -> str:
