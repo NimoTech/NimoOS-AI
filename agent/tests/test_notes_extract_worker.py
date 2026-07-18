@@ -154,6 +154,23 @@ def test_fail_job_guards_against_concurrent_reenqueue(tmp_path):
     assert row["attempts"] == 0
 
 
+def test_requeue_orphaned_flips_running_to_pending(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+    conn.execute("UPDATE notes_extract_jobs SET status='running' WHERE session_id='s1'")
+    conn.commit()
+    n = notes_extract._requeue_orphaned(conn)
+    assert n == 1
+    row = conn.execute("SELECT status FROM notes_extract_jobs WHERE session_id='s1'"
+                       ).fetchone()
+    assert row["status"] == "pending"
+
+
 def test_worker_retries_then_gives_up(tmp_path):
     conn = _conn(tmp_path)
     conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "

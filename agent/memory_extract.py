@@ -199,6 +199,15 @@ def apply_extraction(conn, user_id, snapshot, result, *, now=None,
     return counts
 
 
+def _requeue_orphaned(conn) -> int:
+    """A row still 'running' at startup was claimed by a dead process —
+    this worker is the table's only consumer, so flip it back to pending."""
+    cur = conn.execute(
+        "UPDATE memory_extract_jobs SET status='pending' WHERE status='running'")
+    conn.commit()
+    return cur.rowcount
+
+
 def _claim_idle_job(conn, now):
     """Pick the oldest pending job whose session has been idle >= IDLE_SECONDS.
     Returns the row (sqlite3.Row) or None."""
@@ -313,6 +322,9 @@ def _default_history_loader(session_id) -> list:
 
 def start_worker(conn):
     """Launch the background worker; returns (task, stop_event)."""
+    n = _requeue_orphaned(conn)
+    if n > 0:
+        _LOG.info("memory extract: requeued %d orphaned running job(s)", n)
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
     return task, stop_event

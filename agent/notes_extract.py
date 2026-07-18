@@ -151,6 +151,15 @@ def maybe_enqueue_notes_job(conn, session_id, user_id, *, provider_url,
     return True
 
 
+def _requeue_orphaned(conn) -> int:
+    """A row still 'running' at startup was claimed by a dead process —
+    this worker is the table's only consumer, so flip it back to pending."""
+    cur = conn.execute(
+        "UPDATE notes_extract_jobs SET status='pending' WHERE status='running'")
+    conn.commit()
+    return cur.rowcount
+
+
 def _claim_idle_job(conn, now):
     return conn.execute(
         "SELECT * FROM notes_extract_jobs WHERE status='pending' "
@@ -246,6 +255,9 @@ async def worker_loop(conn, *, stop_event):
 
 def start_worker(conn):
     """Launch the background worker; returns (task, stop_event)."""
+    n = _requeue_orphaned(conn)
+    if n > 0:
+        logger.info("notes extract: requeued %d orphaned running job(s)", n)
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
     return task, stop_event
