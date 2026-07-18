@@ -190,6 +190,11 @@ async def process_pending_once(conn, *, llm_call, history_loader,
     conn.execute("UPDATE notes_extract_jobs SET status='running', attempts=?, "
                  "updated_at=? WHERE session_id=?", (attempts, now, session_id))
     conn.commit()
+    if not notes_store.is_auto_extract_enabled(conn, user_id):
+        conn.execute("DELETE FROM notes_extract_jobs "
+                     "WHERE session_id=? AND status='running'", (session_id,))
+        conn.commit()
+        return True
     try:
         async with memory_lock.get_user_lock(str(user_id)):
             existing = _session_note_titles(conn, user_id, session_id)
