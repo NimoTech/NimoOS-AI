@@ -294,7 +294,8 @@ from openai import AsyncOpenAI
 
 
 async def _default_llm_call(job, prompt) -> str:
-    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"])
+    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"],
+                         timeout=LLM_TIMEOUT, max_retries=0)
     resp = await client.chat.completions.create(
         model=job["model_name"],
         messages=[{"role": "user", "content": prompt}],

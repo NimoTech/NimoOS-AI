@@ -214,7 +214,8 @@ async def process_pending_once(conn, *, llm_call, history_loader,
 
 async def _default_llm_call(job, prompt) -> str:
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"])
+    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"],
+                         timeout=LLM_TIMEOUT, max_retries=0)
     resp = await client.chat.completions.create(
         model=job["model_name"],
         messages=[{"role": "user", "content": prompt}],
