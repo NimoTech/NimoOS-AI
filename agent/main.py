@@ -2614,11 +2614,11 @@ async def get_notes_settings(request: Request):
 async def put_notes_settings(request: Request, body: NotesSettingsPayload):
     uid = _notes_uid(request)
     conn = _db()
+    if body.mode not in ("adopt", "migrate"):
+        raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
     if body.auto_extract is not None:
         notes_store.set_auto_extract(conn, uid, body.auto_extract)
     if body.notes_root:
-        if body.mode not in ("adopt", "migrate"):
-            raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
         old = notes_store.get_notes_root(conn)
         new = os.path.abspath(body.notes_root)
         if new != old:
