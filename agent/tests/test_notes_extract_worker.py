@@ -86,6 +86,27 @@ def test_apply_index_failure_sets_sentinel(tmp_path):
     assert row["content_hash"] == ""
 
 
+def test_toggle_off_after_enqueue_aborts_at_claim_time(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+    notes_store.set_auto_extract(conn, "1", False)
+
+    async def must_not_call(job, prompt):
+        raise AssertionError("LLM must not be called")
+
+    ran = asyncio.run(notes_extract.process_pending_once(
+        conn, llm_call=must_not_call, history_loader=lambda sid: [],
+        note_indexer=_fake_indexer_ok, now=100 + notes_extract.IDLE_SECONDS + 1))
+    assert ran is True
+    assert conn.execute("SELECT COUNT(*) c FROM notes_extract_jobs").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM notes WHERE user_id='1'").fetchone()["c"] == 0
+
+
 def test_worker_end_to_end_creates_draft(tmp_path):
     conn = _conn(tmp_path)
     conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
@@ -152,6 +173,23 @@ def test_fail_job_guards_against_concurrent_reenqueue(tmp_path):
     assert row is not None
     assert row["status"] == "pending"
     assert row["attempts"] == 0
+
+
+def test_requeue_orphaned_flips_running_to_pending(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("INSERT INTO sessions (id, user_id, source, created_at, updated_at) "
+                 "VALUES ('s1','1','web',0,0)")
+    conn.commit()
+    notes_extract.maybe_enqueue_notes_job(
+        conn, "s1", "1", now=100, provider_url="u", provider_key="k",
+        provider_type="openai", model_name="m")
+    conn.execute("UPDATE notes_extract_jobs SET status='running' WHERE session_id='s1'")
+    conn.commit()
+    n = notes_extract._requeue_orphaned(conn)
+    assert n == 1
+    row = conn.execute("SELECT status FROM notes_extract_jobs WHERE session_id='s1'"
+                       ).fetchone()
+    assert row["status"] == "pending"
 
 
 def test_worker_retries_then_gives_up(tmp_path):

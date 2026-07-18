@@ -106,6 +106,24 @@ async def test_settings_roundtrip_and_delete(app_ctx, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_settings_bad_mode_without_notes_root_rejected(app_ctx):
+    async with _client() as ac:
+        r = await ac.put("/agent/notes/settings", headers={"X-User-Id": "1"},
+                         json={"mode": "bogus"})
+    assert r.status_code == 400
+    assert "mode must be adopt|migrate" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_settings_auto_extract_only_still_ok_with_default_mode(app_ctx):
+    async with _client() as ac:
+        r = await ac.put("/agent/notes/settings", headers={"X-User-Id": "1"},
+                         json={"auto_extract": False})
+    assert r.status_code == 200
+    assert r.json()["auto_extract"] is False
+
+
+@pytest.mark.asyncio
 async def test_settings_migrate_refuses_nonempty_target(app_ctx, tmp_path):
     target = tmp_path / "NewNotes"
     (target / "1").mkdir(parents=True)

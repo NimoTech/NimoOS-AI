@@ -80,6 +80,8 @@ def parse_extraction(text):
 
 
 def _session_note_titles(conn, user_id, session_id):
+    # LIKE substring match is safe: session ids are uuid4 (no %/_ metachars);
+    # worst case over-match only causes extra dedup within the same user.
     rows = conn.execute(
         "SELECT title FROM notes WHERE user_id=? AND deleted_at IS NULL "
         "AND source_refs_json LIKE ?",
@@ -88,7 +90,7 @@ def _session_note_titles(conn, user_id, session_id):
 
 
 async def apply_extraction(conn, user_id, session_id, notes, *,
-                           note_indexer=index_note, now=None):
+                           note_indexer=index_note):
     """Create draft insight notes; returns the created note dicts. DB writes
     run under the per-user lock; Qdrant indexing runs outside it (same
     lock discipline as memory_extract)."""
@@ -151,6 +153,15 @@ def maybe_enqueue_notes_job(conn, session_id, user_id, *, provider_url,
     return True
 
 
+def _requeue_orphaned(conn) -> int:
+    """A row still 'running' at startup was claimed by a dead process —
+    this worker is the table's only consumer, so flip it back to pending."""
+    cur = conn.execute(
+        "UPDATE notes_extract_jobs SET status='pending' WHERE status='running'")
+    conn.commit()
+    return cur.rowcount
+
+
 def _claim_idle_job(conn, now):
     return conn.execute(
         "SELECT * FROM notes_extract_jobs WHERE status='pending' "
@@ -181,6 +192,11 @@ async def process_pending_once(conn, *, llm_call, history_loader,
     conn.execute("UPDATE notes_extract_jobs SET status='running', attempts=?, "
                  "updated_at=? WHERE session_id=?", (attempts, now, session_id))
     conn.commit()
+    if not notes_store.is_auto_extract_enabled(conn, user_id):
+        conn.execute("DELETE FROM notes_extract_jobs "
+                     "WHERE session_id=? AND status='running'", (session_id,))
+        conn.commit()
+        return True
     try:
         async with memory_lock.get_user_lock(str(user_id)):
             existing = _session_note_titles(conn, user_id, session_id)
@@ -192,7 +208,7 @@ async def process_pending_once(conn, *, llm_call, history_loader,
             raise ValueError("unparseable extraction output")
         if parsed:
             await apply_extraction(conn, user_id, session_id, parsed,
-                                   note_indexer=note_indexer, now=now)
+                                   note_indexer=note_indexer)
         conn.execute("DELETE FROM notes_extract_jobs "
                      "WHERE session_id=? AND status='running'", (session_id,))
         conn.commit()
@@ -205,7 +221,8 @@ async def process_pending_once(conn, *, llm_call, history_loader,
 
 async def _default_llm_call(job, prompt) -> str:
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"])
+    client = AsyncOpenAI(base_url=job["provider_url"], api_key=job["provider_key"],
+                         timeout=LLM_TIMEOUT, max_retries=0)
     resp = await client.chat.completions.create(
         model=job["model_name"],
         messages=[{"role": "user", "content": prompt}],
@@ -246,6 +263,9 @@ async def worker_loop(conn, *, stop_event):
 
 def start_worker(conn):
     """Launch the background worker; returns (task, stop_event)."""
+    n = _requeue_orphaned(conn)
+    if n > 0:
+        logger.info("notes extract: requeued %d orphaned running job(s)", n)
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
     return task, stop_event
