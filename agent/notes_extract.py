@@ -80,6 +80,8 @@ def parse_extraction(text):
 
 
 def _session_note_titles(conn, user_id, session_id):
+    # LIKE substring match is safe: session ids are uuid4 (no %/_ metachars);
+    # worst case over-match only causes extra dedup within the same user.
     rows = conn.execute(
         "SELECT title FROM notes WHERE user_id=? AND deleted_at IS NULL "
         "AND source_refs_json LIKE ?",
@@ -88,7 +90,7 @@ def _session_note_titles(conn, user_id, session_id):
 
 
 async def apply_extraction(conn, user_id, session_id, notes, *,
-                           note_indexer=index_note, now=None):
+                           note_indexer=index_note):
     """Create draft insight notes; returns the created note dicts. DB writes
     run under the per-user lock; Qdrant indexing runs outside it (same
     lock discipline as memory_extract)."""
@@ -206,7 +208,7 @@ async def process_pending_once(conn, *, llm_call, history_loader,
             raise ValueError("unparseable extraction output")
         if parsed:
             await apply_extraction(conn, user_id, session_id, parsed,
-                                   note_indexer=note_indexer, now=now)
+                                   note_indexer=note_indexer)
         conn.execute("DELETE FROM notes_extract_jobs "
                      "WHERE session_id=? AND status='running'", (session_id,))
         conn.commit()
