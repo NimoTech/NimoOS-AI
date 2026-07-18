@@ -3,6 +3,8 @@ import sqlite3
 import time
 import uuid
 
+from audit import audit as _audit
+
 # 24 hours. Long enough that a user who closed the tab and came back the next
 # day can still approve. Server restart wipes _pending anyway, so very long
 # timeouts don't pin process memory across realistic operational windows.
@@ -80,6 +82,18 @@ class ConfirmManager:
             raise KeyError("confirm_expired")
         if expected_session_id is not None and pending.session_id != expected_session_id:
             raise KeyError("confirm_session_mismatch")
+        try:
+            row = self._db.execute(
+                "SELECT action, command FROM pending_confirmations WHERE confirm_id=?",
+                (confirm_id,)).fetchone()
+            _audit("confirm_resolved", session_id=pending.session_id,
+                   confirm_id=confirm_id,
+                   action=(row["action"] if row else None),
+                   command=(row["command"] if row else None),
+                   decision="approved" if confirmed else "denied",
+                   remember=bool(remember))
+        except Exception:  # noqa: BLE001 — audit must not break resolution
+            pass
         self._results[confirm_id] = confirmed
         if remember:
             self._remember[confirm_id] = True

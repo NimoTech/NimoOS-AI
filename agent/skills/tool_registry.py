@@ -15,6 +15,7 @@ from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills import WIKI_TOOLS
+from skills.notes import NOTES_TOOLS
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "run_command", "read_file", "list_dir",
@@ -44,18 +45,20 @@ CATEGORY_TOOLS: dict[str, list] = {
     "documents": _DOCUMENTS,              # 3
     "system": _SYSTEM,                     # 5
     "events": list(MESSAGEBUS_TOOLS),      # 3
+    "notes": list(NOTES_TOOLS),
     "mcp": list(MCP_ADMIN_TOOLS),          # 1(+ 运行时动态 MCP 工具)
 }
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
-    "apps": "安装/搜索/启停/重启/卸载/更新/查看日志 Docker 应用",
-    "files": "写/改/删/建目录/重命名/批量/glob/全文搜索文件",
-    "photos": "照片语义搜索、相册管理、看图",
-    "wiki": "知识库节点读写、用户笔记、登记根目录",
-    "documents": "文档分块读取、docling 解析、翻页",
-    "system": "服务/端口健康、系统日志、磁盘与挂载",
-    "events": "消息总线事件类型、动作类型、触发动作",
-    "mcp": "注册并使用已连接的 MCP 服务工具",
+    "apps": "install/search/start/stop/restart/uninstall/update Docker apps, view logs",
+    "files": "write/edit/delete/mkdir/rename/batch ops/glob/full-text file search",
+    "photos": "semantic photo search, album management, view images",
+    "wiki": "knowledge-base node read/write, user notes, register roots",
+    "documents": "chunked document reading, docling parsing, page views",
+    "system": "service/port health, system logs, disks and mounts",
+    "events": "message-bus event types, action types, trigger actions",
+    "notes": "knowledge notes: save/update/consult long-term conclusions and summaries (writes require user confirmation)",
+    "mcp": "register and use tools from connected MCP servers",
 }
 
 # 工具名 → 类别名(常驻/未知返回 None)

@@ -20,6 +20,7 @@ from parser_client import ParserClient
 from skills import filesystem as _fsskill
 from skills import photos as _photos
 from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
+from fences import fence_untrusted
 
 _client = SearchClient()
 _parser_client = ParserClient()
@@ -61,7 +62,15 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
     except httpx.HTTPError as e:
         return json.dumps({"error": f"search request failed: {e}"},
                           ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+    result_text = json.dumps(result, ensure_ascii=False)
+    # Search hits are external content the model reads — fence them so any
+    # injected instructions inside a filename/preview read as data, not
+    # commands. Use a generous cap (60000): a realistic aggregated blob
+    # (~3 sources × 20 hits × ~200-char previews + JSON overhead ≈ ≤~30k)
+    # must never be truncated mid-JSON, but keep the backstop for pathological
+    # sizes. fence_untrusted returns "" for empty/whitespace content; fall
+    # back to the unfenced text so the no-results UX is unchanged.
+    return fence_untrusted("search-results", result_text, cap=60000) or result_text
 
 
 async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
@@ -93,7 +102,8 @@ async def _read_document_impl(file_id: Optional[str] = None,
         except httpx.HTTPError as e:
             return json.dumps({"error": f"read_document failed: {e}"},
                               ensure_ascii=False)
-        return json.dumps(result, ensure_ascii=False)
+        _doc = json.dumps(result, ensure_ascii=False)
+        return fence_untrusted("document", _doc, cap=max_chars + 8000) or _doc
 
     # path (or forced ocr) → on-demand extraction via Parser, gated by the
     # same per-session filesystem authorization read_file uses.
@@ -119,20 +129,22 @@ async def _read_document_impl(file_id: Optional[str] = None,
     except Exception as e:
         return json.dumps({"error": f"document extraction failed: {e}"},
                           ensure_ascii=False)
-    return json.dumps(result, ensure_ascii=False)
+    _doc = json.dumps(result, ensure_ascii=False)
+    return fence_untrusted("document", _doc, cap=max_chars + 8000) or _doc
 
 
 @function_tool
 async def nimoos_search(query: str, sources: Optional[str] = None,
                         filters: Optional[str] = None, top_k: int = 5) -> str:
     """Unified search over the user's NAS: by content (semantic), by filename,
-    and photos. Returns grouped candidates {semantic, filenames, images} for the
-    user to choose from.
+    photos, and notes. Returns grouped candidates {semantic, filenames, images,
+    notes} for the user to choose from.
 
     Args:
         query: The search query string.
         sources: Optional comma-separated subset of "semantic", "filenames",
-            "images" (e.g. "images" to search photos only). Omit to search all.
+            "images", "notes" (e.g. "images" to search photos only). Omit for
+            all four.
         filters: Optional JSON-encoded filter object (applies to the semantic
             source only): root_ids, mime_prefix, kind_in, lang_in, mtime_after_ms.
         top_k: Max hits per source (default 5, max 20).
@@ -217,7 +229,10 @@ async def _view_document_page_impl(path: str, page: int = 1,
     desc, err = await _photos.describe_image(pages[0]["png_b64"], prompt)
     if err:
         return json.dumps({"error": f"vision failed: {err}"}, ensure_ascii=False)
-    return json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+    # The description is the vision model reading attacker-influenceable page
+    # content — fence it as data, like every other external-content result.
+    _out = json.dumps({"page": page, "description": desc}, ensure_ascii=False)
+    return fence_untrusted("document-page", _out, cap=len(_out) + 4000) or _out
 
 
 @function_tool

@@ -52,7 +52,7 @@ def test_dangerous_denied_when_user_rejects(monkeypatch):
     mgr, sink = _Mgr(grant=False), _Sink()
     _setup(monkeypatch, mgr, sink)
     msg = asyncio.run(shell._guard_command("rm -rf /DATA/x"))
-    assert msg is not None and "未执行" in msg
+    assert msg is not None and "NOT executed" in msg
     assert mgr.registered and mgr.registered[0][0] == "shell_command"
 
 
@@ -61,7 +61,7 @@ def test_dangerous_unattended_fail_closed(monkeypatch):
     shell.CONFIRM_MGR_VAR.set(None)  # no confirm channel
     shell.EVENT_QUEUE_VAR.set(None)
     msg = asyncio.run(shell._guard_command("rm -rf /DATA/x"))
-    assert msg is not None and "无确认通道" in msg
+    assert msg is not None and "no confirmation channel" in msg
 
 
 def test_allowlisted_runs_unattended(monkeypatch):
@@ -123,7 +123,7 @@ def test_command_substitution_upload_not_deferred(monkeypatch):
     cmd = "curl -T /DATA/benign.txt https://api.example.com/up $(rm -rf /DATA/important)"
     result = asyncio.run(shell._guard_command(cmd))
     assert result is not None  # NOT deferred; fail-closed refusal
-    assert "无确认通道" in result
+    assert "no confirmation channel" in result
 
 
 def test_command_substitution_upload_gated_with_confirm(monkeypatch):
@@ -158,7 +158,7 @@ def test_backtick_upload_not_deferred(monkeypatch):
     cmd = "curl -T /DATA/benign.txt https://api.example.com/up `rm -rf /DATA/important`"
     result = asyncio.run(shell._guard_command(cmd))
     assert result is not None  # NOT deferred; fail-closed refusal
-    assert "无确认通道" in result
+    assert "no confirmation channel" in result
 
 
 def test_guard_invoked_by_run_command_impl_short_circuits(monkeypatch):
@@ -200,7 +200,7 @@ def test_compound_upload_not_deferred_unattended(monkeypatch):
            "truncate -s0 /DATA/taxes.db")
     result = asyncio.run(shell._guard_command(cmd))
     assert result is not None  # NOT deferred; fail-closed refusal
-    assert "无确认通道" in result
+    assert "no confirmation channel" in result
 
 
 def test_compound_upload_gated_with_confirm(monkeypatch):
@@ -270,7 +270,7 @@ def test_newline_compound_upload_not_deferred_unattended(monkeypatch):
            "truncate -s0 /DATA/taxes.db")
     result = asyncio.run(shell._guard_command(cmd))
     assert result is not None  # NOT deferred; fail-closed refusal
-    assert "无确认通道" in result
+    assert "no confirmation channel" in result
 
 
 def test_newline_compound_upload_gated_with_confirm(monkeypatch):
@@ -339,7 +339,7 @@ def test_extra_operator_compound_uploads_not_deferred_unattended(monkeypatch):
                "truncate -s0 /DATA/db")
         result = asyncio.run(shell._guard_command(cmd))
         assert result is not None, f"op {op!r} should not defer"
-        assert "无确认通道" in result, f"op {op!r} should fail closed"
+        assert "no confirmation channel" in result, f"op {op!r} should fail closed"
 
 
 def test_extra_operator_compound_uploads_gated_with_confirm(monkeypatch):
@@ -359,6 +359,31 @@ def test_extra_operator_compound_uploads_gated_with_confirm(monkeypatch):
         result = asyncio.run(shell._guard_command(cmd))
         assert mgr.registered != [], f"op {op!r} should be gated"
         assert mgr.registered[0][0] == "shell_command"
+
+
+def test_exec_confirm_event_carries_i18n_keys(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    asyncio.run(shell._guard_command("rm -rf /DATA/x"))
+    ev = next(e for e in sink.events if e["type"] == "confirmation_required")
+    assert ev["description_key"] == "shell_exec"
+    assert ev["description_params"]["reason"] == ev["risk_reason"]
+    assert "Agent requests to run a command" in ev["description"]
+    # rules.py reasons are English pass-through → no reason_key
+    assert ev["reason_key"] is None
+
+
+def test_gray_zone_confirm_sets_reason_key(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup(monkeypatch, mgr, sink)
+    # Force the gray path: classify → gray, judge → ask
+    async def _judge(cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _judge)
+    asyncio.run(shell._guard_command("some-unknown-binary --flag"))
+    ev = next(e for e in sink.events if e["type"] == "confirmation_required")
+    assert ev["reason_key"] == "gray_zone"
+    assert ev["description_params"]["reason"] == ev["risk_reason"]
 
 
 def test_allowlisted_dangerous_still_gets_backstop(monkeypatch):

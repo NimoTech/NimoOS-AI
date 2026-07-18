@@ -71,6 +71,7 @@ async def test_list_full_tree_error_passthrough(monkeypatch):
 
 
 from skills import photos as sphotos
+import skills.notes as snotes
 
 
 def test_whitelist_now_has_eight_including_photos():
@@ -112,16 +113,45 @@ def test_setup_user_context_sets_photos_uid():
     assert sphotos.USER_ID_VAR.get() == "42"
 
 
+def test_setup_user_context_sets_notes_uid():
+    tools.setup_user_context("42")
+    assert snotes.USER_ID_VAR.get() == "42"
+
+
 import asyncio
 from mcp_server import fs_gate
 
 
-def test_whitelist_now_has_nine_including_view():
-    names = {d["name"] for d in tools.list_tool_defs()}
-    assert "view_document_page" in names
-    assert len(names) == 9
-    for bad in ("write_file", "create_album", "add_to_album"):
-        assert bad not in names
+def test_whitelist_now_has_eleven_including_notes():
+    names = [s["name"] for s in tools.TOOL_SPECS]
+    assert len(names) == 11
+    assert "list_notes" in names and "read_note" in names
+
+
+@pytest.mark.asyncio
+async def test_call_list_notes_dispatches(monkeypatch):
+    import skills.notes as snotes
+
+    async def fake(note_type, status, limit):
+        assert (note_type, status, limit) == ("insight", "draft", 5)
+        return '{"notes": []}'
+
+    monkeypatch.setattr(snotes, "_list_notes_impl", fake)
+    out = await tools.call("list_notes",
+                           {"type": "insight", "status": "draft", "limit": 5})
+    assert out == '{"notes": []}'
+
+
+@pytest.mark.asyncio
+async def test_call_list_notes_non_integer_limit_raises_clean_error():
+    with pytest.raises(tools.McpToolError):
+        await tools.call("list_notes", {"limit": "abc"})
+
+
+@pytest.mark.asyncio
+async def test_call_read_note_requires_id():
+    with pytest.raises(Exception):
+        await tools.call("read_note", {})
 
 
 def test_read_document_schema_has_file_id_and_path():

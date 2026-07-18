@@ -25,6 +25,35 @@ MCP_SESSION_TIMEOUT = 60  # seconds
 
 STDIO_CONNECT_TIMEOUT = 90  # 秒;stdio 首次 npx/uvx 下包可能很慢(下完本地缓存,后续快)
 
+# ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
+# A registered stdio MCP server spawns command+args directly in the netns
+# executor, bypassing the shell guard. Without this, a user tricked into
+# approving `mcp_register_server("bash -c 'rm -rf /DATA'")` would run an
+# arbitrary destructive command on the next turn. Deny-by-default by BASENAME:
+# only known MCP launchers may spawn, at any path (`/usr/bin/npx` ok). A path
+# allow-by-directory rule was rejected — /bin, /usr/bin contain bash/rm/dd, so
+# "any binary in a standard bin dir" would defeat the gate. Servers shipped as
+# a bare binary must be launched via a launcher (uvx/npx/python -m …).
+_MCP_STDIO_ALLOWED_CMDS = {
+    "npx", "uvx", "uv", "node", "nodejs", "python", "python3",
+    "deno", "bun", "bunx",
+}
+
+
+class McpCommandNotAllowed(Exception):
+    """A stdio MCP server's launch command is not on the allow-list."""
+
+
+def _assert_stdio_command_allowed(command: str) -> None:
+    cmd = (command or "").strip()
+    if not cmd:
+        raise McpCommandNotAllowed("empty MCP stdio command")
+    if os.path.basename(cmd) in _MCP_STDIO_ALLOWED_CMDS:
+        return
+    raise McpCommandNotAllowed(
+        f"MCP stdio launch command not allowed: {cmd!r}. Launch the server via "
+        f"an MCP launcher (npx/uvx/uv/node/python …).")
+
 # 透传给 stdio 子进程的运行时变量(缺了会乱码/时区/临时目录出错)
 _ENV_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 
@@ -139,7 +168,7 @@ def _gate_args(args: dict, patterns: list[str]) -> None:
             continue
         for pat in patterns:
             if pat and pat in v:
-                raise ValueError(f"参数 {k} 命中黑名单({pat})")
+                raise ValueError(f"argument {k} hit the blacklist ({pat})")
 
 
 async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
@@ -151,7 +180,7 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     session_id = SESSION_ID_VAR.get()
     confirm_id = mgr.register(
         session_id, f"mcp_call:{key}",
-        f"调用 MCP server「{server['name']}」的工具 {tool_name}",
+        f'Call tool {tool_name} on MCP server "{server["name"]}"',
         json.dumps(args, ensure_ascii=False)[:500])
     await queue.put({
         "type": "confirmation_required", "confirm_id": confirm_id,
@@ -180,19 +209,19 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
         try:
             _gate_args(args, USER_PATTERNS_VAR.get([]))
         except ValueError as e:
-            return f"已被黑名单拦截: {e}"
+            return f"[MCP error] blocked by blacklist: {e}"
         if not await _ensure_confirmed(server, tool_name, args):
-            return "用户拒绝了该 MCP 工具调用"
+            return "[MCP error] the user denied this MCP tool call"
         try:
             conn = await _get_run_conn(server)          # lazy connect (connection layer)
         except Exception as e:
-            return (f"系统错误:无法连接到 MCP 服务方「{server['name']}」({e})。"
-                    f"这是连接/服务端故障,与调用参数无关——请勿改参数重试,"
-                    f"告知用户检查该 MCP 服务状态。")
+            return (f'[MCP error] cannot connect to MCP server "{server["name"]}" ({e}). '
+                    "This is a connection/server failure unrelated to the call arguments — "
+                    "do NOT retry with different arguments; tell the user to check that MCP server.")
         try:
             result = await conn.call_tool(tool_name, args)   # tool execution layer
         except Exception as e:
-            return f"MCP 工具 {tool_name} 执行出错: {e}"
+            return f"[MCP error] MCP tool {tool_name} failed: {e}"
         return flatten_result(result)
 
     return FunctionTool(
@@ -249,6 +278,9 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             name=server.get("name", "mcp"),
         )
     elif transport == "stdio":
+        # Deny-by-default gate: the stdio command spawns directly in the netns
+        # executor, bypassing the shell guard — never spawn an off-list command.
+        _assert_stdio_command_allowed(server.get("command", ""))
         from mcp_client.netns_stdio import MCPServerNetnsStdio
         import netns.client as netns_client
         socket_path = await netns_client.start_mcp_stdio(
@@ -358,7 +390,7 @@ async def _metas_for_server(server: dict):
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
         await _emit_warning(server.get("name", "mcp"),
-                            "stdio 工具首次使用正在后台下载初始化,稍后重试")
+                            "stdio tools are initializing in the background for first use; retry shortly")
         return []
     try:
         return await _cold_fetch(server)        # http/sse:内联快取(短超时,不阻塞 run 启动)
@@ -402,7 +434,7 @@ async def test_server(server: dict) -> dict:
     try:
         return await asyncio.wait_for(_test_server_inner(server), timeout=timeout)
     except asyncio.TimeoutError:
-        return {"ok": False, "error": "探测超时"}
+        return {"ok": False, "error": "Probe timed out", "error_key": "probe_timeout"}
 
 
 async def _test_server_inner(server: dict) -> dict:
@@ -413,15 +445,15 @@ async def _test_server_inner(server: dict) -> dict:
     try:
         conn = await _connect(server, connect_timeout=budget)
     except Exception as e:
-        return {"ok": False, "error": f"连接失败: {e}"}
+        return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
     try:
         tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=budget)
     except asyncio.TimeoutError:
         await conn.aclose()
-        return {"ok": False, "error": "列工具超时"}
+        return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
     except Exception as e:
         await conn.aclose()
-        return {"ok": False, "error": f"列工具失败: {e}"}
+        return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed", "detail": str(e)}
     await conn.aclose()
     metas = [_extract_meta(t) for t in tools]
     if "id" in server:

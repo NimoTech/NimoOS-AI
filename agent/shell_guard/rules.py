@@ -36,6 +36,74 @@ def _cmd_name(seg: Segment) -> str:
     return os.path.basename(seg.argv[0]) if seg.argv else ""
 
 
+# ── exec-wrapper / assignment unwrapping ──────────────────────────────────────
+# argv[0] alone does NOT tell us what runs: `env CMD`, `nohup CMD`, `X=1 CMD`
+# all execute CMD while presenting a benign argv[0]. Classifying on the raw
+# argv[0] let `env rm -rf /DATA` slip through as SAFE (2026-07-16 review). We
+# strip assignment prefixes and known exec-wrappers to reveal the command that
+# actually runs, then classify THAT. Best-effort and fail-safe: whatever we
+# cannot resolve stays as-is and lands in GRAY (never SAFE).
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_EXEC_WRAPPERS = {
+    "env", "nohup", "nice", "timeout", "stdbuf", "setsid", "ionice",
+    "sudo", "doas", "xargs", "chroot",
+}
+# Wrappers whose first non-option operand is NOT the command (must be skipped):
+# timeout DURATION CMD, chroot DIR CMD.
+_WRAPPERS_WITH_OPERAND = {"timeout", "chroot"}
+
+
+def _effective_argv(argv: list[str]) -> list[str]:
+    a = list(argv)
+    for _ in range(8):  # bounded: guards against pathological nesting
+        # strip leading VAR=VAL assignment tokens
+        j = 0
+        while j < len(a) and _ENV_ASSIGN_RE.match(a[j]):
+            j += 1
+        if j:
+            a = a[j:]
+            continue
+        if not a:
+            break
+        name = os.path.basename(a[0])
+        if name in _EXEC_WRAPPERS:
+            rest = a[1:]
+            k = 0
+            while k < len(rest) and rest[k].startswith("-"):
+                k += 1
+            if name in _WRAPPERS_WITH_OPERAND and k < len(rest):
+                k += 1  # skip the mandatory operand (duration / dir)
+            inner = rest[k:]
+            if not inner:
+                # No inner command (bare `env`, `env -i`): the wrapper is
+                # running in its degenerate/print mode — leave it as-is so it
+                # classifies via its own name (e.g. `env`/`printenv` = SAFE).
+                break
+            a = inner
+            continue
+        break
+    return a
+
+
+def _effective_seg(seg: Segment) -> Segment:
+    return Segment(argv=_effective_argv(seg.argv),
+                   redirect_targets=seg.redirect_targets,
+                   read_targets=seg.read_targets)
+
+
+# A SAFE command name is only trusted when argv[0] is a bare name (resolved via
+# PATH) or lives in a standard system bin dir. `/tmp/ls`, `./ls`, a downloaded
+# binary named `cat` — anything path-qualified outside these dirs — is not the
+# system tool it names, so it must not inherit SAFE.
+_TRUSTED_BIN_DIRS = ("/bin/", "/usr/bin/", "/usr/local/bin/", "/sbin/", "/usr/sbin/")
+
+
+def _is_trusted_argv0(arg0: str) -> bool:
+    if "/" not in arg0:
+        return True
+    return any(arg0.startswith(d) for d in _TRUSTED_BIN_DIRS)
+
+
 def _is_dangerous_seg(seg: Segment, all_segs: list[Segment], idx: int) -> str | None:
     name = _cmd_name(seg)
     flags = [a for a in seg.argv[1:] if a.startswith("-")]
@@ -146,18 +214,21 @@ def _worse(a: Decision, b: Decision) -> Decision:
 
 
 def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
-    name = _cmd_name(seg)
-    paths = extract_paths(seg)
+    # Classify on the EFFECTIVE command (wrappers/assignments stripped), so
+    # `env rm -rf /DATA` is judged as the `rm` it actually runs, not as `env`.
+    eff = _effective_seg(seg)
+    name = _cmd_name(eff)
+    paths = extract_paths(eff)
 
     # sensitive prefixes/suffixes: reading OR writing always escalates
     sensitive = [p for p in paths if _is_protected_path(p)]
     if sensitive:
         return Decision("protected", f"touches protected path(s): {sensitive}", sensitive)
 
-    danger = _is_dangerous_seg(seg, all_segs, idx)
+    danger = _is_dangerous_seg(eff, all_segs, idx)
 
     # /DATA mass op: escalate only for destructive commands (avoid over-blocking reads)
-    if _is_destructive(seg):
+    if _is_destructive(eff):
         mass = [p for p in paths if _is_data_mass(p)]
         if mass:
             return Decision("protected", f"mass delete under /DATA: {mass}", mass)
@@ -166,10 +237,11 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
         return Decision("dangerous", danger, paths)
 
     has_write_redirect = bool(seg.redirect_targets)
-    if name in _SAFE_CMDS and not has_write_redirect:
+    arg0 = eff.argv[0] if eff.argv else ""
+    if name in _SAFE_CMDS and not has_write_redirect and _is_trusted_argv0(arg0):
         return Decision("safe")
-    if name == "git" and len(seg.argv) > 1 and seg.argv[1] in _SAFE_GIT_SUB \
-            and not has_write_redirect:
+    if name == "git" and len(eff.argv) > 1 and eff.argv[1] in _SAFE_GIT_SUB \
+            and not has_write_redirect and _is_trusted_argv0(arg0):
         return Decision("safe")
 
     return Decision("gray", f"unclassified command: {name or '(redirect)'}", paths)

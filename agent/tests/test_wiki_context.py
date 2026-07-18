@@ -24,8 +24,8 @@ async def test_build_returns_placeholder_when_wiki_unreachable():
 
     c = _build_client(h)
     out = await WikiContextBuilder(c).build(user_patterns=[])
-    assert "Wiki 服务暂不可用" in out
-    assert "## NimoOS 存储空间地图" in out
+    assert "Wiki service temporarily unavailable" in out
+    assert "## NimoOS storage map" in out
 
 
 @pytest.mark.asyncio
@@ -58,17 +58,17 @@ async def test_build_renders_map_and_notes():
 
     c = _build_client(h)
     out = await WikiContextBuilder(c).build(user_patterns=[])
-    assert "## NimoOS 存储空间地图" in out
+    assert "## NimoOS storage map" in out
     assert "/DATA" in out
     assert "项目一" in out
-    # proj2 has no ai_label → fallback to basename + "(未生成摘要)"
+    # proj2 has no ai_label → fallback to basename + "(no summary yet)"
     assert "proj2" in out
-    assert "(未生成摘要)" in out
-    assert "## 用户笔记" in out
+    assert "(no summary yet)" in out
+    assert "## User notes" in out
     # Only proj1 (fresh notes) should appear in the notes section
     assert "/DATA/Projects/proj1" in out
     # proj2 notes are stale → not in notes section (but is in map)
-    notes_section = out.split("## 用户笔记")[1]
+    notes_section = out.split("## User notes")[1]
     assert "/DATA/Projects/proj2" not in notes_section
 
 
@@ -97,7 +97,7 @@ async def test_build_caps_projects_to_top_15():
         assert f"/DATA/p{i:02d}" in out
     for i in range(15, 25):
         assert f"/DATA/p{i:02d}" not in out
-    assert "还有 10 个项目" in out
+    assert "plus 10 more items" in out
 
 
 @pytest.mark.asyncio
@@ -152,7 +152,7 @@ async def test_build_truncates_long_notes():
     # Per-node cap: 500 chars
     assert "Y" * 500 in out
     assert "Y" * 501 not in out
-    assert "更多见 wiki_get_node" in out
+    assert "more via wiki_get_node" in out
 
 
 @pytest.mark.asyncio
@@ -168,5 +168,5 @@ async def test_render_map_includes_user_declared_preamble():
 
     client = _build_client(handler)
     block = await WikiContextBuilder(client).build([])
-    assert "用户登记" in block or "显式" in block or "user-declared" in block.lower(), \
+    assert "explicitly registered" in block.lower() or "user-declared" in block.lower(), \
         f"map preamble missing in:\n{block}"

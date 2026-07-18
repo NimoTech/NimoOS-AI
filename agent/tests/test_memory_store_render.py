@@ -18,7 +18,7 @@ def test_block_lists_entries_with_kind(conn):
     ms.add_memory(conn, "u1", "likes oat milk", "preference", priority=5, now=1000)
     ms.add_memory(conn, "u1", "learning Spanish", "goal", priority=1, now=1000)
     block = ms.render_user_block(conn, "u1", now=1000)
-    assert block.startswith("## 关于这位用户")
+    assert block.startswith("## About this user")
     assert "- (preference) likes oat milk" in block
     assert "- (goal) learning Spanish" in block
     # higher priority appears first

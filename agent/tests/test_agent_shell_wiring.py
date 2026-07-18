@@ -25,5 +25,5 @@ def test_run_sets_shell_db_and_patterns_vars():
 
 
 def test_system_prompt_mentions_shell_readonly_and_network():
-    assert "只读" in agentmod.SYSTEM_PROMPT
+    assert "read-only" in agentmod.SYSTEM_PROMPT
     assert "network=true" in agentmod.SYSTEM_PROMPT

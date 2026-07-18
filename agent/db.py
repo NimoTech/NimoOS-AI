@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS access_requests (
     path        TEXT NOT NULL,
     kind        TEXT NOT NULL,
     reason      TEXT NOT NULL,
+    reason_key  TEXT,
     decision    TEXT,
     created_at  INTEGER NOT NULL,
     resolved_at INTEGER
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     kind              TEXT NOT NULL,              -- 'preference' | 'fact' | 'goal'
     text              TEXT NOT NULL,
     source            TEXT NOT NULL,              -- 'auto' | 'tool' | 'user'
+    trust             TEXT NOT NULL DEFAULT 'normal', -- 'normal' | 'low'
     priority          INTEGER NOT NULL DEFAULT 0,
     status            TEXT NOT NULL DEFAULT 'active', -- 'active'|'disabled'|'superseded'
     lineage_id        TEXT NOT NULL,
@@ -198,6 +200,23 @@ CREATE TABLE IF NOT EXISTS recall_index_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_recall_jobs_status
     ON recall_index_jobs(status, enqueued_at);
+
+CREATE TABLE IF NOT EXISTS notes_extract_jobs (
+    session_id  TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    provider_url  TEXT,
+    provider_key  TEXT,
+    provider_type TEXT,
+    model_name    TEXT,
+    last_error    TEXT,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_extract_jobs_status
+    ON notes_extract_jobs(status, enqueued_at);
 
 CREATE TABLE IF NOT EXISTS mcp_tokens (
     id           TEXT PRIMARY KEY,
@@ -264,6 +283,81 @@ CREATE TABLE IF NOT EXISTS shell_allowlist (
     note        TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL
 );
+
+-- Knowledge notes (M1). Files under <notes_root>/<user_id>/ are the CONTENT
+-- authority; these rows are the METADATA authority, joined by the immutable
+-- frontmatter UUID (= notes.id). Soft-delete only: hard deletes would orphan
+-- mentions/edges once phase-2 graph extraction lands.
+CREATE TABLE IF NOT EXISTS notes (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    path          TEXT NOT NULL,          -- relative to <notes_root>
+    title         TEXT NOT NULL DEFAULT '',
+    description   TEXT NOT NULL DEFAULT '',
+    type          TEXT NOT NULL DEFAULT 'note'
+                   CHECK(type IN ('note','summary','insight','digest')),
+    status        TEXT NOT NULL DEFAULT 'draft'
+                   CHECK(status IN ('draft','curated','archived')),
+    content_hash  TEXT NOT NULL,
+    source_refs_json TEXT,
+    created_by    TEXT NOT NULL DEFAULT 'human'
+                   CHECK(created_by IN ('human','agent','pipeline')),
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    deleted_at    INTEGER,
+    extraction_status TEXT NOT NULL DEFAULT 'none'
+                   CHECK(extraction_status IN ('none','pending','done','failed')),
+    extracted_at  INTEGER,
+    content_hash_at_extraction TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user_status
+    ON notes(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_user_path ON notes(user_id, path);
+
+CREATE TABLE IF NOT EXISTS note_links (
+    src_note_id  TEXT NOT NULL REFERENCES notes(id),
+    dst_kind     TEXT NOT NULL CHECK(dst_kind IN ('note','file','url')),
+    dst_ref      TEXT NOT NULL,
+    anchor_text  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (src_note_id, dst_kind, dst_ref)
+);
+
+-- Phase-2 knowledge-graph placeholders. M1 writes ONLY type='topic' entities
+-- (frontmatter tags) + their mentions; extraction workers fill the rest later.
+CREATE TABLE IF NOT EXISTS entities (
+    id             TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    type           TEXT NOT NULL DEFAULT 'topic',
+    aliases_json   TEXT,
+    description    TEXT NOT NULL DEFAULT '',
+    qdrant_point_id TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    deleted_at     INTEGER,
+    UNIQUE(user_id, type, name)
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    src_entity       TEXT NOT NULL REFERENCES entities(id),
+    dst_entity       TEXT NOT NULL REFERENCES entities(id),
+    rel_type         TEXT NOT NULL,
+    weight           REAL NOT NULL DEFAULT 1.0,
+    description      TEXT NOT NULL DEFAULT '',
+    source_refs_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mentions (
+    entity_id  TEXT NOT NULL REFERENCES entities(id),
+    note_id    TEXT NOT NULL REFERENCES notes(id),
+    chunk_ref  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (entity_id, note_id, chunk_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_entity ON mentions(entity_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_note ON mentions(note_id);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -347,6 +441,10 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "source" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "source TEXT NOT NULL DEFAULT 'web'")
+    # Idempotent ALTER for existing databases without the reason_key column.
+    ar_cols = {row["name"] for row in conn.execute("PRAGMA table_info(access_requests)")}
+    if ar_cols and "reason_key" not in ar_cols:
+        conn.execute("ALTER TABLE access_requests ADD COLUMN reason_key TEXT")
     # Idempotent ALTER for existing databases without batch_id column.
     staged_cols = {row["name"]
                    for row in conn.execute("PRAGMA table_info(staged_changes)")}
@@ -356,6 +454,20 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     cb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channel_bindings)")}
     if "download_dir" not in cb_cols:
         conn.execute("ALTER TABLE channel_bindings ADD COLUMN download_dir TEXT")
+    # Idempotent ALTER for existing databases without the trust column.
+    mem_cols = {r["name"] for r in conn.execute("PRAGMA table_info(memory_entries)")}
+    if "trust" not in mem_cols:
+        conn.execute("ALTER TABLE memory_entries ADD COLUMN "
+                     "trust TEXT NOT NULL DEFAULT 'normal'")
+    # Idempotent ALTER for existing databases predating the M3 extraction
+    # columns on notes (pipeline auto-precipitation status).
+    notes_cols = {r[1] for r in conn.execute("PRAGMA table_info(notes)")}
+    if "extraction_status" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN extraction_status TEXT DEFAULT 'none'")
+    if "extracted_at" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN extracted_at INTEGER")
+    if "content_hash_at_extraction" not in notes_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN content_hash_at_extraction TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

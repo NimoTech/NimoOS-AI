@@ -16,6 +16,7 @@ import stat
 import time
 from typing import Optional
 
+from audit import audit as _audit
 from fs import paths, ignore, ownership, staging, access_request
 from fs.snapshots import SnapshotTooLarge
 
@@ -86,7 +87,7 @@ async def _resolve_and_gate_or_request(ctx, raw: str, op: str) -> str:
             raise  # no interactive channel; behave as before
         granted = await access_request.request_access(ctx, abs_, kind, op)
         if not granted:
-            raise paths.PermissionDenied(f"用户拒绝了对 {abs_} 的访问")
+            raise paths.PermissionDenied(f"The user denied access to {abs_}")
         return _resolve_and_gate(ctx, raw)
 
 
@@ -111,6 +112,12 @@ async def _emit_staged(ctx, seq: int, op: str, path: str, *,
         "dst_path": dst_path,
         "size_bytes": size_bytes,
     })
+    try:
+        _audit("fs_change", user_id=ctx.get("user_id"),
+               session_id=ctx.get("session_id"), op=op, path=path,
+               dst_path=dst_path)
+    except Exception:  # noqa: BLE001 — audit must never break the fs op
+        pass
 
 
 def _binary_marker(abs_path: str) -> Optional[str]:

@@ -90,9 +90,9 @@ def _extract_json(resp):
 # ---------------------------------------------------------------------------
 
 _EXPECTED_TOOLS = {
-    "list_albums", "nimoos_search", "read_document", "read_file_chunk",
-    "search_photos", "view_document_page", "wiki_get_node",
-    "wiki_list_full_tree", "wiki_recent_changes",
+    "list_albums", "list_notes", "nimoos_search", "read_document",
+    "read_file_chunk", "read_note", "search_photos", "view_document_page",
+    "wiki_get_node", "wiki_list_full_tree", "wiki_recent_changes",
 }
 
 

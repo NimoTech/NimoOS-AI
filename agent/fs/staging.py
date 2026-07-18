@@ -7,6 +7,8 @@ import sqlite3
 import time
 from typing import Optional
 
+from audit import audit as _audit
+
 
 def record(conn: sqlite3.Connection, session_id: str, run_id: str,
            seq: int, op: str, path: str, *,
@@ -48,12 +50,17 @@ def maybe_take_file_snapshot(conn, store, session_id: str, run_id: str,
 
 
 def commit_session(conn: sqlite3.Connection, store, session_id: str) -> None:
-    conn.execute(
+    cur = conn.execute(
         "UPDATE staged_changes SET status='committed' "
         "WHERE session_id=? AND status='pending'",
         (session_id,),
     )
     conn.commit()
+    # L4: committing staged file changes is a real, durable disk action — audit it.
+    try:
+        _audit("fs_commit", session_id=session_id, committed=cur.rowcount)
+    except Exception:  # noqa: BLE001 — audit must never break the commit
+        pass
     store.prune_session(session_id)
 
 
@@ -90,6 +97,11 @@ def revert_run(conn: sqlite3.Connection, store, session_id: str,
                 (r["id"],),
             )
             conn.commit()
+            try:  # L4: reverting a staged change mutates disk — audit it
+                _audit("fs_revert", session_id=session_id, op=r["op"],
+                       path=r["path"], dst_path=r["dst_path"])
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:
             failed.append({"id": r["id"], "op": r["op"], "path": r["path"],
                            "error": str(e)})
@@ -118,10 +130,15 @@ def _revert_rows(conn, store, rows) -> dict:
             conn.execute("UPDATE staged_changes SET status='reverted' WHERE id=?",
                          (r["id"],))
             conn.commit()
+            try:  # L4: audit each reverted change (rows come from SELECT *)
+                _audit("fs_revert", session_id=r["session_id"], op=r["op"],
+                       path=r["path"], dst_path=r["dst_path"])
+            except Exception:  # noqa: BLE001
+                pass
         except OSError as e:
             if getattr(e, "errno", None) == errno.ENOTEMPTY:
                 return {"status": "conflict",
-                        "reason": "目录非空,请先撤销移入的文件", "row_id": r["id"]}
+                        "reason": "directory not empty; revert the files moved into it first", "row_id": r["id"]}
             failed.append({"id": r["id"], "op": r["op"], "error": str(e)})
     if failed:
         return {"status": "partial", "failed": failed}

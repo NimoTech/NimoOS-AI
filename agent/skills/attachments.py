@@ -19,6 +19,8 @@ from contextvars import ContextVar
 
 from agents import function_tool
 
+from fences import fence_untrusted
+
 
 SESSION_ID_VAR: ContextVar[str] = ContextVar("att_session_id", default="")
 USER_ID_VAR: ContextVar[str] = ContextVar("att_user_id", default="")
@@ -75,10 +77,11 @@ def _read_attachment_impl(attachment_id: str, *, session_id: str,
             raw = f.read(read_bytes + 1)
         decoded = raw.decode("utf-8", errors="ignore")
         truncated = len(decoded) > max_chars or len(raw) > read_bytes
+        _body = decoded[:max_chars]
         return {
             "kind": "text",
             "filename": filename,
-            "content": decoded[:max_chars],
+            "content": fence_untrusted("attachment", _body, cap=max_chars + 2000) or _body,
             "truncated": truncated,
             "total_bytes": size_bytes,
         }
@@ -110,13 +113,14 @@ def _read_attachment_impl(attachment_id: str, *, session_id: str,
         truncated = (len(decoded) > max_chars
                      or len(raw) > read_bytes
                      or bool(meta.get("truncated")))
+        _body = decoded[:max_chars]
         return {
             "kind": "document",
             "filename": filename,
             "mime": mime,
             "extractor": meta.get("extractor"),
             "pages": meta.get("pages"),
-            "content": decoded[:max_chars],
+            "content": fence_untrusted("attachment", _body, cap=max_chars + 2000) or _body,
             "truncated": truncated,
             "total_bytes": size_bytes,
         }

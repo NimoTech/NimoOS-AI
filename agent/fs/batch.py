@@ -7,6 +7,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 
+from audit import audit as _audit
 from fs import staging, validators, access_request
 from fs.vtree import VTree, VTreeError
 
@@ -44,7 +45,7 @@ def preflight(ctx, operations: list) -> PreflightResult:
     res = PreflightResult()
     if len(operations) > MAX_OPS:
         res.errors.append({"index": -1, "op": "batch",
-                           "reason": f"操作数 {len(operations)} 超过上限 {MAX_OPS}"})
+                           "reason": f"operation count {len(operations)} exceeds the limit {MAX_OPS}"})
         return res
 
     vt = VTree()
@@ -59,7 +60,7 @@ def preflight(ctx, operations: list) -> PreflightResult:
         for raw in raw_paths:
             cat, ap = validators.classify(ctx, raw)
             if cat == "blocked":
-                res.blocked.append({"path": ap, "reason": "受保护路径,已忽略"})
+                res.blocked.append({"path": ap, "reason": "protected path; skipped"})
                 fatal = True
             elif cat == "need_grant":
                 if ap not in grant_seen:
@@ -74,7 +75,7 @@ def preflight(ctx, operations: list) -> PreflightResult:
         # ---- reject symlinks ----
         if any(os.path.islink(rp) for rp in raw_paths):
             res.errors.append({"index": i, "op": kind,
-                               "reason": "路径为符号链接,batch_fs 暂不支持,请单独处理"})
+                               "reason": "path is a symlink; batch_fs does not support symlinks yet — handle it separately"})
             continue
 
         # ---- safety valve for recursive delete ----
@@ -82,7 +83,7 @@ def preflight(ctx, operations: list) -> PreflightResult:
             cnt, byt = _estimate_dir(abs_paths[0])
             if cnt > MAX_DELETE_ENTRIES or byt > MAX_DELETE_BYTES:
                 res.errors.append({"index": i, "op": kind,
-                                   "reason": f"目录过大(约 {cnt} 项),请手动或用终端删除"})
+                                   "reason": f"directory too large (~{cnt} entries); delete it manually or via the terminal"})
                 continue
 
         # ---- virtual-tree validation (cascade / circular / empty) ----
@@ -95,7 +96,7 @@ def preflight(ctx, operations: list) -> PreflightResult:
                 vt.delete(abs_paths[0], recursive=op.get("recursive", False))
             else:
                 res.errors.append({"index": i, "op": kind,
-                                   "reason": f"未知操作: {kind}"})
+                                   "reason": f"unknown operation: {kind}"})
                 continue
         except VTreeError as e:
             res.errors.append({"index": i, "op": kind, "reason": str(e)})
@@ -188,6 +189,18 @@ async def commit(ctx, result) -> str:
                 summary["delete"] += 1
                 items.append({"id": row_id, "seq": seq, "op": del_op, "path": target})
     finally:
+        # L4: audit every batch operation with the same fs_change event single
+        # ops use (fs/ops.py) — batch_fs is the system-prompt-preferred path for
+        # multi-file changes and must NOT be an audit blind spot. audit() never
+        # raises, but keep it defensive so a logging fault can't abort the batch.
+        for it in items:
+            try:
+                _audit("fs_change", user_id=ctx.get("user_id"),
+                       session_id=ctx.get("session_id"), op=it["op"],
+                       path=it["path"], dst_path=it.get("dst_path"),
+                       batch_id=batch_id)
+            except Exception:  # noqa: BLE001
+                pass
         if items:
             await ctx["sink"].put({
                 "type": "staged_batch", "run_id": ctx["run_id"],
@@ -199,10 +212,10 @@ async def commit(ctx, result) -> str:
 def _format_rejection(res) -> str:
     lines = []
     if res.blocked:
-        lines.append("受保护路径,已忽略(请从批次移除): " +
+        lines.append("Protected paths; skipped (remove them from the batch): " +
                      ", ".join(b["path"] for b in res.blocked))
     if res.errors:
-        lines.append("校验失败,未做任何改动:")
+        lines.append("Validation failed; nothing was changed:")
         for e in res.errors:
             lines.append(f"  - [#{e['index']}] {e['op']}: {e['reason']}")
     return "\n".join(lines)
@@ -226,18 +239,18 @@ async def run_batch(ctx, operations: list) -> str:
         granted = await access_request.request_access_batch(
             ctx, res.need_grant, "write")
         if not granted:
-            return "用户拒绝了访问授权,未做任何改动。"
+            return "The user denied the access authorization; nothing was changed."
         # TOCTOU: disk may have changed while the card was pending -> re-preflight
         res = preflight(ctx, operations)
         if res.need_grant or res.blocked or res.errors:
-            return ("磁盘状态在授权期间发生变化,已取消(未做任何改动)。\n"
+            return ("Disk state changed while waiting for authorization; the batch was cancelled (nothing was changed).\n"
                     + _format_rejection(res))
 
     try:
         batch_id = await commit(ctx, res)
     except Exception as e:
-        return (f"批量提交中途失败:{e}。已暂存的部分已生成可撤销卡片"
-                f"(同一批次),可在卡片上整批或逐项撤销。")
+        return (f"The batch commit failed midway: {e}. The already-staged part produced an undoable card "
+                f"(same batch); you can revert it wholesale or per item from the card.")
     count = conn_count(ctx, batch_id)
-    return (f"已暂存 {count} 项结构操作(batch={batch_id})。"
-            f"等待用户在卡片上确认或撤销。")
+    return (f"Staged {count} structure operations (batch={batch_id}). "
+            f"Waiting for the user to confirm or revert them on the card.")

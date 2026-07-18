@@ -119,7 +119,7 @@ async def test_cold_stdio_self_heals_not_inline(monkeypatch, _clear_cache):
     metas = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
     assert metas == []
     assert scheduled["n"] == 1
-    assert warns and ("初始化" in warns[-1][1] or "下载" in warns[-1][1])
+    assert warns and ("initializing" in warns[-1][1] or "background" in warns[-1][1])
 
 
 @pytest.mark.asyncio
@@ -161,7 +161,7 @@ async def test_test_server_uses_stdio_timeout(monkeypatch, _clear_cache):
     assert out["ok"] is True
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)
     out2 = await mc.test_server({"id": 2, "name": "h", "transport": "http", "url": "https://x"})
-    assert out2["ok"] is False and "超时" in out2["error"]
+    assert out2["ok"] is False and "timed out" in out2["error"]
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)   # http probe budget tiny -> list times out fast
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
-    assert out["ok"] is False and "超时" in out["error"]
+    assert out["ok"] is False and "timed out" in out["error"]
 
 
 @pytest.mark.asyncio

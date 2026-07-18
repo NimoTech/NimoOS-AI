@@ -164,3 +164,62 @@ func TestShellAllowlistGateAdminPassthrough(t *testing.T) {
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code, "DELETE admin must pass through")
 }
+
+// TestNotesSettingsGateRoutePrecedence proves /agent/notes/settings is
+// admin-gated (governs the system-wide notes root and file migration)
+// before falling through to the general /agent/* proxy wildcard. Mirrors
+// TestShellAllowlistGateRoutePrecedence's registration order.
+func TestNotesSettingsGateRoutePrecedence(t *testing.T) {
+	us := fakeUserService(t, "user") // non-admin: gate must reject with 403
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxied := 0
+	proxy := func(c echo.Context) error { proxied++; return c.String(http.StatusOK, "proxied") }
+	// Mirror route/v2.go registration order: gated routes first, wildcard last.
+	e.Any("/agent/notes/settings", proxy, AdminOnly(dir))
+	e.Any("/agent/notes/dir-info", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, path := range []string{"/agent/notes/settings", "/agent/notes/dir-info"} {
+		for _, m := range []string{http.MethodGet, http.MethodPut} {
+			req := httptest.NewRequest(m, path, nil)
+			req.Header.Set("Authorization", "Bearer tok")
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+			require.Equalf(t, http.StatusForbidden, rec.Code,
+				"%s %s must hit the gated route, not the wildcard", m, path)
+		}
+	}
+
+	// Sibling notes endpoints must fall through to the wildcard ungated.
+	req := httptest.NewRequest(http.MethodGet, "/agent/notes", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, proxied)
+}
+
+// TestNotesSettingsGateAdminPassthrough proves an admin caller passes
+// through the gate to reach the proxy for notes settings.
+func TestNotesSettingsGateAdminPassthrough(t *testing.T) {
+	us := fakeUserService(t, "admin")
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxy := func(c echo.Context) error { return c.String(http.StatusOK, "proxied") }
+	e.Any("/agent/notes/settings", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPut} {
+		req := httptest.NewRequest(m, "/agent/notes/settings", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusOK, rec.Code, "%s admin must pass through", m)
+	}
+}

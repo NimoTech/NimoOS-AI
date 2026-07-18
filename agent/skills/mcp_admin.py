@@ -58,11 +58,12 @@ async def mcp_register_server(command_line: str, name: str = "") -> str:
     """
     base = _read_ai_base()
     if not base:
-        return "系统错误:无法定位 nimoos-ai 服务,无法注册 MCP server。请告知用户去设置页手动添加。"
+        return ("System error: cannot locate the nimoos-ai service, so the MCP server "
+                "cannot be registered. Tell the user to add it manually on the settings page.")
     try:
         parsed = await _parse(base, command_line)
     except ParseError as e:
-        return f"解析失败:{e}。请检查命令是否正确(如 `npx -y @scope/pkg`)。"
+        return f"Parse failed: {e}. Check the command line (e.g. `npx -y @scope/pkg`)."
 
     display_name = (name or "").strip() or parsed.get("suggested_name") or "mcp"
     transport = parsed.get("transport", "stdio")
@@ -71,11 +72,12 @@ async def mcp_register_server(command_line: str, name: str = "") -> str:
     queue = mc.EVENT_QUEUE_VAR.get()
     session_id = mc.SESSION_ID_VAR.get()
     if mgr is None or queue is None:
-        return "系统错误:确认通道不可用,无法注册。请告知用户去设置页手动添加。"
+        return ("System error: the confirmation channel is unavailable; cannot register. "
+                "Tell the user to add it manually on the settings page.")
 
     confirm_id = mgr.register(
         session_id, f"mcp_install:{display_name}",
-        f"注册 MCP server「{display_name}」({transport})",
+        f'Register MCP server "{display_name}" ({transport})',
         command_line)
     await queue.put({
         "type": "confirmation_required", "confirm_id": confirm_id,
@@ -85,15 +87,15 @@ async def mcp_register_server(command_line: str, name: str = "") -> str:
     })
     confirmed = await mgr.wait(confirm_id)
     if not confirmed:
-        return "用户拒绝了安装该 MCP server。"
+        return "The user declined to install this MCP server."
 
     user_id = skills_registry.USER_ID_VAR.get()
     try:
         await _register(base, user_id, command_line, display_name)
     except Exception as e:
-        return f"注册失败:{e}。可让用户去设置页(AI → MCP servers)手动添加。"
-    return (f"已注册 MCP server「{display_name}」({transport})。"
-            f"它的工具会在你的下一条消息生效。")
+        return f"Registration failed: {e}. The user can add it manually in Settings (AI → MCP servers)."
+    return (f'Registered MCP server "{display_name}" ({transport}). '
+            f"Its tools will be available from your next message.")
 
 
 ALL_TOOLS = [mcp_register_server]

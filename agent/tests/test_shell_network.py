@@ -52,7 +52,7 @@ async def test_network_denied_returns_message_without_running(monkeypatch):
         nonlocal called; called = True; return "[exit 0]\n"
     monkeypatch.setattr(shell, "_run", _fake_run)
     out = await shell._run_command_impl("curl x", 30, True)
-    assert "拒绝" in out
+    assert "denied" in out
     assert called is False
 
 
@@ -83,7 +83,9 @@ async def test_confirm_event_emitted(monkeypatch):
     async def _fake_run(cmd, t, net, view): return "[exit 0]\n"
     monkeypatch.setattr(shell, "_run", _fake_run)
     await shell._run_command_impl("curl x", 30, True)
-    assert any(e.get("type") == "confirmation_required" for e in sink.events)
+    ev = next(e for e in sink.events if e.get("type") == "confirmation_required")
+    assert ev["description_key"] == "shell_network"
+    assert "network access" in ev["description"]
 
 
 @pytest.mark.asyncio

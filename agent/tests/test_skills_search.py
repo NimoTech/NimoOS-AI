@@ -39,7 +39,12 @@ async def test_nimoos_search_propagates_user_id(monkeypatch):
     assert calls["arguments"]["top_k"] == 3
     assert "modality" not in calls["arguments"], "modality removed in favor of sources"
     assert "sources" not in calls["arguments"], "sources absent when not specified"
-    assert json.loads(out) == {"hits": []}
+    # Model-facing result is now wrapped in an untrusted-data fence (search
+    # hits are external content); unwrap it to check the underlying payload.
+    assert '<untrusted-data source="search-results">' in out
+    body = (out.split('<untrusted-data source="search-results">\n', 1)[1]
+               .rsplit("\n</untrusted-data>", 1)[0])
+    assert json.loads(body) == {"hits": []}
 
 
 @pytest.mark.asyncio

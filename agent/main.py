@@ -282,6 +282,15 @@ async def _recall_worker_startup():
     import recall_index
     recall_index.start_worker(_db())
 
+    from notes.sync import start_notes_sync
+    _notes_sync_task, _notes_sync_stop = start_notes_sync(_db())
+
+
+@app.on_event("startup")
+async def _notes_extract_worker_startup():
+    import notes_extract
+    notes_extract.start_worker(_db())
+
 
 _channel_manager = None
 
@@ -797,6 +806,10 @@ async def egress_confirm(req: _EgressConfirmRequest):
             "description": description,
         })
         granted = await _confirm_mgr.wait(cid)
+        from audit import audit as _audit  # noqa: PLC0415
+        _audit("egress_grant", session_id=session_id, host=req.host,
+               bytes=req.bytes, reason=req.reason,
+               decision="approved" if granted else "denied")
         return {"allow": bool(granted)}
     except Exception as exc:
         _LOG.error("egress-confirm error for session %s: %s — fail-closed", session_id, exc)
@@ -1554,7 +1567,7 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
     turn). Only granted/denied are shown; pending/cancelled are skipped.
     """
     rows = conn.execute(
-        "SELECT confirm_id, run_id, path, kind, reason, decision "
+        "SELECT confirm_id, run_id, path, kind, reason, reason_key, decision "
         "FROM access_requests "
         "WHERE session_id=? AND decision IN ('granted','denied') "
         "ORDER BY created_at ASC",
@@ -1589,6 +1602,7 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
             "path": r["path"],
             "kind": r["kind"],
             "reason": r["reason"],
+            "reasonKey": r["reason_key"] or "",
             "decided": True,
             "granted": r["decision"] == "granted",
         } for r in group]
@@ -2078,7 +2092,7 @@ def _start_run(session_id: str, user_id: str, message: str,
             cancelled = True
             error_msg = "cancelled"
             try:
-                await sink.put({"type": "error", "content": "已停止"})
+                await sink.put({"type": "error", "content": "Stopped"})
                 await sink.put({"type": "done"})
             except asyncio.CancelledError:
                 pass
@@ -2115,6 +2129,14 @@ def _start_run(session_id: str, user_id: str, message: str,
                 recall_index.maybe_enqueue_index_job(_conn, session_id, user_id)
             except Exception:
                 pass
+            try:
+                import notes_extract
+                notes_extract.maybe_enqueue_notes_job(
+                    _conn, session_id, user_id,
+                    provider_url=provider_url, provider_key=provider_key,
+                    provider_type=provider_type, model_name=model)
+            except Exception:
+                _LOG.exception("notes-extract enqueue failed")
             # Don't leave references to a finished task pinned in _active_runs;
             # the sink is still kept (so very-late subscribers can replay) but
             # the task ref is cleared so GC can reclaim its frames.
@@ -2524,6 +2546,218 @@ async def get_observability_compose():
     path = os.path.join(os.path.dirname(__file__), "observability", "phoenix_compose.yaml")
     with open(path, "r", encoding="utf-8") as f:
         return PlainTextResponse(f.read(), media_type="application/yaml")
+
+
+# ---------------------------------------------------------------------------
+# Knowledge notes API (M2). Files are the content authority; these endpoints
+# are the UI's metadata/CRUD surface. Identity via X-User-Id (Go proxy strips
+# JWT and injects it). Settings is admin-gated at the Go layer (route/v2.go).
+# ---------------------------------------------------------------------------
+from notes import reserved as notes_reserved
+from notes import store as notes_store
+from notes.indexer import index_note as notes_index_note
+from notes.indexer import deindex_note as notes_deindex_note
+
+
+class NoteCreatePayload(BaseModel):
+    title: str
+    content: str
+    note_type: str = "note"
+    tags: list[str] = []
+    source_refs: list[dict] = []
+    description: str = ""
+
+
+class NoteUpdatePayload(BaseModel):
+    expected_revision: int
+    content: str | None = None
+    title: str | None = None
+    status: str | None = None
+    tags: list[str] | None = None
+    description: str | None = None
+
+
+class NotesSettingsPayload(BaseModel):
+    notes_root: str | None = None
+    mode: str = "adopt"          # adopt | migrate
+    auto_extract: bool | None = None
+
+
+def _notes_uid(request: Request) -> str:
+    uid = request.headers.get("X-User-Id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    return uid
+
+
+async def _notes_post_write(conn, uid: str, note: dict, body: str) -> None:
+    ok = await notes_index_note(note, body)
+    if not ok:
+        conn.execute("UPDATE notes SET content_hash='' WHERE id=? AND user_id=?",
+                     (note["id"], uid))
+        conn.commit()
+    try:
+        notes_reserved.render_for_user(conn, uid)
+    except Exception:
+        logging.getLogger("nimoos-agent").exception("reserved render failed")
+
+
+@app.get("/agent/notes/settings")
+async def get_notes_settings(request: Request):
+    uid = _notes_uid(request)
+    conn = _db()
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+
+
+@app.put("/agent/notes/settings")
+async def put_notes_settings(request: Request, body: NotesSettingsPayload):
+    uid = _notes_uid(request)
+    conn = _db()
+    if body.mode not in ("adopt", "migrate"):
+        raise HTTPException(status_code=400, detail="mode must be adopt|migrate")
+    if body.auto_extract is not None:
+        notes_store.set_auto_extract(conn, uid, body.auto_extract)
+    if body.notes_root:
+        old = notes_store.get_notes_root(conn)
+        new = os.path.abspath(body.notes_root)
+        if new != old:
+            if body.mode == "migrate":
+                if os.path.isdir(new) and os.listdir(new):
+                    raise HTTPException(status_code=400,
+                                        detail="migrate target is not empty — choose an "
+                                               "empty directory or use mode=adopt")
+                os.makedirs(new, exist_ok=True)
+                for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
+                    shutil.move(os.path.join(old, entry), os.path.join(new, entry))
+            notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+
+
+# Probes are confined to the user-visible data root (tests monkeypatch this).
+_NOTES_PROBE_ROOT = "/DATA"
+
+
+# Registered before /agent/notes/{note_id} so "dir-info" is not captured as an id.
+@app.get("/agent/notes/dir-info")
+async def notes_dir_info(request: Request, path: str = ""):
+    """Probe a candidate notes folder for the settings UI: same emptiness
+    semantics as the migrate guard in put_notes_settings (any entry counts,
+    dotfiles included). A missing directory is migratable (migrate mkdirs it)."""
+    _notes_uid(request)
+    p = os.path.abspath(path or "")
+    if p != _NOTES_PROBE_ROOT and not p.startswith(_NOTES_PROBE_ROOT + "/"):
+        raise HTTPException(status_code=400,
+                            detail=f"path must be under {_NOTES_PROBE_ROOT}")
+    exists = os.path.isdir(p)
+    if not exists:
+        return {"exists": False, "empty": True}
+    try:
+        empty = not os.listdir(p)
+    except OSError:
+        # Unreadable: report non-empty so the UI doesn't promise a migrate
+        # the backend guard would then reject.
+        empty = False
+    return {"exists": True, "empty": empty}
+
+
+@app.get("/agent/notes")
+async def list_notes_api(request: Request, type: str = "", status: str = "",
+                         limit: int = 50):
+    uid = _notes_uid(request)
+    rows = notes_store.list_notes(_db(), uid, note_type=type or None,
+                                  status=status or None,
+                                  limit=max(1, min(limit, 200)))
+    return {"notes": rows}
+
+
+@app.post("/agent/notes", status_code=201)
+async def create_note_api(request: Request, body: NoteCreatePayload):
+    uid = _notes_uid(request)
+    conn = _db()
+    try:
+        note = notes_store.create_note(
+            conn, uid, title=body.title, body=body.content,
+            note_type=body.note_type, tags=body.tags,
+            source_refs=body.source_refs, created_by="human",
+            description=body.description)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await _notes_post_write(conn, uid, note, body.content)
+    return note
+
+
+@app.get("/agent/notes/{note_id}")
+async def get_note_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    note = notes_store.get_note(_db(), uid, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return note
+
+
+@app.put("/agent/notes/{note_id}")
+async def update_note_api(note_id: str, request: Request,
+                          body: NoteUpdatePayload):
+    uid = _notes_uid(request)
+    conn = _db()
+    try:
+        note = notes_store.update_note(
+            conn, uid, note_id, expected_revision=body.expected_revision,
+            title=body.title, body=body.content, status=body.status,
+            tags=body.tags, description=body.description)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="not found")
+    except notes_store.RevisionConflict as e:
+        return JSONResponse(status_code=409, content={
+            "detail": "revision conflict",
+            "current_revision": e.current_revision})
+    await _notes_post_write(conn, uid, note, note["body"])
+    return note
+
+
+@app.delete("/agent/notes/{note_id}")
+async def delete_note_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    conn = _db()
+    if not notes_store.soft_delete_note(conn, uid, note_id):
+        raise HTTPException(status_code=404, detail="not found")
+    await notes_deindex_note(uid, note_id)
+    try:
+        notes_reserved.render_for_user(conn, uid)
+    except Exception:
+        pass
+    return {"status": "deleted", "id": note_id}
+
+
+async def _set_status(note_id: str, request: Request, status: str):
+    uid = _notes_uid(request)
+    conn = _db()
+    cur = notes_store.get_note(conn, uid, note_id)
+    if cur is None:
+        raise HTTPException(status_code=404, detail="not found")
+    note = notes_store.update_note(conn, uid, note_id,
+                                   expected_revision=cur["revision"],
+                                   status=status)
+    await _notes_post_write(conn, uid, note, note["body"])
+    return note
+
+
+@app.post("/agent/notes/{note_id}/curate")
+async def curate_note_api(note_id: str, request: Request):
+    return await _set_status(note_id, request, "curated")
+
+
+@app.post("/agent/notes/{note_id}/archive")
+async def archive_note_api(note_id: str, request: Request):
+    return await _set_status(note_id, request, "archived")
+
+
+@app.get("/agent/notes/{note_id}/backlinks")
+async def note_backlinks_api(note_id: str, request: Request):
+    uid = _notes_uid(request)
+    return {"backlinks": notes_store.get_backlinks(_db(), uid, note_id)}
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from pathlib import Path
 from agents import function_tool
 
 import db as dbmod
+from audit import audit as _audit
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
 
 import shell_guard
@@ -66,8 +67,8 @@ WORK_ROOT = Path(os.environ.get(
     str(Path.home() / ".nimoos" / "agent"),
 ))
 
-_NETWORK_HINT = ("\n(System Hint: 命令可能因沙箱默认断网而失败。"
-                 "若确需联网,请以 network=true 重试,会请用户确认。)")
+_NETWORK_HINT = ("\n(System hint: the command may have failed because the sandbox is offline by default. "
+                 "If network access is genuinely needed, retry with network=true — the user will be asked to confirm.)")
 
 
 def _work_dir(session_id: str) -> Path:
@@ -199,12 +200,13 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     if mgr is None or sink is None:
         return False  # headless: cannot confirm → stay offline
     confirm_id = mgr.register(session_id, "shell_network",
-                              "Agent 请求联网执行命令", command)
+                              "Agent requests network access for a command", command)
     await sink.put({
         "type": "confirmation_required",
         "confirm_id": confirm_id,
         "action": "shell_network",
-        "description": "Agent 请求联网执行命令",
+        "description": "Agent requests network access for a command",
+        "description_key": "shell_network",
         "command": command,
     })
     granted = await mgr.wait(confirm_id)
@@ -236,6 +238,15 @@ async def _guard_command(command: str) -> str | None:
     session_id = SESSION_ID_VAR.get()
     db = DB_VAR.get()
 
+    def _rec(outcome: str, level: str, reason: str = ""):
+        try:
+            uid_row = db.execute("SELECT user_id FROM sessions WHERE id=?", (session_id,)).fetchone() if db is not None else None
+            _uid = uid_row["user_id"] if uid_row else None
+        except Exception:  # noqa: BLE001
+            _uid = None
+        _audit("shell_command", user_id=_uid, session_id=session_id,
+               command=command, level=level, reason=reason, outcome=outcome)
+
     decision = shell_guard.classify(command)
     if decision.level == "safe":
         return None
@@ -247,6 +258,7 @@ async def _guard_command(command: str) -> str | None:
         # gets a recoverable snapshot/trash).
         if decision.level in ("dangerous", "protected"):
             guard_backstop.prepare_backstop(decision.paths)
+        _rec("allowlisted", decision.level, "allowlist")
         return None
 
     # gray → judge; allow verdict passes through, else fall to confirm
@@ -276,6 +288,7 @@ async def _guard_command(command: str) -> str | None:
                     from egress import parse as _ep  # noqa: PLC0415
                     _intent = _ep.parse_upload(command)
                     if _intent is not None and _intent.external:
+                        _rec("deferred_upload", "gray", "egress-apath")
                         return None
                 except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
                     pass
@@ -286,33 +299,40 @@ async def _guard_command(command: str) -> str | None:
             # unrecoverable data loss.
             if decision.paths:
                 guard_backstop.prepare_backstop(decision.paths)
+            _rec("allowed_gray", "gray", "judge-allow")
             return None
-        reason = "命令需人工确认(灰区判定)"
+        reason = "needs manual confirmation (gray-zone verdict)"
+        reason_key = "gray_zone"
     else:
         reason = decision.reason
+        reason_key = None
 
     mgr = CONFIRM_MGR_VAR.get()
     sink = EVENT_QUEUE_VAR.get()
     if mgr is None or sink is None:
-        return ("此命令需人工批准(无确认通道),未执行。"
-                "请在面板确认,或将其加入 shell 白名单。")
+        _rec("refused_unattended", decision.level, reason)
+        return ("This command requires manual approval (no confirmation channel available); it was NOT executed. "
+                "Confirm it in the panel, or add it to the shell allowlist.")
 
     # Build the backstop BEFORE asking, so the card can show undo status.
     backstop = guard_backstop.prepare_backstop(decision.paths)
     if backstop.undoable and backstop.kind == "snapshot":
-        undo = "已快照,可回滚"
+        undo = "snapshot taken; can be rolled back"
     elif backstop.undoable and backstop.kind == "trash":
-        undo = "已入回收站,可恢复"
+        undo = "moved to trash; can be restored"
     else:
-        undo = "⚠ 此操作无法自动备份,执行后不可撤销"
+        undo = "⚠ cannot be backed up automatically; irreversible once executed"
 
     confirm_id = mgr.register(session_id, "shell_command",
-                              f"Agent 请求执行命令:{reason}", command)
+                              f"Agent requests to run a command: {reason}", command)
     await sink.put({
         "type": "confirmation_required",
         "confirm_id": confirm_id,
         "action": "shell_command",
-        "description": f"Agent 请求执行命令:{reason}",
+        "description": f"Agent requests to run a command: {reason}",
+        "description_key": "shell_exec",
+        "description_params": {"reason": reason},
+        "reason_key": reason_key,
         "command": command,
         "risk_level": decision.level,
         "risk_reason": reason,
@@ -320,13 +340,15 @@ async def _guard_command(command: str) -> str | None:
     })
     granted = await mgr.wait(confirm_id)
     if not granted:
-        return "用户拒绝或未能确认该命令,未执行。"
+        _rec("refused_user", decision.level, reason)
+        return "The user denied or failed to confirm the command; it was NOT executed."
     if db is not None and mgr.consume_remember(confirm_id):
         # Store an anchored EXACT-match regex, not an open prefix — otherwise a
         # remembered `rm -rf /DATA/scratch` would also auto-run a later superset
         # `rm -rf /DATA/scratch /DATA/important`, deleting an unapproved path.
         import re as _re  # noqa: PLC0415
         guard_allowlist.add(db, "regex", f"^{_re.escape(command)}$", "confirm-card")
+    _rec("confirmed", decision.level, reason)
     return None
 
 
@@ -354,10 +376,13 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                 v = _er.assess(intent.files, inline_payload=None)
 
                 if v.level == "block":
+                    _audit("egress_block", session_id=session_id,
+                           host=intent.host, files=intent.files,
+                           stage="rules", reason=v.reason)
                     return (
-                        "该上传被隐私策略拦截,未执行。"
-                        f"原因:{v.reason}。"
-                        "如确需外发请人工处理。"
+                        "This upload was blocked by privacy policy and NOT executed. "
+                        f"Reason: {v.reason}. "
+                        "If it truly must be sent out, handle it manually."
                     )
 
                 elif v.level == "clean":
@@ -377,10 +402,13 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                     verdict = await _ej.judge(content, intent.host)
 
                     if verdict == "block":
+                        _audit("egress_block", session_id=session_id,
+                               host=intent.host, files=intent.files,
+                               stage="judge", reason=v.reason)
                         return (
-                            "该上传被内容审查拦截,未执行。"
-                            "上传内容被判断为含有敏感/隐私数据。"
-                            "如确需外发请人工处理。"
+                            "This upload was blocked by content inspection and NOT executed. "
+                            "The upload content was judged to contain sensitive/private data. "
+                            "If it truly must be sent out, handle it manually."
                         )
                     elif verdict == "ask":
                         mgr = CONFIRM_MGR_VAR.get()
@@ -388,20 +416,22 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         if mgr is None or sink is None:
                             # No confirm channel available — fail safe: refuse.
                             return (
-                                "无法确认上传操作(无确认通道),未执行。"
-                                "请通过界面确认后重试,或人工处理。"
+                                "Cannot confirm the upload (no confirmation channel); NOT executed. "
+                                "Retry after confirming via the UI, or handle it manually."
                             )
                         confirm_id = mgr.register(
                             session_id,
                             "egress_upload",
-                            f"Agent 请求上传文件到外部主机 {intent.host}",
+                            f"Agent requests to upload files to external host {intent.host}",
                             command,
                         )
                         await sink.put({
                             "type": "confirmation_required",
                             "confirm_id": confirm_id,
                             "action": "egress_upload",
-                            "description": f"Agent 请求上传文件到外部主机 {intent.host}",
+                            "description": f"Agent requests to upload files to external host {intent.host}",
+                            "description_key": "egress_upload",
+                            "description_params": {"host": intent.host},
                             "host": intent.host,
                             "files": intent.files,
                             "reason": v.reason,
@@ -410,7 +440,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         granted = await mgr.wait(confirm_id)
                         if not granted:
                             return (
-                                "用户拒绝或未能确认上传操作,未执行。"
+                                "The user denied or failed to confirm the upload; it was NOT executed."
                             )
                     # verdict == "allow" OR user confirmed → fall through to grant + execute
 
@@ -437,6 +467,11 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         intent.host, max_bytes=total_bytes, ttl_sec=60
                     ),
                 )
+                # L4: a granted outbound upload is a security-relevant egress
+                # decision — audit it (level records rules clean vs judge-allow).
+                _audit("egress_grant", session_id=session_id,
+                       host=intent.host, files=intent.files,
+                       max_bytes=total_bytes, level=v.level)
         except Exception as _apath_exc:  # noqa: BLE001 — I2: fail-closed skeleton guard
             # An unexpected error in the A-path evaluation (e.g. pathspec version
             # mismatch, import failure after lazy load, etc.).  Log it and refuse
@@ -448,7 +483,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                 _apath_exc,
             )
             return (
-                "上传操作因内部错误无法评估,未执行,请人工处理。"
+                "The upload could not be evaluated due to an internal error; NOT executed. Handle it manually."
             )
         # ── end A-path ────────────────────────────────────────────────────────
 
@@ -461,7 +496,7 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
     # bwrap mode: original network-grant + offline-hint logic — do not modify.
     use_net = await _maybe_grant_network(session_id, command) if network else False
     if network and not use_net:
-        return "联网请求被拒绝(用户拒绝或当前会话无法确认)。可去掉 network 离线执行。"
+        return "Network access was denied (user declined or this session cannot confirm). You can drop network=true and run offline."
 
     result = await _run(command, timeout_sec, use_net, view)
 

@@ -7,11 +7,18 @@ services:
     image: localhost/nimoos-agent:bundled
     pull_policy: never
     network_mode: host          # 绑 127.0.0.1:8282,nimoos-ai 反代不变
-    # netns/unshare egress isolation: NET_ADMIN(veth/netns) + SYS_ADMIN(unshare --net/--mount)
-    # seccomp/apparmor/systempaths=unconfined dropped — unshare path does not require them
+    # netns egress isolation caps. SYS_ADMIN is REQUIRED: the executor's
+    # unshare(CLONE_NEWNET) that creates the per-command network namespace needs
+    # CAP_SYS_ADMIN — spike-verified 2026-07-16 (cap-drop=ALL → unshare EPERM;
+    # cap-add=SYS_ADMIN → OK). NET_ADMIN configures the veth/interfaces inside it.
+    # Do NOT drop SYS_ADMIN — it would break the netns P0 boundary.
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+    # Belt-and-suspenders: forbid gaining ANY further privilege beyond the caps
+    # above (setuid binaries, file capabilities). Does not affect the granted caps.
+    security_opt:
+      - no-new-privileges:true
     mem_limit: 2g
     pids_limit: 1024
     cpus: "2.0"

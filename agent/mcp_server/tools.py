@@ -1,8 +1,8 @@
 # NimoOS-AI/agent/mcp_server/tools.py
-"""Adapter: re-expose 6 read-only skills as MCP tools. tools/call routes to
-each skill's existing _impl; tools/list uses curated inputSchemas (so e.g.
-read_document never exposes the Plan-2 path/ocr params). No capability logic
-is reimplemented here."""
+"""Adapter: re-expose 11 read-only tools backed by the search/wiki/photos/notes
+skills as MCP tools. tools/call routes to each skill's existing _impl;
+tools/list uses curated inputSchemas (so e.g. read_document never exposes the
+Plan-2 path/ocr params). No capability logic is reimplemented here."""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +12,7 @@ from mcp_server import fs_gate
 from skills.search import search as _search
 from skills import wiki as _wiki
 from skills import photos as _photos
+from skills import notes as _notes
 from wiki_client import WikiClient
 
 MAX_TREE_NODES = 500
@@ -35,6 +36,7 @@ def setup_user_context(user_id: str) -> None:
     _search.USER_ID_VAR.set(str(user_id))
     _wiki.WIKI_CLIENT_VAR.set(WikiClient(user_id=str(user_id)))
     _photos.USER_ID_VAR.set(str(user_id))
+    _notes.USER_ID_VAR.set(str(user_id))
 
 
 async def _h_search(args: dict) -> str:
@@ -138,17 +140,34 @@ async def _h_view_document_page(args: dict):
     return ImageResult(png_b64, "image/png")
 
 
+async def _h_list_notes(args: dict) -> str:
+    try:
+        limit = int(args.get("limit") or 20)
+    except (TypeError, ValueError):
+        raise McpToolError("limit must be an integer")
+    return await _notes._list_notes_impl(
+        str(args.get("type") or ""), str(args.get("status") or ""), limit)
+
+
+async def _h_read_note(args: dict) -> str:
+    note_id = str(args.get("note_id") or "")
+    if not note_id:
+        raise McpToolError("note_id is required")
+    return await _notes._read_note_impl(note_id)
+
+
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 
 TOOL_SPECS = [
     {"name": "nimoos_search",
-     "description": ("Search the user's NAS: semantic content, filenames, and "
-                     "photos. Returns grouped candidates with file_id values you "
-                     "pass to read_document/read_file_chunk. top_k max 20."),
+     "description": ("Search the user's NAS: semantic content, filenames, "
+                     "photos, and notes. Returns grouped candidates with "
+                     "file_id values you pass to read_document/read_file_chunk. "
+                     "top_k max 20."),
      "inputSchema": {"type": "object", "required": ["query"], "properties": {
          "query": _STR,
-         "sources": {**_STR, "description": "comma list of semantic,filenames,images"},
+         "sources": {**_STR, "description": "comma list of semantic,filenames,images,notes"},
          "filters": {**_STR, "description": "JSON filter for the semantic source"},
          "top_k": {**_INT, "description": "hits per source, max 20"}}},
      "handler": _h_search},
@@ -214,6 +233,28 @@ TOOL_SPECS = [
                      "assetCount, dateStart, dateEnd}]} (capped at 100)."),
      "inputSchema": {"type": "object", "properties": {}},
      "handler": _h_list_albums},
+    {
+        "name": "list_notes",
+        "description": "List knowledge notes from the NimoOS knowledge base "
+                       "(title/description/tags/status metadata), newest first.",
+        "inputSchema": {"type": "object", "properties": {
+            "type": {"type": "string",
+                     "description": "Filter by type: note|summary|insight|digest"},
+            "status": {"type": "string",
+                       "description": "Filter by status: draft|curated|archived"},
+            "limit": {"type": "integer", "description": "Max results (1-100), default 20"},
+        }},
+        "handler": _h_list_notes,
+    },
+    {
+        "name": "read_note",
+        "description": "Read one knowledge note by id — metadata plus full Markdown body.",
+        "inputSchema": {"type": "object", "properties": {
+            "note_id": {"type": "string",
+                        "description": "Note id from list_notes or nimoos_search"},
+        }, "required": ["note_id"]},
+        "handler": _h_read_note,
+    },
 ]
 
 _BY_NAME = {s["name"]: s for s in TOOL_SPECS}

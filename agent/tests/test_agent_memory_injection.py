@@ -17,7 +17,7 @@ def test_injection_appends_block_for_compose_profile(tmp_path):
     base = "BASE PROMPT"
     block = agent_module.compose_memory_block(conn, "u1")
     assert block != ""
-    assert "## 关于这位用户" in block
+    assert "## About this user" in block
     assert "likes oat milk" in block
     conn.close()
 

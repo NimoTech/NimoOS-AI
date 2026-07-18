@@ -427,7 +427,22 @@ func TestUnknownHostTOFU(t *testing.T) {
 	//  because isConfirmed returns true.)
 }
 
-// TestExternalUploadOverThresholdAsks: upload > T_UPLOAD with deny confirm → connection closed.
+func TestTOFUExpires(t *testing.T) {
+	resetConfirmedHosts()
+	old := tofuTTL
+	defer func() { tofuTTL = old }()
+	tofuTTL = 50 * time.Millisecond
+	markConfirmed("example.com")
+	if !isConfirmed("example.com") {
+		t.Fatal("host should be confirmed immediately after markConfirmed")
+	}
+	time.Sleep(70 * time.Millisecond)
+	if isConfirmed("example.com") {
+		t.Fatal("TOFU confirmation should expire after tofuTTL")
+	}
+}
+
+// TestExternalUploadOverThresholdAsks: upload > uploadThreshold with deny confirm → connection closed.
 // We simulate this by exercising the counting logic and confirm callback directly.
 func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	resetConfirmedHosts()
@@ -492,12 +507,12 @@ func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	// upload threshold logic directly by calling the relevant functions.
 
 	// Direct unit test of threshold logic:
-	// Simulate: external host confirmed (TOFU done), no grant, upload > T_UPLOAD.
+	// Simulate: external host confirmed (TOFU done), no grant, upload > uploadThreshold.
 	host := "threshold-test.example.com"
 	markConfirmed(host) // pre-confirm so TOFU is skipped.
 
 	// The confirm denies upload_over_threshold.
-	denied := !callConfirm(host, T_UPLOAD+1, "upload_over_threshold")
+	denied := !callConfirm(host, uploadThreshold+1, "upload_over_threshold")
 	if !denied {
 		t.Fatal("confirm should deny upload_over_threshold")
 	}
@@ -506,7 +521,7 @@ func TestExternalUploadOverThresholdAsks(t *testing.T) {
 	}
 }
 
-// TestGrantedSilent: with a valid grant, upload > T_UPLOAD does NOT call confirm.
+// TestGrantedSilent: with a valid grant, upload > uploadThreshold does NOT call confirm.
 func TestGrantedSilent(t *testing.T) {
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
@@ -558,7 +573,7 @@ func TestGrantedSilent(t *testing.T) {
 
 	// Simulate upload over threshold — should NOT call confirm.
 	markConfirmed(host)
-	overThreshold := int64(T_UPLOAD + 1024)
+	overThreshold := uploadThreshold + 1024
 	if hasGrant(host) {
 		// Grant covers it — no confirm needed.
 		// Deduct bytes from grant.
@@ -859,6 +874,23 @@ func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
 	}
 }
 
+// TestAntiRebindingCheckMetadata: even when classified as internal (169.254/16
+// IS internal, so the isInternal consistency check would pass), the Control hook
+// must reject a dial to a cloud metadata IP. This closes the multi-A-record /
+// DNS-rebinding bypass where the first resolved IP is a dead internal address and
+// the actual dial lands on the metadata endpoint.
+func TestAntiRebindingCheckMetadata(t *testing.T) {
+	dialer := secureDialer(true) // classified internal (169.254/16 is internal)
+
+	_, err := dialer.Dial("tcp", "169.254.169.254:80")
+	if err == nil {
+		t.Fatal("expected Control hook to reject metadata IP, but Dial succeeded")
+	}
+	if !strings.Contains(err.Error(), "metadata") {
+		t.Errorf("expected error to mention metadata (got: %v)", err)
+	}
+}
+
 // TestConfirmURLDeny: callConfirm returns false when server denies.
 func TestConfirmURLDeny(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -933,9 +965,36 @@ func TestProxyPlainHTTPInternal(t *testing.T) {
 	}
 }
 
+// TestProxyPlainHTTPMetadataDenied verifies the SSRF-credential-exfil vector is
+// closed on the plain-HTTP path too: cloud metadata services are queried over
+// plain HTTP by design (never TLS), so a non-CONNECT request to 169.254.169.254
+// must be denied with 403 even though it is link-local ("internal").
+func TestProxyPlainHTTPMetadataDenied(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+
+	old := confirmURL
+	confirmURL = "" // must be denied before any confirm/dial
+	defer func() { confirmURL = old }()
+
+	req := httptest.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data/iam/security-credentials/", nil)
+	req.Host = "169.254.169.254:80"
+	req.RequestURI = ""
+	rw := httptest.NewRecorder()
+
+	proxyPlainHTTP(rw, req)
+
+	if rw.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for metadata endpoint over plain HTTP, got %d body=%s", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "cloud metadata endpoint") {
+		t.Errorf("expected metadata-block message, got body=%s", rw.Body.String())
+	}
+}
+
 // TestUploadGateDenyNoDataLeak verifies C1: when the confirm server denies an
 // upload_over_threshold request, the over-limit chunk is never written to dst.
-// The dst-side received byte count must be ≤ T_UPLOAD (the threshold) at the
+// The dst-side received byte count must be ≤ uploadThreshold (the threshold) at the
 // point the connection is closed; the denied chunk must not have leaked.
 func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	resetConfirmedHosts()
@@ -1025,7 +1084,7 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 			n, rerr := cliR.Read(buf)
 			if n > 0 {
 				chunk := int64(n)
-				if !uploadAuthorized && uploadTotal+chunk > T_UPLOAD {
+				if !uploadAuthorized && uploadTotal+chunk > uploadThreshold {
 					if hasGrant(host) {
 						if !consumeGrant(host, chunk, cliR) {
 							break
@@ -1062,8 +1121,8 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 		}
 	}()
 
-	// Send exactly T_UPLOAD bytes (at threshold, not yet over).
-	belowThreshold := make([]byte, T_UPLOAD)
+	// Send exactly uploadThreshold bytes (at threshold, not yet over).
+	belowThreshold := make([]byte, uploadThreshold)
 	for i := range belowThreshold {
 		belowThreshold[i] = 0xAB
 	}
@@ -1074,7 +1133,7 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	// Give the goroutine time to flush the below-threshold bytes.
 	time.Sleep(50 * time.Millisecond)
 
-	// Now send 1 extra byte — this chunk puts total over T_UPLOAD.
+	// Now send 1 extra byte — this chunk puts total over uploadThreshold.
 	// The goroutine must call confirm (which denies) and NOT write this byte.
 	overChunk := []byte{0xFF}
 	cliW.Write(overChunk) //nolint:errcheck — pipe may be closed by deny path
@@ -1093,13 +1152,13 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	case <-time.After(2 * time.Second):
 	}
 
-	// Verify: dst must have received at most T_UPLOAD bytes (the denied chunk leaked = bug).
+	// Verify: dst must have received at most uploadThreshold bytes (the denied chunk leaked = bug).
 	dstMu.Lock()
 	received := int64(len(dstReceived))
 	dstMu.Unlock()
 
-	if received > T_UPLOAD {
-		t.Errorf("C1 data-leak: dst received %d bytes, want ≤ %d (T_UPLOAD); denied chunk leaked", received, T_UPLOAD)
+	if received > uploadThreshold {
+		t.Errorf("C1 data-leak: dst received %d bytes, want ≤ %d (uploadThreshold); denied chunk leaked", received, uploadThreshold)
 	}
 
 	// Verify confirm was called with reason=upload_over_threshold.
@@ -1120,4 +1179,151 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 	}
 
 	cliW.Close()
+}
+
+func TestSyntheticGrantIsBounded(t *testing.T) {
+	old := grantTTL
+	defer func() { grantTTL = old }()
+	grantStore.Lock(); grantStore.m = make(map[string]*ticket); grantStore.Unlock()
+	grantTTL = 10 * time.Minute
+	// Simulate what handleConnect registers after a threshold confirm:
+	registerSyntheticGrant("h1", 100_000) // helper introduced by this task
+	grantStore.Lock(); tk := grantStore.m["h1"]; grantStore.Unlock()
+	if tk == nil { t.Fatal("grant not registered") }
+	if tk.MaxBytes > 100_000+grantHeadroom {
+		t.Fatalf("grant budget unbounded: %d", tk.MaxBytes)
+	}
+	if tk.Expiry.After(time.Now().Add(grantTTL + time.Second)) {
+		t.Fatal("grant expiry exceeds grantTTL")
+	}
+}
+
+func TestMetadataEndpointDenied(t *testing.T) {
+	for _, ips := range []string{"169.254.169.254", "169.254.170.2", "100.100.100.200"} {
+		if !isMetadataIP(net.ParseIP(ips)) {
+			t.Fatalf("%s must be classified as metadata (deny)", ips)
+		}
+	}
+	// a normal link-local (the proxy's own plumbing) must NOT be metadata
+	if isMetadataIP(net.ParseIP("169.254.7.1")) {
+		t.Fatal("proxy plumbing IP 169.254.7.1 must not be denied as metadata")
+	}
+}
+
+// ─── per-connection upload bound (2026-07-16 latch fix) ───────────────────────
+
+// scriptedConn is a net.Conn double whose Read yields a preset sequence of
+// chunks then blocks forever (until Close), and whose Close is observable.
+type scriptedConn struct {
+	chunks [][]byte
+	idx    int
+	closed bool
+	block  chan struct{}
+}
+
+func newScriptedConn(chunks [][]byte) *scriptedConn {
+	return &scriptedConn{chunks: chunks, block: make(chan struct{})}
+}
+func (c *scriptedConn) Read(b []byte) (int, error) {
+	if c.idx >= len(c.chunks) {
+		<-c.block // no more scripted data; block until Close
+		return 0, io.EOF
+	}
+	n := copy(b, c.chunks[c.idx])
+	c.idx++
+	return n, nil
+}
+func (c *scriptedConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *scriptedConn) Close() error {
+	if !c.closed {
+		c.closed = true
+		close(c.block)
+	}
+	return nil
+}
+func (c *scriptedConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *scriptedConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *scriptedConn) SetDeadline(t time.Time) error      { return nil }
+func (c *scriptedConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *scriptedConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// countingConn is a net.Conn double that counts bytes written to it.
+type countingConn struct {
+	written int64
+	closed  bool
+}
+
+func (c *countingConn) Read(b []byte) (int, error) { return 0, io.EOF }
+func (c *countingConn) Write(b []byte) (int, error) {
+	c.written += int64(len(b))
+	return len(b), nil
+}
+func (c *countingConn) Close() error                       { c.closed = true; return nil }
+func (c *countingConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *countingConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *countingConn) SetDeadline(t time.Time) error      { return nil }
+func (c *countingConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *countingConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "127.0.0.1:0" }
+
+// TestUploadBoundedOnSameConnection: after ONE confirm on the crossing chunk,
+// a connection may upload at most grantHeadroom more bytes, then it is RST —
+// it can NOT stream unbounded data by keeping the same tunnel open.
+func TestUploadBoundedOnSameConnection(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
+
+	// confirm always allows
+	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(confirmResp{Allow: true})
+	}))
+	defer confirmSrv.Close()
+	oldURL := confirmURL
+	confirmURL = confirmSrv.URL
+	defer func() { confirmURL = oldURL }()
+
+	oldThresh, oldHead := uploadThreshold, grantHeadroom
+	uploadThreshold = 100
+	grantHeadroom = 200
+	defer func() { uploadThreshold = oldThresh; grantHeadroom = oldHead }()
+
+	host := "bound.example.com"
+	markConfirmed(host) // TOFU already done
+
+	// 40 chunks of 50 bytes = 2000 bytes offered. Bound should cut it far short.
+	chunks := make([][]byte, 40)
+	for i := range chunks {
+		chunks[i] = make([]byte, 50)
+	}
+	cli := newScriptedConn(chunks)
+	dst := &countingConn{}
+
+	done := make(chan struct{})
+	go func() { pumpUploadGated(cli, dst, host); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pumpUploadGated did not terminate — connection not bounded")
+	}
+
+	// Crossing chunk lands at uploadTotal=150 (observed). Allowed extra =
+	// grantHeadroom=200. So the tunnel forwards exactly 150+200=350 bytes then RST.
+	const wantMax = int64(350)
+	if dst.written > wantMax {
+		t.Errorf("forwarded %d bytes, exceeds per-connection bound %d — latch is unbounded",
+			dst.written, wantMax)
+	}
+	if dst.written < uploadThreshold {
+		t.Errorf("forwarded only %d bytes, expected at least the pre-threshold traffic", dst.written)
+	}
+	if !cli.closed {
+		t.Error("client connection was not RST after budget exhaustion")
+	}
 }

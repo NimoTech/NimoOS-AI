@@ -13,14 +13,15 @@ import json
 import os
 import time
 
-# op category -> human reason shown on the card.
+# op category -> human reason shown on the card (English fallback; the UI
+# localizes via reason_key, see NimoOS-UI PermissionRequestCard.vue).
 _REASON = {
-    "list":   "需要浏览该文件夹",
-    "read":   "需要读取其中的文件",
-    "write":  "需要在其中创建或修改文件",
-    "search": "需要在其中检索内容",
+    "list":   "Needs to browse this folder",
+    "read":   "Needs to read files inside",
+    "write":  "Needs to create or modify files inside",
+    "search": "Needs to search its contents",
 }
-_DEFAULT_REASON = "需要访问该路径以完成你请求的操作"
+_DEFAULT_REASON = "Needs access to this path to complete your request"
 
 # Single-flight: collapse concurrent requests for the same (session, path)
 # onto one card. Keyed (session_id, abs_path) -> asyncio.Future[bool].
@@ -54,15 +55,16 @@ def _insert_visible_resource(ctx, abs_path: str, kind: str) -> None:
     ctx["conn"].commit()
 
 
-def _record_request(ctx, confirm_id: str, abs_path: str, kind: str, reason: str) -> None:
+def _record_request(ctx, confirm_id: str, abs_path: str, kind: str,
+                    reason: str, reason_key: str) -> None:
     """Durably record a new (pending) access request so a refreshed page can
     rebuild the card. decision stays NULL until resolved."""
     ctx["conn"].execute(
         "INSERT INTO access_requests "
-        "(confirm_id, session_id, run_id, path, kind, reason, decision, created_at) "
-        "VALUES (?,?,?,?,?,?,NULL,?)",
+        "(confirm_id, session_id, run_id, path, kind, reason, reason_key, decision, created_at) "
+        "VALUES (?,?,?,?,?,?,?,NULL,?)",
         (confirm_id, ctx["session_id"], ctx.get("run_id", ""), abs_path, kind, reason,
-         int(time.time())),
+         reason_key, int(time.time())),
     )
     ctx["conn"].commit()
 
@@ -90,18 +92,20 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
 
     mgr = ctx["confirm_mgr"]
     reason = _REASON.get(op, _DEFAULT_REASON)
+    reason_key = op if op in _REASON else "default"
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     _pending_requests[cache_key] = fut
     confirm_id = None
     try:
         confirm_id = mgr.register(session_id, "grant_access", abs_path, "")
-        _record_request(ctx, confirm_id, abs_path, kind, reason)
+        _record_request(ctx, confirm_id, abs_path, kind, reason, reason_key)
         await ctx["sink"].put({
             "type": "access_request",
             "confirm_id": confirm_id,
             "path": abs_path,
             "kind": kind,
             "reason": reason,
+            "reason_key": reason_key,
         })
         granted = await mgr.wait(confirm_id)
         _record_decision(ctx, confirm_id, "granted" if granted else "denied")
@@ -151,6 +155,7 @@ async def request_access_batch(ctx, abs_paths: list[str], op: str) -> bool:
 
     session_id = ctx["session_id"]
     reason = _REASON.get(op, _DEFAULT_REASON)
+    reason_key = op if op in _REASON else "default"
     confirm_id = None
     try:
         confirm_id = mgr.register(session_id, "grant_access", abs_paths[0], "")
@@ -158,7 +163,7 @@ async def request_access_batch(ctx, abs_paths: list[str], op: str) -> bool:
         # JSON-encoded list so a refreshed page can rebuild the multi-path card.
         # Using INSERT OR IGNORE keeps `_record_request` safe if somehow called
         # twice (though that cannot happen here).
-        _record_request(ctx, confirm_id, json.dumps(abs_paths), "folder", reason)
+        _record_request(ctx, confirm_id, json.dumps(abs_paths), "folder", reason, reason_key)
         await ctx["sink"].put({
             "type": "access_request",
             "confirm_id": confirm_id,
@@ -168,6 +173,7 @@ async def request_access_batch(ctx, abs_paths: list[str], op: str) -> bool:
             "path": abs_paths[0],
             "kind": "folder",
             "reason": reason,
+            "reason_key": reason_key,
         })
         granted = await mgr.wait(confirm_id)
         _record_decision(ctx, confirm_id, "granted" if granted else "denied")
