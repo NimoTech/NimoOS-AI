@@ -45,6 +45,10 @@ from wiki_context import WikiContextBuilder
 
 _LOG = logging.getLogger("nimoos-agent")
 
+# Each run persists the FULL history as a new snapshot row; keep a bounded
+# undo window per session instead of letting the table grow O(turns^2).
+SNAPSHOT_KEEP = 10
+
 SYSTEM_PROMPT = """You are Nimo, a general-purpose AI assistant that also has the ability to manage the user's NimoOS NAS.
 
 Treat NAS management as one of many capabilities, not your sole purpose. You can:
@@ -468,6 +472,13 @@ class AgentRunner:
         self._conn.execute(
             "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
             (msg_id, session_id, "history", json.dumps(history), int(time.time()))
+        )
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_id=? AND role='history' "
+            "AND rowid NOT IN ("
+            " SELECT rowid FROM messages WHERE session_id=? AND role='history'"
+            " ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+            (session_id, session_id, SNAPSHOT_KEEP)
         )
         self._conn.execute(
             "UPDATE sessions SET updated_at=? WHERE id=?",
