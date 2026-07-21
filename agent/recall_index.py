@@ -48,6 +48,21 @@ def maybe_enqueue_index_job(conn, session_id, user_id, *, now=None,
     return True
 
 
+def _msg_text(m) -> str:
+    """Human text of one history item. Strings pass through; content-block
+    lists yield their text parts joined; everything else (reasoning,
+    function_call/_output carry no 'content' string) indexes nothing."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [b.get("text") for b in c
+                 if isinstance(b, dict)
+                 and isinstance(b.get("text"), str) and b.get("text")]
+        return "\n".join(parts)
+    return ""
+
+
 def chunk_messages(messages, *, start_chunk_no, now,
                    max_chars=CHUNK_MAX_CHARS) -> list[dict]:
     """Group the given (already-sliced, new) messages into chunks under
@@ -58,9 +73,7 @@ def chunk_messages(messages, *, start_chunk_no, now,
     size = 0
     n = start_chunk_no
     for m in messages:
-        content = m.get("content", "")
-        if not isinstance(content, str):
-            content = str(content)
+        content = _msg_text(m)
         line = f"{m.get('role', '')}: {content}".strip()
         if not line or content.strip() == "":
             continue
