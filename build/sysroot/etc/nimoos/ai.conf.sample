@@ -21,6 +21,11 @@ Devices = GPU.1
 MaxLoadedModels = 3
 # 空闲多少分钟后自动卸载释放显存(对齐 Ollama keep_alive 默认 5 分钟);0 = 永不卸载。
 IdleTTLMinutes = 5
+# 每个模型(servable)的 KV cache 池大小,单位 GB(OVMS cache_size),决定有效上下文长度,
+# 所有并发请求 + prefix cache 共享。默认 2(按 24GB B60 标定);显存更大的卡可调大,
+# 注意最坏情况显存占用 ≈ 权重 + MaxLoadedModels × CacheSizeGB。改后需重启,且已加载的
+# 模型要等下次重新加载(空闲卸载/重启 OVMS)才用新值。
+CacheSizeGB = 2
 
 # Attachment limits (override via env NIMOOS_MAX_ATTACHMENT_SIZE etc.)
 MaxAttachmentSize         = 524288000     ; 500 MB, global upper bound

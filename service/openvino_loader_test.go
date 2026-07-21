@@ -7,9 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+// cacheSizeGB 必须渲染进 graph.pbtxt 的 cache_size(config openvino.CacheSizeGB 可配)。
+func TestOvmsGraphPbtxtCacheSize(t *testing.T) {
+	if s := ovmsGraphPbtxt("GPU.1", 6); !strings.Contains(s, "cache_size: 6,") {
+		t.Errorf("graph.pbtxt missing cache_size: 6, got:\n%s", s)
+	}
+}
 
 func TestSelectLRU(t *testing.T) {
 	base := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
@@ -155,7 +163,7 @@ func TestReconcileFromOVMS(t *testing.T) {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(d, "graph.pbtxt"), []byte(ovmsGraphPbtxt(dev)), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(d, "graph.pbtxt"), []byte(ovmsGraphPbtxt(dev, 2)), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

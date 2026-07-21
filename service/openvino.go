@@ -151,9 +151,10 @@ type OpenVINOAdapter struct {
 
 	// 多模型驻留 + 空闲回收(对齐 Ollama)。loaded 是写入 config.json 的常驻集,唯一事实源;
 	// 所有读写都在 loadMu 下。
-	loaded    map[string]*loadedModel
-	maxLoaded int           // 同时最多驻留数,默认 3
-	idleTTL   time.Duration // 空闲多久卸载;0=永不卸载
+	loaded      map[string]*loadedModel
+	maxLoaded   int           // 同时最多驻留数,默认 3
+	idleTTL     time.Duration // 空闲多久卸载;0=永不卸载
+	cacheSizeGB int           // 每个 servable 的 KV cache 池大小(GB),默认 2
 }
 
 const (
@@ -165,8 +166,9 @@ const (
 // NewOpenVINOAdapter builds an adapter. devicesCSV is the comma-separated
 // selectable device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
 // maxLoaded 是同时最多驻留的模型数(<=0 视作默认 3);idleTTLMinutes 是空闲卸载分钟数
-// (0 = 永不卸载)。构造时按 OVMS 实时服务集重建驻留集(reconcileFromOVMS)。
-func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes int) *OpenVINOAdapter {
+// (0 = 永不卸载);cacheSizeGB 是每个 servable 的 KV cache 池大小(GB,<=0 视作默认 2)。
+// 构造时按 OVMS 实时服务集重建驻留集(reconcileFromOVMS)。
+func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes, cacheSizeGB int) *OpenVINOAdapter {
 	var devs []string
 	for _, d := range strings.Split(devicesCSV, ",") {
 		if t := strings.TrimSpace(d); t != "" {
@@ -179,6 +181,9 @@ func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes in
 	if maxLoaded <= 0 {
 		maxLoaded = 3
 	}
+	if cacheSizeGB <= 0 {
+		cacheSizeGB = 2
+	}
 	a := &OpenVINOAdapter{
 		baseURL:       baseURL,
 		devices:       devs,
@@ -189,6 +194,7 @@ func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes in
 		loaded:        map[string]*loadedModel{},
 		maxLoaded:     maxLoaded,
 		idleTTL:       time.Duration(idleTTLMinutes) * time.Minute,
+		cacheSizeGB:   cacheSizeGB,
 	}
 	a.reconcileFromOVMS()
 	go a.reaperLoop()

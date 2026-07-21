@@ -40,7 +40,7 @@ func TestModelManager_ListModels_OllamaDown_StillListsOpenVINO(t *testing.T) {
 	require.NoError(t, os.MkdirAll(mdir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(mdir, "openvino_language_model.xml"), []byte("<x/>"), 0o644))
 
-	ov := NewOpenVINOAdapter("http://127.0.0.1:9100", "GPU.1", 3, 5)
+	ov := NewOpenVINOAdapter("http://127.0.0.1:9100", "GPU.1", 3, 5, 2)
 	ov.srcModelsPath = src // 同包测试可直接设私有字段
 
 	// ollamaBaseURL 指向不可达地址,触发 Ollama-down 分支。

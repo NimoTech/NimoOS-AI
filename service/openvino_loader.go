@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,7 +180,7 @@ func (a *OpenVINOAdapter) stageServable(bareModel, device, servable string) erro
 	if err := os.Symlink(src, link); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "graph.pbtxt"), []byte(ovmsGraphPbtxt(device)), 0o644)
+	return os.WriteFile(filepath.Join(dir, "graph.pbtxt"), []byte(ovmsGraphPbtxt(device, a.cacheSizeGB)), 0o644)
 }
 
 type ovmsMediapipeEntry struct {
@@ -199,9 +200,10 @@ type ovmsConfig struct {
 // enable_prefix_caching + dynamic_split_fuse + cache_size 是性能关键:agent 模式
 // 每次会话都注入相同的大段 system prompt(工具+skills 定义),工具调用还会触发多轮
 // LLM 请求。没有前缀缓存时每轮都要把几千 token 的前缀从头 prefill(实测 ~3s/轮);
-// 开启后重复前缀的 prefill 降到 ~0.2s(实测 15× 提升),跨请求也命中。cache_size
-// 单位 GB,2GB 在 19GB 权重 + 24GB 显存的 B60 上留有余量。
-func ovmsGraphPbtxt(device string) string {
+// 开启后重复前缀的 prefill 降到 ~0.2s(实测 15× 提升),跨请求也命中。cacheSizeGB
+// 单位 GB(config openvino.CacheSizeGB,默认 2):2GB 在 19GB 权重 + 24GB 显存的
+// B60 上留有余量;显存更大的卡(如 30GB 的 B70)可调大以换更长的有效上下文。
+func ovmsGraphPbtxt(device string, cacheSizeGB int) string {
 	return `input_stream: "HTTP_REQUEST_PAYLOAD:input"
 output_stream: "HTTP_RESPONSE_PAYLOAD:output"
 node: {
@@ -223,7 +225,7 @@ node: {
       plugin_config: '{"PERFORMANCE_HINT":"LATENCY"}',
       enable_prefix_caching: true,
       dynamic_split_fuse: true,
-      cache_size: 2,
+      cache_size: ` + strconv.Itoa(cacheSizeGB) + `,
       reasoning_parser: "qwen3",
       tool_parser: "qwen3coder"
     }

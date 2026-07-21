@@ -22,6 +22,7 @@ type Config struct {
 	OpenVINODevices string // 逗号分隔的常驻设备,如 "GPU.1" 或 "GPU.1,GPU.0";第一个为默认设备
 	OpenVINOMaxLoaded      int // 同时最多驻留的模型数(对齐 Ollama OLLAMA_MAX_LOADED_MODELS),默认 3
 	OpenVINOIdleTTLMinutes int // 空闲多少分钟后自动卸载(对齐 Ollama keep_alive),默认 5;0=永不卸载
+	OpenVINOCacheSizeGB    int // 每个 servable 的 KV cache 池大小(GB,OVMS cache_size),默认 2
 }
 
 // Init loads the config and assigns it to the package-level Cfg. It is the
@@ -70,6 +71,7 @@ func Load(configFile, confSample string) (*Config, error) {
 		OpenVINODevices: v.GetString("openvino.Devices"),
 		OpenVINOMaxLoaded:      v.GetInt("openvino.MaxLoadedModels"),
 		OpenVINOIdleTTLMinutes: v.GetInt("openvino.IdleTTLMinutes"),
+		OpenVINOCacheSizeGB:    v.GetInt("openvino.CacheSizeGB"),
 	}
 
 	if cfg.RuntimePath == "" {
@@ -111,6 +113,9 @@ func Load(configFile, confSample string) (*Config, error) {
 	// IdleTTLMinutes:显式 0 = 永不卸载,必须与"键缺失"区分 —— 仅当未设置时才取默认 5。
 	if !v.IsSet("openvino.IdleTTLMinutes") {
 		cfg.OpenVINOIdleTTLMinutes = 5
+	}
+	if cfg.OpenVINOCacheSizeGB <= 0 {
+		cfg.OpenVINOCacheSizeGB = 2
 	}
 	return cfg, nil
 }

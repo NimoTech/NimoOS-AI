@@ -33,6 +33,30 @@ func TestOpenVINODefaultsWhenKeysAbsent(t *testing.T) {
 	if cfg.OpenVINOIdleTTLMinutes != 5 {
 		t.Errorf("IdleTTLMinutes = %d, want 5", cfg.OpenVINOIdleTTLMinutes)
 	}
+	if cfg.OpenVINOCacheSizeGB != 2 {
+		t.Errorf("CacheSizeGB = %d, want 2", cfg.OpenVINOCacheSizeGB)
+	}
+}
+
+func TestOpenVINOCacheSizeExplicit(t *testing.T) {
+	t.Parallel()
+	// 显式 CacheSizeGB 生效;0/负值无意义,回退默认 2。
+	p := writeTempConf(t, "[openvino]\nCacheSizeGB = 6\n")
+	cfg, err := Load(p, "")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenVINOCacheSizeGB != 6 {
+		t.Errorf("CacheSizeGB = %d, want 6", cfg.OpenVINOCacheSizeGB)
+	}
+	p = writeTempConf(t, "[openvino]\nCacheSizeGB = 0\n")
+	cfg, err = Load(p, "")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OpenVINOCacheSizeGB != 2 {
+		t.Errorf("CacheSizeGB = %d, want 2 (fallback)", cfg.OpenVINOCacheSizeGB)
+	}
 }
 
 func TestOpenVINOExplicitZeroTTLAndMax(t *testing.T) {
