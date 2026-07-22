@@ -9,7 +9,7 @@ def test_system_prompt_has_required_directives():
     assert "ai_label" in s
     assert "summary" in s
     assert "40" in s, "ai_label length cap should be stated"
-    assert "200" in s, "summary length cap should be stated"
+    assert "400" in s, "summary length cap should be stated"
     assert "markdown" in s.lower()
 
 

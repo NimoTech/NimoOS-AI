@@ -32,7 +32,7 @@ def test_run_once_short_circuits_on_empty_evidence(monkeypatch):
     n = worker.run_once(cfg)
     assert n == 1
     assert len(posted) == 1
-    assert posted[0]["ai_label"] == "空目录"
+    assert posted[0]["ai_label"] == "Empty directory"
     assert "+failed" not in posted[0]["generator_version"]
 
 
@@ -50,7 +50,7 @@ def test_run_once_with_nonzero_child_count_but_empty_evidence(monkeypatch):
     n = worker.run_once(cfg)
     assert n == 1
     assert len(posted) == 1
-    assert posted[0]["ai_label"] == "空目录"
+    assert posted[0]["ai_label"] == "Empty directory"
     assert "+failed" not in posted[0]["generator_version"]
 
 
@@ -70,7 +70,7 @@ def test_run_once_writes_placeholder_on_llm_error(monkeypatch):
     assert worker.run_once(Config()) == 1
     assert len(posted) == 1
     assert "+failed" in posted[0]["generator_version"]
-    assert "生成失败" in posted[0]["ai_label"]
+    assert "generation failed" in posted[0]["ai_label"]
 
 
 def test_run_once_writes_placeholder_on_jsonparse(monkeypatch):
