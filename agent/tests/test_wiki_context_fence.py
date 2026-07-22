@@ -58,5 +58,9 @@ def test_render_map_path_and_label_sanitized():
     assert "<script>" not in out
     assert "<img>" not in out
     assert "<x>" not in out
-    assert "</untrusted-data>" not in out  # no stray close tag from the map
+    # M7: the node listing is now fenced as data. _scaf strips '<'/'>' from
+    # injected labels/paths, so an injected </untrusted-data> can't add a stray
+    # tag — there is exactly ONE legit open+close around the whole listing.
+    assert out.count('<untrusted-data source="wiki-map">') == 1
+    assert out.count("</untrusted-data>") == 1
     assert "\n<script>" not in out  # newline injection collapsed

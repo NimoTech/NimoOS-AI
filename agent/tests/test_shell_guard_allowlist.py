@@ -17,8 +17,12 @@ def test_prefix_match():
 
 def test_regex_match():
     conn = _db()
-    AL.add(conn, "regex", r"^rsync -a /DATA/ /backup/", "user")
-    assert AL.match(conn, "rsync -a /DATA/ /backup/ --delete") is True
+    AL.add(conn, "regex", r"rsync -a /DATA/ /backup/", "user")
+    # exact command matches (fullmatch)
+    assert AL.match(conn, "rsync -a /DATA/ /backup/") is True
+    # M5: regex is anchored (re.fullmatch) — a SUPERSET command that appends an
+    # extra, unapproved flag (`--delete`) must NOT be vouched by the entry.
+    assert AL.match(conn, "rsync -a /DATA/ /backup/ --delete") is False
     assert AL.match(conn, "rm -rf /DATA") is False
 
 
@@ -84,3 +88,22 @@ def test_unparseable_command_fails_closed():
     AL.add(conn, "path_scope", "/DATA/scratch", "user")
     # Command substitution / subshells are unparseable → never vouched.
     assert AL.match(conn, "echo $(rm -rf /DATA)") is False
+
+
+def test_prefix_does_not_waive_protected_read():
+    """M4: a loose prefix entry (`cat `) must NOT auto-approve a read of a
+    PROTECTED path — otherwise it silently exfiltrates /etc/shadow, agent.db,
+    ~/.ssh keys, etc."""
+    conn = _db()
+    AL.add(conn, "prefix", "cat ", "admin")
+    assert AL.match(conn, "cat /DATA/notes.txt") is True     # benign path: allowed
+    assert AL.match(conn, "cat /etc/shadow") is False        # protected: refused
+    assert AL.match(conn, "cat /var/lib/nimoos/ai/agent/agent.db") is False
+
+
+def test_regex_does_not_waive_protected_read():
+    """M4: same guard for regex entries."""
+    conn = _db()
+    AL.add(conn, "regex", r"cat .*", "admin")
+    assert AL.match(conn, "cat /DATA/x") is True
+    assert AL.match(conn, "cat /etc/shadow") is False

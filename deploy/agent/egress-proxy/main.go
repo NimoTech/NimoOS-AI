@@ -67,6 +67,22 @@ func normalizeIP(ip net.IP) net.IP {
 	if v4 := ip.To4(); v4 != nil {
 		return v4
 	}
+	// Unwrap deprecated IPv4-COMPATIBLE IPv6 (::a.b.c.d, no ffff — To4() misses
+	// it) so an embedded metadata/internal IPv4 (e.g. ::169.254.169.254) can't
+	// slip through classified as "external". first-octet != 0 distinguishes a
+	// real embedded IPv4 from ::1 (loopback) / low ::x addresses.
+	if v16 := ip.To16(); v16 != nil && v16[12] != 0 {
+		allZero := true
+		for _, b := range v16[:12] {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return net.IPv4(v16[12], v16[13], v16[14], v16[15]).To4()
+		}
+	}
 	return ip
 }
 
@@ -230,6 +246,63 @@ func callConfirm(host string, bytesCount int64, reason string) bool {
 		return false
 	}
 	return cr.Allow
+}
+
+// dnsMaxNameLen caps the DNS query-name length the forwarder will relay.
+// The forwarder (M1) is otherwise an unmetered side channel — DNS tunneling
+// packs exfil bytes into long subdomain labels. Dropping over-long names bounds
+// per-query payload and logs the attempt (observability). 0 disables the cap.
+// NOT a full DNS-DLP; rate/cardinality limiting is future work.
+var dnsMaxNameLen = 200
+
+// dnsQueryName extracts the first question's QNAME from a DNS message (bytes
+// after the 12-byte header). Returns the dotted name, its raw wire length, and
+// ok=false on a malformed/short/compressed question.
+func dnsQueryName(msg []byte) (name string, wireLen int, ok bool) {
+	if len(msg) < 13 {
+		return "", 0, false
+	}
+	pos := 12
+	labels := make([]string, 0, 8)
+	total := 0
+	for {
+		if pos >= len(msg) {
+			return "", 0, false
+		}
+		l := int(msg[pos])
+		if l == 0 {
+			break
+		}
+		if l&0xc0 != 0 { // compression pointer — not valid in a question QNAME
+			return "", 0, false
+		}
+		pos++
+		if pos+l > len(msg) {
+			return "", 0, false
+		}
+		labels = append(labels, string(msg[pos:pos+l]))
+		total += l + 1
+		pos += l
+		if total > 255 {
+			break
+		}
+	}
+	return strings.Join(labels, "."), total, true
+}
+
+// dnsShouldDrop reports whether a DNS message should be dropped (over-long
+// QNAME) and logs the reason.
+func dnsShouldDrop(proto string, msg []byte) bool {
+	if dnsMaxNameLen <= 0 {
+		return false
+	}
+	name, nlen, ok := dnsQueryName(msg)
+	if ok && nlen > dnsMaxNameLen {
+		log.Printf("dns %s query dropped (name len %d > %d, possible tunneling): %.60s",
+			proto, nlen, dnsMaxNameLen, name)
+		return true
+	}
+	return false
 }
 
 // ─── Grant tickets ────────────────────────────────────────────────────────────
@@ -740,6 +813,9 @@ func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop fun
 			}
 			query := make([]byte, n)
 			copy(query, buf[:n])
+			if dnsShouldDrop("udp", query) {
+				continue // drop over-long (tunneling-shaped) query; do not forward
+			}
 			go func(pkt []byte, clientAddr net.Addr) {
 				upConn, err := net.Dial("udp", upstream)
 				if err != nil {
@@ -799,6 +875,9 @@ func startDNSForwarder(listenAddr, upstream string) (actualAddr string, stop fun
 				if _, err := io.ReadFull(c, msg); err != nil {
 					return
 				}
+				if dnsShouldDrop("tcp", msg) {
+					return // drop over-long (tunneling-shaped) query; do not forward
+				}
 				// Forward to upstream with length prefix.
 				prefix := make([]byte, 2)
 				binary.BigEndian.PutUint16(prefix, msgLen)
@@ -846,12 +925,14 @@ func main() {
 	tofuTTLFlag := flag.Duration("tofu-ttl", time.Hour, "TTL for auto-TOFU host confirmations")
 	grantTTLFlag := flag.Duration("grant-ttl", 10*time.Minute, "TTL for synthetic post-confirm upload grants")
 	uploadThreshFlag := flag.Int64("upload-threshold", 65536, "bytes before an external upload asks confirm")
+	dnsMaxNameFlag := flag.Int("dns-max-name", 200, "max DNS query-name length; longer queries are dropped as possible tunneling (0=disabled)")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
 	tofuTTL = *tofuTTLFlag
 	grantTTL = *grantTTLFlag
 	uploadThreshold = *uploadThreshFlag
+	dnsMaxNameLen = *dnsMaxNameFlag
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream

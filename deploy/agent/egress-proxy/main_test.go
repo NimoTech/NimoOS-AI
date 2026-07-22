@@ -1327,3 +1327,56 @@ func TestUploadBoundedOnSameConnection(t *testing.T) {
 		t.Error("client connection was not RST after budget exhaustion")
 	}
 }
+
+// ─── M8: IPv4-compatible IPv6 unwrapping ──────────────────────────────────────
+
+func TestNormalizeIPv4CompatibleUnwrapped(t *testing.T) {
+	// ::169.254.169.254 (IPv4-compatible, no ffff) must unwrap to the embedded
+	// IPv4 so metadata/internal classification sees it — not stay "external".
+	ip := net.ParseIP("::169.254.169.254")
+	if ip == nil {
+		t.Fatal("parse ::169.254.169.254")
+	}
+	got := normalizeIP(ip)
+	want := net.IPv4(169, 254, 169, 254).To4()
+	if !got.Equal(want) {
+		t.Fatalf("normalizeIP(::169.254.169.254) = %v, want %v", got, want)
+	}
+}
+
+func TestNormalizeLoopbackNotMisunwrapped(t *testing.T) {
+	// ::1 must NOT be unwrapped to 0.0.0.1 (first embedded octet is 0).
+	got := normalizeIP(net.ParseIP("::1"))
+	if got.To4() != nil && got.To4().Equal(net.IPv4(0, 0, 0, 1).To4()) {
+		t.Fatalf("::1 wrongly unwrapped to 0.0.0.1")
+	}
+}
+
+// ─── M1: DNS query-name length cap (reuses buildDNSQuery above) ───────────────
+
+func TestDNSDropsOverlongName(t *testing.T) {
+	old := dnsMaxNameLen
+	dnsMaxNameLen = 50
+	defer func() { dnsMaxNameLen = old }()
+
+	short := buildDNSQuery("example.com")
+	if dnsShouldDrop("udp", short) {
+		t.Error("short legit name was dropped")
+	}
+
+	// long high-entropy subdomain (tunneling shape)
+	long := buildDNSQuery("aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccc.attacker.com")
+	if !dnsShouldDrop("udp", long) {
+		t.Error("over-long tunneling-shaped name was NOT dropped")
+	}
+}
+
+func TestDNSCapDisabled(t *testing.T) {
+	old := dnsMaxNameLen
+	dnsMaxNameLen = 0
+	defer func() { dnsMaxNameLen = old }()
+	long := buildDNSQuery("aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccc.attacker.com")
+	if dnsShouldDrop("udp", long) {
+		t.Error("cap disabled (0) should never drop")
+	}
+}

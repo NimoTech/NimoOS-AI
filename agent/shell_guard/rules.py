@@ -165,15 +165,20 @@ _PROTECTED_SUBSTR = ("/.ssh/", "agent.db")
 _DATA_ROOT = "/DATA"
 
 
-def _resolve(p: str) -> str:
+def _resolve(p: str, cwd: str | None = None) -> str:
+    # A relative path must resolve against the command's EXECUTION cwd (the
+    # session work dir), NOT the classifier process's own cwd — otherwise
+    # `../../etc/x` resolves to a different target than where it will be written.
     try:
+        if cwd and not os.path.isabs(p):
+            p = os.path.join(cwd, p)
         return os.path.realpath(p)
     except OSError:
         return p
 
 
-def _is_protected_path(raw: str) -> bool:
-    rp = _resolve(raw)
+def _is_protected_path(raw: str, cwd: str | None = None) -> bool:
+    rp = _resolve(raw, cwd)
     if any(rp == pre or rp.startswith(pre + "/") for pre in _PROTECTED_PREFIXES):
         return True
     if rp.endswith(_PROTECTED_SUFFIXES):
@@ -183,10 +188,10 @@ def _is_protected_path(raw: str) -> bool:
     return False
 
 
-def _is_data_mass(raw: str) -> bool:
+def _is_data_mass(raw: str, cwd: str | None = None) -> bool:
     if "*" in raw and (raw == "/DATA/*" or raw.startswith("/DATA/")):
         return True
-    return _resolve(raw.rstrip("/")) == _DATA_ROOT
+    return _resolve(raw.rstrip("/"), cwd) == _DATA_ROOT
 
 
 def _is_destructive(seg: Segment) -> bool:
@@ -213,7 +218,8 @@ def _worse(a: Decision, b: Decision) -> Decision:
     return a if _RANK[a.level] >= _RANK[b.level] else b
 
 
-def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
+def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int,
+                  cwd: str | None = None) -> Decision:
     # Classify on the EFFECTIVE command (wrappers/assignments stripped), so
     # `env rm -rf /DATA` is judged as the `rm` it actually runs, not as `env`.
     eff = _effective_seg(seg)
@@ -221,7 +227,7 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
     paths = extract_paths(eff)
 
     # sensitive prefixes/suffixes: reading OR writing always escalates
-    sensitive = [p for p in paths if _is_protected_path(p)]
+    sensitive = [p for p in paths if _is_protected_path(p, cwd)]
     if sensitive:
         return Decision("protected", f"touches protected path(s): {sensitive}", sensitive)
 
@@ -229,7 +235,7 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
 
     # /DATA mass op: escalate only for destructive commands (avoid over-blocking reads)
     if _is_destructive(eff):
-        mass = [p for p in paths if _is_data_mass(p)]
+        mass = [p for p in paths if _is_data_mass(p, cwd)]
         if mass:
             return Decision("protected", f"mass delete under /DATA: {mass}", mass)
 
@@ -247,7 +253,7 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int) -> Decision:
     return Decision("gray", f"unclassified command: {name or '(redirect)'}", paths)
 
 
-def classify(command: str) -> Decision:
+def classify(command: str, cwd: str | None = None) -> Decision:
     segs = segments(command)
     if segs is None:
         return Decision("gray", "command could not be parsed (obfuscation/substitution)")
@@ -256,7 +262,7 @@ def classify(command: str) -> Decision:
     result = Decision("safe")
     all_paths: list[str] = []
     for idx, seg in enumerate(segs):
-        result = _worse(result, _classify_seg(seg, segs, idx))
+        result = _worse(result, _classify_seg(seg, segs, idx, cwd))
         for p in extract_paths(seg):
             if p not in all_paths:
                 all_paths.append(p)
