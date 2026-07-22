@@ -247,7 +247,13 @@ async def _guard_command(command: str) -> str | None:
         _audit("shell_command", user_id=_uid, session_id=session_id,
                command=command, level=level, reason=reason, outcome=outcome)
 
-    decision = shell_guard.classify(command)
+    # Resolve relative paths against the command's REAL execution cwd (the
+    # session work dir the executor uses), not the classifier process cwd.
+    try:
+        _cwd = str(_work_dir(session_id)) if session_id else None
+    except Exception:  # noqa: BLE001
+        _cwd = None
+    decision = shell_guard.classify(command, cwd=_cwd)
     if decision.level == "safe":
         return None
 

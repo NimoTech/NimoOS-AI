@@ -109,11 +109,12 @@ def prepare_backstop(paths: list[str], trash_root: str | None = None) -> Backsto
     if not real:
         return BackstopResult("none", "", False, "no existing target to back up")
 
-    # btrfs branch: only take the snapshot shortcut when ALL targets are on
-    # btrfs. A snapshot of one target's subvolume does not cover targets on
-    # other mounts, so a mixed set falls through to the per-target hardlink
-    # path (honest about what it actually saved).
-    if all(fs_type(p) == "btrfs" for p in real):
+    # btrfs branch: the snapshot shortcut snapshots ONE subvolume (real[0]'s).
+    # It only honestly covers a SINGLE target — with multiple targets it could
+    # miss ones on other subvolumes while still claiming undoable=True. So take
+    # the snapshot only for a lone btrfs target; multiple targets fall through
+    # to the per-target hardlink path, which is honest about what it saved.
+    if len(real) == 1 and fs_type(real[0]) == "btrfs":
         snap = _snapshot_btrfs(real[0], root)
         if snap is not None:
             return snap

@@ -6,8 +6,16 @@ statically tokenize returns None so the caller treats it as GRAY (never SAFE).
 """
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass, field
+
+# `${IFS}` / `$IFS` expand to whitespace in bash and are the classic way to
+# hide word boundaries from a naive tokenizer (`rm${IFS}-rf${IFS}/DATA` reads
+# as one token whose basename is 'DATA' → GRAY instead of DANGEROUS, yet bash
+# runs `rm -rf /DATA`). Normalize the UNQUOTED forms to a space before
+# tokenizing so the real argv is recovered. IFS defaults to space/tab/newline.
+_IFS_RE = re.compile(r"\$\{IFS\}|\$IFS(?![A-Za-z0-9_])")
 
 # The complete set of bash control operators that separate commands. Keep this
 # complete — a missing operator lets a compound command collapse into one
@@ -56,6 +64,31 @@ def _split_unquoted_newlines(command: str) -> str:
     return "".join(out)
 
 
+def _expand_ifs_unquoted(command: str) -> str:
+    """Replace UNQUOTED ${IFS}/$IFS with a single space; leave quoted ones
+    (e.g. "${IFS}") verbatim. Quote tracking mirrors _split_unquoted_newlines."""
+    out = []
+    quote = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(command[i + 1]); i += 2; continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c; out.append(c); i += 1; continue
+        m = _IFS_RE.match(command, i)
+        if m:
+            out.append(" "); i = m.end(); continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
 def _tokenize(command: str) -> list[str] | None:
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
@@ -66,6 +99,7 @@ def _tokenize(command: str) -> list[str] | None:
 
 
 def segments(command: str) -> list[Segment] | None:
+    command = _expand_ifs_unquoted(command)
     command = _split_unquoted_newlines(command)
     toks = _tokenize(command)
     if toks is None:
