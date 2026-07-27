@@ -18,12 +18,15 @@ def _mk_agent_md(folder, *, dir_mode=0o755):
 def _ceiling(tmp_path, monkeypatch):
     import agent_md
     real_probe = agent_md.probe
+    calls = []
 
     def probe_with_ceiling(folder, **kw):
+        calls.append(kw)
         kw.setdefault("ceiling", str(tmp_path))
         return real_probe(folder, **kw)
 
     monkeypatch.setattr(main_module.agent_md, "probe", probe_with_ceiling)
+    return calls
 
 
 @pytest.fixture
@@ -79,3 +82,13 @@ async def test_file_row_has_no_agent_md_field(session, tmp_path):
     _add(session, str(f), kind="file")
     rows = await main_module.list_visible_resources("s1", x_user_id="u1")
     assert "agent_md" not in rows[0]
+
+
+@pytest.mark.asyncio
+async def test_probe_called_with_read_body_false(session, tmp_path, _ceiling):
+    folder = str(tmp_path / "proj")
+    _mk_agent_md(folder)
+    _add(session, folder)
+    await main_module.list_visible_resources("s1", x_user_id="u1")
+    assert len(_ceiling) == 1
+    assert _ceiling[0].get("read_body") is False
