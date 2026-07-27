@@ -80,3 +80,18 @@ def test_parse_summary_accepts_json_with_trailing_prose():
 def test_parse_summary_still_rejects_pure_prose():
     assert notes_distill.parse_summary(
         "I cannot summarize this document.") is None
+
+
+def test_parse_summary_accepts_raw_newlines_in_strings():
+    raw = '{"title":"T","description":"d","body":"line1\nline2","tags":[]}'
+    out = notes_distill.parse_summary(raw)
+    assert out == {"title": "T", "description": "d",
+                   "body": "line1\nline2", "tags": []}
+
+
+def test_parse_summary_prose_wrapped_with_raw_newlines():
+    raw = ("Here is the summary in JSON format:\n\n"
+           '{"title":"T","description":"d","body":"line1\nline2","tags":[]}')
+    out = notes_distill.parse_summary(raw)
+    assert out == {"title": "T", "description": "d",
+                   "body": "line1\nline2", "tags": []}
