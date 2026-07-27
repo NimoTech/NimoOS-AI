@@ -141,7 +141,12 @@ def test_parser_4xx_is_not_retried(tmp_path):
     assert row is not None and row["status"] == "failed"
 
 
-def test_creds_unresolved_drops_job_as_skipped(tmp_path):
+def test_creds_unresolved_is_retried_then_tombstones_as_failed(tmp_path):
+    """Post-final-review Minor #1: credential resolution failure is
+    recoverable (Go internal-token endpoint restart window, token file
+    momentarily unreadable), unlike the other two drop paths — so it must go
+    through fail_job (retryable) rather than skip_job (terminal on the very
+    first hiccup)."""
     conn = _conn(tmp_path)
     _seed(conn)
 
@@ -154,8 +159,21 @@ def test_creds_unresolved_drops_job_as_skipped(tmp_path):
     asyncio.run(notes_distill.process_pending_once(
         conn, llm_call=llm, extractor=_extract_short, creds_resolver=creds_none,
         note_indexer=_ok, now=100, day="20260727"))
-    row = conn.execute("SELECT status FROM notes_distill_jobs").fetchone()
-    assert row is not None and row["status"] == "skipped"
+    row = conn.execute("SELECT status, attempts FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row["status"] == "pending" and row["attempts"] == 1
+
+    # Exhaust the remaining attempts; at MAX_ATTEMPTS the row finally
+    # tombstones as 'failed' (not deleted, not 'skipped').
+    for i in range(notes_distill.MAX_ATTEMPTS - 1):
+        asyncio.run(notes_distill.process_pending_once(
+            conn, llm_call=llm, extractor=_extract_short,
+            creds_resolver=creds_none, note_indexer=_ok, now=100 + i,
+            day="20260727"))
+    row = conn.execute("SELECT status, attempts FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row["status"] == "failed"
+    assert row["attempts"] == notes_distill.MAX_ATTEMPTS
 
 
 def test_empty_extract_text_drops_job_as_skipped(tmp_path):

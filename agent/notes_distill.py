@@ -392,9 +392,15 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
     try:
         creds = await creds_resolver(user_id, model)
         if not creds:
-            logger.info("notes-distill: dropping %s — credentials unresolved "
-                       "for model %r", file_path, model)
-            skip_job(conn, file_path, "credentials unresolved", now)
+            # Recoverable, not terminal: credential resolution goes through
+            # the Go internal-token endpoint, which can be transiently
+            # unavailable (service restart window, token file momentarily
+            # unreadable) — unlike the other two drops below, retry via
+            # fail_job so a passing window doesn't permanently skip a file
+            # until its mtime changes.
+            msg = f"credentials unresolved for model {model!r}"
+            logger.info("notes-distill: retrying %s — %s", file_path, msg)
+            fail_job(conn, file_path, job["attempts"], msg, now)
             return True
         doc = await extractor(file_path, EXTRACT_MAX_CHARS)
         text = (doc or {}).get("markdown") or ""
@@ -432,12 +438,15 @@ async def _default_llm_call(creds: dict, prompt: str) -> str:
     client = AsyncOpenAI(base_url=creds["base_url"], api_key=creds["api_key"],
                          timeout=LLM_TIMEOUT, max_retries=0)
     extra_kwargs = {}
-    if creds.get("provider_type") == "ollama":
+    if creds.get("provider_type") in ("ollama", "qwen"):
         # Bypass the house think-switch's ModelSettings/Agents-SDK path (this
         # is a raw AsyncOpenAI call, not an Agent run) but reuse its
-        # provider_adapters constants directly: qwen-family local models
-        # otherwise burn 2500+ reasoning tokens and blow LLM_TIMEOUT on every
-        # background summarization call.
+        # provider_adapters constants directly: qwen-family models — whether
+        # served locally through Ollama (provider_type "ollama") or as a
+        # cloud DashScope/Qwen provider (provider_type "qwen", which
+        # provider_adapters groups with OLLAMA/OPENVINO for thinking control)
+        # — otherwise burn 2500+ reasoning tokens and blow LLM_TIMEOUT on
+        # every background summarization call.
         settings = build_model_settings(
             ProviderType.OLLAMA, ThinkingConfig(enabled=False, level=ThinkingLevel.LOW))
         if settings.extra_body:
