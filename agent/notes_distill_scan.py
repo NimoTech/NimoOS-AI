@@ -8,9 +8,9 @@ exception. A full mtime reconcile makes every pass self-healing."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import time
 
 import notes_distill
 from notes import store as notes_store
@@ -31,7 +31,6 @@ def _known_mtimes(conn, user_id: str) -> dict[str, int]:
     for r in conn.execute(
             "SELECT source_refs_json FROM notes WHERE user_id=? "
             "AND type='summary' AND deleted_at IS NULL", (str(user_id),)):
-        import json
         try:
             refs = json.loads(r["source_refs_json"] or "[]")
         except (ValueError, TypeError):
@@ -88,24 +87,35 @@ def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
     return total
 
 
+def _opted_in_users(conn) -> list[str]:
+    """user_ids that currently have at least one root opted in. A user who
+    once opted in and then cleared the list still has a `user_settings` row
+    (set_distill_roots stores "[]", it never deletes) — filtering on the
+    parsed value, not row presence, is what keeps an emptied-out user from
+    triggering a Wiki round-trip every pass forever."""
+    candidates = {r["user_id"] for r in conn.execute(
+        "SELECT DISTINCT user_id FROM user_settings WHERE key=?",
+        (notes_store.DISTILL_ROOTS_KEY,))}
+    return [uid for uid in candidates
+            if notes_store.get_distill_roots(conn, uid)]
+
+
 async def _scanner_loop(conn, *, stop_event):
     from wiki_client import WikiClient
     while not stop_event.is_set():
         try:
-            row = conn.execute(
-                "SELECT DISTINCT user_id FROM user_settings WHERE key=?",
-                (notes_store.DISTILL_ROOTS_KEY,)).fetchall()
-            if row:
+            users = _opted_in_users(conn)
+            if users:
                 client = WikiClient()
                 try:
                     roots = await client.list_roots()
                 finally:
                     await client.aclose()
-                for r in row:
-                    n = scan_once(conn, user_id=r["user_id"], roots=roots)
+                for user_id in users:
+                    n = scan_once(conn, user_id=user_id, roots=roots)
                     if n:
                         logger.info("notes distill scan: enqueued %d for %s",
-                                    n, r["user_id"])
+                                    n, user_id)
         except Exception as e:                   # never let the loop die
             logger.warning("notes distill scan error: %s", e)
         try:

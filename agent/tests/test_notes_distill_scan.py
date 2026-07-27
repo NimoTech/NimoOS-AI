@@ -83,3 +83,22 @@ def test_scan_once_skips_disabled_root(tmp_path):
     notes_store.set_distill_roots(conn, "u1", ["r-on"])
     assert notes_distill_scan.scan_once(conn, user_id="u1", roots=[
         {"id": "r-on", "path": str(on), "enabled": False}]) == 0
+
+
+def test_scan_reenqueues_when_file_newer_than_known(tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    f = _mk(root, "a.pdf")
+    known = {str(f): int(f.stat().st_mtime) - 10}   # we distilled an older version
+    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
+                                     root_path=str(root), known=known)
+    assert n == 1
+    row = conn.execute("SELECT file_mtime FROM notes_distill_jobs").fetchone()
+    assert row["file_mtime"] == int(f.stat().st_mtime)
+
+
+def test_opted_in_users_excludes_users_who_cleared_their_roots(tmp_path):
+    conn = _conn(tmp_path)
+    notes_store.set_distill_roots(conn, "u1", ["r-on"])
+    notes_store.set_distill_roots(conn, "u2", [])   # touched, then cleared
+    assert notes_distill_scan._opted_in_users(conn) == ["u1"]
