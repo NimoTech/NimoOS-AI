@@ -5,10 +5,13 @@ enqueue happens only from the scanner (or an explicit manual request); the
 worker NEVER polls the LLM on a timer (wiki summary worker lesson)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import time
+
+import httpx
 
 import memory_lock
 from memory_extract import _clean_json_text
@@ -18,6 +21,14 @@ from notes.indexer import index_note
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
+
+POLL_SECONDS = 30
+# 180s, not the 60s used elsewhere: summarizing a document on a local CPU
+# model is far slower than the short extraction prompts, and a too-tight
+# timeout turns every slow-but-working run into a wasted retry.
+LLM_TIMEOUT = 180
+PACE_KNEE = 0.7
+PACE_MAX = 60.0
 
 # Document subset of Parser's TEXT_EXT_ALLOWLIST. Source-code extensions are
 # deliberately excluded: Parser does not error on unknown extensions (it reads
@@ -246,3 +257,157 @@ async def apply_distillation(conn, user_id: str, *, file_path: str,
                      (note["id"], str(user_id)))
         conn.commit()
     return note
+
+
+def load_ratio() -> float:
+    """1-min loadavg divided by CPU count; 0.0 on any failure. loadavg (not
+    CPU%) is deliberate: it counts D-state processes, so a Qdrant write
+    bottleneck backpressures us too (same reasoning as Parser's pacing)."""
+    try:
+        return os.getloadavg()[0] / max(1, os.cpu_count() or 1)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def pace_seconds(ratio: float) -> float:
+    """Sleep to insert before the next job. Free below the knee, then grows
+    linearly up to PACE_MAX."""
+    if ratio <= PACE_KNEE:
+        return 0.0
+    return min(PACE_MAX, (ratio - PACE_KNEE) * 60.0)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Parser 4xx means this file will never work (bad path / outside roots /
+    gone) — retrying just burns the attempt budget three times over."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return not (400 <= exc.response.status_code < 500)
+    return True
+
+
+async def _summarize(llm_call, creds, text: str, *, filename: str) -> str:
+    chunks = chunk_text(text)
+    if len(chunks) <= 1:
+        return await asyncio.wait_for(
+            llm_call(creds, build_summary_prompt(text, filename=filename)),
+            timeout=LLM_TIMEOUT)
+    partials = []
+    for i, ch in enumerate(chunks):
+        partials.append(await asyncio.wait_for(
+            llm_call(creds, build_map_prompt(ch, i, len(chunks),
+                                             filename=filename)),
+            timeout=LLM_TIMEOUT))
+    return await asyncio.wait_for(
+        llm_call(creds, build_reduce_prompt(partials, filename=filename)),
+        timeout=LLM_TIMEOUT)
+
+
+async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
+                               note_indexer=index_note, now=None,
+                               day=None) -> bool:
+    """Claim and run at most one job. Returns False only when there was
+    nothing to do — the caller uses that to decide whether to sleep."""
+    now = int(time.time()) if now is None else now
+    day = time.strftime("%Y%m%d", time.localtime(now)) if day is None else day
+
+    probe = conn.execute(
+        "SELECT user_id FROM notes_distill_jobs WHERE status='pending' "
+        "ORDER BY enqueued_at ASC LIMIT 1").fetchone()
+    if probe is None:
+        return False
+    quota_ok = notes_store.quota_remaining(conn, probe["user_id"], day=day) > 0
+    job = claim_job(conn, quota_ok=quota_ok, now=now)
+    if job is None:
+        return False
+
+    file_path, user_id = job["file_path"], job["user_id"]
+    model = notes_store.get_background_model(conn, user_id)
+    if not model:
+        # Unconfigured background model = feature off. Drop, don't retry.
+        finish_job(conn, file_path)
+        return True
+    try:
+        creds = await creds_resolver(user_id, model)
+        if not creds:
+            finish_job(conn, file_path)
+            return True
+        doc = await extractor(file_path, EXTRACT_MAX_CHARS)
+        text = (doc or {}).get("markdown") or ""
+        if not text.strip():
+            finish_job(conn, file_path)
+            return True
+        raw = await _summarize(llm_call, creds, text,
+                               filename=os.path.basename(file_path))
+        parsed = parse_summary(raw)
+        if parsed is None:
+            raise ValueError("unparseable summary output")
+        await apply_distillation(
+            conn, user_id, file_path=file_path, root_id=job["root_id"],
+            mtime=job["file_mtime"], parsed=parsed,
+            truncated=bool((doc or {}).get("truncated")),
+            note_indexer=note_indexer)
+        if job["origin"] != "manual":
+            notes_store.quota_consume(conn, user_id, day=day)
+        finish_job(conn, file_path)
+        return True
+    except Exception as e:                       # noqa: BLE001 — never die
+        logger.warning("notes-distill failed for %s: %s", file_path, e)
+        attempts = MAX_ATTEMPTS if not _is_retryable(e) else job["attempts"]
+        fail_job(conn, file_path, attempts, e, now)
+        return True
+
+
+async def _default_llm_call(creds: dict, prompt: str) -> str:
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(base_url=creds["base_url"], api_key=creds["api_key"],
+                         timeout=LLM_TIMEOUT, max_retries=0)
+    resp = await client.chat.completions.create(
+        model=creds["model"],
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    return resp.choices[0].message.content or ""
+
+
+async def _default_extractor(path: str, max_chars: int) -> dict:
+    from parser_client import ParserClient
+    client = ParserClient()
+    try:
+        return await client.extract(path, ocr=False, max_chars=max_chars)
+    finally:
+        await client.aclose()
+
+
+async def _default_creds(user_id: str, model: str):
+    from channels import credentials
+    return await credentials.resolve(user_id, model)
+
+
+async def worker_loop(conn, *, stop_event):
+    """One job per tick, serial. Sleeps the full poll interval whenever the
+    queue is empty — this worker must never poll the LLM on a timer."""
+    while not stop_event.is_set():
+        try:
+            did_work = await process_pending_once(
+                conn, llm_call=_default_llm_call,
+                extractor=_default_extractor, creds_resolver=_default_creds)
+        except Exception as e:                   # never let the loop die
+            logger.exception("notes-distill worker tick error: %s", e)
+            did_work = False
+        delay = POLL_SECONDS if not did_work else pace_seconds(load_ratio())
+        if delay <= 0:
+            continue
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+
+def start_worker(conn):
+    """Launch the background worker; returns (task, stop_event)."""
+    n = requeue_orphaned(conn)
+    if n > 0:
+        logger.info("notes distill: requeued %d orphaned running job(s)", n)
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
+    return task, stop_event
