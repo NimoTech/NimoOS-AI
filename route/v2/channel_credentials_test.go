@@ -84,6 +84,33 @@ func TestProviderCredentialsLocalAndErrors(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 }
 
+// TestProviderCredentialsLocalPrefixStripped covers the bare-Ollama branch's
+// handling of the UI's "local:<name>" model spec (listModelOptions /
+// background_model): the resolver must strip the prefix before returning the
+// model, mirroring chat.go:367 and the UI's agentStore.js — otherwise Ollama
+// receives a literal "local:qwen3" and rejects it.
+func TestProviderCredentialsLocalPrefixStripped(t *testing.T) {
+	svc := newTestServices(t)
+
+	cases := []struct {
+		name       string
+		inputModel string
+		wantModel  string
+	}{
+		{"bare model name passes through unchanged", "qwen3", "qwen3"},
+		{"local: prefix is stripped", "local:qwen3", "qwen3"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := credsCall(t, svc, "u1", tc.inputModel)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Contains(t, rec.Body.String(), `"provider_type":"ollama"`)
+			require.Contains(t, rec.Body.String(), `"model":"`+tc.wantModel+`"`)
+		})
+	}
+}
+
 func TestProviderCredentialsRejectsMissingOrWrongToken(t *testing.T) {
 	svc := newTestServices(t)
 	enc, err := svc.MasterKey().Encrypt("sk-should-not-leak")

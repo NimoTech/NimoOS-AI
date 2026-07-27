@@ -80,3 +80,38 @@ def test_status_reports_counts(tmp_path, monkeypatch):
     assert body["pending"] == 1
     assert body["distilled"] == 0
     assert body["quota_remaining"] == 50
+
+
+def test_status_pending_count_excludes_tombstoned_jobs(tmp_path, monkeypatch):
+    """C3: 'failed'/'skipped' tombstones must not inflate the pending count
+    the settings panel shows the user."""
+    c, conn = _client(tmp_path, monkeypatch)
+    import notes_distill
+    notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=1)
+    notes_distill.enqueue(conn, file_path="/DATA/b.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=2)
+    notes_distill.enqueue(conn, file_path="/DATA/c.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=3)
+    notes_distill.claim_job(conn, quota_ok=True, now=10)   # claims a.pdf
+    notes_distill.fail_job(conn, "/DATA/a.pdf", notes_distill.MAX_ATTEMPTS,
+                           ValueError("boom"), 11)
+    notes_distill.claim_job(conn, quota_ok=True, now=12)   # claims b.pdf
+    notes_distill.skip_job(conn, "/DATA/b.pdf", "model unconfigured", 13)
+    statuses = {r["file_path"]: r["status"] for r in
+                conn.execute("SELECT file_path, status FROM notes_distill_jobs")}
+    assert statuses == {"/DATA/a.pdf": "failed", "/DATA/b.pdf": "skipped",
+                        "/DATA/c.pdf": "pending"}
+
+    body = c.get("/agent/notes/distill/status", headers=H).json()
+    assert body["pending"] == 1
+
+
+def test_manual_distill_denies_path_outside_data_without_any_gate_stub(
+        tmp_path, monkeypatch):
+    """(e): unmocked fs_gate integration — /etc/passwd is never under /DATA,
+    so the headless deny-only gate (mcp_server/fs_gate.py) must 403 it on its
+    own, with no monkeypatch of _distill_gate_ok."""
+    c, conn = _client(tmp_path, monkeypatch)
+    r = c.post("/agent/notes/distill", headers=H, json={"path": "/etc/passwd"})
+    assert r.status_code == 403

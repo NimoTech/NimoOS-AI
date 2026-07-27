@@ -97,12 +97,19 @@ def _opted_in_users(conn) -> list[str]:
     once opted in and then cleared the list still has a `user_settings` row
     (set_distill_roots stores "[]", it never deletes) — filtering on the
     parsed value, not row presence, is what keeps an emptied-out user from
-    triggering a Wiki round-trip every pass forever."""
+    triggering a Wiki round-trip every pass forever.
+
+    Also excludes users with an empty background_model: consistent with
+    "empty = feature silent" (notes_store.get_background_model docstring) —
+    without this gate the scanner would keep walking the filesystem and
+    enqueueing jobs that process_pending_once immediately tombstones as
+    'skipped' every pass, for a feature the user never turned on."""
     candidates = {r["user_id"] for r in conn.execute(
         "SELECT DISTINCT user_id FROM user_settings WHERE key=?",
         (notes_store.DISTILL_ROOTS_KEY,))}
     return [uid for uid in candidates
-            if notes_store.get_distill_roots(conn, uid)]
+            if notes_store.get_distill_roots(conn, uid)
+            and notes_store.get_background_model(conn, uid)]
 
 
 async def _scanner_loop(conn, *, stop_event):

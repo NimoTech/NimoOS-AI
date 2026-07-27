@@ -72,7 +72,7 @@ def test_claim_returns_none_for_auto_when_quota_exhausted(tmp_path):
     assert notes_distill.claim_job(conn, quota_ok=True, now=1000) is not None
 
 
-def test_fail_job_retries_then_drops(tmp_path):
+def test_fail_job_retries_then_tombstones_as_failed(tmp_path):
     conn = _conn(tmp_path)
     notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",
                           root_id="r1", file_mtime=1, now=10)
@@ -83,8 +83,24 @@ def test_fail_job_retries_then_drops(tmp_path):
 
     notes_distill.claim_job(conn, quota_ok=True, now=40)
     notes_distill.fail_job(conn, "/DATA/a.pdf", 3, ValueError("boom"), 50)
-    assert conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs"
-                        ).fetchone()["c"] == 0
+    # At the attempts ceiling the row is tombstoned as 'failed', not deleted —
+    # a DELETE would drop the file out of notes_distill_scan._known_mtimes and
+    # cause an infinite re-enqueue/re-attempt loop on every scan pass.
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row is not None
+    assert row["status"] == "failed" and "boom" in row["last_error"]
+
+
+def test_skip_job_tombstones_as_skipped_and_is_never_claimed(tmp_path):
+    conn = _conn(tmp_path)
+    notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=10)
+    notes_distill.claim_job(conn, quota_ok=True, now=20)
+    notes_distill.skip_job(conn, "/DATA/a.pdf", "model unconfigured", 30)
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "skipped"
+    assert row["last_error"] == "model unconfigured"
+    assert notes_distill.claim_job(conn, quota_ok=True, now=40) is None
 
 
 def test_requeue_orphaned_flips_running_back(tmp_path):

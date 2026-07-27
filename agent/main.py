@@ -2742,7 +2742,8 @@ async def notes_distill_status(request: Request):
     uid = _notes_uid(request)
     conn = _db()
     pending = conn.execute(
-        "SELECT COUNT(*) c FROM notes_distill_jobs WHERE user_id=?",
+        "SELECT COUNT(*) c FROM notes_distill_jobs WHERE user_id=? "
+        "AND status IN ('pending','running')",
         (uid,)).fetchone()["c"]
     distilled = conn.execute(
         "SELECT COUNT(*) c FROM notes WHERE user_id=? AND type='summary' "

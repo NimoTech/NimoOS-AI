@@ -17,6 +17,9 @@ import memory_lock
 from memory_extract import _clean_json_text
 from notes import store as notes_store
 from notes.indexer import index_note
+from provider_adapters import (
+    ProviderType, ThinkingConfig, ThinkingLevel, build_model_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,14 +202,35 @@ def finish_job(conn, file_path: str) -> None:
 
 
 def fail_job(conn, file_path: str, attempts: int, err, now: int) -> None:
+    """At the attempts ceiling, tombstone the row as 'failed' instead of
+    deleting it. A DELETE here would erase the file from
+    notes_distill_scan._known_mtimes's ledger, so an unchanged poison
+    document would be re-enqueued and re-attempted forever (the exact
+    wiki-summary-worker failure class) — the enqueue UPSERT is the only
+    intended path back to 'pending' (file changed, or a manual re-POST)."""
     if attempts >= MAX_ATTEMPTS:
-        conn.execute("DELETE FROM notes_distill_jobs "
-                     "WHERE file_path=? AND status='running'", (file_path,))
+        conn.execute(
+            "UPDATE notes_distill_jobs SET status='failed', last_error=?, "
+            "updated_at=? WHERE file_path=? AND status='running'",
+            (str(err)[:500], now, file_path))
     else:
         conn.execute(
             "UPDATE notes_distill_jobs SET status='pending', last_error=?, "
             "updated_at=? WHERE file_path=? AND status='running'",
             (str(err)[:500], now, file_path))
+    conn.commit()
+
+
+def skip_job(conn, file_path: str, reason: str, now: int) -> None:
+    """Tombstone a job as 'skipped' for the three drop paths in
+    process_pending_once (model unconfigured / creds unresolved / empty
+    extract text) — same rationale as fail_job's ceiling tombstone: a DELETE
+    would drop the file out of _known_mtimes and cause an infinite
+    re-enqueue/re-attempt loop every scan pass."""
+    conn.execute(
+        "UPDATE notes_distill_jobs SET status='skipped', last_error=?, "
+        "updated_at=? WHERE file_path=? AND status='running'",
+        (str(reason)[:500], now, file_path))
     conn.commit()
 
 
@@ -343,10 +367,26 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         return False
 
     file_path, user_id = job["file_path"], job["user_id"]
+    if job["origin"] != "manual":
+        # The quota probe above only checked the globally-oldest pending
+        # row's user — claim_job's ORDER BY (manual-first, then FIFO) can
+        # claim a DIFFERENT user's row, so quota can both starve other users
+        # and be overrun for this one. Recheck against the actually-claimed
+        # user before doing any expensive work.
+        if notes_store.quota_remaining(conn, user_id, day=day) <= 0:
+            conn.execute(
+                "UPDATE notes_distill_jobs SET status='pending', attempts=? "
+                "WHERE file_path=? AND status='running'",
+                (job["attempts"] - 1, file_path))
+            conn.commit()
+            return False
     model = notes_store.get_background_model(conn, user_id)
     if not model:
-        # Unconfigured background model = feature off. Drop, don't retry.
-        finish_job(conn, file_path)
+        # Unconfigured background model = feature off. Tombstone, don't
+        # retry — a DELETE here would drop this file out of
+        # notes_distill_scan._known_mtimes and cause an infinite
+        # re-enqueue/re-attempt loop on every scan pass.
+        skip_job(conn, file_path, "background model unconfigured", now)
         return True
     creds = None
     try:
@@ -354,14 +394,14 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         if not creds:
             logger.info("notes-distill: dropping %s — credentials unresolved "
                        "for model %r", file_path, model)
-            finish_job(conn, file_path)
+            skip_job(conn, file_path, "credentials unresolved", now)
             return True
         doc = await extractor(file_path, EXTRACT_MAX_CHARS)
         text = (doc or {}).get("markdown") or ""
         if not text.strip():
             logger.info("notes-distill: dropping %s — extract returned no "
                        "text", file_path)
-            finish_job(conn, file_path)
+            skip_job(conn, file_path, "extract returned no text", now)
             return True
         raw = await _summarize(llm_call, creds, text,
                                filename=os.path.basename(file_path))
@@ -391,11 +431,23 @@ async def _default_llm_call(creds: dict, prompt: str) -> str:
     from openai import AsyncOpenAI
     client = AsyncOpenAI(base_url=creds["base_url"], api_key=creds["api_key"],
                          timeout=LLM_TIMEOUT, max_retries=0)
+    extra_kwargs = {}
+    if creds.get("provider_type") == "ollama":
+        # Bypass the house think-switch's ModelSettings/Agents-SDK path (this
+        # is a raw AsyncOpenAI call, not an Agent run) but reuse its
+        # provider_adapters constants directly: qwen-family local models
+        # otherwise burn 2500+ reasoning tokens and blow LLM_TIMEOUT on every
+        # background summarization call.
+        settings = build_model_settings(
+            ProviderType.OLLAMA, ThinkingConfig(enabled=False, level=ThinkingLevel.LOW))
+        if settings.extra_body:
+            extra_kwargs["extra_body"] = settings.extra_body
     try:
         resp = await client.chat.completions.create(
             model=creds["model"],
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
+            **extra_kwargs,
         )
         return resp.choices[0].message.content or ""
     finally:
