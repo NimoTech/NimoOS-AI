@@ -10,7 +10,10 @@ import logging
 import os
 import time
 
+import memory_lock
 from memory_extract import _clean_json_text
+from notes import store as notes_store
+from notes.indexer import index_note
 
 logger = logging.getLogger(__name__)
 
@@ -181,3 +184,65 @@ def requeue_orphaned(conn) -> int:
         "UPDATE notes_distill_jobs SET status='pending' WHERE status='running'")
     conn.commit()
     return cur.rowcount
+
+
+def find_summary_note(conn, user_id: str, file_path: str) -> dict | None:
+    """Locate this document's existing summary note. LIKE is only a
+    prefilter — identity is an exact match on source_refs[0].path, so a
+    path that is a prefix of another never collides."""
+    rows = conn.execute(
+        "SELECT id, revision, status, source_refs_json FROM notes "
+        "WHERE user_id=? AND type='summary' AND deleted_at IS NULL "
+        "AND source_refs_json LIKE ?",
+        (str(user_id), f"%{file_path}%")).fetchall()
+    for r in rows:
+        try:
+            refs = json.loads(r["source_refs_json"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        if refs and isinstance(refs[0], dict) and refs[0].get("path") == file_path:
+            return {"id": r["id"], "revision": r["revision"],
+                    "status": r["status"], "source_refs": refs}
+    return None
+
+
+async def apply_distillation(conn, user_id: str, *, file_path: str,
+                             root_id: str, mtime: int, parsed: dict,
+                             truncated: bool, note_indexer=index_note):
+    """Create or refresh this document's summary note. DB writes run under
+    the per-user lock; Qdrant indexing runs outside it (same discipline as
+    memory_extract / notes_extract)."""
+    refs = [{"path": file_path, "root_id": str(root_id), "mtime": int(mtime),
+             "truncated": bool(truncated)}]
+    async with memory_lock.get_user_lock(str(user_id)):
+        existing = find_summary_note(conn, user_id, file_path)
+        if existing and existing["status"] == "curated":
+            # Never clobber what a human has confirmed — flag it and let the
+            # user decide whether to re-distill.
+            stale_refs = list(existing["source_refs"])
+            stale_refs[0] = {**stale_refs[0], "stale": True}
+            note = notes_store.update_note(
+                conn, str(user_id), existing["id"],
+                expected_revision=existing["revision"],
+                source_refs=stale_refs)
+            return note
+        if existing:
+            note = notes_store.update_note(
+                conn, str(user_id), existing["id"],
+                expected_revision=existing["revision"],
+                title=parsed["title"], body=parsed["body"],
+                description=parsed["description"], tags=parsed["tags"],
+                source_refs=refs)
+        else:
+            note = notes_store.create_note(
+                conn, str(user_id), title=parsed["title"], body=parsed["body"],
+                note_type="summary", tags=parsed["tags"], source_refs=refs,
+                created_by="pipeline", description=parsed["description"])
+    ok = await note_indexer(note, note["body"])
+    if not ok:
+        # Pending-index sentinel (mirrors notes_extract): keep the note, let
+        # the sync scanner retry indexing next pass.
+        conn.execute("UPDATE notes SET content_hash='' WHERE id=? AND user_id=?",
+                     (note["id"], str(user_id)))
+        conn.commit()
+    return note
