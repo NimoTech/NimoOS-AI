@@ -109,3 +109,62 @@ def test_total_cap_marks_later_files_truncated(conn, tmp_path):
         _authorize(conn, folder)
     out = agent_module._compose_system_prompt(conn, "s1", "BASE")
     assert "more agent.md files truncated" in out
+
+
+def test_whitespace_only_agent_md_is_not_injected_unfenced(conn, tmp_path):
+    """A non-empty but whitespace-only body must not fall back to the raw,
+    unfenced body via `fence_untrusted(...) or st.body` — fence_untrusted
+    returns "" for whitespace-only content, and the correct behavior is to
+    inject nothing (not the raw body, not an empty fence)."""
+    folder = str(tmp_path / "blank")
+    _mk_agent_md(folder, body="\n\n\n")
+    _authorize(conn, folder)
+    out = agent_module._compose_system_prompt(conn, "s1", "BASE")
+    assert f"- {folder} (folder, has agent.md)" in out
+    assert "<untrusted-data" not in out
+    assert "agent.md notes from authorized folders" not in out
+
+
+def test_total_cap_reached_skips_disk_read_for_later_file(conn, tmp_path, monkeypatch):
+    """Once `total >= max_total`, _compose_system_prompt must call probe()
+    with read_body=False, which returns body=None without touching disk. The
+    file is still counted as truncated. This test instruments the probe call
+    chain to prove that branch is actually reached (not just assumed)."""
+    max_per_file = 8 * 1024  # matches _compose_system_prompt's default
+
+    calls = []
+    wrapped = agent_module.agent_md.probe  # already ceiling-wrapped by the
+                                            # autouse _ceiling fixture above
+
+    def recording_probe(folder, **kw):
+        result = wrapped(folder, **kw)
+        calls.append((folder, kw.get("read_body"), result.body))
+        return result
+
+    monkeypatch.setattr(agent_module.agent_md, "probe", recording_probe)
+
+    # Four folders of exactly max_per_file bytes drive total to exactly
+    # max_total (4 * 8192 = 32768) without ever exceeding it mid-loop, so the
+    # first four are all loaded normally (read_body=True each time).
+    for i in range(4):
+        folder = str(tmp_path / f"q{i}")
+        _mk_agent_md(folder, body="z" * max_per_file)
+        _authorize(conn, folder)
+    # The fifth folder is only reached once total == max_total, so
+    # read_body=(total < max_total) is False for it.
+    last_folder = str(tmp_path / "q4")
+    _mk_agent_md(last_folder, body="z" * max_per_file)
+    _authorize(conn, last_folder)
+
+    out = agent_module._compose_system_prompt(conn, "s1", "BASE")
+
+    no_read_calls = [c for c in calls if c[1] is False]
+    assert no_read_calls, (
+        f"expected at least one probe() call with read_body=False, "
+        f"but total never reached max_total; calls were: {calls}"
+    )
+    # The no-read probe call must return body=None (no disk read happened).
+    assert no_read_calls[-1][2] is None
+    assert no_read_calls[-1][0] == last_folder
+
+    assert "[...1 more agent.md files truncated]" in out

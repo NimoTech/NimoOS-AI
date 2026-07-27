@@ -161,11 +161,11 @@ def _compose_system_prompt(conn, session_id: str, base: str,
                     truncated += 1
                 elif st.body:
                     md_path = os.path.join(r["path"], agent_md.FILENAME)
-                    md_blocks.append(
-                        fence_untrusted(f"agent-md:{md_path}", st.body,
-                                        cap=max_per_file + 2000) or st.body
-                    )
-                    total += len(st.body)
+                    fenced = fence_untrusted(f"agent-md:{md_path}", st.body,
+                                              cap=max_per_file + 2000)
+                    if fenced:
+                        md_blocks.append(fenced)
+                        total += len(st.body)
         else:
             summary_lines.append(f"- {r['path']} (single file)")
     block = "\n".join(summary_lines)
