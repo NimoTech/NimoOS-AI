@@ -39,12 +39,15 @@ def _ceiling(tmp_path, monkeypatch):
     tests — pytest's tmp_path is under /tmp (1777)."""
     import agent_md
     real_probe = agent_md.probe
+    calls = []
 
     def probe_with_ceiling(folder, **kw):
+        calls.append(dict(kw))
         kw.setdefault("ceiling", str(tmp_path))
         return real_probe(folder, **kw)
 
     monkeypatch.setattr(agent_module.agent_md, "probe", probe_with_ceiling)
+    return calls
 
 
 def unfence_block(prompt, source):
@@ -64,6 +67,20 @@ def test_loaded_agent_md_is_fenced(conn, tmp_path):
     assert f"- {folder} (folder, has agent.md)" in out
     body = unfence_block(out, f"agent-md:{os.path.join(folder, 'agent.md')}")
     assert "project notes" in body
+
+
+def test_compose_calls_probe_with_no_ceiling(conn, tmp_path, _ceiling):
+    """Production must never pass ceiling: it exists only so tests can stop
+    the ancestor walk before /tmp. If _compose_system_prompt ever passed
+    ceiling=r["path"] (collapsing the walk to the folder itself), this would
+    silently reopen the writable-grandparent case (D3) the walk exists to
+    catch."""
+    folder = str(tmp_path / "proj")
+    _mk_agent_md(folder)
+    _authorize(conn, folder)
+    agent_module._compose_system_prompt(conn, "s1", "BASE")
+    assert len(_ceiling) == 1
+    assert "ceiling" not in _ceiling[0]
 
 
 def test_prompt_states_the_notes_are_not_instructions(conn, tmp_path):

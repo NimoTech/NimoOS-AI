@@ -21,7 +21,7 @@ def _ceiling(tmp_path, monkeypatch):
     calls = []
 
     def probe_with_ceiling(folder, **kw):
-        calls.append(kw)
+        calls.append(dict(kw))
         kw.setdefault("ceiling", str(tmp_path))
         return real_probe(folder, **kw)
 
@@ -92,3 +92,18 @@ async def test_probe_called_with_read_body_false(session, tmp_path, _ceiling):
     await main_module.list_visible_resources("s1", x_user_id="u1")
     assert len(_ceiling) == 1
     assert _ceiling[0].get("read_body") is False
+
+
+@pytest.mark.asyncio
+async def test_probe_called_with_no_ceiling(session, tmp_path, _ceiling):
+    """Production must never pass ceiling: it exists only so tests can stop
+    the ancestor walk before /tmp. If list_visible_resources ever passed
+    ceiling=r["path"] (collapsing the walk to the folder itself), this would
+    silently reopen the writable-grandparent case (D3) the walk exists to
+    catch."""
+    folder = str(tmp_path / "proj")
+    _mk_agent_md(folder)
+    _add(session, folder)
+    await main_module.list_visible_resources("s1", x_user_id="u1")
+    assert len(_ceiling) == 1
+    assert "ceiling" not in _ceiling[0]

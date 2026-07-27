@@ -191,6 +191,25 @@ def test_symlinked_ancestor_writable_target_is_skipped(tmp_path):
     assert st.detail == os.path.realpath(str(real_writable))
 
 
+def test_verdict_is_recomputed_after_permissions_change(tmp_path):
+    """The design forbids caching or persisting the verdict: directory
+    permissions can change after a folder is authorized (e.g. a user shares
+    it), and a stored verdict would then be a stale security answer. probe()
+    must re-examine the filesystem on every call, not memoize by
+    (folder, read_body, max_bytes, ceiling) — a memo keyed that way never
+    collides across tests because every test uses a distinct tmp_path, so
+    only a same-folder before/after test like this one can catch it."""
+    folder = str(tmp_path / "proj")
+    _mk(folder)
+    st = agent_md.probe(folder, ceiling=str(tmp_path))
+    assert st.state == agent_md.LOADED
+
+    os.chmod(folder, 0o777)
+    st2 = agent_md.probe(folder, ceiling=str(tmp_path))
+    assert st2.state == agent_md.SKIPPED
+    assert st2.reason == agent_md.WRITABLE_PARENT
+
+
 def test_symlinked_folder_itself_hides_writable_real_ancestor(tmp_path):
     """Pins the upfront os.path.realpath(folder) call in _ancestors():
     dirname-peeling from an UNRESOLVED symlinked folder never reaches the
