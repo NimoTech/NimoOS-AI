@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+import agent_md
 import db as db_module
 import context_compaction
 import mcp_tokens
@@ -966,7 +967,18 @@ async def list_visible_resources(
         "WHERE session_id=? ORDER BY added_at",
         (session_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("kind") == "folder":
+            # Evaluated fresh on every listing: directory permissions can
+            # change after authorization, so a persisted verdict would be
+            # stale — and stale is not acceptable for a security decision.
+            st = agent_md.probe(d["path"], read_body=False)
+            d["agent_md"] = {"state": st.state, "reason": st.reason,
+                             "detail": st.detail}
+        out.append(d)
+    return out
 
 
 @app.post("/agent/sessions/{session_id}/visible-resources")
