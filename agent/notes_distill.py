@@ -326,14 +326,19 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         # Unconfigured background model = feature off. Drop, don't retry.
         finish_job(conn, file_path)
         return True
+    creds = None
     try:
         creds = await creds_resolver(user_id, model)
         if not creds:
+            logger.info("notes-distill: dropping %s — credentials unresolved "
+                       "for model %r", file_path, model)
             finish_job(conn, file_path)
             return True
         doc = await extractor(file_path, EXTRACT_MAX_CHARS)
         text = (doc or {}).get("markdown") or ""
         if not text.strip():
+            logger.info("notes-distill: dropping %s — extract returned no "
+                       "text", file_path)
             finish_job(conn, file_path)
             return True
         raw = await _summarize(llm_call, creds, text,
@@ -351,9 +356,12 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         finish_job(conn, file_path)
         return True
     except Exception as e:                       # noqa: BLE001 — never die
-        logger.warning("notes-distill failed for %s: %s", file_path, e)
+        msg = str(e)
+        if creds and creds.get("api_key"):
+            msg = msg.replace(creds["api_key"], "***")
+        logger.warning("notes-distill failed for %s: %s", file_path, msg)
         attempts = MAX_ATTEMPTS if not _is_retryable(e) else job["attempts"]
-        fail_job(conn, file_path, attempts, e, now)
+        fail_job(conn, file_path, attempts, msg, now)
         return True
 
 
@@ -361,12 +369,15 @@ async def _default_llm_call(creds: dict, prompt: str) -> str:
     from openai import AsyncOpenAI
     client = AsyncOpenAI(base_url=creds["base_url"], api_key=creds["api_key"],
                          timeout=LLM_TIMEOUT, max_retries=0)
-    resp = await client.chat.completions.create(
-        model=creds["model"],
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    return resp.choices[0].message.content or ""
+    try:
+        resp = await client.chat.completions.create(
+            model=creds["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return resp.choices[0].message.content or ""
+    finally:
+        await client.close()
 
 
 async def _default_extractor(path: str, max_chars: int) -> dict:

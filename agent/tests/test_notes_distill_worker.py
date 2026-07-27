@@ -159,3 +159,31 @@ def test_pace_seconds_zero_when_idle_and_grows_under_load():
     assert notes_distill.pace_seconds(0.7) == 0.0
     assert notes_distill.pace_seconds(1.4) > 0.0
     assert notes_distill.pace_seconds(99.0) <= notes_distill.PACE_MAX
+
+
+def test_error_message_redacts_api_key(tmp_path):
+    conn = _conn(tmp_path)
+    _seed(conn)
+
+    async def creds_with_secret(user_id, model):
+        return {"provider_type": "other", "base_url": "http://x/v1",
+                "api_key": "sk-supersecret123", "model": "m"}
+
+    async def extract_500_leaky(path, max_chars):
+        raise httpx.HTTPStatusError(
+            "500 server error, request echoed key sk-supersecret123",
+            request=httpx.Request("POST", "http://x"),
+            response=httpx.Response(500))
+
+    async def llm(creds, prompt):
+        return PARSED_JSON
+
+    asyncio.run(notes_distill.process_pending_once(
+        conn, llm_call=llm, extractor=extract_500_leaky,
+        creds_resolver=creds_with_secret, note_indexer=_ok, now=100,
+        day="20260727"))
+    row = conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row["status"] == "pending"
+    assert "sk-supersecret123" not in row["last_error"]
+    assert "***" in row["last_error"]
