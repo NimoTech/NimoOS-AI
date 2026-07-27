@@ -5,6 +5,7 @@ import pytest
 
 from skills import ALL_TOOLS
 from skills.search import search as search_skill
+from tests.conftest import unfence
 
 
 def test_search_tools_in_all_tools():
@@ -147,7 +148,8 @@ async def test_read_document_propagates_user_id_and_args(monkeypatch):
     assert calls["name"] == "read_document"
     assert calls["user_id"] == "u1"
     assert calls["arguments"] == {"file_id": "f1", "offset": 0, "max_chars": 24000}
-    data = json.loads(out)
+    # Document text is external content — fenced as untrusted (L3).
+    data = json.loads(unfence(out, source="document"))
     assert data["text"] == "hello [Page 1]"
     assert data["truncated"] is False
 
@@ -219,7 +221,7 @@ async def test_read_document_path_authorized_calls_parser(monkeypatch, tmp_path)
 
     monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
     out = await search_skill._read_document_impl(path=str(f))
-    data = json.loads(out)
+    data = json.loads(unfence(out, source="document"))
     assert data["markdown"] == "hello pdf"
     assert captured["path"] == os.path.realpath(str(f))
     assert captured["user_id"] == "u1"
@@ -274,7 +276,7 @@ async def test_read_document_path_out_of_scope_requests_access(monkeypatch, tmp_
     monkeypatch.setattr(search_skill._parser_client, "extract", fake_extract)
 
     out = await search_skill._read_document_impl(path=str(f))
-    data = json.loads(out)
+    data = json.loads(unfence(out, source="document"))
     assert data["markdown"] == "resume text"            # proceeded after grant
     assert recorded["abs_path"] == os.path.realpath(str(f))  # card was requested
     assert recorded["op"] == "read"
@@ -329,7 +331,7 @@ async def test_view_document_page_renders_and_describes(monkeypatch, tmp_path):
     monkeypatch.setattr(search_skill._photos, "describe_image", fake_describe)
 
     out = await search_skill._view_document_page_impl(path=str(f), page=3)
-    data = json.loads(out)
+    data = json.loads(unfence(out, source="document-page"))
     assert data["description"] == "a bar chart of Q1 sales"
     assert captured["path"] == os.path.realpath(str(f))
     assert captured["page"] == 3

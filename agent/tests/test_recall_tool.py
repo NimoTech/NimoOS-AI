@@ -6,6 +6,7 @@ import agent as agent_module
 from skills import ALL_TOOLS
 from skills.memory import memory as mem_skill
 from skills import tool_registry as tr
+from tests.conftest import unfence
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +34,9 @@ async def test_recall_passes_user_id_and_returns_hits(monkeypatch):
         return {"hits": [{"text": "we discussed docker", "session_id": "s9",
                           "chunk_no": 0, "created_at": 1, "score": 0.8}]}
     monkeypatch.setattr(mem_skill, "_query_agent_memory", fake_query)
-    out = json.loads(await mem_skill._recall_impl("docker error"))
+    # Recalled memories can contain external content — fenced as untrusted (L3).
+    out = json.loads(unfence(await mem_skill._recall_impl("docker error"),
+                             source="recall"))
     assert seen["user_id"] == "u1" and seen["query"] == "docker error"
     assert out["hits"][0]["text"] == "we discussed docker"
 
