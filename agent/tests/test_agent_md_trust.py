@@ -186,3 +186,45 @@ def test_symlinked_ancestor_writable_target_is_skipped(tmp_path):
     assert st.state == agent_md.SKIPPED
     assert st.reason == agent_md.WRITABLE_PARENT
     assert st.detail == os.path.realpath(str(real_writable))
+
+
+def test_symlinked_folder_itself_hides_writable_real_ancestor(tmp_path):
+    """Pins the upfront os.path.realpath(folder) call in _ancestors():
+    dirname-peeling from an UNRESOLVED symlinked folder never reaches the
+    real ancestry the symlink actually lives in.
+
+    Shape matters here: the authorized folder must sit AT the symlink hop
+    (not two levels below it, like the sibling
+    test_symlinked_ancestor_writable_target_is_skipped above). When the
+    authorized folder is deeper than the hop, os.stat()'s own follow-symlink
+    behaviour reaches the writable real ancestor during the walk regardless
+    of whether _ancestors() realpath's up front — so that sibling test
+    still passes even with the realpath call deleted. This one does not:
+
+      tmp_path/real_parent            0o777 (attacker-writable)
+      tmp_path/real_parent/target     0o755 (clean agent.md, 0o644)
+      tmp_path/link -> tmp_path/real_parent/target
+      folder = tmp_path/link
+
+    With the realpath call, the walk starts at the resolved
+    .../real_parent/target, then reaches real_parent (0o777) and skips.
+    Without it, the walk starts at the unresolved tmp_path/link (os.stat
+    follows it to the clean 0o755 target), then dirname-peels the *string*
+    "tmp_path/link" straight to tmp_path, hits the ceiling, and returns
+    LOADED — real_parent is never visited.
+    """
+    real_parent = tmp_path / "real_parent"
+    real_parent.mkdir(mode=0o777)
+    os.chmod(str(real_parent), 0o777)  # mkdir mode is masked by umask
+
+    target = real_parent / "target"
+    _mk(str(target), dir_mode=0o755)
+
+    link = tmp_path / "link"
+    os.symlink(str(target), str(link))
+
+    folder = str(link)
+    st = agent_md.probe(folder, ceiling=str(tmp_path))
+    assert st.state == agent_md.SKIPPED
+    assert st.reason == agent_md.WRITABLE_PARENT
+    assert st.detail == os.path.realpath(str(real_parent))
