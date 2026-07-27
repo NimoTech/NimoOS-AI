@@ -5,9 +5,12 @@ enqueue happens only from the scanner (or an explicit manual request); the
 worker NEVER polls the LLM on a timer (wiki summary worker lesson)."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+
+from memory_extract import _clean_json_text
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,81 @@ DISTILL_EXTS = frozenset({
 
 def is_distillable(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in DISTILL_EXTS
+
+
+CHUNK_CHARS = 12000
+MAX_CHUNKS = 8
+EXTRACT_MAX_CHARS = CHUNK_CHARS * MAX_CHUNKS
+
+_JSON_CONTRACT = (
+    'Output STRICT JSON and nothing else:\n'
+    '{"title":"<short title>","description":"<one-line summary>",'
+    '"body":"<markdown summary>","tags":["tag"]}\n'
+    "Write in the same language as the document. Use standard markdown "
+    "links, never [[wikilinks]]."
+)
+
+
+def chunk_text(text: str, size: int = CHUNK_CHARS,
+               max_chunks: int = MAX_CHUNKS) -> list[str]:
+    """Fixed-width split with a hard chunk cap. The cap is the cost ceiling:
+    without it a 500-page scan would cost dozens of LLM calls."""
+    if not text:
+        return []
+    return [text[i:i + size]
+            for i in range(0, len(text), size)][:max_chunks]
+
+
+def build_summary_prompt(text: str, *, filename: str) -> str:
+    return (
+        f"Summarize the document '{filename}' for a personal knowledge base. "
+        "Capture what it is about, its key conclusions, decisions, figures "
+        "and obligations. Skip boilerplate.\n"
+        f"{_JSON_CONTRACT}\n\n## Document\n{text}"
+    )
+
+
+def build_map_prompt(chunk: str, idx: int, total: int, *, filename: str) -> str:
+    return (
+        f"This is part {idx + 1} of {total} of the document '{filename}'. "
+        "Write a dense factual digest of THIS PART only, as plain markdown "
+        "(no JSON). Preserve names, dates, figures and obligations.\n\n"
+        f"## Part\n{chunk}"
+    )
+
+
+def build_reduce_prompt(partials: list[str], *, filename: str) -> str:
+    joined = "\n\n---\n\n".join(
+        f"### Part {i + 1}\n{p}" for i, p in enumerate(partials))
+    return (
+        f"Below are sequential digests of the document '{filename}'. "
+        "Merge them into one coherent summary for a personal knowledge base. "
+        "Do not mention that the document was processed in parts.\n"
+        f"{_JSON_CONTRACT}\n\n## Digests\n{joined}"
+    )
+
+
+def parse_summary(raw):
+    """Return a validated summary dict, or None when the payload is not the
+    expected JSON shape (caller treats None as a retryable failure)."""
+    try:
+        obj = json.loads(_clean_json_text(raw))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    title, body = obj.get("title"), obj.get("body")
+    if not (isinstance(title, str) and title.strip()
+            and isinstance(body, str) and body.strip()):
+        return None
+    desc = obj.get("description")
+    tags_raw = obj.get("tags")
+    tags = [t.strip() for t in tags_raw
+            if isinstance(t, str) and t.strip()] \
+        if isinstance(tags_raw, list) else []
+    return {"title": title.strip(),
+            "description": desc.strip() if isinstance(desc, str) else "",
+            "body": body.strip(), "tags": tags}
 
 
 def enqueue(conn, *, file_path: str, user_id: str, root_id: str,
