@@ -3,6 +3,8 @@ import json
 import os
 import pytest
 
+from tests.conftest import unfence
+
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
@@ -43,7 +45,8 @@ def test_text_returns_content(setup):
         "a1", session_id="s1", user_id="u1", max_chars=100,
         conn=conn, data_root=str(root))
     assert result["kind"] == "text"
-    assert result["content"] == "hello world"
+    # Content is fenced as untrusted (L3); the payload itself is unchanged.
+    assert unfence(result["content"], source="attachment") == "hello world"
     assert result["truncated"] is False
 
 
@@ -56,9 +59,12 @@ def test_text_truncated_by_chars_safe_for_multibyte(setup):
         "a2", session_id="s1", user_id="u1", max_chars=10,
         conn=conn, data_root=str(root))
     assert result["truncated"] is True
-    assert len(result["content"]) == 10
-    assert "�" not in result["content"]
-    assert result["content"] == "中" * 10
+    body = unfence(result["content"], source="attachment")
+    # max_chars truncation happens before fencing, so the payload is still
+    # exactly 10 chars and never splits a multi-byte character.
+    assert len(body) == 10
+    assert "�" not in body
+    assert body == "中" * 10
 
 
 def test_video_returns_metadata(setup):
@@ -141,7 +147,7 @@ def test_function_tool_reads_via_context_vars(setup):
         max_chars=skill.MAX_CHARS_VAR.get(),
     )
     assert result["kind"] == "text"
-    assert result["content"] == "hello via context"
+    assert unfence(result["content"], source="attachment") == "hello via context"
 
 
 def test_document_with_sidecar_returns_content(setup, tmp_path):
@@ -160,7 +166,7 @@ def test_document_with_sidecar_returns_content(setup, tmp_path):
         "d1", session_id="s1", user_id="u1", max_chars=1000,
         conn=conn, data_root=str(root))
     assert result["kind"] == "document"
-    assert result["content"] == "# Title\nbody text"
+    assert unfence(result["content"], source="attachment") == "# Title\nbody text"
     assert result["extractor"] == "pypdf"
     assert result["pages"] == 4
     assert result["truncated"] is False

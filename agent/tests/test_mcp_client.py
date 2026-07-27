@@ -4,6 +4,7 @@ import pytest
 
 from confirm import ConfirmManager
 import mcp_client.client as mc
+from tests.conftest import unfence
 
 META = {"name": "search", "description": "does a thing",
         "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}
@@ -60,7 +61,8 @@ async def test_invoke_confirm_then_call():
 
     asyncio.create_task(approve())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
-    assert out == "RESULT"
+    # Third-party MCP results are external content — fenced as untrusted (L3).
+    assert unfence(out, source="mcp-result") == "RESULT"
     assert fconn.calls == [("search", {"q": "hi"})]
     assert "1::search" not in mc._CONFIRMED_TOOLS_VAR.get(set())
 
@@ -98,7 +100,7 @@ async def test_remember_skips_second_confirm():
     await tool.on_invoke_tool(None, '{"q":"a"}')
     before = len(q.events)
     out = await tool.on_invoke_tool(None, '{"q":"b"}')
-    assert out == "RESULT"
+    assert unfence(out, source="mcp-result") == "RESULT"
     assert len(q.events) == before
 
 
