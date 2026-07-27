@@ -57,3 +57,26 @@ def test_parse_summary_rejects_missing_body():
 
 def test_parse_summary_rejects_non_json():
     assert notes_distill.parse_summary("sorry, I cannot") is None
+
+
+def test_parse_summary_accepts_prose_wrapped_json():
+    raw = "Here is the summary in JSON format:\n\n" + json.dumps({
+        "title": "T", "description": "D", "body": "B", "tags": ["a"]
+    })
+    out = notes_distill.parse_summary(raw)
+    assert out == {"title": "T", "description": "D", "body": "B",
+                   "tags": ["a"]}
+
+
+def test_parse_summary_accepts_json_with_trailing_prose():
+    raw = json.dumps({
+        "title": "T", "description": "D", "body": "B", "tags": ["a"]
+    }) + "\n\nLet me know if you need anything else!"
+    out = notes_distill.parse_summary(raw)
+    assert out == {"title": "T", "description": "D", "body": "B",
+                   "tags": ["a"]}
+
+
+def test_parse_summary_still_rejects_pure_prose():
+    assert notes_distill.parse_summary(
+        "I cannot summarize this document.") is None

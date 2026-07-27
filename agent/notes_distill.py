@@ -101,13 +101,32 @@ def build_reduce_prompt(partials: list[str], *, filename: str) -> str:
     )
 
 
+def _first_json_object(text: str):
+    """Fallback for models that wrap the JSON in prose ('Here is the
+    summary: {...}'): decode the first JSON object found in the text,
+    ignoring any prose before or after it."""
+    idx = text.find("{")
+    if idx == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+    except ValueError:
+        return None
+    return obj
+
+
 def parse_summary(raw):
     """Return a validated summary dict, or None when the payload is not the
     expected JSON shape (caller treats None as a retryable failure)."""
     try:
-        obj = json.loads(_clean_json_text(raw))
+        cleaned = _clean_json_text(raw)
+        obj = json.loads(cleaned)
     except (json.JSONDecodeError, TypeError):
-        return None
+        if not isinstance(raw, str):
+            return None
+        obj = _first_json_object(_clean_json_text(raw))
+        if obj is None:
+            return None
     if not isinstance(obj, dict):
         return None
     title, body = obj.get("title"), obj.get("body")
@@ -356,7 +375,7 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         finish_job(conn, file_path)
         return True
     except Exception as e:                       # noqa: BLE001 — never die
-        msg = str(e)
+        msg = str(e) or type(e).__name__
         if creds and creds.get("api_key"):
             msg = msg.replace(creds["api_key"], "***")
         logger.warning("notes-distill failed for %s: %s", file_path, msg)

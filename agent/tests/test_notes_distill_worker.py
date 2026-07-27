@@ -161,6 +161,25 @@ def test_pace_seconds_zero_when_idle_and_grows_under_load():
     assert notes_distill.pace_seconds(99.0) <= notes_distill.PACE_MAX
 
 
+def test_empty_str_error_falls_back_to_exception_type_name(tmp_path):
+    conn = _conn(tmp_path)
+    _seed(conn)
+
+    async def extract_timeout(path, max_chars):
+        raise asyncio.TimeoutError()
+
+    async def llm(creds, prompt):
+        return PARSED_JSON
+
+    asyncio.run(notes_distill.process_pending_once(
+        conn, llm_call=llm, extractor=extract_timeout, creds_resolver=_creds,
+        note_indexer=_ok, now=100, day="20260727"))
+    row = conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row["status"] == "pending"
+    assert row["last_error"] == "TimeoutError"
+
+
 def test_error_message_redacts_api_key(tmp_path):
     conn = _conn(tmp_path)
     _seed(conn)
