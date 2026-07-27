@@ -204,7 +204,8 @@ def update_note(conn, user_id: str, note_id: str, *, expected_revision: int,
                 title: str | None = None, body: str | None = None,
                 note_type: str | None = None, tags: list[str] | None = None,
                 status: str | None = None,
-                description: str | None = None) -> dict:
+                description: str | None = None,
+                source_refs: list[dict] | None = None) -> dict:
     row = _get_row(conn, user_id, note_id)
     if row is None:
         raise KeyError(note_id)
@@ -224,6 +225,8 @@ def update_note(conn, user_id: str, note_id: str, *, expected_revision: int,
         note["status"] = status
     if description is not None:
         note["description"] = description
+    if source_refs is not None:
+        note["source_refs"] = list(source_refs)
     note["tags"] = list(tags) if tags is not None \
         else _note_tags(conn, note_id)
     note["revision"] += 1
@@ -233,10 +236,11 @@ def update_note(conn, user_id: str, note_id: str, *, expected_revision: int,
     _write_note_file(conn, note, body)
     conn.execute(
         "UPDATE notes SET title=?, description=?, type=?, status=?, "
-        "content_hash=?, revision=?, updated_at=? WHERE id=? AND user_id=?",
+        "content_hash=?, source_refs_json=?, revision=?, updated_at=? "
+        "WHERE id=? AND user_id=?",
         (note["title"], note["description"], note["type"], note["status"],
-         _hash(body), note["revision"], note["updated_at"],
-         note_id, str(user_id)))
+         _hash(body), json.dumps(note["source_refs"], ensure_ascii=False),
+         note["revision"], note["updated_at"], note_id, str(user_id)))
     _sync_tags(conn, str(user_id), note_id, note["tags"])
     sync_links(conn, note_id, body)
     conn.commit()
@@ -317,3 +321,92 @@ def get_backlinks(conn, user_id: str, note_id: str) -> list[dict]:
          "AND n.id != ? AND l.dst_ref IN (?,?,?,?,?) "
          "ORDER BY n.updated_at DESC")
     return [dict(r) for r in conn.execute(q, (str(user_id), note_id, *refs))]
+
+
+DISTILL_ROOTS_KEY = "notes_distill_roots"
+DISTILL_CAP_KEY = "notes_distill_daily_cap"
+DISTILL_QUOTA_KEY = "notes_distill_quota"
+BACKGROUND_MODEL_KEY = "background_model"
+DEFAULT_DAILY_CAP = 50
+
+
+def _get_setting(conn, user_id: str, key: str) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key=?",
+        (str(user_id), key)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_setting(conn, user_id: str, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(user_id, key) DO UPDATE SET "
+        "value=excluded.value, updated_at=excluded.updated_at",
+        (str(user_id), key, value, int(time.time())))
+    conn.commit()
+
+
+def get_distill_roots(conn, user_id: str) -> list[str]:
+    """Wiki root ids opted into auto-distillation. Empty = feature silent."""
+    raw = _get_setting(conn, user_id, DISTILL_ROOTS_KEY)
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return [str(x) for x in val] if isinstance(val, list) else []
+
+
+def set_distill_roots(conn, user_id: str, root_ids) -> None:
+    _set_setting(conn, user_id, DISTILL_ROOTS_KEY,
+                 json.dumps([str(r) for r in root_ids], ensure_ascii=False))
+
+
+def get_daily_cap(conn, user_id: str) -> int:
+    try:
+        cap = int(_get_setting(conn, user_id, DISTILL_CAP_KEY))
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_CAP
+    return cap if cap >= 0 else DEFAULT_DAILY_CAP
+
+
+def set_daily_cap(conn, user_id: str, cap: int) -> None:
+    _set_setting(conn, user_id, DISTILL_CAP_KEY, str(int(cap)))
+
+
+def get_background_model(conn, user_id: str) -> str:
+    """Model key for background tasks: 'cloud:<pid>:<model>' or a bare
+    Ollama model name. Empty means unconfigured — feature stays off."""
+    return _get_setting(conn, user_id, BACKGROUND_MODEL_KEY) or ""
+
+
+def set_background_model(conn, user_id: str, model: str) -> None:
+    _set_setting(conn, user_id, BACKGROUND_MODEL_KEY, str(model))
+
+
+def _quota_used(conn, user_id: str, day: str) -> int:
+    raw = _get_setting(conn, user_id, DISTILL_QUOTA_KEY)
+    if not raw:
+        return 0
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return 0
+    if not isinstance(obj, dict) or obj.get("day") != day:
+        return 0
+    try:
+        return max(0, int(obj.get("used", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def quota_remaining(conn, user_id: str, *, day: str) -> int:
+    return max(0, get_daily_cap(conn, user_id) - _quota_used(conn, user_id, day))
+
+
+def quota_consume(conn, user_id: str, *, day: str) -> None:
+    """Bump today's counter. A stale day key resets to 1 (no cron needed)."""
+    _set_setting(conn, user_id, DISTILL_QUOTA_KEY,
+                 json.dumps({"day": day,
+                             "used": _quota_used(conn, user_id, day) + 1}))
