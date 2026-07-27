@@ -54,6 +54,18 @@ def test_scan_skips_hidden_and_system_dirs(tmp_path):
     assert n == 1
 
 
+def test_scan_skips_hidden_files(tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    _mk(root, ".wiki.md")   # Wiki's per-directory nav map — distillable ext, hidden name
+    _mk(root, "a.md")
+    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
+                                     root_path=str(root), known={})
+    assert n == 1
+    row = conn.execute("SELECT file_path FROM notes_distill_jobs").fetchone()
+    assert row["file_path"] == str(root / "a.md")
+
+
 def test_scan_missing_root_is_not_fatal(tmp_path):
     conn = _conn(tmp_path)
     assert notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",

@@ -18,9 +18,12 @@ from notes import store as notes_store
 logger = logging.getLogger(__name__)
 
 SCAN_INTERVAL = 60
-# Directories we must never descend into: NimoOS' hidden system area plus
-# anything dot-prefixed (VCS metadata, caches, Obsidian sidecars).
-_SKIP_DIR_PREFIX = "."
+# Never descend into, nor enqueue, anything dot-prefixed: NimoOS' hidden
+# system area, VCS metadata, editor/OS sidecars — and, load-bearingly, Wiki's
+# own per-directory `.wiki.md` navigation-map file. That file has a
+# distillable `.md` extension, so without this guard opting a root in would
+# distill Wiki's nav maps into junk notes (observed live in production).
+_SKIP_HIDDEN_PREFIX = "."
 
 
 def _known_mtimes(conn, user_id: str) -> dict[str, int]:
@@ -52,8 +55,10 @@ def scan_root(conn, *, user_id: str, root_id: str, root_path: str,
     enqueued = 0
     for dirpath, dirnames, filenames in os.walk(root_path, onerror=lambda e: None):
         dirnames[:] = [d for d in dirnames
-                       if not d.startswith(_SKIP_DIR_PREFIX)]
+                       if not d.startswith(_SKIP_HIDDEN_PREFIX)]
         for name in filenames:
+            if name.startswith(_SKIP_HIDDEN_PREFIX):
+                continue
             if not notes_distill.is_distillable(name):
                 continue
             full = os.path.join(dirpath, name)
