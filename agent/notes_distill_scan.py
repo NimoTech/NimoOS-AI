@@ -1,0 +1,120 @@
+"""Fallback reconciler for document distillation (spec §4.1).
+
+This is NOT a redundancy: Wiki's fsnotify watcher degrades a root to
+scan_only whenever the kernel refuses more inotify watches
+(NimoOS-Wiki/service/scanner/watcher.go, ErrWatchLimit), and three
+overlapping watchers on this box make that the normal case rather than an
+exception. A full mtime reconcile makes every pass self-healing."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+
+import notes_distill
+from notes import store as notes_store
+
+logger = logging.getLogger(__name__)
+
+SCAN_INTERVAL = 60
+# Directories we must never descend into: NimoOS' hidden system area plus
+# anything dot-prefixed (VCS metadata, caches, Obsidian sidecars).
+_SKIP_DIR_PREFIX = "."
+
+
+def _known_mtimes(conn, user_id: str) -> dict[str, int]:
+    """path -> last distilled mtime, from existing summary notes and from
+    jobs already queued. Both are needed: a queued-but-not-yet-run file has
+    no note yet, and re-enqueueing it every 60s would reset its attempts."""
+    known: dict[str, int] = {}
+    for r in conn.execute(
+            "SELECT source_refs_json FROM notes WHERE user_id=? "
+            "AND type='summary' AND deleted_at IS NULL", (str(user_id),)):
+        import json
+        try:
+            refs = json.loads(r["source_refs_json"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        if refs and isinstance(refs[0], dict) and refs[0].get("path"):
+            known[refs[0]["path"]] = int(refs[0].get("mtime") or 0)
+    for r in conn.execute(
+            "SELECT file_path, file_mtime FROM notes_distill_jobs "
+            "WHERE user_id=?", (str(user_id),)):
+        known[r["file_path"]] = max(known.get(r["file_path"], 0),
+                                    int(r["file_mtime"]))
+    return known
+
+
+def scan_root(conn, *, user_id: str, root_id: str, root_path: str,
+              known: dict[str, int]) -> int:
+    """Walk one root, enqueue documents whose mtime is newer than what we
+    already distilled. Returns the number enqueued."""
+    enqueued = 0
+    for dirpath, dirnames, filenames in os.walk(root_path, onerror=lambda e: None):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(_SKIP_DIR_PREFIX)]
+        for name in filenames:
+            if not notes_distill.is_distillable(name):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                mtime = int(os.stat(full).st_mtime)
+            except OSError:
+                continue
+            if mtime <= known.get(full, -1):
+                continue
+            if notes_distill.enqueue(conn, file_path=full, user_id=user_id,
+                                     root_id=root_id, file_mtime=mtime):
+                enqueued += 1
+    return enqueued
+
+
+def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
+    """Scan every opted-in, enabled root once."""
+    opted_in = set(notes_store.get_distill_roots(conn, user_id))
+    if not opted_in:
+        return 0
+    known = _known_mtimes(conn, user_id)
+    total = 0
+    for r in roots:
+        if str(r.get("id")) not in opted_in or not r.get("enabled"):
+            continue
+        path = r.get("path") or ""
+        if not path:
+            continue
+        total += scan_root(conn, user_id=user_id, root_id=str(r["id"]),
+                           root_path=path, known=known)
+    return total
+
+
+async def _scanner_loop(conn, *, stop_event):
+    from wiki_client import WikiClient
+    while not stop_event.is_set():
+        try:
+            row = conn.execute(
+                "SELECT DISTINCT user_id FROM user_settings WHERE key=?",
+                (notes_store.DISTILL_ROOTS_KEY,)).fetchall()
+            if row:
+                client = WikiClient()
+                try:
+                    roots = await client.list_roots()
+                finally:
+                    await client.aclose()
+                for r in row:
+                    n = scan_once(conn, user_id=r["user_id"], roots=roots)
+                    if n:
+                        logger.info("notes distill scan: enqueued %d for %s",
+                                    n, r["user_id"])
+        except Exception as e:                   # never let the loop die
+            logger.warning("notes distill scan error: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=SCAN_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
+def start_scanner(conn):
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_scanner_loop(conn, stop_event=stop_event))
+    return task, stop_event

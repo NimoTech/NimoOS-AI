@@ -97,6 +97,22 @@ class WikiClient:
         r.raise_for_status()
         return r.json()
 
+    async def list_roots(self) -> list[dict]:
+        """GET /v1/wiki/roots — id / path / enabled per configured root.
+
+        Wiki's WikiRoot struct (NimoOS-Wiki/service/repo/models.go) ships
+        without json tags, so the wire keys are Go's default PascalCase
+        (ID/Path/Enabled/...), not the lowercase the rest of this module
+        assumes — normalize here so callers never see the raw casing.
+        """
+        r = await self._client().get("/v1/wiki/roots", headers=self._headers())
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data = data.get("roots") or data.get("data") or []
+        return [{str(k).lower(): v for k, v in d.items()}
+                for d in data if isinstance(d, dict)]
+
     async def post_root(self, path: str, level: str) -> dict:
         r = await self._client().post("/v1/wiki/roots",
                                       json={"path": path, "level": level},

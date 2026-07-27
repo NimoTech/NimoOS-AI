@@ -299,6 +299,12 @@ async def _notes_distill_worker_startup():
     notes_distill.start_worker(_db())
 
 
+@app.on_event("startup")
+async def _notes_distill_scanner_startup():
+    import notes_distill_scan
+    notes_distill_scan.start_scanner(_db())
+
+
 _channel_manager = None
 
 
