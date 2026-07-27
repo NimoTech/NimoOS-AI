@@ -1,4 +1,6 @@
 import os
+import signal
+
 import pytest
 
 import agent_md
@@ -135,3 +137,52 @@ def test_ceiling_defaults_to_filesystem_root(tmp_path):
 def test_missing_folder_is_absent(tmp_path):
     st = agent_md.probe(str(tmp_path / "nope"), ceiling=str(tmp_path))
     assert st.state == agent_md.ABSENT
+
+
+def test_fifo_at_agent_md_path_is_skipped_not_hung(tmp_path):
+    """A FIFO planted at <folder>/agent.md must not block os.open() forever
+    (a one-line `mkfifo` DoS). With O_NONBLOCK the open returns immediately;
+    os.fstat then reports a non-regular file and the S_ISREG check fails it
+    closed. Guard with signal.alarm so a regression hangs this test loudly
+    instead of hanging the whole suite (pytest-timeout is not installed)."""
+    folder = str(tmp_path / "proj")
+    os.makedirs(folder)
+    fifo_path = os.path.join(folder, "agent.md")
+    os.mkfifo(fifo_path)
+
+    def _on_alarm(signum, frame):
+        raise TimeoutError(
+            "probe() hung opening a FIFO — O_NONBLOCK regression"
+        )
+
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(5)
+    try:
+        st = agent_md.probe(folder, ceiling=str(tmp_path))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    assert st.state == agent_md.SKIPPED
+    assert st.reason == agent_md.NOT_REGULAR
+
+
+def test_symlinked_ancestor_writable_target_is_skipped(tmp_path):
+    """A symlinked ancestor must not hide a writable directory behind a
+    clean-looking path: _ancestors() realpath's each ancestor before
+    checking its mode. Without that realpath call, a refactor could pass
+    all other tests while silently reopening the hole this pins."""
+    real_writable = tmp_path / "real_writable"
+    real_writable.mkdir(mode=0o777)
+    os.chmod(str(real_writable), 0o777)  # mkdir mode is masked by umask
+
+    link = tmp_path / "innocuous_link"
+    os.symlink(str(real_writable), str(link))
+
+    folder = str(link / "sub" / "proj")
+    _mk(folder)
+
+    st = agent_md.probe(folder, ceiling=str(tmp_path))
+    assert st.state == agent_md.SKIPPED
+    assert st.reason == agent_md.WRITABLE_PARENT
+    assert st.detail == os.path.realpath(str(real_writable))

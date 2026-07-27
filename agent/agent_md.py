@@ -77,7 +77,14 @@ def probe(folder: str, *, read_body: bool = True,
     path = os.path.join(folder, FILENAME)
     try:
         # O_NOFOLLOW: a symlink as the final component raises ELOOP.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: a FIFO planted at this path would otherwise block this
+        # open() forever (a one-line `mkfifo` DoS); with O_NONBLOCK the open
+        # returns immediately and the S_ISREG check below fails it closed.
+        # It is a no-op on regular files.
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        )
     except (FileNotFoundError, NotADirectoryError):
         return AgentMdStatus(ABSENT)
     except OSError as e:
