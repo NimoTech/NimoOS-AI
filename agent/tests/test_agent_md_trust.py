@@ -168,10 +168,13 @@ def test_fifo_at_agent_md_path_is_skipped_not_hung(tmp_path):
 
 
 def test_symlinked_ancestor_writable_target_is_skipped(tmp_path):
-    """A symlinked ancestor must not hide a writable directory behind a
-    clean-looking path: _ancestors() realpath's each ancestor before
-    checking its mode. Without that realpath call, a refactor could pass
-    all other tests while silently reopening the hole this pins."""
+    """A symlinked ancestor (deep in the walk, not at the authorized folder
+    itself) must resolve to its writable real target and get caught. This
+    does NOT by itself pin the upfront os.path.realpath(folder) call in
+    _ancestors() — os.stat()'s own symlink-following during the dirname
+    walk is enough to reach the target here regardless of that call. See
+    test_symlinked_folder_itself_hides_writable_real_ancestor below, which
+    does pin it."""
     real_writable = tmp_path / "real_writable"
     real_writable.mkdir(mode=0o777)
     os.chmod(str(real_writable), 0o777)  # mkdir mode is masked by umask
