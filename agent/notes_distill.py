@@ -14,7 +14,7 @@ import time
 import httpx
 
 import memory_lock
-from memory_extract import _clean_json_text
+from memory_extract import _clean_json_text, _first_json_object
 from notes import store as notes_store
 from notes.indexer import index_note
 from provider_adapters import (
@@ -108,23 +108,6 @@ def build_reduce_prompt(partials: list[str], *, filename: str) -> str:
         "Do not mention that the document was processed in parts.\n"
         f"{_JSON_CONTRACT}\n\n## Digests\n{joined}"
     )
-
-
-def _first_json_object(text: str):
-    """Fallback for models that wrap the JSON in prose ('Here is the
-    summary: {...}'): decode the first JSON object found in the text,
-    ignoring any prose before or after it. Also tolerates raw control
-    characters (unescaped newlines) inside string values, which local
-    models routinely emit — strict=False relaxes only that, nothing
-    else about the JSON grammar."""
-    idx = text.find("{")
-    if idx == -1:
-        return None
-    try:
-        obj, _ = json.JSONDecoder(strict=False).raw_decode(text[idx:])
-    except ValueError:
-        return None
-    return obj
 
 
 def parse_summary(raw):

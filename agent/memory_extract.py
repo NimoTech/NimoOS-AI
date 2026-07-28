@@ -102,11 +102,33 @@ def _clean_json_text(text: str) -> str:
     return t.strip()
 
 
+def _first_json_object(text: str):
+    """Fallback for models that wrap the JSON in prose ('Here is the
+    summary: {...}'): decode the first JSON object found in the text,
+    ignoring any prose before or after it. Also tolerates raw control
+    characters (unescaped newlines) inside string values, which local
+    models routinely emit — strict=False relaxes only that, nothing
+    else about the JSON grammar."""
+    idx = text.find("{")
+    if idx == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(text[idx:])
+    except ValueError:
+        return None
+    return obj
+
+
 def parse_extraction(text):
     try:
-        obj = json.loads(_clean_json_text(text))
+        cleaned = _clean_json_text(text)
+        obj = json.loads(cleaned, strict=False)
     except (json.JSONDecodeError, TypeError):
-        return None
+        if not isinstance(text, str):
+            return None
+        obj = _first_json_object(_clean_json_text(text))
+        if obj is None:
+            return None
     if not isinstance(obj, dict):
         return None
     actions = []

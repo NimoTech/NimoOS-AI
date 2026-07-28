@@ -34,3 +34,27 @@ def test_parse_returns_none_on_garbage():
     assert mx.parse_extraction("not json at all") is None
     assert mx.parse_extraction("[1,2,3]") is None        # not an object
     assert mx.parse_extraction("") is None
+
+
+def test_parse_extraction_accepts_prose_wrapped_json():
+    import json
+    raw = "Here is the JSON:\n\n" + json.dumps(
+        {"actions": [{"op": "ADD", "kind": "fact", "text": "is an engineer"}],
+         "referenced": ["m1"]})
+    out = mx.parse_extraction(raw)
+    assert out == {"actions": [{"op": "ADD", "kind": "fact", "text": "is an engineer",
+                                "priority": 0, "id": None}],
+                   "referenced": ["m1"]}
+
+
+def test_parse_extraction_accepts_raw_newlines_in_strings():
+    raw = ('{"actions":[{"op":"ADD","kind":"fact","text":"line1\nline2"}],'
+           '"referenced":[]}')
+    out = mx.parse_extraction(raw)
+    assert out == {"actions": [{"op": "ADD", "kind": "fact", "text": "line1\nline2",
+                                "priority": 0, "id": None}],
+                   "referenced": []}
+
+
+def test_parse_extraction_still_rejects_pure_prose():
+    assert mx.parse_extraction("I cannot extract anything from this.") is None
