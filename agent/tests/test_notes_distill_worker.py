@@ -1,9 +1,12 @@
 import asyncio
 import json
+import os
 import sys, pathlib
+import types
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import httpx
+import pytest
 
 from db import init_db
 import notes_distill
@@ -11,6 +14,40 @@ from notes import store as notes_store
 
 PARSED_JSON = json.dumps({"title": "T", "description": "d",
                           "body": "B", "tags": []})
+
+
+class _OSProxy:
+    """Delegates everything except `stat` to the real `os` module. Used to
+    fake `notes_distill.os.stat` without mutating the process-wide `os`
+    module in place: an earlier version of this fixture did
+    `monkeypatch.setattr(notes_distill.os, "stat", ...)` (patching the real,
+    shared module object) and that left pytest's own tmp_path/cache
+    bookkeeping calling the stub after this test's teardown, crashing the
+    whole session — rebinding the module-level name `notes_distill.os` to a
+    throwaway proxy object instead keeps the blast radius to this module."""
+
+    def __init__(self, stat_fn):
+        self.stat = stat_fn
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+@pytest.fixture(autouse=True)
+def _fake_stat_for_conventional_data_paths(monkeypatch):
+    """Most of this file's tests seed jobs under the fictitious '/DATA/...'
+    convention this suite uses for "pretend file" — never real files on
+    disk, which was harmless before the size-cap check added a mandatory
+    os.stat() call to process_pending_once. Fake a small, in-cap size only
+    for that prefix; any other path (e.g. a real tmp_path file, or a
+    deliberately-missing one) falls through to the real os.stat unchanged,
+    which is exactly what the size-cap and vanished-file tests below need."""
+    def _stat(path, *a, **kw):
+        if str(path).startswith("/DATA/"):
+            return types.SimpleNamespace(st_size=1024)
+        return os.stat(path, *a, **kw)
+
+    monkeypatch.setattr(notes_distill, "os", _OSProxy(_stat))
 
 
 def _conn(tmp_path):
@@ -265,6 +302,78 @@ def test_error_message_redacts_api_key(tmp_path):
     assert row["status"] == "pending"
     assert "sk-supersecret123" not in row["last_error"]
     assert "***" in row["last_error"]
+
+
+def test_oversized_file_is_skipped_without_extract_or_llm(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    _seed(conn, path="/DATA/big.pdf")
+
+    class _FakeStat:
+        st_size = notes_distill.MAX_DISTILL_BYTES + 1
+
+    monkeypatch.setattr(notes_distill.os, "stat", lambda path: _FakeStat())
+
+    async def extractor(path, max_chars):
+        raise AssertionError("extractor must not be called")
+
+    async def llm(creds, prompt):
+        raise AssertionError("LLM must not be called")
+
+    asyncio.run(notes_distill.process_pending_once(
+        conn, llm_call=llm, extractor=extractor, creds_resolver=_creds,
+        note_indexer=_ok, now=100, day="20260727"))
+    row = conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row is not None
+    assert row["status"] == "skipped"
+    assert row["last_error"] == "file too large for distillation"
+
+
+def test_file_at_exactly_the_size_cap_proceeds_to_extract(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    _seed(conn, path="/DATA/exactly-cap.pdf")
+
+    class _FakeStat:
+        st_size = notes_distill.MAX_DISTILL_BYTES
+
+    monkeypatch.setattr(notes_distill.os, "stat", lambda path: _FakeStat())
+    calls = []
+
+    async def llm(creds, prompt):
+        calls.append(prompt)
+        return PARSED_JSON
+
+    assert asyncio.run(notes_distill.process_pending_once(
+        conn, llm_call=llm, extractor=_extract_short, creds_resolver=_creds,
+        note_indexer=_ok, now=100, day="20260727"))
+    assert len(calls) == 1
+    row = conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs").fetchone()
+    assert row["c"] == 0   # finish_job deleted it — the happy path completed
+
+
+def test_vanished_file_is_dropped_via_finish_job_not_retried(tmp_path):
+    """Current behavior for a file that disappears between enqueue and the
+    pre-extract stat: os.stat raises OSError, which is treated the same as
+    the other terminal drop paths in this function — finish_job DELETEs the
+    row outright (not fail_job's retry, not skip_job's tombstone). This
+    mirrors the module's other "file gone" convention (notes_distill_scan's
+    scan_root silently drops a stat failure too), so a vanished file never
+    burns a retry and never lingers as a tombstone."""
+    conn = _conn(tmp_path)
+    missing_path = str(tmp_path / "does-not-exist.pdf")
+    _seed(conn, path=missing_path)
+
+    async def extractor(path, max_chars):
+        raise AssertionError("extractor must not be called")
+
+    async def llm(creds, prompt):
+        raise AssertionError("LLM must not be called")
+
+    assert asyncio.run(notes_distill.process_pending_once(
+        conn, llm_call=llm, extractor=extractor, creds_resolver=_creds,
+        note_indexer=_ok, now=100, day="20260727"))
+    row = conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs").fetchone()
+    assert row["c"] == 0   # deleted, not tombstoned as 'skipped' or 'failed'
 
 
 def test_post_claim_quota_recheck_reverts_a_different_users_overrun_job(
