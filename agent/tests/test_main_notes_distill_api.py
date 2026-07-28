@@ -115,3 +115,38 @@ def test_manual_distill_denies_path_outside_data_without_any_gate_stub(
     c, conn = _client(tmp_path, monkeypatch)
     r = c.post("/agent/notes/distill", headers=H, json={"path": "/etc/passwd"})
     assert r.status_code == 403
+
+
+def test_manual_distill_accepts_media_shaped_root_via_real_gate(
+        tmp_path, monkeypatch):
+    """REGRESSION PIN: the manual distill gate must accept files outside
+    /DATA (e.g. under /media, /mnt — where Wiki roots and Parser's extract
+    already allow reads) using the REAL fs_gate logic, not a stubbed
+    _distill_gate_ok. We can't write to real /media in a test, so we widen
+    main._DISTILL_GATE_ROOTS to ("/DATA", str(tmp_path)) and post a file
+    inside tmp_path — this exercises the same fs_gate.mcp_resolve_read_path
+    containment check a real /media path would hit, just rooted at tmp_path
+    instead. Before the fix, main has no _DISTILL_GATE_ROOTS attribute at
+    all, so monkeypatch.setattr (raising=True by default) errors out and
+    this test fails by construction — confirmed RED against old code."""
+    c, conn = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "_DISTILL_GATE_ROOTS", ("/DATA", str(tmp_path)))
+    doc = tmp_path / "media_doc.pdf"
+    doc.write_text("x")
+    r = c.post("/agent/notes/distill", headers=H, json={"path": str(doc)})
+    assert r.status_code == 200 and r.json()["queued"] is True
+
+
+def test_manual_distill_denies_system_data_under_alternate_root(
+        tmp_path, monkeypatch):
+    """The .system_data carve-out must still apply per-root: a path with a
+    .system_data segment under an otherwise-allowed alternate root (real
+    fs_gate semantics, no _distill_gate_ok stub) stays denied."""
+    c, conn = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "_DISTILL_GATE_ROOTS", ("/DATA", str(tmp_path)))
+    sysdata_dir = tmp_path / ".system_data"
+    sysdata_dir.mkdir()
+    doc = sysdata_dir / "x.md"
+    doc.write_text("x")
+    r = c.post("/agent/notes/distill", headers=H, json={"path": str(doc)})
+    assert r.status_code == 403

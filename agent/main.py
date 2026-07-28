@@ -2708,15 +2708,24 @@ class DistillRequestPayload(BaseModel):
     path: str
 
 
+# The three roots Parser's extract accepts (its EXTRACT_ROOTS); the same
+# gate logic (realpath containment, .system_data carve) applies per root.
+# fs_gate itself stays /DATA-only for the external MCP surface.
+_DISTILL_GATE_ROOTS = ("/DATA", "/media", "/mnt")
+
+
 def _distill_gate_ok(user_id: str, path: str) -> bool:
-    """Headless deny-only /DATA gate — the same one MCP path reads use.
-    Never open a second file-access route (DEVELOPMENT_PLAN ban #5)."""
+    """Headless deny-only gate — same fs_gate logic MCP path reads use,
+    widened to the extract roots. Never a second file-access route
+    (DEVELOPMENT_PLAN ban #5)."""
     from mcp_server import fs_gate
-    try:
-        fs_gate.mcp_resolve_read_path(path)
-        return True
-    except fs_gate.McpPathDenied:
-        return False
+    for root in _DISTILL_GATE_ROOTS:
+        try:
+            fs_gate.mcp_resolve_read_path(path, root=root)
+            return True
+        except fs_gate.McpPathDenied:
+            continue
+    return False
 
 
 @app.post("/agent/notes/distill")
