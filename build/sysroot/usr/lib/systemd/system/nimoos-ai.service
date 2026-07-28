@@ -8,6 +8,11 @@ ExecStart=/usr/bin/nimoos-ai -c /etc/nimoos/ai.conf
 PIDFile=/var/run/nimoos/ai.pid
 Restart=always
 Type=notify
+# Go 网关正常 <300MB;上限防未知泄漏拖垮整机(2026-07-28 OOM 复盘)。
+MemoryAccounting=yes
+MemoryHigh=2G
+MemoryMax=3G
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target
