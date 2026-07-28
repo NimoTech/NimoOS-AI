@@ -48,33 +48,49 @@ def _known_mtimes(conn, user_id: str) -> dict[str, int]:
     return known
 
 
-def scan_root(conn, *, user_id: str, root_id: str, root_path: str,
-              known: dict[str, int]) -> int:
+async def scan_root(conn, *, user_id: str, root_id: str, root_path: str,
+                    known: dict[str, int]) -> int:
     """Walk one root, enqueue documents whose mtime is newer than what we
-    already distilled. Returns the number enqueued."""
+    already distilled. Returns the number enqueued.
+
+    The walk (`_collect`) is pure filesystem I/O with no shared state, so it
+    runs in a worker thread via `asyncio.to_thread` — it must NOT close over
+    `conn`, since the sqlite connection never crosses threads in this
+    codebase. The enqueue loop touches `conn` and stays on the event loop,
+    yielding every 50 files so a large root doesn't stall the loop for the
+    whole pass."""
+    def _collect():
+        out = []
+        for dirpath, dirnames, filenames in os.walk(root_path,
+                                                    onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(_SKIP_HIDDEN_PREFIX)]
+            for name in filenames:
+                if name.startswith(_SKIP_HIDDEN_PREFIX):
+                    continue
+                if not notes_distill.is_distillable(name):
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    out.append((full, int(os.stat(full).st_mtime)))
+                except OSError:
+                    continue
+        return out
+
+    candidates = await asyncio.to_thread(_collect)
     enqueued = 0
-    for dirpath, dirnames, filenames in os.walk(root_path, onerror=lambda e: None):
-        dirnames[:] = [d for d in dirnames
-                       if not d.startswith(_SKIP_HIDDEN_PREFIX)]
-        for name in filenames:
-            if name.startswith(_SKIP_HIDDEN_PREFIX):
-                continue
-            if not notes_distill.is_distillable(name):
-                continue
-            full = os.path.join(dirpath, name)
-            try:
-                mtime = int(os.stat(full).st_mtime)
-            except OSError:
-                continue
-            if mtime <= known.get(full, -1):
-                continue
-            if notes_distill.enqueue(conn, file_path=full, user_id=user_id,
-                                     root_id=root_id, file_mtime=mtime):
-                enqueued += 1
+    for i, (full, mtime) in enumerate(candidates):
+        if i and i % 50 == 0:
+            await asyncio.sleep(0)
+        if mtime <= known.get(full, -1):
+            continue
+        if notes_distill.enqueue(conn, file_path=full, user_id=user_id,
+                                 root_id=root_id, file_mtime=mtime):
+            enqueued += 1
     return enqueued
 
 
-def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
+async def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
     """Scan every opted-in, enabled root once."""
     opted_in = set(notes_store.get_distill_roots(conn, user_id))
     if not opted_in:
@@ -87,8 +103,8 @@ def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
         path = r.get("path") or ""
         if not path:
             continue
-        total += scan_root(conn, user_id=user_id, root_id=str(r["id"]),
-                           root_path=path, known=known)
+        total += await scan_root(conn, user_id=user_id, root_id=str(r["id"]),
+                                 root_path=path, known=known)
     return total
 
 
@@ -124,7 +140,7 @@ async def _scanner_loop(conn, *, stop_event):
                 finally:
                     await client.aclose()
                 for user_id in users:
-                    n = scan_once(conn, user_id=user_id, roots=roots)
+                    n = await scan_once(conn, user_id=user_id, roots=roots)
                     if n:
                         logger.info("notes distill scan: enqueued %d for %s",
                                     n, user_id)

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -107,6 +108,6 @@ def test_cancelled_job_is_not_re_enqueued_by_the_scanner(tmp_path, monkeypatch):
     assert r.status_code == 200
 
     known = notes_distill_scan._known_mtimes(conn, "u1")
-    enqueued = notes_distill_scan.scan_root(
-        conn, user_id="u1", root_id="r1", root_path=str(root), known=known)
+    enqueued = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known=known))
     assert enqueued == 0

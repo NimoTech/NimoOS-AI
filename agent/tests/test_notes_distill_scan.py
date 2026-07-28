@@ -1,3 +1,4 @@
+import asyncio
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -27,8 +28,8 @@ def test_scan_enqueues_only_documents(tmp_path):
     _mk(root, "b.md")
     _mk(root, "c.py")
     _mk(root, "d.dwg")
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known={})
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known={}))
     assert n == 2
     paths = {r["file_path"] for r in
              conn.execute("SELECT file_path FROM notes_distill_jobs")}
@@ -40,8 +41,9 @@ def test_scan_skips_unchanged_files(tmp_path):
     root = tmp_path / "docs"
     f = _mk(root, "a.pdf")
     known = {str(f): int(f.stat().st_mtime)}
-    assert notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                        root_path=str(root), known=known) == 0
+    assert asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root),
+        known=known)) == 0
 
 
 def test_scan_skips_hidden_and_system_dirs(tmp_path):
@@ -50,8 +52,8 @@ def test_scan_skips_hidden_and_system_dirs(tmp_path):
     _mk(root, ".system_data/x.pdf")
     _mk(root, ".hidden/y.pdf")
     _mk(root, "visible.pdf")
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known={})
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known={}))
     assert n == 1
 
 
@@ -60,8 +62,8 @@ def test_scan_skips_hidden_files(tmp_path):
     root = tmp_path / "docs"
     _mk(root, ".wiki.md")   # Wiki's per-directory nav map — distillable ext, hidden name
     _mk(root, "a.md")
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known={})
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known={}))
     assert n == 1
     row = conn.execute("SELECT file_path FROM notes_distill_jobs").fetchone()
     assert row["file_path"] == str(root / "a.md")
@@ -69,9 +71,9 @@ def test_scan_skips_hidden_files(tmp_path):
 
 def test_scan_missing_root_is_not_fatal(tmp_path):
     conn = _conn(tmp_path)
-    assert notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                        root_path=str(tmp_path / "nope"),
-                                        known={}) == 0
+    assert asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(tmp_path / "nope"),
+        known={})) == 0
 
 
 def test_scan_once_only_visits_opted_in_roots(tmp_path):
@@ -80,10 +82,10 @@ def test_scan_once_only_visits_opted_in_roots(tmp_path):
     _mk(on, "a.pdf")
     _mk(off, "b.pdf")
     notes_store.set_distill_roots(conn, "u1", ["r-on"])
-    n = notes_distill_scan.scan_once(conn, user_id="u1", roots=[
+    n = asyncio.run(notes_distill_scan.scan_once(conn, user_id="u1", roots=[
         {"id": "r-on", "path": str(on), "enabled": True},
         {"id": "r-off", "path": str(off), "enabled": True},
-    ])
+    ]))
     assert n == 1
     row = conn.execute("SELECT file_path FROM notes_distill_jobs").fetchone()
     assert row["file_path"] == str(on / "a.pdf")
@@ -94,8 +96,8 @@ def test_scan_once_skips_disabled_root(tmp_path):
     on = tmp_path / "on"
     _mk(on, "a.pdf")
     notes_store.set_distill_roots(conn, "u1", ["r-on"])
-    assert notes_distill_scan.scan_once(conn, user_id="u1", roots=[
-        {"id": "r-on", "path": str(on), "enabled": False}]) == 0
+    assert asyncio.run(notes_distill_scan.scan_once(conn, user_id="u1", roots=[
+        {"id": "r-on", "path": str(on), "enabled": False}])) == 0
 
 
 def test_scan_reenqueues_when_file_newer_than_known(tmp_path):
@@ -103,8 +105,8 @@ def test_scan_reenqueues_when_file_newer_than_known(tmp_path):
     root = tmp_path / "docs"
     f = _mk(root, "a.pdf")
     known = {str(f): int(f.stat().st_mtime) - 10}   # we distilled an older version
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known=known)
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known=known))
     assert n == 1
     row = conn.execute("SELECT file_mtime FROM notes_distill_jobs").fetchone()
     assert row["file_mtime"] == int(f.stat().st_mtime)
@@ -147,8 +149,8 @@ def test_scan_root_does_not_reenqueue_a_failed_tombstone_for_unchanged_file(
     assert row["status"] == "failed"
 
     known = notes_distill_scan._known_mtimes(conn, "u1")
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known=known)
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known=known))
     assert n == 0
     assert conn.execute("SELECT status FROM notes_distill_jobs"
                         ).fetchone()["status"] == "failed"
@@ -173,8 +175,8 @@ def test_enqueue_flips_a_tombstone_back_to_pending_when_file_is_newer(
                         ).fetchone()["status"] == "failed"
 
     known = {str(f): old_mtime - 10}   # simulate the file having been edited
-    n = notes_distill_scan.scan_root(conn, user_id="u1", root_id="r1",
-                                     root_path=str(root), known=known)
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known=known))
     assert n == 1
     row = conn.execute("SELECT status, attempts FROM notes_distill_jobs"
                        ).fetchone()
@@ -206,3 +208,57 @@ def test_known_mtimes_includes_tombstoned_job_rows(tmp_path):
                         ).fetchone()["status"] == "failed"
     known = notes_distill_scan._known_mtimes(conn, "u1")
     assert known["/DATA/a.pdf"] == 42
+
+
+def test_scan_root_collection_never_captures_the_connection(tmp_path,
+                                                             monkeypatch):
+    """The filesystem walk runs in a worker thread (asyncio.to_thread), and
+    the sqlite connection must never cross threads — the discipline this
+    codebase relies on instead of check_same_thread=False. Record what gets
+    handed to asyncio.to_thread and assert conn is reachable from neither
+    the positional/keyword args nor the callable's closure cells."""
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    _mk(root, "a.pdf")
+
+    real_to_thread = asyncio.to_thread
+    calls = []
+
+    async def recording_to_thread(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        closure_cells = [c.cell_contents for c in (func.__closure__ or ())]
+        assert conn not in args
+        assert conn not in kwargs.values()
+        assert conn not in closure_cells
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known={}))
+    assert n == 1
+    assert len(calls) == 1
+
+
+def test_scan_root_yields_between_enqueues_for_large_roots(tmp_path,
+                                                            monkeypatch):
+    """>50 distillable files means the enqueue loop must yield to the event
+    loop periodically (every 50 files) instead of monopolizing it for the
+    whole pass. Assert asyncio.sleep(0) is invoked at least once."""
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    for i in range(55):
+        _mk(root, f"f{i}.md")
+
+    real_sleep = asyncio.sleep
+    zero_delay_calls = []
+
+    async def recording_sleep(delay, *args, **kwargs):
+        if delay == 0:
+            zero_delay_calls.append(delay)
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    n = asyncio.run(notes_distill_scan.scan_root(
+        conn, user_id="u1", root_id="r1", root_path=str(root), known={}))
+    assert n == 55
+    assert len(zero_delay_calls) >= 1
