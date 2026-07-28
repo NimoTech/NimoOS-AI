@@ -293,6 +293,18 @@ async def _notes_extract_worker_startup():
     notes_extract.start_worker(_db())
 
 
+@app.on_event("startup")
+async def _notes_distill_worker_startup():
+    import notes_distill
+    notes_distill.start_worker(_db())
+
+
+@app.on_event("startup")
+async def _notes_distill_scanner_startup():
+    import notes_distill_scan
+    notes_distill_scan.start_scanner(_db())
+
+
 _channel_manager = None
 
 
@@ -2593,6 +2605,9 @@ class NotesSettingsPayload(BaseModel):
     notes_root: str | None = None
     mode: str = "adopt"          # adopt | migrate
     auto_extract: bool | None = None
+    distill_roots: list[str] | None = None
+    distill_daily_cap: int | None = None
+    background_model: str | None = None
 
 
 def _notes_uid(request: Request) -> str:
@@ -2614,12 +2629,19 @@ async def _notes_post_write(conn, uid: str, note: dict, body: str) -> None:
         logging.getLogger("nimoos-agent").exception("reserved render failed")
 
 
+def _notes_settings_body(conn, uid: str) -> dict:
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid),
+            "distill_roots": notes_store.get_distill_roots(conn, uid),
+            "distill_daily_cap": notes_store.get_daily_cap(conn, uid),
+            "background_model": notes_store.get_background_model(conn, uid)}
+
+
 @app.get("/agent/notes/settings")
 async def get_notes_settings(request: Request):
     uid = _notes_uid(request)
     conn = _db()
-    return {"notes_root": notes_store.get_notes_root(conn),
-            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+    return _notes_settings_body(conn, uid)
 
 
 @app.put("/agent/notes/settings")
@@ -2643,8 +2665,16 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
                 for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
                     shutil.move(os.path.join(old, entry), os.path.join(new, entry))
             notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
-    return {"notes_root": notes_store.get_notes_root(conn),
-            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+    if body.distill_roots is not None:
+        notes_store.set_distill_roots(conn, uid, body.distill_roots)
+    if body.distill_daily_cap is not None:
+        if body.distill_daily_cap < 0:
+            raise HTTPException(status_code=400,
+                                detail="distill_daily_cap must be >= 0")
+        notes_store.set_daily_cap(conn, uid, body.distill_daily_cap)
+    if body.background_model is not None:
+        notes_store.set_background_model(conn, uid, body.background_model)
+    return _notes_settings_body(conn, uid)
 
 
 # Probes are confined to the user-visible data root (tests monkeypatch this).
@@ -2672,6 +2702,60 @@ async def notes_dir_info(request: Request, path: str = ""):
         # the backend guard would then reject.
         empty = False
     return {"exists": True, "empty": empty}
+
+
+class DistillRequestPayload(BaseModel):
+    path: str
+
+
+def _distill_gate_ok(user_id: str, path: str) -> bool:
+    """Headless deny-only /DATA gate — the same one MCP path reads use.
+    Never open a second file-access route (DEVELOPMENT_PLAN ban #5)."""
+    from mcp_server import fs_gate
+    try:
+        fs_gate.mcp_resolve_read_path(path)
+        return True
+    except fs_gate.McpPathDenied:
+        return False
+
+
+@app.post("/agent/notes/distill")
+async def notes_distill_manual(request: Request, body: DistillRequestPayload):
+    import notes_distill
+    uid = _notes_uid(request)
+    path = os.path.abspath(body.path)
+    if not _distill_gate_ok(uid, path):
+        raise HTTPException(status_code=403, detail="path not allowed")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="file not found")
+    if not notes_distill.is_distillable(path):
+        raise HTTPException(status_code=400, detail="unsupported document type")
+    conn = _db()
+    notes_distill.enqueue(conn, file_path=path, user_id=uid, root_id="",
+                          file_mtime=int(os.stat(path).st_mtime),
+                          origin="manual")
+    return {"queued": True}
+
+
+@app.get("/agent/notes/distill/status")
+async def notes_distill_status(request: Request):
+    uid = _notes_uid(request)
+    conn = _db()
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM notes_distill_jobs WHERE user_id=? "
+        "AND status IN ('pending','running')",
+        (uid,)).fetchone()["c"]
+    distilled = conn.execute(
+        "SELECT COUNT(*) c FROM notes WHERE user_id=? AND type='summary' "
+        "AND created_by='pipeline' AND deleted_at IS NULL",
+        (uid,)).fetchone()["c"]
+    day = time.strftime("%Y%m%d")
+    return {
+        "pending": pending,
+        "distilled": distilled,
+        "quota_remaining": notes_store.quota_remaining(conn, uid, day=day),
+        "background_model": notes_store.get_background_model(conn, uid),
+    }
 
 
 @app.get("/agent/notes")
