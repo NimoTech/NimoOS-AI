@@ -419,8 +419,9 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
         try:
             size = os.stat(file_path).st_size
         except OSError:
-            logger.info("notes-distill: dropping %s — file gone", file_path)
-            finish_job(conn, file_path)
+            logger.info("notes-distill: skipping %s — stat failed (gone or "
+                        "unreachable)", file_path)
+            skip_job(conn, file_path, "file missing or unreachable", now)
             return True
         if size > MAX_DISTILL_BYTES:
             logger.info("notes-distill: skipping %s — %d bytes exceeds cap",

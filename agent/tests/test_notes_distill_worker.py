@@ -351,14 +351,16 @@ def test_file_at_exactly_the_size_cap_proceeds_to_extract(tmp_path, monkeypatch)
     assert row["c"] == 0   # finish_job deleted it — the happy path completed
 
 
-def test_vanished_file_is_dropped_via_finish_job_not_retried(tmp_path):
-    """Current behavior for a file that disappears between enqueue and the
-    pre-extract stat: os.stat raises OSError, which is treated the same as
-    the other terminal drop paths in this function — finish_job DELETEs the
-    row outright (not fail_job's retry, not skip_job's tombstone). This
-    mirrors the module's other "file gone" convention (notes_distill_scan's
-    scan_root silently drops a stat failure too), so a vanished file never
-    burns a retry and never lingers as a tombstone."""
+def test_vanished_file_is_tombstoned_not_deleted(tmp_path):
+    """Post-review fix: a stat failure (missing file, or a transient
+    ESTALE/EIO blip on a flaky network mount where the file still exists)
+    must NOT silently DELETE the row via finish_job — that would erase it
+    from notes_distill_scan._known_mtimes with no diagnostic trail, and on
+    a flaky mount the very next scan pass would re-enqueue and hit the same
+    blip again: perpetual churn, zero visibility. It must tombstone via
+    skip_job instead, same as the other terminal drop paths in this
+    function, so the reason is visible in the queue page and there is
+    exactly one row, not a retry loop."""
     conn = _conn(tmp_path)
     missing_path = str(tmp_path / "does-not-exist.pdf")
     _seed(conn, path=missing_path)
@@ -372,8 +374,11 @@ def test_vanished_file_is_dropped_via_finish_job_not_retried(tmp_path):
     assert asyncio.run(notes_distill.process_pending_once(
         conn, llm_call=llm, extractor=extractor, creds_resolver=_creds,
         note_indexer=_ok, now=100, day="20260727"))
-    row = conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs").fetchone()
-    assert row["c"] == 0   # deleted, not tombstoned as 'skipped' or 'failed'
+    row = conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row is not None
+    assert row["status"] == "skipped"
+    assert row["last_error"] == "file missing or unreachable"
 
 
 def test_post_claim_quota_recheck_reverts_a_different_users_overrun_job(
