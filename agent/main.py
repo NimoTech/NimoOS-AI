@@ -2758,6 +2758,39 @@ async def notes_distill_status(request: Request):
     }
 
 
+@app.get("/agent/notes/distill/jobs")
+async def notes_distill_jobs(request: Request, status: str = "",
+                             limit: int = 200):
+    uid = _notes_uid(request)
+    conn = _db()
+    limit = max(1, min(int(limit), 500))
+    where = "user_id=?"
+    args: list = [uid]
+    if status:
+        if status not in ("pending", "running", "failed"):
+            raise HTTPException(400, "status must be pending|running|failed")
+        if status == "failed":
+            # Tombstones: 'failed' (retries exhausted) and 'skipped'
+            # (terminal drop) are one bucket to the user; rows keep the
+            # raw status so the UI can badge them apart.
+            where += " AND status IN ('failed','skipped')"
+        else:
+            where += " AND status=?"
+            args.append(status)
+    rows = conn.execute(
+        f"SELECT file_path, status, origin, attempts, last_error, "
+        f"enqueued_at, updated_at FROM notes_distill_jobs WHERE {where} "
+        f"ORDER BY updated_at DESC LIMIT ?", (*args, limit)).fetchall()
+    counts = {"pending": 0, "running": 0, "failed": 0}
+    for r in conn.execute(
+            "SELECT status, COUNT(*) c FROM notes_distill_jobs "
+            "WHERE user_id=? GROUP BY status", (uid,)):
+        key = "failed" if r["status"] in ("failed", "skipped") else r["status"]
+        if key in counts:
+            counts[key] += r["c"]
+    return {"jobs": [dict(r) for r in rows], "counts": counts}
+
+
 @app.get("/agent/notes")
 async def list_notes_api(request: Request, type: str = "", status: str = "",
                          limit: int = 50):
