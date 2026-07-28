@@ -45,6 +45,26 @@ def test_parse_rejects_malformed():
     assert [n["title"] for n in out] == ["ok"]
 
 
+def test_parse_accepts_prose_wrapped_json():
+    raw = "Here is the JSON:\n\n" + json.dumps({"notes": [
+        {"title": "t0", "description": "d", "body": "b", "tags": ["x"]}]})
+    out = notes_extract.parse_extraction(raw)
+    assert out == [{"title": "t0", "description": "d", "body": "b", "tags": ["x"]}]
+
+
+def test_parse_accepts_raw_newlines_in_strings():
+    raw = ('{"notes":[{"title":"t0","description":"d",'
+           '"body":"line1\nline2","tags":["x"]}]}')
+    out = notes_extract.parse_extraction(raw)
+    assert out == [{"title": "t0", "description": "d",
+                    "body": "line1\nline2", "tags": ["x"]}]
+
+
+def test_parse_still_rejects_pure_prose():
+    assert notes_extract.parse_extraction(
+        "I cannot extract anything from this.") is None
+
+
 def test_apply_creates_draft_insight(tmp_path):
     conn = _conn(tmp_path)
     created = asyncio.run(notes_extract.apply_extraction(
