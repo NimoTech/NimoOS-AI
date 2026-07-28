@@ -276,6 +276,31 @@ def test_sweep_dead_tombstones_skipped_row_for_deleted_file(tmp_path):
                         ).fetchone()["c"] == 0
 
 
+def test_sweep_dead_tombstones_never_deletes_a_user_cancellation(tmp_path):
+    """A cancelled tombstone (status='skipped', last_error=CANCELLED_BY_USER,
+    the exact literal main.py's cancel endpoint writes) must survive the
+    sweep even for a deleted file — otherwise the path drops out of
+    _known_mtimes and the next scan pass re-enqueues and re-distills a file
+    the user explicitly cancelled."""
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    f = _mk(root, "a.pdf")
+    notes_distill.enqueue(conn, file_path=str(f), user_id="u1", root_id="r1",
+                          file_mtime=1, now=1)
+    notes_distill.claim_job(conn, quota_ok=True, now=2)
+    notes_distill.skip_job(conn, str(f), notes_distill.CANCELLED_BY_USER, 3)
+    assert conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                        ).fetchone()["last_error"] == "cancelled by user"
+
+    f.unlink()
+    n = asyncio.run(notes_distill_scan.sweep_dead_tombstones(conn, user_id="u1"))
+    assert n == 0
+    row = conn.execute("SELECT status, last_error FROM notes_distill_jobs"
+                       ).fetchone()
+    assert row["status"] == "skipped"
+    assert row["last_error"] == notes_distill.CANCELLED_BY_USER
+
+
 def test_sweep_dead_tombstones_survives_for_existing_file(tmp_path):
     conn = _conn(tmp_path)
     root = tmp_path / "docs"

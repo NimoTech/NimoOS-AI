@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
+# Shared literal between main.py's cancel endpoint (writes this as last_error
+# on the 'skipped' tombstone it creates) and notes_distill_scan's dead-
+# tombstone sweep (must never delete a tombstone carrying this reason, even
+# once the file is gone from disk) — a single constant keeps the two call
+# sites from silently drifting apart.
+CANCELLED_BY_USER = "cancelled by user"
+
 # A book-length scanned PDF (100MB+) burns all MAX_ATTEMPTS retries against
 # Parser's 120s extract timeout (live incident: 3x ReadTimeout in the queue
 # diagnostics) — reject it before the extract call instead. 50MB leaves
