@@ -239,6 +239,81 @@ def test_scan_root_collection_never_captures_the_connection(tmp_path,
     assert len(calls) == 1
 
 
+def test_sweep_dead_tombstones_deletes_failed_row_for_deleted_file(tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    f = _mk(root, "a.pdf")
+    notes_distill.enqueue(conn, file_path=str(f), user_id="u1", root_id="r1",
+                          file_mtime=1, now=1)
+    notes_distill.claim_job(conn, quota_ok=True, now=2)
+    notes_distill.fail_job(conn, str(f), notes_distill.MAX_ATTEMPTS,
+                           ValueError("boom"), 3)
+    assert conn.execute("SELECT status FROM notes_distill_jobs"
+                        ).fetchone()["status"] == "failed"
+
+    f.unlink()
+    n = asyncio.run(notes_distill_scan.sweep_dead_tombstones(conn, user_id="u1"))
+    assert n == 1
+    assert conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs"
+                        ).fetchone()["c"] == 0
+
+
+def test_sweep_dead_tombstones_skipped_row_for_deleted_file(tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    f = _mk(root, "a.pdf")
+    notes_distill.enqueue(conn, file_path=str(f), user_id="u1", root_id="r1",
+                          file_mtime=1, now=1)
+    notes_distill.claim_job(conn, quota_ok=True, now=2)
+    notes_distill.skip_job(conn, str(f), "extract returned no text", 3)
+    assert conn.execute("SELECT status FROM notes_distill_jobs"
+                        ).fetchone()["status"] == "skipped"
+
+    f.unlink()
+    n = asyncio.run(notes_distill_scan.sweep_dead_tombstones(conn, user_id="u1"))
+    assert n == 1
+    assert conn.execute("SELECT COUNT(*) c FROM notes_distill_jobs"
+                        ).fetchone()["c"] == 0
+
+
+def test_sweep_dead_tombstones_survives_for_existing_file(tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    f = _mk(root, "a.pdf")
+    notes_distill.enqueue(conn, file_path=str(f), user_id="u1", root_id="r1",
+                          file_mtime=1, now=1)
+    notes_distill.claim_job(conn, quota_ok=True, now=2)
+    notes_distill.fail_job(conn, str(f), notes_distill.MAX_ATTEMPTS,
+                           ValueError("boom"), 3)
+
+    n = asyncio.run(notes_distill_scan.sweep_dead_tombstones(conn, user_id="u1"))
+    assert n == 0
+    row = conn.execute("SELECT status FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "failed"
+
+
+def test_sweep_dead_tombstones_never_touches_pending_or_running_rows(
+        tmp_path):
+    conn = _conn(tmp_path)
+    root = tmp_path / "docs"
+    file_a = _mk(root, "a.pdf")   # enqueued first -> claimed -> 'running'
+    file_b = _mk(root, "b.pdf")  # stays 'pending'
+    notes_distill.enqueue(conn, file_path=str(file_a), user_id="u1",
+                          root_id="r1", file_mtime=1, now=1)
+    notes_distill.enqueue(conn, file_path=str(file_b), user_id="u1",
+                          root_id="r1", file_mtime=1, now=2)
+    notes_distill.claim_job(conn, quota_ok=True, now=3)   # FIFO -> claims file_a
+    file_a.unlink()
+    file_b.unlink()
+
+    n = asyncio.run(notes_distill_scan.sweep_dead_tombstones(conn, user_id="u1"))
+    assert n == 0
+    rows = {r["file_path"]: r["status"] for r in
+            conn.execute("SELECT file_path, status FROM notes_distill_jobs")}
+    assert rows[str(file_a)] == "running"
+    assert rows[str(file_b)] == "pending"
+
+
 def test_scan_root_yields_between_enqueues_for_large_roots(tmp_path,
                                                             monkeypatch):
     """>50 distillable files means the enqueue loop must yield to the event
