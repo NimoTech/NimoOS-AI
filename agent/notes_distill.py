@@ -14,7 +14,7 @@ import time
 import httpx
 
 import memory_lock
-from memory_extract import _clean_json_text
+from memory_extract import _clean_json_text, _first_json_object
 from notes import store as notes_store
 from notes.indexer import index_note
 from provider_adapters import (
@@ -24,6 +24,12 @@ from provider_adapters import (
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
+
+# A book-length scanned PDF (100MB+) burns all MAX_ATTEMPTS retries against
+# Parser's 120s extract timeout (live incident: 3x ReadTimeout in the queue
+# diagnostics) — reject it before the extract call instead. 50MB leaves
+# headroom for an ordinary multi-page scan.
+MAX_DISTILL_BYTES = 50 * 1024 * 1024
 
 POLL_SECONDS = 30
 # 180s, not the 60s used elsewhere: summarizing a document on a local CPU
@@ -104,23 +110,6 @@ def build_reduce_prompt(partials: list[str], *, filename: str) -> str:
     )
 
 
-def _first_json_object(text: str):
-    """Fallback for models that wrap the JSON in prose ('Here is the
-    summary: {...}'): decode the first JSON object found in the text,
-    ignoring any prose before or after it. Also tolerates raw control
-    characters (unescaped newlines) inside string values, which local
-    models routinely emit — strict=False relaxes only that, nothing
-    else about the JSON grammar."""
-    idx = text.find("{")
-    if idx == -1:
-        return None
-    try:
-        obj, _ = json.JSONDecoder(strict=False).raw_decode(text[idx:])
-    except ValueError:
-        return None
-    return obj
-
-
 def parse_summary(raw):
     """Return a validated summary dict, or None when the payload is not the
     expected JSON shape (caller treats None as a retryable failure)."""
@@ -187,10 +176,18 @@ def claim_job(conn, *, quota_ok: bool, now=None):
     if row is None:
         return None
     attempts = row["attempts"] + 1
-    conn.execute(
+    cur = conn.execute(
         "UPDATE notes_distill_jobs SET status='running', attempts=?, "
-        "updated_at=? WHERE file_path=?", (attempts, now, row["file_path"]))
+        "updated_at=? WHERE file_path=? AND status='pending'",
+        (attempts, now, row["file_path"]))
     conn.commit()
+    if cur.rowcount == 0:
+        # Someone else already claimed this row between the SELECT above and
+        # this UPDATE. Safe today only via the implicit single-connection,
+        # no-await-between-statements invariant of this worker — but the
+        # guard is free, and it turns a future concurrency regression into a
+        # silent "nothing to claim" instead of a double claim.
+        return None
     return conn.execute("SELECT * FROM notes_distill_jobs WHERE file_path=?",
                         (row["file_path"],)).fetchone()
 
@@ -401,6 +398,18 @@ async def process_pending_once(conn, *, llm_call, extractor, creds_resolver,
             msg = f"credentials unresolved for model {model!r}"
             logger.info("notes-distill: retrying %s — %s", file_path, msg)
             fail_job(conn, file_path, job["attempts"], msg, now)
+            return True
+        try:
+            size = os.stat(file_path).st_size
+        except OSError:
+            logger.info("notes-distill: skipping %s — stat failed (gone or "
+                        "unreachable)", file_path)
+            skip_job(conn, file_path, "file missing or unreachable", now)
+            return True
+        if size > MAX_DISTILL_BYTES:
+            logger.info("notes-distill: skipping %s — %d bytes exceeds cap",
+                        file_path, size)
+            skip_job(conn, file_path, "file too large for distillation", now)
             return True
         doc = await extractor(file_path, EXTRACT_MAX_CHARS)
         text = (doc or {}).get("markdown") or ""
