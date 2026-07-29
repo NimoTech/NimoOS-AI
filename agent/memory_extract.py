@@ -119,7 +119,14 @@ def _first_json_object(text: str):
     return obj
 
 
-def parse_extraction(text):
+def loads_tolerant(text):
+    """Parse LLM output that SHOULD be a JSON object but often isn't quite:
+    code fences, prose wrapping ('Here is the JSON: {...}'), and raw control
+    characters inside string values are all tolerated. Returns the decoded
+    object (any JSON type the strict path yields, dict from the fallback)
+    or None. Shared by memory_extract.parse_extraction,
+    notes_extract.parse_extraction and notes_distill.parse_summary — keep
+    their tolerance behavior identical by construction."""
     try:
         cleaned = _clean_json_text(text)
         obj = json.loads(cleaned, strict=False)
@@ -129,6 +136,13 @@ def parse_extraction(text):
         obj = _first_json_object(_clean_json_text(text))
         if obj is None:
             return None
+    return obj
+
+
+def parse_extraction(text):
+    obj = loads_tolerant(text)
+    if obj is None:
+        return None
     if not isinstance(obj, dict):
         return None
     actions = []
