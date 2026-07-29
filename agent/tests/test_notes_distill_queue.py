@@ -103,6 +103,55 @@ def test_skip_job_tombstones_as_skipped_and_is_never_claimed(tmp_path):
     assert notes_distill.claim_job(conn, quota_ok=True, now=40) is None
 
 
+def test_enqueue_over_a_running_row_is_a_noop(tmp_path):
+    """A running row must not be flipped back to pending by a coalescing
+    enqueue — that would reset attempts and let the file be double-processed
+    (once by the in-flight worker, once by whoever claims the freshly-pending
+    row). enqueue still returns True: the file is already in flight, which is
+    "accepted" from the caller's point of view."""
+    conn = _conn(tmp_path)
+    notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=10)
+    notes_distill.claim_job(conn, quota_ok=True, now=20)
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "running" and row["attempts"] == 1
+
+    accepted = notes_distill.enqueue(conn, file_path="/DATA/a.pdf",
+                                     user_id="u1", root_id="r1",
+                                     file_mtime=999, now=30)
+    assert accepted is True
+
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "running"
+    assert row["attempts"] == 1
+    assert row["file_mtime"] == 1
+    assert row["enqueued_at"] == 10
+
+
+def test_enqueue_over_a_failed_tombstone_flips_to_pending(tmp_path):
+    """Existing behavior, pinned: a 'failed' tombstone IS reset to pending
+    with attempts=0 by a coalescing enqueue (the file changed, or a manual
+    re-POST) — only 'running' rows are guarded."""
+    conn = _conn(tmp_path)
+    notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",
+                          root_id="r1", file_mtime=1, now=10)
+    notes_distill.claim_job(conn, quota_ok=True, now=20)
+    notes_distill.fail_job(conn, "/DATA/a.pdf", notes_distill.MAX_ATTEMPTS,
+                           ValueError("boom"), 30)
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "failed"
+
+    accepted = notes_distill.enqueue(conn, file_path="/DATA/a.pdf",
+                                     user_id="u1", root_id="r1",
+                                     file_mtime=999, now=40)
+    assert accepted is True
+
+    row = conn.execute("SELECT * FROM notes_distill_jobs").fetchone()
+    assert row["status"] == "pending"
+    assert row["attempts"] == 0
+    assert row["file_mtime"] == 999
+
+
 def test_requeue_orphaned_flips_running_back(tmp_path):
     conn = _conn(tmp_path)
     notes_distill.enqueue(conn, file_path="/DATA/a.pdf", user_id="u1",

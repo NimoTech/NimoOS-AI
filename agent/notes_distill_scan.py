@@ -90,6 +90,52 @@ async def scan_root(conn, *, user_id: str, root_id: str, root_path: str,
     return enqueued
 
 
+async def sweep_dead_tombstones(conn, *, user_id: str) -> int:
+    """Delete 'failed'/'skipped' tombstone rows whose file no longer exists on
+    disk. A tombstone's only purpose is to suppress re-enqueue/re-attempt of
+    an unchanged, already-failed file (see fail_job/skip_job docstrings) — once
+    the file itself is gone, the row is pure residue: if a file with the same
+    path ever reappears it is a new file and should get a fresh attempt
+    budget, not inherit the old failure.
+
+    EXCEPT a user cancellation (last_error == notes_distill.CANCELLED_BY_USER,
+    written by main.py's cancel endpoint): that tombstone must never be swept,
+    even if the file looks momentarily gone (e.g. a transient mount blip). If
+    it were deleted, the path would drop out of _known_mtimes and the very
+    next scan pass would re-enqueue and re-distill a file the user explicitly
+    cancelled — sending it to the configured (possibly cloud) LLM against
+    their explicit intent. The predicate is written NULL-safely even though
+    last_error is never NULL on a tombstone (fail_job/skip_job always write a
+    reason).
+
+    Only tombstones ('failed'/'skipped') are touched; 'pending'/'running' rows
+    are left alone even if their file is currently missing (that is
+    process_pending_once's stat-failure path, not the scanner's job). The
+    tombstone set is small in practice, but this runs on the event loop, so —
+    for consistency with scan_root's enqueue loop — yield every 50 exists()
+    checks."""
+    rows = conn.execute(
+        "SELECT file_path FROM notes_distill_jobs WHERE user_id=? "
+        "AND status IN ('failed','skipped') "
+        "AND (last_error IS NULL OR last_error != ?)",
+        (str(user_id), notes_distill.CANCELLED_BY_USER)).fetchall()
+    deleted = 0
+    for i, r in enumerate(rows):
+        if i and i % 50 == 0:
+            await asyncio.sleep(0)
+        if os.path.exists(r["file_path"]):
+            continue
+        conn.execute(
+            "DELETE FROM notes_distill_jobs WHERE file_path=? "
+            "AND status IN ('failed','skipped') "
+            "AND (last_error IS NULL OR last_error != ?)",
+            (r["file_path"], notes_distill.CANCELLED_BY_USER))
+        deleted += 1
+    if deleted:
+        conn.commit()
+    return deleted
+
+
 async def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
     """Scan every opted-in, enabled root once."""
     opted_in = set(notes_store.get_distill_roots(conn, user_id))
@@ -105,6 +151,7 @@ async def scan_once(conn, *, user_id: str, roots: list[dict]) -> int:
             continue
         total += await scan_root(conn, user_id=user_id, root_id=str(r["id"]),
                                  root_path=path, known=known)
+    await sweep_dead_tombstones(conn, user_id=user_id)
     return total
 
 

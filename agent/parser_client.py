@@ -39,14 +39,18 @@ class ParserClient:
 
     async def extract(self, path: str, ocr: bool = False,
                       max_chars: int = 24000,
+                      max_pages: Optional[int] = None,
                       user_id: Optional[str] = None) -> dict[str, Any]:
         base = self._resolve_base_url()
         headers: dict[str, str] = {}
         if user_id:
             headers["X-NimoOS-User-ID"] = user_id
+        body: dict[str, Any] = {"path": path, "ocr": ocr, "max_chars": max_chars}
+        if max_pages is not None:
+            body["max_pages"] = max_pages
         r = await self._client.post(
             f"{base}/v1/parser/extract",
-            json={"path": path, "ocr": ocr, "max_chars": max_chars},
+            json=body,
             headers=headers,
         )
         try:

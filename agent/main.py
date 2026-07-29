@@ -2802,14 +2802,15 @@ async def notes_distill_jobs(request: Request, status: str = "",
 
 @app.post("/agent/notes/distill/jobs/cancel")
 async def notes_distill_cancel(body: DistillRequestPayload, request: Request):
+    import notes_distill
     uid = _notes_uid(request)
     conn = _db()
     path = os.path.abspath(body.path)
     cur = conn.execute(
         "UPDATE notes_distill_jobs SET status='skipped', "
-        "last_error='cancelled by user', updated_at=? "
+        "last_error=?, updated_at=? "
         "WHERE file_path=? AND user_id=? AND status='pending'",
-        (int(time.time()), path, uid))
+        (notes_distill.CANCELLED_BY_USER, int(time.time()), path, uid))
     conn.commit()
     if cur.rowcount == 0:
         # Not found, not yours, or already claimed/terminal — one answer:

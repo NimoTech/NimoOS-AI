@@ -29,6 +29,47 @@ async def test_extract_posts_correct_shape(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_extract_includes_max_pages_when_given(tmp_path):
+    url_file = tmp_path / "parser.url"
+    url_file.write_text("http://127.0.0.1:8283\n")
+
+    async def fake_post(url, json=None, headers=None):
+        class R:
+            status_code = 200
+            def json(self): return {"path": json["path"], "markdown": "md",
+                                     "truncated": False, "ocr": json["ocr"]}
+            def raise_for_status(self): pass
+        assert json == {"path": "/DATA/x.pdf", "ocr": False,
+                        "max_chars": 24000, "max_pages": 40}
+        return R()
+
+    client = ParserClient(discovery_path=str(url_file))
+    with patch.object(client._client, "post", side_effect=fake_post):
+        await client.extract("/DATA/x.pdf", max_chars=24000, max_pages=40)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_extract_omits_max_pages_when_none(tmp_path):
+    url_file = tmp_path / "parser.url"
+    url_file.write_text("http://127.0.0.1:8283\n")
+
+    async def fake_post(url, json=None, headers=None):
+        class R:
+            status_code = 200
+            def json(self): return {"path": json["path"], "markdown": "md",
+                                     "truncated": False, "ocr": json["ocr"]}
+            def raise_for_status(self): pass
+        assert "max_pages" not in json
+        return R()
+
+    client = ParserClient(discovery_path=str(url_file))
+    with patch.object(client._client, "post", side_effect=fake_post):
+        await client.extract("/DATA/x.pdf", max_chars=24000)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_extract_raises_with_body_on_error(tmp_path):
     url_file = tmp_path / "parser.url"
     url_file.write_text("http://127.0.0.1:8283\n")

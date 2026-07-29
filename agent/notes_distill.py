@@ -25,11 +25,23 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
+# Shared literal between main.py's cancel endpoint (writes this as last_error
+# on the 'skipped' tombstone it creates) and notes_distill_scan's dead-
+# tombstone sweep (must never delete a tombstone carrying this reason, even
+# once the file is gone from disk) — a single constant keeps the two call
+# sites from silently drifting apart.
+CANCELLED_BY_USER = "cancelled by user"
+
 # A book-length scanned PDF (100MB+) burns all MAX_ATTEMPTS retries against
 # Parser's 120s extract timeout (live incident: 3x ReadTimeout in the queue
 # diagnostics) — reject it before the extract call instead. 50MB leaves
 # headroom for an ordinary multi-page scan.
 MAX_DISTILL_BYTES = 50 * 1024 * 1024
+
+# Magazine-class PDFs run ~2-3k chars/page, so 40 pages comfortably covers the
+# 96k-char extract budget (EXTRACT_MAX_CHARS below) while avoiding Parser's
+# 120s extract timeout on 100+ page documents running docling on CPU.
+MAX_DISTILL_PAGES = 40
 
 POLL_SECONDS = 30
 # 180s, not the 60s used elsewhere: summarizing a document on a local CPU
@@ -141,7 +153,16 @@ def parse_summary(raw):
 def enqueue(conn, *, file_path: str, user_id: str, root_id: str,
             file_mtime: int, origin: str = "auto", now=None) -> bool:
     """Coalescing UPSERT keyed on file_path. A manual request outranks a
-    later auto one — never demote origin back to 'auto'."""
+    later auto one — never demote origin back to 'auto'.
+
+    A 'running' row is left untouched (the `WHERE status != 'running'` guard
+    on the DO UPDATE): flipping an in-flight job back to 'pending' would reset
+    its attempts counter and race the worker's own finish_job/fail_job
+    transition, letting the same file be claimed and processed twice
+    (double quota consumption). This is a no-op, not a failure — the file is
+    already in flight — so the return value is still True: True means
+    "accepted", not "row changed".
+    """
     if not is_distillable(file_path):
         return False
     now = int(time.time()) if now is None else now
@@ -157,7 +178,8 @@ def enqueue(conn, *, file_path: str, user_id: str, root_id: str,
              origin=CASE WHEN notes_distill_jobs.origin='manual'
                          THEN 'manual' ELSE excluded.origin END,
              enqueued_at=excluded.enqueued_at,
-             updated_at=excluded.updated_at""",
+             updated_at=excluded.updated_at
+           WHERE notes_distill_jobs.status != 'running'""",
         (file_path, str(user_id), str(root_id), int(file_mtime), origin,
          now, now))
     conn.commit()
@@ -476,7 +498,8 @@ async def _default_extractor(path: str, max_chars: int) -> dict:
     from parser_client import ParserClient
     client = ParserClient()
     try:
-        return await client.extract(path, ocr=False, max_chars=max_chars)
+        return await client.extract(path, ocr=False, max_chars=max_chars,
+                                    max_pages=MAX_DISTILL_PAGES)
     finally:
         await client.aclose()
 
