@@ -58,3 +58,17 @@ def test_parse_extraction_accepts_raw_newlines_in_strings():
 
 def test_parse_extraction_still_rejects_pure_prose():
     assert mx.parse_extraction("I cannot extract anything from this.") is None
+
+
+def test_loads_tolerant_fenced():
+    text = '```json\n{"a": 1}\n```'
+    assert mx.loads_tolerant(text) == {"a": 1}
+
+
+def test_loads_tolerant_prose_wrapped():
+    text = 'Here is the JSON: {"a": 1}'
+    assert mx.loads_tolerant(text) == {"a": 1}
+
+
+def test_loads_tolerant_non_str_returns_none():
+    assert mx.loads_tolerant(None) is None

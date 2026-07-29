@@ -14,7 +14,7 @@ import time
 import httpx
 
 import memory_lock
-from memory_extract import _clean_json_text, _first_json_object
+from memory_extract import loads_tolerant
 from notes import store as notes_store
 from notes.indexer import index_note
 from provider_adapters import (
@@ -125,15 +125,9 @@ def build_reduce_prompt(partials: list[str], *, filename: str) -> str:
 def parse_summary(raw):
     """Return a validated summary dict, or None when the payload is not the
     expected JSON shape (caller treats None as a retryable failure)."""
-    try:
-        cleaned = _clean_json_text(raw)
-        obj = json.loads(cleaned, strict=False)
-    except (json.JSONDecodeError, TypeError):
-        if not isinstance(raw, str):
-            return None
-        obj = _first_json_object(_clean_json_text(raw))
-        if obj is None:
-            return None
+    obj = loads_tolerant(raw)
+    if obj is None:
+        return None
     if not isinstance(obj, dict):
         return None
     title, body = obj.get("title"), obj.get("body")
