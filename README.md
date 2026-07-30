@@ -1,69 +1,79 @@
 # NimoOS-AI
 
-NimoOS 的 AI 服务 —— **LLM 推理网关** + **本地 Agent 运行时**。
+The AI service for NimoOS — an **LLM inference gateway** plus a **local agent runtime**.
 
-> ### About / 关于本项目
+> ### About
 >
 > NimoOS is a fork of [CasaOS](https://github.com/IceWhaleTech/CasaOS)
 > (Apache-2.0), originally developed by IceWhale Technology Co., Ltd.
-> Building on that foundation, NimoOS adds an AI agent, RAG-based
-> retrieval, a knowledge layer, and a built-in web terminal.
+> Building on that foundation, NimoOS adds an AI agent, RAG-based retrieval,
+> a knowledge layer, and a built-in web terminal.
 >
-> NimoOS 基于 [CasaOS](https://github.com/IceWhaleTech/CasaOS)（Apache-2.0）
-> fork 而来，原始项目由 IceWhale Technology Co., Ltd. 开发。在此基础上，
-> NimoOS 重建了 AI Agent、RAG 检索、知识库与内置终端等能力。
+> See [`NOTICE`](./NOTICE) for attribution details. CasaOS and IceWhale are
+> trademarks of IceWhale Technology Co., Ltd.; NimoOS is an independent
+> project and is not affiliated with IceWhale.
 >
-> 归属详情见 [`NOTICE`](./NOTICE)。CasaOS 与 IceWhale 是 IceWhale Technology
-> Co., Ltd. 的商标；NimoOS 是独立项目，与 IceWhale 无隶属关系。
->
-> 本仓库是 NimoTech 原创，不含 CasaOS 衍生代码。
+> This repository is NimoTech's own work and contains no CasaOS-derived code.
+
 
 > ⚠️ Multi-user isolation is incomplete — Photos and Search are not yet
-> per-user scoped. Read [SECURITY.md](./SECURITY.md#known-limitations)
-> before deploying NimoOS for more than one person.
->
-> ⚠️ 多用户隔离尚不完整（Photos 与搜索未按用户隔离）。若要给多人使用，
-> 请先阅读 [SECURITY.md](./SECURITY.md#known-limitations)。
+> per-user scoped. Read [SECURITY.md](./SECURITY.md#known-limitations) before
+> deploying NimoOS for more than one person.
 
-## 这是什么
 
-绑定 localhost、由 NimoOS Gateway 转发，API 前缀 `/v1/ai`。由两个独立进程组成：
+## What this is
+Binds localhost and is fronted by the NimoOS gateway under `/v1/ai`. It runs as
+two separate processes:
 
-- **Go 服务** —— 推理路由、模型与供应商管理、对外 MCP server 端点
-- **Python Agent 运行时** —— 工具调用、跨会话记忆、skills、聊天平台接入
+- **Go service** — inference routing, model and provider management, the
+  outward-facing MCP server endpoint
+- **Python agent runtime** — tool calls, cross-session memory, skills, chat
+  platform bridges
 
-## 主要能力
+## Capabilities
 
-| 能力 | 说明 |
+| Capability | Notes |
 |---|---|
-| 推理路由 | 本地（Ollama）与云端多供应商 / 多模型 |
-| Agent 工具链 | 文件读写、shell、批量文件结构、文档阅读（含视觉页面） |
-| 跨会话记忆 | 画像层 + 召回层 + 自动抽取 + 上下文压缩 |
-| Skills | 渐进式披露 |
-| MCP | 既是客户端（接外部 MCP server），也是 server（把 NimoOS 能力暴露给外部 AI 客户端） |
-| 聊天平台接入 | Telegram · Discord |
+| Inference routing | Local (Ollama) and cloud, multiple providers and models |
+| Agent tooling | File read/write, shell, bulk file structure, document reading including visual pages |
+| Cross-session memory | Profile layer, recall layer, automatic extraction, context compaction |
+| Skills | Progressive disclosure |
+| MCP | Both a client (connects to external servers) and a server (exposes NimoOS to external AI clients) |
+| Chat bridges | Telegram, Discord |
 
-## 安全模型
+## Security model
 
-Agent 可以读文件、在服务器上执行 shell 命令。其约束是**行为层护栏 + 出站咽喉**，
-**不是硬沙箱** —— 边界与适用范围见 [`SECURITY.md`](./SECURITY.md#ai-agent-security-model)。
+The agent can read files and run shell commands on your server. Its containment
+is **behavioural guardrails plus an egress chokepoint — not a hard sandbox**.
+Boundaries and intended scope: [`SECURITY.md`](./SECURITY.md#ai-agent-security-model).
 
-## 构建
 
-需要完整的 NimoOS monorepo checkout —— 所有 Go 服务通过 `replace` 指向本地的
-`NimoOS-Common`，`go.mod` 里的版本号是装饰性的。
+## Building
+
+NimoOS is a multi-repository project. Every Go service uses a `replace`
+directive pointing at the local `NimoOS-Common` checkout, so a build needs the
+full workspace — see
+[NimoOS-Build](https://github.com/NimoTech/NimoOS-Build) for the layout and the
+one-line clone helper.
+
+`NimoOS-MessageBus` must be generated first; its generated API code is not
+committed and other services' `go generate` consumes its OpenAPI spec.
 
 ```bash
-CGO_ENABLED=1 go build ./...   # go-systemd 需要 CGO
-go test ./...                  # 注意：存在若干已知的既有失败用例
+CGO_ENABLED=1 go build ./...   # go-systemd needs CGO
+go test ./...                  # note: some tests are known to fail already
 ```
 
-Python Agent 侧见 [`agent/`](./agent/)。
+Go services pin `go 1.21` and echo v4.12 — **do not run `go mod tidy`**.
 
-## 文档
 
-架构、请求流转、事件与运行时细节见 [`OVERVIEW.md`](./OVERVIEW.md)。
+The Python agent lives in [`agent/`](./agent/).
 
-## 许可
 
-Apache-2.0，见 [`LICENSE`](./LICENSE)。
+## Documentation
+
+Architecture, request flow and runtime details: [`OVERVIEW.md`](./OVERVIEW.md).
+
+## License
+
+Apache-2.0 — see [`LICENSE`](./LICENSE).
