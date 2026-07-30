@@ -4,6 +4,24 @@ import pytest
 import db as db_module
 import agent as agent_module
 
+from tests.test_agent_md_prompt import unfence_block
+
+
+@pytest.fixture(autouse=True)
+def _ceiling(tmp_path, monkeypatch):
+    """_compose_system_prompt calls agent_md.probe() with no ceiling, so pin
+    one for these tests — pytest's tmp_path lives under /tmp (mode 1777),
+    which agent_md.probe correctly treats as a world-writable ancestor and
+    refuses to load agent.md from underneath. See tests/test_agent_md_prompt.py
+    for the same fixture applied to the newer tests."""
+    real_probe = agent_module.agent_md.probe
+
+    def probe_with_ceiling(folder, **kw):
+        kw.setdefault("ceiling", str(tmp_path))
+        return real_probe(folder, **kw)
+
+    monkeypatch.setattr(agent_module.agent_md, "probe", probe_with_ceiling)
+
 
 def test_compose_no_visible_resources(tmp_path):
     conn = db_module.init_db(str(tmp_path / "a.db"),
@@ -28,7 +46,8 @@ def test_compose_includes_agent_md(tmp_path):
     conn.commit()
     out = agent_module._compose_system_prompt(conn, "s1", "BASE")
     assert "has agent.md" in out
-    assert "# This project is foo" in out
+    body = unfence_block(out, f"agent-md:{os.path.join(str(root), 'agent.md')}")
+    assert "# This project is foo" in body
 
 
 def test_compose_truncates_at_total_cap(tmp_path):

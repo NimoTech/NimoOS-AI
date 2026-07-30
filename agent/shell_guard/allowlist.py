@@ -8,6 +8,7 @@ import time
 import uuid
 
 from shell_guard.parse import segments, extract_paths
+from shell_guard.rules import _is_protected_path
 
 
 def add(conn, match_type: str, value: str, created_by: str, note: str = "") -> str:
@@ -38,11 +39,20 @@ def delete(conn, entry_id: str) -> bool:
 
 
 def _entry_matches(command: str, seg, match_type: str, value: str) -> bool:
+    if match_type in ("prefix", "regex"):
+        # A loose prefix/regex entry (e.g. prefix "cat ") must NOT waive a
+        # command that reads/writes a PROTECTED path — otherwise `cat ` would
+        # auto-approve `cat /etc/shadow` / agent.db / ~/.ssh/…. path_scope is
+        # exempt: it already constrains every path to the configured scope.
+        if any(_is_protected_path(p) for p in extract_paths(seg)):
+            return False
     if match_type == "prefix":
         return command.strip().startswith(value)
     if match_type == "regex":
         try:
-            return re.search(value, command) is not None
+            # Anchored: an unanchored pattern would vouch for any command that
+            # merely CONTAINS the pattern (superset smuggling).
+            return re.fullmatch(value, command) is not None
         except re.error:
             return False
     if match_type == "path_scope":

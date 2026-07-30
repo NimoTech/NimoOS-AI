@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+import agent_md
 import db as db_module
 import context_compaction
 import mcp_tokens
@@ -290,6 +291,18 @@ async def _recall_worker_startup():
 async def _notes_extract_worker_startup():
     import notes_extract
     notes_extract.start_worker(_db())
+
+
+@app.on_event("startup")
+async def _notes_distill_worker_startup():
+    import notes_distill
+    notes_distill.start_worker(_db())
+
+
+@app.on_event("startup")
+async def _notes_distill_scanner_startup():
+    import notes_distill_scan
+    notes_distill_scan.start_scanner(_db())
 
 
 _channel_manager = None
@@ -966,7 +979,18 @@ async def list_visible_resources(
         "WHERE session_id=? ORDER BY added_at",
         (session_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("kind") == "folder":
+            # Evaluated fresh on every listing: directory permissions can
+            # change after authorization, so a persisted verdict would be
+            # stale — and stale is not acceptable for a security decision.
+            st = agent_md.probe(d["path"], read_body=False)
+            d["agent_md"] = {"state": st.state, "reason": st.reason,
+                             "detail": st.detail}
+        out.append(d)
+    return out
 
 
 @app.post("/agent/sessions/{session_id}/visible-resources")
@@ -2581,6 +2605,9 @@ class NotesSettingsPayload(BaseModel):
     notes_root: str | None = None
     mode: str = "adopt"          # adopt | migrate
     auto_extract: bool | None = None
+    distill_roots: list[str] | None = None
+    distill_daily_cap: int | None = None
+    background_model: str | None = None
 
 
 def _notes_uid(request: Request) -> str:
@@ -2602,12 +2629,19 @@ async def _notes_post_write(conn, uid: str, note: dict, body: str) -> None:
         logging.getLogger("nimoos-agent").exception("reserved render failed")
 
 
+def _notes_settings_body(conn, uid: str) -> dict:
+    return {"notes_root": notes_store.get_notes_root(conn),
+            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid),
+            "distill_roots": notes_store.get_distill_roots(conn, uid),
+            "distill_daily_cap": notes_store.get_daily_cap(conn, uid),
+            "background_model": notes_store.get_background_model(conn, uid)}
+
+
 @app.get("/agent/notes/settings")
 async def get_notes_settings(request: Request):
     uid = _notes_uid(request)
     conn = _db()
-    return {"notes_root": notes_store.get_notes_root(conn),
-            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+    return _notes_settings_body(conn, uid)
 
 
 @app.put("/agent/notes/settings")
@@ -2631,8 +2665,16 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
                 for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
                     shutil.move(os.path.join(old, entry), os.path.join(new, entry))
             notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
-    return {"notes_root": notes_store.get_notes_root(conn),
-            "auto_extract": notes_store.is_auto_extract_enabled(conn, uid)}
+    if body.distill_roots is not None:
+        notes_store.set_distill_roots(conn, uid, body.distill_roots)
+    if body.distill_daily_cap is not None:
+        if body.distill_daily_cap < 0:
+            raise HTTPException(status_code=400,
+                                detail="distill_daily_cap must be >= 0")
+        notes_store.set_daily_cap(conn, uid, body.distill_daily_cap)
+    if body.background_model is not None:
+        notes_store.set_background_model(conn, uid, body.background_model)
+    return _notes_settings_body(conn, uid)
 
 
 # Probes are confined to the user-visible data root (tests monkeypatch this).
@@ -2660,6 +2702,121 @@ async def notes_dir_info(request: Request, path: str = ""):
         # the backend guard would then reject.
         empty = False
     return {"exists": True, "empty": empty}
+
+
+class DistillRequestPayload(BaseModel):
+    path: str
+
+
+# The three roots Parser's extract accepts (its EXTRACT_ROOTS); the same
+# gate logic (realpath containment, .system_data carve) applies per root.
+# fs_gate itself stays /DATA-only for the external MCP surface.
+_DISTILL_GATE_ROOTS = ("/DATA", "/media", "/mnt")
+
+
+def _distill_gate_ok(user_id: str, path: str) -> bool:
+    """Headless deny-only gate — same fs_gate logic MCP path reads use,
+    widened to the extract roots. Never a second file-access route
+    (DEVELOPMENT_PLAN ban #5)."""
+    from mcp_server import fs_gate
+    for root in _DISTILL_GATE_ROOTS:
+        try:
+            fs_gate.mcp_resolve_read_path(path, root=root)
+            return True
+        except fs_gate.McpPathDenied:
+            continue
+    return False
+
+
+@app.post("/agent/notes/distill")
+async def notes_distill_manual(request: Request, body: DistillRequestPayload):
+    import notes_distill
+    uid = _notes_uid(request)
+    path = os.path.abspath(body.path)
+    if not _distill_gate_ok(uid, path):
+        raise HTTPException(status_code=403, detail="path not allowed")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="file not found")
+    if not notes_distill.is_distillable(path):
+        raise HTTPException(status_code=400, detail="unsupported document type")
+    conn = _db()
+    notes_distill.enqueue(conn, file_path=path, user_id=uid, root_id="",
+                          file_mtime=int(os.stat(path).st_mtime),
+                          origin="manual")
+    return {"queued": True}
+
+
+@app.get("/agent/notes/distill/status")
+async def notes_distill_status(request: Request):
+    uid = _notes_uid(request)
+    conn = _db()
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM notes_distill_jobs WHERE user_id=? "
+        "AND status IN ('pending','running')",
+        (uid,)).fetchone()["c"]
+    distilled = conn.execute(
+        "SELECT COUNT(*) c FROM notes WHERE user_id=? AND type='summary' "
+        "AND created_by='pipeline' AND deleted_at IS NULL",
+        (uid,)).fetchone()["c"]
+    day = time.strftime("%Y%m%d")
+    return {
+        "pending": pending,
+        "distilled": distilled,
+        "quota_remaining": notes_store.quota_remaining(conn, uid, day=day),
+        "background_model": notes_store.get_background_model(conn, uid),
+    }
+
+
+@app.get("/agent/notes/distill/jobs")
+async def notes_distill_jobs(request: Request, status: str = "",
+                             limit: int = 200):
+    uid = _notes_uid(request)
+    conn = _db()
+    limit = max(1, min(int(limit), 500))
+    where = "user_id=?"
+    args: list = [uid]
+    if status:
+        if status not in ("pending", "running", "failed"):
+            raise HTTPException(400, "status must be pending|running|failed")
+        if status == "failed":
+            # Tombstones: 'failed' (retries exhausted) and 'skipped'
+            # (terminal drop) are one bucket to the user; rows keep the
+            # raw status so the UI can badge them apart.
+            where += " AND status IN ('failed','skipped')"
+        else:
+            where += " AND status=?"
+            args.append(status)
+    rows = conn.execute(
+        f"SELECT file_path, status, origin, attempts, last_error, "
+        f"enqueued_at, updated_at FROM notes_distill_jobs WHERE {where} "
+        f"ORDER BY updated_at DESC LIMIT ?", (*args, limit)).fetchall()
+    counts = {"pending": 0, "running": 0, "failed": 0}
+    for r in conn.execute(
+            "SELECT status, COUNT(*) c FROM notes_distill_jobs "
+            "WHERE user_id=? GROUP BY status", (uid,)):
+        key = "failed" if r["status"] in ("failed", "skipped") else r["status"]
+        if key in counts:
+            counts[key] += r["c"]
+    return {"jobs": [dict(r) for r in rows], "counts": counts}
+
+
+@app.post("/agent/notes/distill/jobs/cancel")
+async def notes_distill_cancel(body: DistillRequestPayload, request: Request):
+    import notes_distill
+    uid = _notes_uid(request)
+    conn = _db()
+    path = os.path.abspath(body.path)
+    cur = conn.execute(
+        "UPDATE notes_distill_jobs SET status='skipped', "
+        "last_error=?, updated_at=? "
+        "WHERE file_path=? AND user_id=? AND status='pending'",
+        (notes_distill.CANCELLED_BY_USER, int(time.time()), path, uid))
+    conn.commit()
+    if cur.rowcount == 0:
+        # Not found, not yours, or already claimed/terminal — one answer:
+        # nothing cancellable at this path right now.
+        raise HTTPException(409, "no pending job for this path")
+    return {"cancelled": True}
 
 
 @app.get("/agent/notes")

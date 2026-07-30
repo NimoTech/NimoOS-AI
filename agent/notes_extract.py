@@ -11,7 +11,7 @@ import logging
 import time
 
 import memory_lock
-from memory_extract import _clean_json_text, _redact_fenced
+from memory_extract import _redact_fenced, loads_tolerant
 from notes import store as notes_store
 from notes.indexer import index_note
 
@@ -53,9 +53,8 @@ def build_extraction_prompt(history, existing_titles) -> str:
 def parse_extraction(text):
     """Return up to MAX_NOTES_PER_EXTRACT validated note dicts, or None if
     the payload is not the expected JSON shape."""
-    try:
-        obj = json.loads(_clean_json_text(text))
-    except (json.JSONDecodeError, TypeError):
+    obj = loads_tolerant(text)
+    if obj is None:
         return None
     if not isinstance(obj, dict) or not isinstance(obj.get("notes"), list):
         return None

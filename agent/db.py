@@ -218,6 +218,22 @@ CREATE TABLE IF NOT EXISTS notes_extract_jobs (
 CREATE INDEX IF NOT EXISTS idx_notes_extract_jobs_status
     ON notes_extract_jobs(status, enqueued_at);
 
+CREATE TABLE IF NOT EXISTS notes_distill_jobs (
+    file_path   TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    root_id     TEXT NOT NULL,
+    file_mtime  INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    origin      TEXT NOT NULL DEFAULT 'auto',
+    last_error  TEXT,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_distill_jobs_claim
+    ON notes_distill_jobs(status, origin, enqueued_at);
+
 CREATE TABLE IF NOT EXISTS mcp_tokens (
     id           TEXT PRIMARY KEY,
     user_id      TEXT NOT NULL,

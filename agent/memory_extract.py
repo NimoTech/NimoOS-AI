@@ -102,10 +102,46 @@ def _clean_json_text(text: str) -> str:
     return t.strip()
 
 
-def parse_extraction(text):
+def _first_json_object(text: str):
+    """Fallback for models that wrap the JSON in prose ('Here is the
+    summary: {...}'): decode the first JSON object found in the text,
+    ignoring any prose before or after it. Also tolerates raw control
+    characters (unescaped newlines) inside string values, which local
+    models routinely emit — strict=False relaxes only that, nothing
+    else about the JSON grammar."""
+    idx = text.find("{")
+    if idx == -1:
+        return None
     try:
-        obj = json.loads(_clean_json_text(text))
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(text[idx:])
+    except ValueError:
+        return None
+    return obj
+
+
+def loads_tolerant(text):
+    """Parse LLM output that SHOULD be a JSON object but often isn't quite:
+    code fences, prose wrapping ('Here is the JSON: {...}'), and raw control
+    characters inside string values are all tolerated. Returns the decoded
+    object (any JSON type the strict path yields, dict from the fallback)
+    or None. Shared by memory_extract.parse_extraction,
+    notes_extract.parse_extraction and notes_distill.parse_summary — keep
+    their tolerance behavior identical by construction."""
+    try:
+        cleaned = _clean_json_text(text)
+        obj = json.loads(cleaned, strict=False)
     except (json.JSONDecodeError, TypeError):
+        if not isinstance(text, str):
+            return None
+        obj = _first_json_object(_clean_json_text(text))
+        if obj is None:
+            return None
+    return obj
+
+
+def parse_extraction(text):
+    obj = loads_tolerant(text)
+    if obj is None:
         return None
     if not isinstance(obj, dict):
         return None

@@ -83,10 +83,16 @@ class WikiContextBuilder:
         )
         lines.append("")
 
+        # Node lines carry ai_label / paths that are attacker-influenceable
+        # (auto-generated from names a downloaded file can control). _scaf()
+        # stops tag-breakout but NOT plain natural-language injection sitting in
+        # what reads as trusted scaffolding — so the whole node listing is fenced
+        # as data. The header/instructions above stay outside the fence (trusted).
+        node_lines: list[str] = []
         for space in spaces:
             sp = space["path"]
             label = space.get("ai_label") or os.path.basename(sp) or sp
-            lines.append(f"- **{_scaf(sp)}** (space) — {_scaf(label)}")
+            node_lines.append(f"- **{_scaf(sp)}** (space) — {_scaf(label)}")
             projects = [
                 n for n in tree
                 if n.get("level") == "project" and n["path"].startswith(sp + "/")
@@ -96,13 +102,15 @@ class WikiContextBuilder:
                 lbl = n.get("ai_label")
                 if not lbl:
                     lbl = os.path.basename(n["path"]) + " (no summary yet)"
-                lines.append(f"  - {_scaf(n['path'])} — {_scaf(lbl)}")
+                node_lines.append(f"  - {_scaf(n['path'])} — {_scaf(lbl)}")
             if len(projects) > PROJECT_CAP:
                 extra = len(projects) - PROJECT_CAP
-                lines.append(
+                node_lines.append(
                     f"  - ... plus {extra} more items; "
                     f"use wiki_list_full_tree(root_id='{_scaf(sp)}') for the full list"
                 )
+        body = "\n".join(node_lines)
+        lines.append(fence_untrusted("wiki-map", body, cap=8000) or body)
         return "\n".join(lines)
 
     async def _render_notes(self, tree: list[dict]) -> str:

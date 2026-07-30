@@ -33,8 +33,8 @@ def _generator_version_failed(cfg) -> str:
 def _post_failed(node, cfg, reason: str) -> None:
     wiki_io.post_summary(
         path=node["path"],
-        ai_label="(生成失败,等待变化后重试)",
-        summary=f"_当前内容下摘要生成失败 ({reason})。目录有新变化后会自动重试。_",
+        ai_label="(generation failed, will retry on change)",
+        summary=f"_Summary generation failed for the current contents ({reason}). It will be retried automatically after the directory changes._",
         based_on_last_modified_ms=node["last_modified_ms"],
         generator_version=_generator_version_failed(cfg),
     )
@@ -59,8 +59,8 @@ def run_once(cfg) -> int:
             if evidence.is_empty():
                 wiki_io.post_summary(
                     path=node["path"],
-                    ai_label="空目录",
-                    summary="此目录目前为空。",
+                    ai_label="Empty directory",
+                    summary="This directory is currently empty.",
                     based_on_last_modified_ms=node["last_modified_ms"],
                     generator_version=_generator_version(cfg),
                 )

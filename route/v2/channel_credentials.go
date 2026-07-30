@@ -52,12 +52,15 @@ func ProviderCredentials(svc service.Services, runtimePath string) echo.HandlerF
 		}
 		if !strings.HasPrefix(model, "cloud:") {
 			// Bare model name = local Ollama. Mirrors the hardcoded branch in
-			// AgentHandler.Proxy (route/v2/agent.go).
+			// AgentHandler.Proxy (route/v2/agent.go). Model may still carry the
+			// UI's "local:" prefix (listModelOptions/background_model); strip
+			// it so bare Ollama sees a real model name, matching chat.go:367
+			// and UI agentStore.js's own prefix stripping.
 			return c.JSON(http.StatusOK, providerCredentials{
 				ProviderType: "ollama",
 				BaseURL:      "http://127.0.0.1:11434/v1",
 				APIKey:       "ollama",
-				Model:        model,
+				Model:        strings.TrimPrefix(model, "local:"),
 			})
 		}
 		parts := strings.SplitN(model, ":", 3)
