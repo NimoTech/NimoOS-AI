@@ -212,7 +212,7 @@ Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+J
 
 **路径门控**:无头 MCP 无聊天 session,不能用 chat 的 `visible_resources` 门控。`mcp_server/fs_gate.py` 提供 deny-only 门控 `mcp_resolve_read_path()`:`realpath` 防 `..`/符号链接/前缀兄弟(`/DATA-evil`),只放 `/DATA`、挖掉 `/DATA/.system_data`;越界抛 `McpPathDenied`。硬失败(门控拒/渲染失败/超时/参数互斥)统一抛 `McpToolError` → `server._call` 映射为 `CallToolResult(isError=True)`。
 
-**模块**:`server.py`(ASGI/协议适配 + `_call` + `render_result`)、`tools.py`(白名单 `TOOL_SPECS` + 各 `_h_*` handler + `ImageResult`/`McpToolError`)、`fs_gate.py`(路径门控)。设计/计划见 `nimo_os_docs/docs/superpowers/specs/2026-06-*-nimoos-mcp-server-*` 及 `2026-06-30-mcp-*`、`2026-07-01-mcp-token-ui-*`。
+**模块**:`server.py`(ASGI/协议适配 + `_call` + `render_result`)、`tools.py`(白名单 `TOOL_SPECS` + 各 `_h_*` handler + `ImageResult`/`McpToolError`)、`fs_gate.py`(路径门控)。设计/计划见 内部设计稿 `2026-06-*-nimoos-mcp-server-*` 及 `2026-06-30-mcp-*`、`2026-07-01-mcp-token-ui-*`。
 
 **caveat**:Photos 数据层当前无 per-user filter → 多用户下 `search_photos`/`list_albums` 暂不能宣称用户隔离(单用户 NAS 无影响)。
 
@@ -220,7 +220,7 @@ Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+J
 
 ## Channels(Telegram / Discord 聊天接入)
 
-把 agent 接到外部聊天平台:用户在 Telegram / Discord 私聊 bot,即与自己的 NimoOS agent 对话。代码在 `agent/channels/`,全部跑在 Python agent 进程内;**纯出站连接**(Telegram 长轮询 `getUpdates`、Discord Gateway WebSocket),家用 NAT 后无需公网入口、无需新增 JWT 豁免路由。设计稿 `nimo_os_docs/docs/superpowers/specs/2026-07-02-nimoos-channels-design.md`(+ `2026-07-04-*-attachments-*`、`2026-07-05-*-interactive-*`)。
+把 agent 接到外部聊天平台:用户在 Telegram / Discord 私聊 bot,即与自己的 NimoOS agent 对话。代码在 `agent/channels/`,全部跑在 Python agent 进程内;**纯出站连接**(Telegram 长轮询 `getUpdates`、Discord Gateway WebSocket),家用 NAT 后无需公网入口、无需新增 JWT 豁免路由。设计稿 内部设计稿 `2026-07-02-nimoos-channels-design.md`(+ `2026-07-04-*-attachments-*`、`2026-07-05-*-interactive-*`)。
 
 ### 分层架构(`agent/channels/`)
 
@@ -270,7 +270,7 @@ Agent 通过 HTTP Header 接收用户黑名单(`X-Agent-User-Blacklist`,base64+J
 
 ## Phoenix tracing(agent 可观测性,#41)
 
-用 [Arize Phoenix](https://phoenix.arize.com/) 收 agent 运行的 OTLP trace。代码 `agent/phoenix_tracing.py`;设计稿 `nimo_os_docs/docs/superpowers/specs/2026-06-30-agent-phoenix-tracing-design.md` / `*-tracing-productization-design.md`。
+用 [Arize Phoenix](https://phoenix.arize.com/) 收 agent 运行的 OTLP trace。代码 `agent/phoenix_tracing.py`;设计稿 内部设计稿 `2026-06-30-agent-phoenix-tracing-design.md` / `*-tracing-productization-design.md`。
 
 - **安装一次、门控随开**:启动时(若 OpenInference/OTel 依赖可 import)装 `OpenAIAgentsInstrumentor` + `GatedSpanExporter`;是否真正导出由进程内 `_enabled` 标志决定,来自 `user_settings` 表的全局 `tracing_enabled`(保留 user_id `__global__`),UI 开关经 `GET/PUT /agent/user-settings/tracing` 即时生效、**无需重启**。关闭时 exporter 直接丢弃、不碰网络 —— 停掉 Phoenix 不会刷 OTLP 重试日志。任何 setup 失败都被吞掉,agent 照常跑。
 - **按 session 分组**:`build_trace_run_config` 给每次 run 一个 `RunConfig`(`workflow_name="nimoos-agent"`、`group_id=session_id`、metadata 带 user_id/model/agent_type);禁用时返回 `tracing_disabled=True`。
@@ -308,13 +308,13 @@ cd NimoOS-AI && CGO_ENABLED=1 go build -o nimoos-ai .
 goreleaser release --snapshot --clean
 
 # 一键安装脚本(系统级,含 Python venv + systemd)
-bash nimo_os_docs/scripts/install-ai.sh
+bash scripts/install-ai.sh
 
 # 启动 Python Agent(开发态)
-bash nimo_os_docs/scripts/start-ai.sh
+bash scripts/start-ai.sh
 ```
 
-参见仓库根 `nimo_os_docs/scripts/`:`install-ai.sh`、`start-ai.sh`、`deploy-agent.sh`。
+参见仓库根 `scripts/`（随 NimoOS 安装脚本分发）:`install-ai.sh`、`start-ai.sh`、`deploy-agent.sh`。
 
 ---
 
