@@ -78,9 +78,9 @@ class ChannelRunDriver:
     async def _finish(self) -> None:
         await self._flush()
         if self._error:
-            await self._emit(f"出错了 (error): {self._error}")
+            await self._emit(f"Something went wrong: {self._error}")
         elif not self._sent_anything:
-            await self._emit("(无回复 / empty reply)")
+            await self._emit("(empty reply)")
 
     async def drive(self, sink) -> None:
         past, q = sink.subscribe()

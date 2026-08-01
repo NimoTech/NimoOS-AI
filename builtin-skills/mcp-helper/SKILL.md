@@ -55,10 +55,10 @@ Prefer this when the user explicitly asks you to install/add an MCP server.
   Streamable HTTP but is configured as SSE (or vice versa). Have the user edit
   the server and switch the transport to **HTTP**. (Microsoft Learn is
   HTTP-only — choosing SSE gives exactly this 405.)
-- **A stdio server warns "正在后台下载初始化, 稍后重试" or shows no tools yet** →
+- **A stdio server warns "initializing in the background, retry shortly" or shows no tools yet** →
   first use downloads the package via `npx`/`uvx` in the background. Wait a few
   seconds and try again; it is cached after the first run.
-- **"连接失败" / "探测超时" on Test, or an occasional mid-call failure** → usually
+- **"Connection failed" / "Probe timed out" on Test, or an occasional mid-call failure** → usually
   a slow or flaky network path to the remote server. Ask them to retry. Cold
   connects are tolerated for a while; a one-off failure that succeeds on retry
   is just network jitter, not a misconfiguration.

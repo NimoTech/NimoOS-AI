@@ -10,10 +10,10 @@ def _names(tools):
 def test_general_turn1_visible_is_core_plus_expand():
     tools = agent_mod.select_tools_for_run([], session_id="s1", profile=None)
     names = _names(tools)
-    # 常驻 6 + expand_tools 一定在
+    # 6 always-on tools + expand_tools must always be present
     assert tr.CORE_TOOL_NAMES <= names
     assert "expand_tools" in names
-    # 门控工具对象存在但默认不可见(is_enabled 在空解锁集下为 False)
+    # gated tool objects exist but default to not visible (is_enabled is False with an empty unlocked set)
     tg.UNLOCKED_VAR.set(set())
     by_name = {getattr(t, "name", ""): t for t in tools}
     install = by_name["install_app"]
@@ -28,16 +28,16 @@ def test_general_unlocked_category_visible():
 
 
 def test_core_objects_not_mutated():
-    # 门控不能改共享原件的 is_enabled(原件仍为默认 True)
+    # gating must not mutate the shared original's is_enabled (original stays default True)
     from skills.app_management import ALL_TOOLS as APP_TOOLS
     orig = APP_TOOLS[0]
     agent_mod.select_tools_for_run([], session_id="s1", profile=None)
     assert orig.is_enabled is True
-    assert not callable(orig.is_enabled)   # 原件 is_enabled 仍是布尔 True,未被换成门控回调
+    assert not callable(orig.is_enabled)   # original's is_enabled is still boolean True, not swapped for a gating callback
 
 
 class _PinnedProfile:
-    tools = ("a", "b")          # 占位:pinned 返回固定集
+    tools = ("a", "b")          # placeholder: pinned returns a fixed set
 
 
 def test_pinned_profile_unchanged():

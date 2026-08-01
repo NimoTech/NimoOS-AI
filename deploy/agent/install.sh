@@ -1,6 +1,7 @@
 #!/bin/bash
-# 离线安装/更新 NimoOS Agent 容器。由 script/package-agent.sh 打的包解压后运行本脚本。
-# 幂等:重复运行 = 更新到包内镜像版本。
+# Offline install/update of the NimoOS Agent container. Run this script after
+# extracting the package built by script/package-agent.sh.
+# Idempotent: rerunning it updates to the image version bundled in the package.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -12,10 +13,11 @@ DATA_DIR="/var/lib/nimoos/ai/agent"
 HEALTH_URL="http://127.0.0.1:8282/healthz"
 HEALTH_TIMEOUT=60
 
-[[ -f "${IMAGE_TAR}" ]] || { echo "✗ 找不到镜像包 ${IMAGE_TAR}" >&2; exit 1; }
+[[ -f "${IMAGE_TAR}" ]] || { echo "✗ Image package not found: ${IMAGE_TAR}" >&2; exit 1; }
 
-# 就绪检查:避免 /DATA 未挂载时把空目录绑进容器(数据写错地方)。
-# 接受「是 mountpoint」或「已初始化(有 .system_data 或非空)」。
+# Readiness check: avoid binding an empty directory into the container when /DATA isn't
+# mounted (data would land in the wrong place). Accepts either "is a mountpoint" or
+# "already initialized (has .system_data or is non-empty)".
 data_ready() {
   local p="$1"
   mountpoint -q "$p" && return 0
@@ -24,41 +26,44 @@ data_ready() {
   return 1
 }
 if ! data_ready /DATA; then
-  echo "✗ /DATA 尚未就绪(非挂载点且为空)。请先确保数据盘挂载,再重试。" >&2
+  echo "✗ /DATA is not ready yet (not a mountpoint and empty). Make sure the data disk is mounted, then retry." >&2
   exit 1
 fi
 
-echo "==> [1/4] 载入离线镜像 ${IMAGE_REF} ..."
+echo "==> [1/4] Loading offline image ${IMAGE_REF} ..."
 docker load -i "${IMAGE_TAR}"
 
-echo "==> [2/4] 部署 compose 到 ${APP_DIR} ..."
+echo "==> [2/4] Deploying compose to ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${DATA_DIR}"
 cp "${HERE}/docker-compose.yml" "${APP_DIR}/docker-compose.yml"
 
-# L4 审计日志防篡改:置为 append-only。容器与宿主共享该 inode(bind mount)且容器内
-# 进程即使是 root 也只能追加、不能截断/删除/改写——这是审计日志"agent 改不了"承诺的
-# 唯一 OS 级支撑(否则仅靠 L1 shell 分类器,一旦放宽即失守)。尽力而为:文件系统不支持
-# +a(部分 btrfs/overlay)时仅告警不阻断。⚠ 日志轮转前须先 `chattr -a`。
+# L4 audit-log tamper resistance: mark it append-only. The container shares this inode
+# with the host (bind mount), and even a root process inside the container can only
+# append, never truncate/delete/rewrite — this is the only OS-level backing for the
+# audit log's "the agent can't alter it" promise (otherwise it rests solely on the L1
+# shell classifier, which fails open the moment it's relaxed). Best-effort: if the
+# filesystem doesn't support +a (some btrfs/overlay setups), just warn without blocking.
+# WARNING: run `chattr -a` before log rotation.
 AUDIT_LOG="${DATA_DIR}/audit.log"
 touch "${AUDIT_LOG}" 2>/dev/null || true
 if chattr +a "${AUDIT_LOG}" 2>/dev/null; then
-  echo "    审计日志已设为 append-only:${AUDIT_LOG}"
+  echo "    Audit log set to append-only: ${AUDIT_LOG}"
 else
-  echo "    ⚠ 无法为审计日志设置 append-only(文件系统可能不支持 chattr +a),已跳过。" >&2
+  echo "    ⚠ Could not set append-only on the audit log (filesystem may not support chattr +a), skipped." >&2
 fi
 
-echo "==> [3/4] 启动 ${APP_ID} ..."
+echo "==> [3/4] Starting ${APP_ID} ..."
 docker compose -p "${APP_ID}" -f "${APP_DIR}/docker-compose.yml" up -d
 
-echo "==> [4/4] 等待 Agent 就绪(最多 ${HEALTH_TIMEOUT}s,轮询 ${HEALTH_URL})..."
+echo "==> [4/4] Waiting for the Agent to become ready (up to ${HEALTH_TIMEOUT}s, polling ${HEALTH_URL}) ..."
 deadline=$(( SECONDS + HEALTH_TIMEOUT ))
 while (( SECONDS < deadline )); do
   if curl -fsS "${HEALTH_URL}" 2>/dev/null | grep -q '"ok"'; then
-    echo "✓ NimoOS Agent 已就绪并运行中。"
+    echo "✓ NimoOS Agent is ready and running."
     exit 0
   fi
   sleep 2
 done
-echo "✗ 超时:Agent 未在 ${HEALTH_TIMEOUT}s 内就绪。" >&2
-echo "  排查:docker logs ${APP_ID}-agent-1" >&2
+echo "✗ Timed out: Agent did not become ready within ${HEALTH_TIMEOUT}s." >&2
+echo "  Troubleshoot: docker logs ${APP_ID}-agent-1" >&2
 exit 1

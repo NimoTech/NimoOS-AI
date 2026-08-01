@@ -38,7 +38,7 @@ func (h *SessionsHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	if body.Title == "" {
-		body.Title = "新会话"
+		body.Title = "New session"
 	}
 	sess, err := h.svc.Sessions().CreateSession(userID, body.Title)
 	if err != nil {

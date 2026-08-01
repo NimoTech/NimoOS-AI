@@ -15,4 +15,4 @@ def test_no_memory_category():
 def test_system_prompt_mentions_memory():
     p = agent_module.SYSTEM_PROMPT
     assert "remember" in p
-    assert "记忆" in p or "memory" in p.lower()
+    assert "memory" in p.lower()

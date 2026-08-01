@@ -10,18 +10,18 @@ import (
 var Cfg *Config
 
 type Config struct {
-	RuntimePath   string
-	DataPath      string
-	MasterKeyPath string
-	LogPath       string
-	AgentURL        string
-	AgentTimeout    int
-	OllamaURL       string
-	OpenVINOURL     string
-	OpenVINOEnabled bool
-	OpenVINODevices string // 逗号分隔的常驻设备,如 "GPU.1" 或 "GPU.1,GPU.0";第一个为默认设备
-	OpenVINOMaxLoaded      int // 同时最多驻留的模型数(对齐 Ollama OLLAMA_MAX_LOADED_MODELS),默认 3
-	OpenVINOIdleTTLMinutes int // 空闲多少分钟后自动卸载(对齐 Ollama keep_alive),默认 5;0=永不卸载
+	RuntimePath            string
+	DataPath               string
+	MasterKeyPath          string
+	LogPath                string
+	AgentURL               string
+	AgentTimeout           int
+	OllamaURL              string
+	OpenVINOURL            string
+	OpenVINOEnabled        bool
+	OpenVINODevices        string // comma-separated resident devices, e.g. "GPU.1" or "GPU.1,GPU.0"; the first is the default device
+	OpenVINOMaxLoaded      int    // max number of models resident at once (mirrors Ollama OLLAMA_MAX_LOADED_MODELS), default 3
+	OpenVINOIdleTTLMinutes int    // minutes of idleness before auto-unload (mirrors Ollama keep_alive), default 5; 0 = never unload
 }
 
 // Init loads the config and assigns it to the package-level Cfg. It is the
@@ -58,16 +58,16 @@ func Load(configFile, confSample string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		RuntimePath:   v.GetString("common.RuntimePath"),
-		DataPath:      v.GetString("common.DataPath"),
-		MasterKeyPath: v.GetString("ai.MasterKeyPath"),
-		LogPath:       v.GetString("common.LogPath"),
-		AgentURL:        v.GetString("agent.AgentURL"),
-		AgentTimeout:    v.GetInt("agent.AgentTimeout"),
-		OllamaURL:       v.GetString("agent.OllamaURL"),
-		OpenVINOURL:     v.GetString("openvino.URL"),
-		OpenVINOEnabled: v.GetBool("openvino.Enabled"),
-		OpenVINODevices: v.GetString("openvino.Devices"),
+		RuntimePath:            v.GetString("common.RuntimePath"),
+		DataPath:               v.GetString("common.DataPath"),
+		MasterKeyPath:          v.GetString("ai.MasterKeyPath"),
+		LogPath:                v.GetString("common.LogPath"),
+		AgentURL:               v.GetString("agent.AgentURL"),
+		AgentTimeout:           v.GetInt("agent.AgentTimeout"),
+		OllamaURL:              v.GetString("agent.OllamaURL"),
+		OpenVINOURL:            v.GetString("openvino.URL"),
+		OpenVINOEnabled:        v.GetBool("openvino.Enabled"),
+		OpenVINODevices:        v.GetString("openvino.Devices"),
 		OpenVINOMaxLoaded:      v.GetInt("openvino.MaxLoadedModels"),
 		OpenVINOIdleTTLMinutes: v.GetInt("openvino.IdleTTLMinutes"),
 	}
@@ -96,7 +96,7 @@ func Load(configFile, confSample string) (*Config, error) {
 	if cfg.OpenVINOURL == "" {
 		cfg.OpenVINOURL = "http://127.0.0.1:9100"
 	}
-	// Enabled 默认 true:仅当配置里显式写了 openvino.Enabled 才用其值,否则 true。
+	// Enabled defaults to true: only use the configured value if openvino.Enabled is explicitly set, otherwise true.
 	if v.IsSet("openvino.Enabled") {
 		cfg.OpenVINOEnabled = v.GetBool("openvino.Enabled")
 	} else {
@@ -108,7 +108,7 @@ func Load(configFile, confSample string) (*Config, error) {
 	if cfg.OpenVINOMaxLoaded <= 0 {
 		cfg.OpenVINOMaxLoaded = 3
 	}
-	// IdleTTLMinutes:显式 0 = 永不卸载,必须与"键缺失"区分 —— 仅当未设置时才取默认 5。
+	// IdleTTLMinutes: an explicit 0 means never unload, and must be distinguished from "key missing" — only use the default of 5 when unset.
 	if !v.IsSet("openvino.IdleTTLMinutes") {
 		cfg.OpenVINOIdleTTLMinutes = 5
 	}

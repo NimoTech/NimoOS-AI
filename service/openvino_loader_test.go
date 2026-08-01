@@ -19,23 +19,23 @@ func TestSelectLRU(t *testing.T) {
 		"c-gpu0": {servable: "c-gpu0", device: "GPU.0", lastUsed: base.Add(-time.Minute)},
 	}
 
-	// 全局 LRU:c-gpu0 最早(base-1m)。
+	// global LRU: c-gpu0 is earliest (base-1m).
 	if got, ok := selectLRU(loaded, "", ""); !ok || got != "c-gpu0" {
 		t.Errorf("global LRU = %q,%v; want c-gpu0,true", got, ok)
 	}
-	// 限 GPU.1:a-gpu1 最早。
+	// restricted to GPU.1: a-gpu1 is earliest.
 	if got, ok := selectLRU(loaded, "GPU.1", ""); !ok || got != "a-gpu1" {
 		t.Errorf("GPU.1 LRU = %q,%v; want a-gpu1,true", got, ok)
 	}
-	// 限 GPU.1 且排除 a-gpu1 → 退到 b-gpu1。
+	// restricted to GPU.1 and excluding a-gpu1 → falls back to b-gpu1.
 	if got, ok := selectLRU(loaded, "GPU.1", "a-gpu1"); !ok || got != "b-gpu1" {
 		t.Errorf("GPU.1 LRU except a = %q,%v; want b-gpu1,true", got, ok)
 	}
-	// 该设备上排除唯一项 → 无候选。
+	// excluding the only entry on that device → no candidate.
 	if got, ok := selectLRU(loaded, "GPU.0", "c-gpu0"); ok {
 		t.Errorf("GPU.0 LRU except c = %q,%v; want \"\",false", got, ok)
 	}
-	// 空集 → 无候选。
+	// empty set → no candidate.
 	if _, ok := selectLRU(map[string]*loadedModel{}, "", ""); ok {
 		t.Error("empty map should return ok=false")
 	}
@@ -48,13 +48,13 @@ func TestSelectExpired(t *testing.T) {
 		"stale-gpu1": {servable: "stale-gpu1", device: "GPU.1", lastUsed: now.Add(-10 * time.Minute)},
 		"edge-gpu0":  {servable: "edge-gpu0", device: "GPU.0", lastUsed: now.Add(-5 * time.Minute)},
 	}
-	// ttl=5m:stale(10m)与 edge(恰好 5m,>= 命中)过期;fresh(1m)不过期。按名字升序。
+	// ttl=5m: stale (10m) and edge (exactly 5m, >= hits) are expired; fresh (1m) is not. Ascending by name.
 	got := selectExpired(loaded, 5*time.Minute, now)
 	want := []string{"edge-gpu0", "stale-gpu1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("selectExpired = %v; want %v", got, want)
 	}
-	// ttl=0 → 永不过期。
+	// ttl=0 → never expires.
 	if got := selectExpired(loaded, 0, now); got != nil {
 		t.Errorf("ttl=0 should return nil, got %v", got)
 	}
@@ -84,7 +84,7 @@ func TestWriteConfigLocked(t *testing.T) {
 	if len(cfg.MediapipeConfigList) != 2 {
 		t.Fatalf("entries = %d, want 2", len(cfg.MediapipeConfigList))
 	}
-	// 按名升序:a-gpu0 在前,b-gpu1 在后。
+	// ascending by name: a-gpu0 first, b-gpu1 second.
 	if cfg.MediapipeConfigList[0].Name != "a-gpu0" || cfg.MediapipeConfigList[1].Name != "b-gpu1" {
 		t.Errorf("order = %q,%q; want a-gpu0,b-gpu1",
 			cfg.MediapipeConfigList[0].Name, cfg.MediapipeConfigList[1].Name)
@@ -113,7 +113,7 @@ func TestReapOnce(t *testing.T) {
 	if _, ok := a.loaded["fresh-gpu1"]; !ok {
 		t.Error("fresh-gpu1 should remain")
 	}
-	// config.json 应只剩 fresh-gpu1。
+	// config.json should only have fresh-gpu1 left.
 	b, err := os.ReadFile(a.configPath)
 	if err != nil {
 		t.Fatalf("read config: %v", err)
@@ -132,7 +132,7 @@ func TestReapOnceNeverWhenTTLZero(t *testing.T) {
 	a := &OpenVINOAdapter{
 		repoPath:   filepath.Join(dir, "repo"),
 		configPath: filepath.Join(dir, "config.json"),
-		idleTTL:    0, // 永不卸载
+		idleTTL:    0, // never unload
 		loaded: map[string]*loadedModel{
 			"old-gpu1": {servable: "old-gpu1", device: "GPU.1", lastUsed: time.Now().Add(-time.Hour)},
 		},
@@ -143,13 +143,15 @@ func TestReapOnceNeverWhenTTLZero(t *testing.T) {
 	}
 }
 
-// reconcile 按 OVMS 实时已服务集(/v1/config 里 state=AVAILABLE 的 servable)重建,
-// 不再读磁盘 config.json。这样整机重启后(OVMS 由 ExecStartPre 清空启动 → 实时服务集
-// 为空)不会把上次的模型复活;仅 nimoos-ai 单独重启、OVMS 仍驻留时才恢复。
+// reconcile rebuilds from OVMS's live serving set (servables with
+// state=AVAILABLE in /v1/config), no longer reading config.json off disk.
+// This way, after a full machine reboot (OVMS starts cleared by ExecStartPre
+// → live serving set is empty), the previous models are not resurrected;
+// they're only restored when nimoos-ai alone restarts while OVMS stays resident.
 func TestReconcileFromOVMS(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
-	// 造两个 servable 的 graph.pbtxt(含 device)。missing-gpu1 故意不建 graph → 应跳过。
+	// Build graph.pbtxt (with device) for two servables. missing-gpu1 deliberately has no graph built → should be skipped.
 	for name, dev := range map[string]string{"x-gpu1": "GPU.1", "y-gpu0": "GPU.0"} {
 		d := filepath.Join(repo, name)
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -160,8 +162,8 @@ func TestReconcileFromOVMS(t *testing.T) {
 		}
 	}
 
-	// 模拟 OVMS /v1/config:x-gpu1 / y-gpu0 / missing-gpu1 均 AVAILABLE;
-	// loading-gpu1 处于 LOADING(非 AVAILABLE)→ ListServedModels 不返回。
+	// Simulate OVMS /v1/config: x-gpu1 / y-gpu0 / missing-gpu1 are all AVAILABLE;
+	// loading-gpu1 is in LOADING (not AVAILABLE) → ListServedModels does not return it.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/config" {
 			http.NotFound(w, r)
@@ -180,7 +182,7 @@ func TestReconcileFromOVMS(t *testing.T) {
 	a.reconcileFromOVMS()
 
 	if len(a.loaded) != 2 {
-		t.Fatalf("loaded = %d, want 2 (missing-gpu1 无 graph 跳过、loading-gpu1 非 AVAILABLE 不返回)", len(a.loaded))
+		t.Fatalf("loaded = %d, want 2 (missing-gpu1 skipped for no graph, loading-gpu1 skipped for not AVAILABLE)", len(a.loaded))
 	}
 	if a.loaded["x-gpu1"] == nil || a.loaded["x-gpu1"].device != "GPU.1" {
 		t.Errorf("x-gpu1 device wrong: %+v", a.loaded["x-gpu1"])
@@ -196,7 +198,7 @@ func TestReconcileFromOVMS(t *testing.T) {
 	}
 }
 
-// 整机冷启动场景:OVMS 实时服务集为空 → reconcile 后 loaded 必须为空(不复活旧模型)。
+// Full cold-boot scenario: OVMS's live serving set is empty → after reconcile, loaded must be empty (no resurrecting old models).
 func TestReconcileFromOVMSEmptyOnFreshBoot(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
@@ -207,6 +209,6 @@ func TestReconcileFromOVMSEmptyOnFreshBoot(t *testing.T) {
 	a.reconcileFromOVMS()
 
 	if len(a.loaded) != 0 {
-		t.Fatalf("fresh boot loaded = %d, want 0 (绝不能复活旧模型)", len(a.loaded))
+		t.Fatalf("fresh boot loaded = %d, want 0 (must never resurrect old models)", len(a.loaded))
 	}
 }

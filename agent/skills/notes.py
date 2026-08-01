@@ -167,7 +167,7 @@ async def write_note(title: str, content: str, note_type: str = "note",
     confirmation card; on approval the note is stored as curated knowledge,
     written as a Markdown file the user can also open/edit directly.
 
-    Use when the user says "记下来/存到知识库" or asks to keep a conclusion,
+    Use when the user says "write this down/save it to my knowledge base" or asks to keep a conclusion,
     summary, or decision for the long term.
 
     Args:

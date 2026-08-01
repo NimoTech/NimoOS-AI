@@ -81,7 +81,7 @@ async def test_trigger_folds_and_keeps_recent(conn):
     h = _big_history(20, 300)
     block, send = await cc.compact_for_run(
         conn, session_id="s1", user_id="u1", model_name="x",
-        history=h, current_text="再问一句", summarize_fn=_fake_sum)
+        history=h, current_text="one more question", summarize_fn=_fake_sum)
     assert block.startswith(cc.SUMMARY_HEADER) and "SUMMARY:" in block
     # rolling_summary persisted
     row = conn.execute("SELECT rolling_summary FROM sessions WHERE id='s1'").fetchone()
@@ -114,10 +114,10 @@ async def test_terminal_truncation_keeps_last_turn(conn):
     conn.execute("INSERT INTO user_settings(user_id,key,value,updated_at) "
                  "VALUES('u1','context_window','1000',0)"); conn.commit()
     # last turn itself huge → even after folding everything else, must truncate
-    h = _big_history(3, 100) + [_u("巨" * 5000), _a("ok")]
+    h = _big_history(3, 100) + [_u("z" * 5000), _a("ok")]
     block, send = await cc.compact_for_run(
         conn, session_id="s1", user_id="u1", model_name="x",
-        history=h, current_text="末轮", summarize_fn=_fake_sum)
+        history=h, current_text="final turn", summarize_fn=_fake_sum)
     assert send[0]["role"] == "user" and len(send) >= 1   # never empty, never raised
 
 

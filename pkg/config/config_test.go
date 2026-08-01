@@ -16,12 +16,13 @@ func writeTempConf(t *testing.T, body string) string {
 	return p
 }
 
-// 这些测试用 Load(返回 *Config、不碰包级 Cfg)而非 Init,因此不共享全局状态,
-// 可安全并行,也不会在测试间互相污染。
+// These tests use Load (returns *Config, does not touch the package-level Cfg)
+// instead of Init, so they share no global state, can run in parallel safely,
+// and don't contaminate each other.
 
 func TestOpenVINODefaultsWhenKeysAbsent(t *testing.T) {
 	t.Parallel()
-	// [openvino] 段不含 MaxLoadedModels / IdleTTLMinutes → 取默认 3 / 5。
+	// [openvino] section has no MaxLoadedModels / IdleTTLMinutes → falls back to default 3 / 5.
 	p := writeTempConf(t, "[openvino]\nURL = http://127.0.0.1:9100\nDevices = GPU.1\n")
 	cfg, err := Load(p, "")
 	if err != nil {
@@ -37,7 +38,7 @@ func TestOpenVINODefaultsWhenKeysAbsent(t *testing.T) {
 
 func TestOpenVINOExplicitZeroTTLAndMax(t *testing.T) {
 	t.Parallel()
-	// 显式 IdleTTLMinutes = 0(永不卸载)必须保留为 0,不被默认 5 覆盖;MaxLoadedModels 显式生效。
+	// An explicit IdleTTLMinutes = 0 (never unload) must stay 0, not get overridden by the default 5; MaxLoadedModels takes its explicit value.
 	p := writeTempConf(t, "[openvino]\nMaxLoadedModels = 2\nIdleTTLMinutes = 0\n")
 	cfg, err := Load(p, "")
 	if err != nil {

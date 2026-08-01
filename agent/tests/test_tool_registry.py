@@ -21,21 +21,21 @@ def test_categories_exact_keys():
 
 
 def test_partition_is_complete_and_disjoint():
-    # 每个静态工具恰好属于 CORE 或某一类,无孤儿、无重复。
+    # every static tool belongs to exactly CORE or one category, no orphans, no duplicates.
     all_names = [_name(t) for t in ALL_TOOLS]
-    assert len(all_names) == len(set(all_names)), "ALL_TOOLS 有重名"
+    assert len(all_names) == len(set(all_names)), "ALL_TOOLS has duplicate names"
     categorized = []
     for tools in tr.CATEGORY_TOOLS.values():
         categorized += [_name(t) for t in tools]
-    # mcp 类的静态成员只有 mcp_register_server(运行时 MCP 工具是动态附加,不在此)
+    # the mcp category's only static member is mcp_register_server (runtime MCP tools are attached dynamically, not here)
     covered = set(tr.CORE_TOOL_NAMES) | set(categorized)
     assert covered == set(all_names), (
-        f"未覆盖: {set(all_names) - covered}; 多余: {covered - set(all_names)}")
-    assert len(categorized) == len(set(categorized)), "某工具被分进多个类别"
+        f"uncovered: {set(all_names) - covered}; extra: {covered - set(all_names)}")
+    assert len(categorized) == len(set(categorized)), "a tool was placed in multiple categories"
 
 
 def test_category_of():
     assert tr.category_of("install_app") == "apps"
     assert tr.category_of("write_file") == "files"
-    assert tr.category_of("run_command") is None      # 常驻
+    assert tr.category_of("run_command") is None      # always-on
     assert tr.category_of("does_not_exist") is None

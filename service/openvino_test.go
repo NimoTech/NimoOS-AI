@@ -7,7 +7,7 @@ func TestOVMSModelName(t *testing.T) {
 		{"qwen3-vl-int4", "GPU.1", "qwen3-vl-int4-gpu1"},
 		{"qwen3-vl-int4", "GPU.0", "qwen3-vl-int4-gpu0"},
 		{"llama3", "CPU", "llama3-cpu"},
-		// 带点号的目录名要被 sanitize 成合法 servable 名(点号→连字符)
+		// dir names with dots must be sanitized into a valid servable name (dot→hyphen)
 		{"qwen3.6-35b-a3b-int4", "GPU.1", "qwen3-6-35b-a3b-int4-gpu1"},
 		{"qwen2-0.5b-int4", "GPU.0", "qwen2-0-5b-int4-gpu0"},
 	}
@@ -23,7 +23,7 @@ func TestOVMSDisplayName(t *testing.T) {
 		{"qwen3-vl-int4-gpu1", "qwen3-vl-int4@GPU.1"},
 		{"qwen3-vl-int4-gpu0", "qwen3-vl-int4@GPU.0"},
 		{"llama3-cpu", "llama3@CPU"},
-		{"no-device-suffix", "no-device-suffix"}, // 无法识别后缀则原样返回
+		{"no-device-suffix", "no-device-suffix"}, // returned as-is when the suffix is not recognized
 	}
 	for _, c := range cases {
 		if got := ovmsDisplayName(c.internal); got != c.want {

@@ -146,7 +146,7 @@ def test_repair_dangling_tool_calls_inserts_output():
     assert out[2]["call_id"] == "c1"
     assert out[2]["output"]  # non-empty placeholder
 
-# 追加到 NimoOS-AI/agent/tests/test_agent.py
+# Appended to NimoOS-AI/agent/tests/test_agent.py
 @pytest.mark.asyncio
 async def test_max_turns_exceeded_emits_event_and_persists(runner, conn):
     import uuid, time
@@ -179,11 +179,11 @@ async def test_max_turns_exceeded_emits_event_and_persists(runner, conn):
         drained.append(q.get_nowait())
     types = [e["type"] for e in drained]
     assert "max_turns_exceeded" in types
-    assert "error" not in types               # 不再当普通报错
+    assert "error" not in types               # no longer treated as a plain error
     assert types[-1] == "done"
     mt = next(e for e in drained if e["type"] == "max_turns_exceeded")
     assert mt["max_turns"] == 10
-    # 历史已落库(刷新后可见 + 继续可用)
+    # history is persisted (visible after refresh + still usable)
     rows = conn.execute("SELECT content FROM messages WHERE session_id=?", (session_id,)).fetchall()
     assert len(rows) == 1
 
@@ -491,7 +491,7 @@ def test_chatcompletions_model_uses_deepseek_reasoning_replay_hook():
     assert default_should_replay_reasoning_content(ctx) is True
 
 
-# 追加到 NimoOS-AI/agent/tests/test_agent.py
+# Appended to NimoOS-AI/agent/tests/test_agent.py
 @pytest.mark.asyncio
 async def test_run_passes_max_turns_to_sdk(runner, conn):
     import uuid, time

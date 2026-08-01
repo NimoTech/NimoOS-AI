@@ -16,7 +16,7 @@ def test_expand_unlocks_and_lists(monkeypatch):
     tg.GATING_SESSION_VAR.set("s1")
     out = tg.expand_categories(["apps"])
     assert "apps" in tg.current_unlocked()
-    assert "install_app" in out          # 返回了该类工具清单
+    assert "install_app" in out          # returns that category's tool list
     assert written["cats"] == ["apps"] or "apps" in written["cats"]
 
 
@@ -26,7 +26,7 @@ def test_expand_unknown_category_returns_error(monkeypatch):
     tg.GATING_SESSION_VAR.set("s1")
     out = tg.expand_categories(["bogus"])
     assert "bogus" in out
-    assert ("apps" in out and "files" in out)   # 错误信息列出合法类别
+    assert ("apps" in out and "files" in out)   # error message lists valid categories
     assert "bogus" not in tg.current_unlocked()
 
 

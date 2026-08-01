@@ -8,7 +8,7 @@ def test_mkdir_then_rename_into_it(tmp_path):
     photos = str(tmp_path / "photos")
     src = tmp_path / "a.jpg"; src.write_text("x")
     vt.mkdir(photos, parents=False)
-    vt.rename(str(src), os.path.join(photos, "a.jpg"))  # 不应抛错
+    vt.rename(str(src), os.path.join(photos, "a.jpg"))  # should not raise
     assert vt.exists(os.path.join(photos, "a.jpg"))
     assert not vt.exists(str(src))
 
@@ -19,7 +19,7 @@ def test_recursive_delete_invalidates_subtree(tmp_path):
     vt = VTree()
     vt.delete(str(a), recursive=True)
     with pytest.raises(VTreeError):
-        vt.rename(str(b), str(a / "C"))   # 父 /A 已不存在
+        vt.rename(str(b), str(a / "C"))   # parent /A no longer exists
 
 
 def test_move_in_then_delete_nonrecursive_rejected(tmp_path):
@@ -29,20 +29,20 @@ def test_move_in_then_delete_nonrecursive_rejected(tmp_path):
     vt.mkdir(str(a))
     vt.rename(str(b), str(a / "B"))
     with pytest.raises(VTreeError):
-        vt.delete(str(a), recursive=False)   # /A 现在非空
+        vt.delete(str(a), recursive=False)   # /A is now non-empty
 
 
 def test_circular_move_rejected(tmp_path):
     a = tmp_path / "A"; a.mkdir()
     vt = VTree()
     with pytest.raises(VTreeError):
-        vt.rename(str(a), str(a / "B" / "C"))   # 移进自身子树 (EINVAL)
+        vt.rename(str(a), str(a / "B" / "C"))   # moving into its own subtree (EINVAL)
 
 
 def test_delete_empty_real_dir_allowed(tmp_path):
-    a = tmp_path / "A"; a.mkdir()    # 真实磁盘上为空
+    a = tmp_path / "A"; a.mkdir()    # empty on real disk
     vt = VTree()
-    vt.delete(str(a), recursive=False)   # 不应抛错
+    vt.delete(str(a), recursive=False)   # should not raise
     assert not vt.exists(str(a))
 
 

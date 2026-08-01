@@ -2187,7 +2187,8 @@ async def run_session(
 ):
     _assert_owns_session(session_id, x_user_id)
     if not (req.model or "").strip():
-        # 没有有效模型名:明确报错,而不是悄悄用某个默认名去打后端(会得到迷惑性的 404)。
+        # No valid model name: fail loudly instead of silently hitting the backend
+        # with some default name (which would produce a confusing 404).
         raise HTTPException(status_code=400,
                             detail="no model selected — pick a model before sending")
     if req.kind == "init" and _session_agent_type(session_id) != "general":
@@ -2664,7 +2665,7 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
                 os.makedirs(new, exist_ok=True)
                 for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
                     shutil.move(os.path.join(old, entry), os.path.join(new, entry))
-            notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
+            notes_store.set_notes_root(conn, new)   # rel path unchanged, identity tracked via frontmatter id
     if body.distill_roots is not None:
         notes_store.set_distill_roots(conn, uid, body.distill_roots)
     if body.distill_daily_cap is not None:

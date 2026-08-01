@@ -39,4 +39,4 @@ def test_batch_fs_impl_organizes_files(tmp_path):
             "dst": str(root / "p" / "a.jpg")}]
     out = _run(fsskill._batch_fs_impl(ops))
     assert (root / "p" / "a.jpg").exists()
-    assert "暂存" in out or "staged" in out.lower()
+    assert "staged" in out.lower()

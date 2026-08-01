@@ -35,8 +35,8 @@ def test_empty_session_zero(conn):
 
 def test_history_counts_tokens_and_pct(conn):
     _sess(conn)
-    _snapshot(conn, "s1", [{"role": "user", "content": "你好" * 50},
-                           {"role": "assistant", "content": "回答" * 50}])
+    _snapshot(conn, "s1", [{"role": "user", "content": "hello" * 50},
+                           {"role": "assistant", "content": "answer" * 50}])
     u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
     assert u["tokens"] > 0
     assert u["window"] == 32768
@@ -44,8 +44,8 @@ def test_history_counts_tokens_and_pct(conn):
 
 
 def test_rolling_summary_is_counted(conn):
-    _sess(conn, summary="这是一段较长的对话历史摘要" * 20)
-    _snapshot(conn, "s1", [{"role": "user", "content": "新问题"}])
+    _sess(conn, summary="this is a fairly long rolling summary of the conversation history " * 20)
+    _snapshot(conn, "s1", [{"role": "user", "content": "new question"}])
     with_sum = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
     conn.execute("UPDATE sessions SET rolling_summary=NULL WHERE id='s1'"); conn.commit()
     without = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
@@ -73,7 +73,7 @@ def test_user_context_window_override(conn):
 def test_cross_user_session_returns_zero(conn):
     # IDOR guard: a session owned by u1 must not leak its usage to u2.
     _sess(conn, sid="s1", user="u1")
-    _snapshot(conn, "s1", [{"role": "user", "content": "机密" * 100}])
+    _snapshot(conn, "s1", [{"role": "user", "content": "secret" * 100}])
     owner = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
     other = cc.compute_usage(conn, session_id="s1", user_id="u2", model="qwen")
     assert owner["tokens"] > 0

@@ -24,7 +24,7 @@ def test_render_creates_okf_reserved_files(conn):
     idx = open(f"{root}/1/index.md").read()
     assert 'okf_version: "0.1"' in idx
     assert "[Alpha](" in idx and "- first" in idx
-    assert "## Insight" in idx                       # 按 type 分组
+    assert "## Insight" in idx                       # grouped by type
     log = open(f"{root}/1/log.md").read()
     assert "**Creation**" in log and "Alpha" in log
 
@@ -45,4 +45,4 @@ def test_soft_deleted_appear_as_deprecation(conn):
     log = open(f"{store.get_notes_root(conn)}/1/log.md").read()
     assert "**Deprecation**" in log and "Gone" in log
     idx = open(f"{store.get_notes_root(conn)}/1/index.md").read()
-    assert "Gone" not in idx                          # 软删不进 index
+    assert "Gone" not in idx                          # soft-deleted notes excluded from index

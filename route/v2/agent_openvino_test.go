@@ -4,19 +4,19 @@ import "testing"
 
 func TestParseOVMSDeviceSuffix(t *testing.T) {
 	cases := []struct {
-		in         string
-		bare, dev  string
-		ok         bool
+		in        string
+		bare, dev string
+		ok        bool
 	}{
 		{"qwen3-vl-int4@GPU.1", "qwen3-vl-int4", "GPU.1", true},
 		{"qwen3-vl-int4@GPU.0", "qwen3-vl-int4", "GPU.0", true},
 		{"llama3@CPU", "llama3", "CPU", true},
 		{"model@NPU.0", "model", "NPU.0", true},
-		{"llama3", "", "", false},        // ollama: 无 @,非 openvino
-		{"deepseek-chat", "", "", false}, // cloud: 无 @
-		{"@GPU.1", "", "", false},        // 空 bare
-		{"model@", "", "", false},        // 空 device
-		{"model@something", "", "", false}, // 非已知设备
+		{"llama3", "", "", false},          // ollama: no @, not openvino
+		{"deepseek-chat", "", "", false},   // cloud: no @
+		{"@GPU.1", "", "", false},          // empty bare model
+		{"model@", "", "", false},          // empty device
+		{"model@something", "", "", false}, // not a known device
 	}
 	for _, c := range cases {
 		bare, dev, ok := parseOVMSDeviceSuffix(c.in)
