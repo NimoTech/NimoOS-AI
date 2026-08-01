@@ -1,15 +1,18 @@
-"""渐进式工具暴露的运行时门控原语。
+"""Runtime gating primitives for progressive tool exposure.
 
-解锁集放 ContextVar(与 agent.py 其它 *_VAR 一致的并发隔离模式):每个 run
-在开始时 UNLOCKED_VAR.set(<从会话载入的集合>),expand_tools 原地 update 它,
-非常驻工具的 is_enabled 回调读它决定是否对模型可见。
+The unlocked set lives in a ContextVar (same concurrency-isolation pattern as
+the other *_VAR globals in agent.py): each run does UNLOCKED_VAR.set(<set
+loaded from the session>) at the start, expand_tools updates it in place, and
+the is_enabled callback of non-always-on tools reads it to decide whether
+they're visible to the model.
 """
 from __future__ import annotations
 
 from contextvars import ContextVar
 from typing import Any, Callable
 
-# run 开始时由 agent.py 注入;默认空集兜底(测试/异常路径)。
+# Injected by agent.py at the start of a run; defaults to an empty set as a
+# fallback (tests/error paths).
 UNLOCKED_VAR: ContextVar[set[str]] = ContextVar("nimoos_unlocked_categories")
 GATING_SESSION_VAR: ContextVar[str] = ContextVar("nimoos_gating_session")
 
@@ -19,10 +22,11 @@ def current_unlocked() -> set[str]:
 
 
 def make_is_enabled(category: str) -> Callable[[Any, Any], bool]:
-    """生成 SDK is_enabled 回调:该类别在已解锁集合中才可见。
+    """Build an SDK is_enabled callback: visible only once this category is unlocked.
 
-    SDK 以 (RunContextWrapper, AgentBase) 调用;此处忽略二者,直接读 ContextVar
-    (本仓库的隔离机制),返回 bool(同步即可,SDK 接受 MaybeAwaitable[bool])。
+    The SDK calls it as (RunContextWrapper, AgentBase); both are ignored here —
+    we read the ContextVar directly (this repo's isolation mechanism) and
+    return a bool (sync is fine, the SDK accepts MaybeAwaitable[bool]).
     """
     def _is_enabled(_ctx: Any, _agent: Any) -> bool:
         return category in current_unlocked()
@@ -30,7 +34,7 @@ def make_is_enabled(category: str) -> Callable[[Any, Any], bool]:
 
 
 # ---------------------------------------------------------------------------
-# expand_tools 元工具
+# expand_tools meta-tool
 # ---------------------------------------------------------------------------
 
 from agents import function_tool
@@ -49,7 +53,7 @@ def categories_overview() -> str:
 
 
 def _persist(categories: list[str]) -> None:
-    """把给定的已解锁类别列表落库(独立函数,便于测试 monkeypatch)。"""
+    """Persist the given list of unlocked categories (a standalone function so tests can monkeypatch it)."""
     import db
     session_id = GATING_SESSION_VAR.get("")
     if session_id:
@@ -57,7 +61,7 @@ def _persist(categories: list[str]) -> None:
 
 
 def expand_categories(categories: list[str]) -> str:
-    """纯逻辑:解锁给定类别,返回给模型看的文本。被 expand_tools 包裹。"""
+    """Pure logic: unlock the given categories, return the text shown to the model. Wrapped by expand_tools."""
     if not categories:
         return categories_overview()
     valid = set(_reg.CATEGORY_TOOLS.keys())
@@ -66,7 +70,7 @@ def expand_categories(categories: list[str]) -> str:
         return (f"Unknown categories {unknown}. Valid categories: " + ", ".join(sorted(valid)) +
                 ". Retry with these category names.")
     cur = current_unlocked()
-    if not isinstance(cur, set):     # 兜底:确保可原地修改
+    if not isinstance(cur, set):     # fallback: ensure it can be mutated in place
         cur = set(cur)
         UNLOCKED_VAR.set(cur)
     newly = [c for c in categories if c not in cur]
@@ -83,13 +87,15 @@ def expand_categories(categories: list[str]) -> str:
 
 @function_tool
 def expand_tools(categories: list[str]) -> str:
-    """解锁一组工具类别,使其工具在下一步可被调用。
+    """Unlock a set of tool categories, making their tools callable on the next step.
 
-    起步时你只有少量核心工具。需要其他能力时,先用本工具解锁相应类别,
-    一次可传多个,尽量一次性解锁本任务预计要用的所有类别。
-    传空列表则返回所有可解锁类别的总览。
+    At the start you only have a small set of core tools. When you need other
+    capabilities, use this tool first to unlock the relevant categories — you
+    can pass several at once, and should try to unlock all the categories this
+    task is expected to need in one call.
+    Passing an empty list returns an overview of all unlockable categories.
 
     Args:
-        categories: 要解锁的类别名列表,如 ["apps", "files"]。
+        categories: List of category names to unlock, e.g. ["apps", "files"].
     """
     return expand_categories(categories)

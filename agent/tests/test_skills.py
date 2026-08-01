@@ -140,7 +140,7 @@ async def test_shell_isolation_etc_readonly(tmp_path):
         '{"command": "touch /etc/should_fail 2>&1; echo done"}',
     )
     assert "done" in out
-    assert "Read-only" in out or "只读" in out or "Permission" in out
+    assert "Read-only" in out or "Permission" in out
 
 
 @pytest.mark.asyncio

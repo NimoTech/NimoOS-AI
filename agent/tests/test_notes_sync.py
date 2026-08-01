@@ -55,7 +55,7 @@ def test_adopts_file_without_id(conn):
     assert stats["adopted"] == 1
     with open(f"{root}/1/manual.md") as f:
         meta, _ = parse_note_text(f.read())
-    assert meta["id"]                       # UUID 已回写
+    assert meta["id"]                       # UUID was written back
     row = conn.execute("SELECT * FROM notes WHERE id=?",
                        (meta["id"],)).fetchone()
     assert row["user_id"] == "1" and row["created_by"] == "human"
@@ -111,7 +111,7 @@ def test_echo_suppressed_for_newline_terminated_body(conn):
     store.create_note(conn, "1", title="t", body="line1\nline2\n")
     stats = _run(sync.scan_once(conn))
     assert stats == {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
-    stats2 = _run(sync.scan_once(conn))   # 第二轮也必须静止
+    stats2 = _run(sync.scan_once(conn))   # second pass must also be quiescent
     assert stats2 == {"adopted": 0, "updated": 0, "moved": 0, "deleted": 0}
 
 
@@ -232,13 +232,13 @@ def test_adoption_skips_foreign_id(conn):
     with open(store.note_abs_path(conn, n)) as f:
         content = f.read()
     with open(f"{root}/2/stolen.md", "w") as f:
-        f.write(content)                          # user2 目录里出现 user1 的 id
+        f.write(content)                          # user1's id shows up in user2's directory
     calls_before = list(conn._test_index_calls)
     stats = _run(sync.scan_once(conn))
     assert stats["adopted"] == 0
     assert conn.execute("SELECT COUNT(*) FROM notes WHERE user_id='2'").fetchone()[0] == 0
     assert conn.execute("SELECT deleted_at FROM notes WHERE id=?",
-                        (n["id"],)).fetchone()[0] is None   # user1 行不受影响
-    # 不为 user2 的冒名文件做索引
+                        (n["id"],)).fetchone()[0] is None   # user1's row is unaffected
+    # don't index the impersonating file under user2
     assert not [c for c in conn._test_index_calls[len(calls_before):]
                 if c[0] == "index" and c[1] == n["id"]]

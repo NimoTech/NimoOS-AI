@@ -57,7 +57,7 @@ def test_preflight_huge_recursive_delete_rejected(ctx, tmp_path, monkeypatch):
     for i in range(5):
         (big / f"f{i}").write_text("x")
     res = batch.preflight(ctx, [_op("delete", str(big), recursive=True)])
-    assert any("过大" in e["reason"] or "too large" in e["reason"].lower()
+    assert any("too large" in e["reason"].lower()
                for e in res.errors)
 
 

@@ -35,10 +35,10 @@ async def test_build_renders_map_and_notes():
     stale = now_ms - 60 * 86_400_000
 
     tree = [
-        {"path": "/DATA", "level": "space", "ai_label": "主盘",
+        {"path": "/DATA", "level": "space", "ai_label": "Main Drive",
          "user_notes_updated_at": 0, "last_modified_ms": now_ms},
         {"path": "/DATA/Projects/proj1", "level": "project",
-         "ai_label": "项目一", "user_notes_updated_at": fresh,
+         "ai_label": "Project One", "user_notes_updated_at": fresh,
          "last_modified_ms": now_ms},
         {"path": "/DATA/Projects/proj2", "level": "project",
          "ai_label": "", "user_notes_updated_at": stale,
@@ -60,7 +60,7 @@ async def test_build_renders_map_and_notes():
     out = await WikiContextBuilder(c).build(user_patterns=[])
     assert "## NimoOS storage map" in out
     assert "/DATA" in out
-    assert "项目一" in out
+    assert "Project One" in out
     # proj2 has no ai_label → fallback to basename + "(no summary yet)"
     assert "proj2" in out
     assert "(no summary yet)" in out
@@ -75,7 +75,7 @@ async def test_build_renders_map_and_notes():
 @pytest.mark.asyncio
 async def test_build_caps_projects_to_top_15():
     now_ms = int(time.time() * 1000)
-    tree = [{"path": "/DATA", "level": "space", "ai_label": "主盘",
+    tree = [{"path": "/DATA", "level": "space", "ai_label": "Main Drive",
              "user_notes_updated_at": 0, "last_modified_ms": now_ms}]
     for i in range(25):
         tree.append({
@@ -104,7 +104,7 @@ async def test_build_caps_projects_to_top_15():
 async def test_build_filters_by_user_patterns():
     now_ms = int(time.time() * 1000)
     tree = [
-        {"path": "/DATA", "level": "space", "ai_label": "主盘",
+        {"path": "/DATA", "level": "space", "ai_label": "Main Drive",
          "user_notes_updated_at": 0, "last_modified_ms": now_ms},
         {"path": "/DATA/secret/proj", "level": "project",
          "ai_label": "S", "user_notes_updated_at": 0,
@@ -131,7 +131,7 @@ async def test_build_truncates_long_notes():
     fresh = now_ms - 1 * 86_400_000
 
     tree = [
-        {"path": "/DATA", "level": "space", "ai_label": "主盘",
+        {"path": "/DATA", "level": "space", "ai_label": "Main Drive",
          "user_notes_updated_at": 0, "last_modified_ms": now_ms},
         {"path": "/DATA/p", "level": "project", "ai_label": "P",
          "user_notes_updated_at": fresh,
@@ -161,7 +161,7 @@ async def test_render_map_includes_user_declared_preamble():
     def handler(request):
         if request.url.path == "/v1/wiki/tree":
             return httpx.Response(200, json=[
-                {"path": "/DATA", "level": "space", "ai_label": "主盘",
+                {"path": "/DATA", "level": "space", "ai_label": "Main Drive",
                  "last_modified_ms": 1000, "user_notes_updated_at": 0},
             ])
         return httpx.Response(404)

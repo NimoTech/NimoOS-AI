@@ -16,11 +16,11 @@ def _wrap(data):
 
 def test_output_text_delta_becomes_message_delta():
     ev = _wrap(ResponseTextDeltaEvent(
-        content_index=0, delta="你有 6 个相册", item_id="i1", logprobs=[],
+        content_index=0, delta="You have 6 albums", item_id="i1", logprobs=[],
         output_index=0, sequence_number=1, type="response.output_text.delta"))
     state = {}
     out = _convert_event(ev, state=state)
-    assert out == {"type": "message_delta", "content": "你有 6 个相册"}
+    assert out == {"type": "message_delta", "content": "You have 6 albums"}
     assert state["streamed_message"] is True
 
 

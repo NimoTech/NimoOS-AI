@@ -56,7 +56,7 @@ def test_index_note_never_raises_even_on_malformed_note(monkeypatch):
             raise RuntimeError("down")
     monkeypatch.setattr(indexer, "_CLIENT", _Boom())
     ok = asyncio.run(
-        indexer.index_note({}, "b"))     # 完全缺 id/type 等键也不许抛
+        indexer.index_note({}, "b"))     # missing id/type entirely must still not raise
     assert ok is False
 
 

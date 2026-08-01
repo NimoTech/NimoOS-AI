@@ -1,8 +1,9 @@
-"""工具分类的单一事实来源:常驻集 + 8 个门控类别。
+"""Single source of truth for tool categorization: the always-on set + 8 gated categories.
 
-渐进式工具暴露用它把 general profile 的工具按类别划分。CORE 永远可见;
-其余按类别经 expand_tools 在会话内解锁。MCP 运行时工具不在此静态表中——
-它们在 agent.py 组装时动态归入 'mcp' 类。
+Progressive tool exposure uses this to split the general profile's tools into
+categories. CORE is always visible; the rest are unlocked within a session via
+expand_tools, by category. MCP runtime tools are not in this static table —
+they're dynamically filed under the 'mcp' category when agent.py assembles tools.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ def _exclude(tools, names: set[str]) -> list:
     return [t for t in tools if _name(t) not in names]
 
 
-# 从各模块切出门控成员(剔除已提升为常驻的工具)。
+# Carve the gated members out of each module (excluding tools already promoted to always-on).
 _FILES = _exclude(FS_TOOLS, {"read_file", "list_dir"})           # 9
 _DOCUMENTS = _exclude(SEARCH_TOOLS, {"nimoos_search"})           # 3
 _SYSTEM = list(HEALTHCHECK_TOOLS) + list(STORAGE_TOOLS)         # 3 + 2 = 5
@@ -46,7 +47,7 @@ CATEGORY_TOOLS: dict[str, list] = {
     "system": _SYSTEM,                     # 5
     "events": list(MESSAGEBUS_TOOLS),      # 3
     "notes": list(NOTES_TOOLS),
-    "mcp": list(MCP_ADMIN_TOOLS),          # 1(+ 运行时动态 MCP 工具)
+    "mcp": list(MCP_ADMIN_TOOLS),          # 1 (+ dynamic runtime MCP tools)
 }
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -61,7 +62,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "mcp": "register and use tools from connected MCP servers",
 }
 
-# 工具名 → 类别名(常驻/未知返回 None)
+# tool name → category name (returns None for always-on/unknown)
 _NAME_TO_CATEGORY: dict[str, str] = {
     _name(t): cat for cat, tools in CATEGORY_TOOLS.items() for t in tools
 }

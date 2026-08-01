@@ -36,22 +36,22 @@ def test_gated_exporter_drops_when_disabled(monkeypatch):
     enabled = {"v": False}
     gated = m.GatedSpanExporter(inner, lambda: enabled["v"])
     assert gated.export(["span"]) == SpanExportResult.SUCCESS
-    assert inner.calls == 0                      # disabled → 不发网络
+    assert inner.calls == 0                      # disabled → no network call
     enabled["v"] = True
     assert gated.export(["span"]) == SpanExportResult.SUCCESS
-    assert inner.calls == 1                       # enabled → 委托内层
+    assert inner.calls == 1                       # enabled → delegates to inner exporter
 
 
 def test_setup_tracing_opt_out(monkeypatch):
     monkeypatch.setenv("NIMOOS_AGENT_TRACING", "0")
     m = importlib.reload(pt)
-    assert m.setup_tracing() is False             # 显式关 → 不安装
+    assert m.setup_tracing() is False             # explicitly off → not installed
 
 
 def test_setup_tracing_installs(monkeypatch):
     monkeypatch.delenv("NIMOOS_AGENT_TRACING", raising=False)
     m = importlib.reload(pt)
-    assert m.setup_tracing() is True              # 依赖已装 → 安装成功
+    assert m.setup_tracing() is True              # deps installed → setup succeeds
 
 
 def test_run_config_enabled(monkeypatch):

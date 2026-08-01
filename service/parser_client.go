@@ -49,7 +49,7 @@ func (c *ParserClient) reloadDiscovery() (string, error) {
 	return url, nil
 }
 
-// SetCachedBaseURL — 测试用,直接注入 cache(模拟陈旧缓存场景)
+// SetCachedBaseURL — for tests, injects the cache directly (simulates a stale-cache scenario)
 func (c *ParserClient) SetCachedBaseURL(url string) {
 	c.mu.Lock()
 	c.cachedURL = url
@@ -65,7 +65,7 @@ func (c *ParserClient) do(ctx context.Context, method, path string, body []byte)
 	if err == nil {
 		return c.readBody(resp)
 	}
-	// 重读 discovery 后再试一次
+	// re-read discovery then try again
 	if _, rerr := c.reloadDiscovery(); rerr != nil {
 		return nil, 0, err
 	}

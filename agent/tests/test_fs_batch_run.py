@@ -62,7 +62,7 @@ def test_run_batch_happy_path_commits(ctx, tmp_path):
             "dst": str(root / "p" / "a.jpg"), "parents": False, "recursive": False}]
     out = _run(batch.run_batch(ctx, ops))
     assert (root / "p" / "a.jpg").exists()
-    assert "暂存" in out or "staged" in out.lower()
+    assert "staged" in out.lower()
     assert ctx["conn"].execute(
         "SELECT COUNT(*) c FROM staged_changes").fetchone()["c"] == 2
 

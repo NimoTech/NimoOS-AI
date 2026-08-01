@@ -18,7 +18,7 @@ def test_set_and_read_global_setting():
     conn = _conn()
     m.set_tracing_globally_enabled(conn, True)
     assert m.tracing_globally_enabled(conn) is True
-    assert m.tracing_enabled_now() is True          # 写时同步进程标志
+    assert m.tracing_enabled_now() is True          # write syncs the in-process flag
     m.set_tracing_globally_enabled(conn, False)
     assert m.tracing_globally_enabled(conn) is False
     assert m.tracing_enabled_now() is False
@@ -28,7 +28,7 @@ def test_global_row_independent_of_user():
     m = importlib.reload(pt)
     conn = _conn()
     m.set_tracing_globally_enabled(conn, True)
-    # 某真实用户没有自己的行,读全局仍为 True
+    # a real user without their own row still reads the global as True
     row = conn.execute(
         "SELECT value FROM user_settings WHERE user_id='__global__' AND key='tracing_enabled'"
     ).fetchone()
@@ -58,6 +58,6 @@ def test_tracing_settings_endpoints(monkeypatch):
     r = client.put("/agent/user-settings/tracing", headers=h, json={"enabled": True})
     assert r.status_code == 200
     assert client.get("/agent/user-settings/tracing", headers=h).json() == {"enabled": True}
-    # 另一个用户看到的是同一个全局值
+    # another user sees the same global value
     assert client.get("/agent/user-settings/tracing",
                       headers={"X-User-Id": "u2"}).json() == {"enabled": True}

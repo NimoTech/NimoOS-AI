@@ -9,7 +9,7 @@ from skills import notes as notes_skills
 
 
 class _AutoConfirm:
-    """register→wait 直通的假 ConfirmManager。approve=False 模拟用户拒绝。"""
+    """Fake ConfirmManager where register→wait passes straight through. approve=False simulates user denial."""
     def __init__(self, approve=True):
         self.approve = approve
         self.registered = []
@@ -91,7 +91,7 @@ def test_read_and_list_are_user_scoped(conn):
     _ctx()
     n = store.create_note(conn, "2", title="other", body="secret")
     out = json.loads(_run(notes_skills._read_note_impl(n["id"])))
-    assert "error" in out                       # 别人的笔记读不到
+    assert "error" in out                       # can't read someone else's note
     out2 = json.loads(_run(notes_skills._list_notes_impl("", "", 20)))
     assert out2["notes"] == []
 
@@ -108,9 +108,9 @@ def test_write_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
         return False
     monkeypatch.setattr(notes_skills, "index_note", _fail)
     out = json.loads(_run(notes_skills._write_note_impl("T", "c", "note", [], [])))
-    assert out["ok"] is True                      # 笔记照常保存
+    assert out["ok"] is True                      # note saved as normal
     row = conn.execute("SELECT content_hash FROM notes").fetchone()
-    assert row["content_hash"] == ""              # 待索引哨兵,交给 sync 重试
+    assert row["content_hash"] == ""              # pending-index sentinel, left for sync to retry
 
 
 def test_update_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
@@ -129,10 +129,10 @@ def test_update_note_index_failure_leaves_pending_sentinel(conn, monkeypatch):
 def test_misconfigured_runtime_error_is_distinct(conn):
     notes_skills.USER_ID_VAR.set("1")
     notes_skills.SESSION_ID_VAR.set("s1")
-    notes_skills.CONFIRM_MGR_VAR.set(None)      # 误配:无确认通道
+    notes_skills.CONFIRM_MGR_VAR.set(None)      # misconfigured: no confirm channel
     notes_skills.EVENT_QUEUE_VAR.set(None)
     out = json.loads(_run(notes_skills._write_note_impl("T", "c", "note", [], [])))
-    assert out["error"] == "confirm channel unavailable"   # 不再冒充 user declined
+    assert out["error"] == "confirm channel unavailable"   # no longer masquerades as user declined
     assert store.list_notes(conn, "1") == []
 
 

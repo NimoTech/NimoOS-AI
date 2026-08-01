@@ -23,11 +23,11 @@ body line 1
 
 def test_parse_extracts_meta_and_body():
     meta, body = parse_note_text(SAMPLE)
-    assert meta["type"] == "insight"          # 小写规范化
+    assert meta["type"] == "insight"          # lowercase-normalized
     assert meta["title"] == "t1"
     assert meta["id"] == "018f-xyz"
     assert meta["source_refs"][0]["file_id"] == "ab12"
-    assert meta["owner"] == "someone-custom"  # 未知键保留(OKF 宽容)
+    assert meta["owner"] == "someone-custom"  # unknown keys preserved (OKF is lenient)
     assert body.startswith("body line 1")
 
 
@@ -46,8 +46,8 @@ def test_serialize_roundtrip_and_key_order():
     out = serialize_note_text(meta, body)
     lines = out.splitlines()
     assert lines[0] == "---"
-    assert lines[1].startswith("type: Insight")      # 首字母大写
-    # 已知键序:type 在最前,自定义 owner 在已知键之后
+    assert lines[1].startswith("type: Insight")      # capitalized first letter
+    # known-key order: type comes first, custom owner comes after known keys
     assert out.index("type:") < out.index("id:") < out.index("owner:")
     meta2, body2 = parse_note_text(out)
     assert meta2 == meta and body2.strip() == body.strip()

@@ -102,11 +102,11 @@ def test_inject_places_card_before_first_tool_block(tmp_path):
     conn = _mk_conn(tmp_path, "place.db")
     _add_req(conn, "c1", "r1", "/DATA/Docs", "granted", 1001)
     messages = [
-        {"role": "user", "content": "整理"},
+        {"role": "user", "content": "organize"},
         {"role": "assistant", "blocks": [
-            {"type": "md", "text": "好的"},
+            {"type": "md", "text": "OK"},
             {"type": "tool", "name": "list_dir", "sections": []},
-            {"type": "md", "text": "整理完成"},
+            {"type": "md", "text": "organizing done"},
         ]},
     ]
     out = main_module._inject_access_request_cards(messages, "s1", conn)

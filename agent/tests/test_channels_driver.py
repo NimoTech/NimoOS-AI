@@ -61,12 +61,12 @@ async def test_error_surfaced_and_empty_reply_fallback():
     sent = []
     sink = FakeSink(past=[{"type": "error", "content": "boom"}, {"type": "done"}])
     await _driver(sent).drive(sink)
-    assert sent == ["出错了 (error): boom"]
+    assert sent == ["Something went wrong: boom"]
 
     sent2 = []
     sink2 = FakeSink(past=[{"type": "done"}])         # nothing at all
     await _driver(sent2).drive(sink2)
-    assert sent2 == ["(无回复 / empty reply)"]
+    assert sent2 == ["(empty reply)"]
 
 
 @pytest.mark.asyncio
@@ -74,12 +74,12 @@ async def test_confirm_event_flushes_then_forwards():
     sent, confirms = [], []
     sink = FakeSink(past=[
         {"type": "message_delta", "content": "I need a file."},
-        {"type": "access_request", "confirm_id": "c1", "path": "/DATA/x", "reason": "读取"},
+        {"type": "access_request", "confirm_id": "c1", "path": "/DATA/x", "reason": "read access"},
         {"type": "done"}])
     await _driver(sent, confirms).drive(sink)
     assert sent == ["I need a file."]                 # conclusion flushed before the ask
     assert confirms == [{"type": "access_request", "confirm_id": "c1",
-                         "path": "/DATA/x", "reason": "读取"}]
+                         "path": "/DATA/x", "reason": "read access"}]
 
 
 @pytest.mark.asyncio
@@ -100,8 +100,8 @@ async def test_pre_confirm_flush_failure_still_surfaces_confirm():
                          sleep=no_sleep, now=lambda: 0.0)
     sink = FakeSink(past=[
         {"type": "message_delta", "content": "I need a file."},
-        {"type": "access_request", "confirm_id": "c1", "path": "/DATA/x", "reason": "读取"},
+        {"type": "access_request", "confirm_id": "c1", "path": "/DATA/x", "reason": "read access"},
         {"type": "done"}])
     await d.drive(sink)   # must not raise despite send_text failing
     assert confirms == [{"type": "access_request", "confirm_id": "c1",
-                         "path": "/DATA/x", "reason": "读取"}]
+                         "path": "/DATA/x", "reason": "read access"}]

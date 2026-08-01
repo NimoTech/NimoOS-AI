@@ -81,7 +81,8 @@ func NewModelManager(ollamaBaseURL string, openvino *OpenVINOAdapter, db *sql.DB
 func (m *ModelManager) ListModels() ([]*Model, error) {
 	resp, err := m.client.Get(m.ollamaBaseURL + "/api/tags")
 	if err != nil {
-		// Ollama 不可达:退回缓存模型,但 OpenVINO(OVMS)独立于 Ollama,仍需聚合。
+		// Ollama unreachable: fall back to cached models, but OpenVINO (OVMS) is
+		// independent of Ollama and still needs to be aggregated.
 		cached, cerr := m.listCachedModels()
 		if cerr != nil {
 			return nil, cerr
