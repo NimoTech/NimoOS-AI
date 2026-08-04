@@ -23,25 +23,25 @@ def render_result(res):
 
 
 def _build_lowlevel() -> Server:
-    server = Server("nimoos-mcp")
+    # mcp 2.0 removed the decorator-style registration (@server.list_tools()) in
+    # favour of constructor injection. Handlers now take (ctx, params) and return
+    # a full Result object rather than a bare list.
+    async def _list(ctx, params) -> mtypes.ListToolsResult:
+        return mtypes.ListToolsResult(tools=[
+            mtypes.Tool(name=d["name"], description=d["description"],
+                        inputSchema=d["inputSchema"])
+            for d in tools.list_tool_defs()])
 
-    @server.list_tools()
-    async def _list() -> list[mtypes.Tool]:
-        return [mtypes.Tool(name=d["name"], description=d["description"],
-                            inputSchema=d["inputSchema"])
-                for d in tools.list_tool_defs()]
-
-    @server.call_tool()
-    async def _call(name: str, arguments: dict):
+    async def _call(ctx, params) -> mtypes.CallToolResult:
         try:
-            res = await tools.call(name, arguments or {})
+            res = await tools.call(params.name, params.arguments or {})
         except tools.McpToolError as e:
             return mtypes.CallToolResult(
                 content=[mtypes.TextContent(type="text", text=str(e))],
                 isError=True)
-        return render_result(res)
+        return mtypes.CallToolResult(content=render_result(res))
 
-    return server
+    return Server("nimoos-mcp", on_list_tools=_list, on_call_tool=_call)
 
 
 def build(conn):

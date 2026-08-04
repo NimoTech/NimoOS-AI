@@ -154,7 +154,7 @@ def test_render_result_maps_types():
     assert len(text) == 1 and isinstance(text[0], mt.TextContent) and text[0].text == "hello"
     img = mcpserver.render_result(tools.ImageResult("AAA", "image/png"))
     assert len(img) == 1 and isinstance(img[0], mt.ImageContent)
-    assert img[0].data == "AAA" and img[0].mimeType == "image/png"
+    assert img[0].data == "AAA" and img[0].mime_type == "image/png"
 
 
 def test_tools_call_error_is_iserror(client):
@@ -168,34 +168,33 @@ def test_tools_call_error_is_iserror(client):
 
 
 def _get_raw_call_handler():
-    """Recover the undecorated `_call` closure from `_build_lowlevel`.
+    """Recover the `_call` handler registered by `_build_lowlevel`.
 
-    `Server.call_tool()`'s decorator registers a wrapping `handler` in
-    `server.request_handlers[CallToolRequest]` that itself has a generic
-    `except Exception: return self._make_error_result(str(e))` — meaning an
-    HTTP round-trip can't distinguish our explicit
-    `except tools.McpToolError` branch in `_call` from the SDK's fallback.
-    The decorator does `return func` unchanged, so the raw `_call` is
-    reachable as a free variable closed over by `handler`.
+    mcp 2.0's constructor-injection API (`Server(..., on_call_tool=_call)`)
+    stores the handler directly and unwrapped in the server's request-handler
+    table — confirmed by reading `mcp/server/lowlevel/server.py`:
+    `HandlerEntry(params_type, h)` stores `h` verbatim, no decorator-based
+    wrapping survives into 2.0. So `_call` is reachable directly via the
+    public `get_request_handler` accessor; no closure unwrapping needed.
     """
     from mcp_server.server import _build_lowlevel
 
     server = _build_lowlevel()
-    handler = server.request_handlers[mtypes.CallToolRequest]
-    idx = handler.__code__.co_freevars.index("func")
-    return handler.__closure__[idx].cell_contents
+    entry = server.get_request_handler("tools/call")
+    return entry.handler
 
 
 @pytest.mark.asyncio
 async def test_call_mcptoolerror_branch_maps_to_iserror_directly(monkeypatch):
     """Pin the explicit `except tools.McpToolError` branch in `server._call`.
 
-    Invokes the raw `_call` closure directly (bypassing the SDK's
-    `Server.call_tool()` wrapper, which has its own generic
-    `except Exception` -> isError=True fallback that would mask a deleted
-    branch). Confirmed by temporarily deleting the branch: this test failed
-    with `tools.McpToolError: boom` propagating uncaught, then passed again
-    once the branch was restored.
+    Invokes the raw `_call` handler directly. Unlike mcp 1.x, the SDK no
+    longer wraps registered handlers with a generic `except Exception`
+    fallback (`on_call_tool` is stored verbatim — see
+    `_get_raw_call_handler`), but this test still pins the branch at the unit
+    level: confirmed by temporarily deleting it, this test failed with
+    `tools.McpToolError: boom` propagating uncaught, then passed again once
+    the branch was restored.
     """
     from mcp_server import tools
 
@@ -205,8 +204,9 @@ async def test_call_mcptoolerror_branch_maps_to_iserror_directly(monkeypatch):
     monkeypatch.setattr(tools, "call", fake_call)
 
     call = _get_raw_call_handler()
-    result = await call("whatever", {})
+    params = mtypes.CallToolRequestParams(name="whatever", arguments={})
+    result = await call(None, params)
 
     assert isinstance(result, mtypes.CallToolResult)
-    assert result.isError is True
+    assert result.is_error is True
     assert result.content[0].text == "boom"
