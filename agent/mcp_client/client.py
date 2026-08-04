@@ -21,9 +21,22 @@ from mcp.types import INVALID_REQUEST
 
 from mcp_client.schema import sanitize_schema, flatten_result
 
-# Connect budget for the run-start cold path. 5→8 for mcp 2.0: mode="auto" first
-# probes server/discover and falls back to the legacy initialize handshake on old
-# servers, i.e. one extra round trip before we can list anything.
+# Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
+# server/discover and falls back to the legacy initialize handshake on old
+# servers, i.e. one extra round trip before we can list anything).
+#
+# CURRENTLY INERT as a runtime bound, though: it only flows into
+# _build_transport's `connect_to` parameter, and that parameter is only
+# consumed by the stdio branch (netns_client.start_mcp_stdio(connect_timeout=
+# connect_to)) — the http branch builds its httpx2.AsyncClient with
+# `timeout=session_to`, and the sse branch passes `timeout=session_to` to
+# sse_client, neither touches connect_to. So today the 5→8 change has zero
+# runtime effect; the actual upper bounds are: http/sse's run-start cold path
+# is capped at the _metas_for_server layer by MCP_COLD_TOTAL_TIMEOUT, and
+# stdio is capped by STDIO_CONNECT_TIMEOUT (via _connect_timeout()), not this
+# constant. Not deleted — tests/test_mcp_stdio.py pins _connect_timeout()'s
+# lookup table against it, and it is still the value _cold_fetch's default
+# `connect_timeout=None` resolves to.
 MCP_CONNECT_TIMEOUT = 8
 
 # Single hard cap on the WHOLE run-start cold path (connect + list). Without it,
@@ -33,7 +46,7 @@ MCP_COLD_TOTAL_TIMEOUT = 10
 
 # ClientSession read timeout — bounds each JSON-RPC request (list_tools AND call_tool),
 # NOT just the connect. Must be generous: remote tool calls (e.g. MS Learn semantic
-# search) routinely take several seconds, far past the 5s connect cap. call_tool has no
+# search) routinely take several seconds, far past the 8s connect cap. call_tool has no
 # outer wait_for, so it is bounded ONLY by this value — too small here silently cancels
 # every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
 MCP_SESSION_TIMEOUT = 60  # seconds
@@ -486,7 +499,7 @@ async def _get_run_conn(server: dict) -> "McpConn":
         if sid in conns:                 # double-check after acquiring
             return conns[sid]
         # call-time: the user is actively invoking the tool — tolerate a cold/slow
-        # connect (generous cap) instead of failing the call at the 5s run-start cap.
+        # connect (generous cap) instead of failing the call at the 8s run-start cap.
         conn = await _connect(server, connect_timeout=_session_timeout(server))
         conns[sid] = conn
         return conn
@@ -518,7 +531,7 @@ def _schedule_revalidate(server: dict) -> None:
 async def _revalidate(server: dict) -> None:
     try:
         # background: not blocking any run, so use the generous session budget for
-        # both connect and list (tolerates a cold remote connect that the 5s
+        # both connect and list (tolerates a cold remote connect that the 8s
         # run-start cap would reject). This is what self-heals a slow server.
         conn = await _connect(server, connect_timeout=_session_timeout(server))
         try:
@@ -616,22 +629,29 @@ async def test_server(server: dict) -> dict:
 async def _test_server_inner(server: dict) -> dict:
     # The probe's overall bound is the outer test_server wait_for(budget). Use that
     # same budget for the inner connect + list so a cold remote connect (~5.6s) isn't
-    # rejected by the short 5s run-start cap; the outer wait_for is the real ceiling.
+    # rejected by the short 8s run-start cap; the outer wait_for is the real ceiling.
     budget = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
     try:
         conn = await _connect(server, connect_timeout=budget)
     except Exception as e:
         return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
+    # The outer test_server wraps this whole coroutine in asyncio.wait_for(timeout).
+    # Its inner wait_for below starts later, so the OUTER deadline fires first on a
+    # slow list_tools -- and CancelledError is a BaseException, which neither
+    # `except asyncio.TimeoutError` nor `except Exception` below can catch. Without
+    # this try/finally, that path (surfaced to the caller as test_server's own
+    # "Probe timed out" result) never reaches conn.aclose(), leaking the Client
+    # context + AsyncExitStack (httpx2 client / unix socket / stdio bridge).
     try:
-        metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=budget)
-    except asyncio.TimeoutError:
+        try:
+            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=budget)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
+        except Exception as e:
+            return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
+                    "detail": str(e)}
+    finally:
         await conn.aclose()
-        return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
-    except Exception as e:
-        await conn.aclose()
-        return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
-                "detail": str(e)}
-    await conn.aclose()
     if "id" in server:
         _cache_put(server["id"], metas, _fingerprint(server), ttl)
     return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas]}

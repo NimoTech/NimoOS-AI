@@ -94,7 +94,7 @@ def test_connect_timeout_per_transport():
 
 def test_session_timeout_per_transport():
     # The per-request (list/call) read timeout is decoupled from the connect cap:
-    # remote tool calls (e.g. MS Learn semantic search) routinely exceed the 5s
+    # remote tool calls (e.g. MS Learn semantic search) routinely exceed the 8s
     # connect cap, so the session timeout must be generous.
     assert mc._session_timeout({"transport": "http"}) == mc.MCP_SESSION_TIMEOUT
     assert mc._session_timeout({"transport": "sse"}) == mc.MCP_SESSION_TIMEOUT
@@ -107,7 +107,7 @@ def test_session_timeout_per_transport():
 @pytest.mark.asyncio
 async def test_connect_http_uses_session_timeout_not_connect_cap(monkeypatch):
     """Client's read_timeout_seconds (bounds every list/call JSON-RPC request) must
-    be the generous MCP_SESSION_TIMEOUT, not the 5s/8s connect cap — otherwise slow
+    be the generous MCP_SESSION_TIMEOUT, not the 8s connect cap — otherwise slow
     remote tool calls get cancelled mid-call (the MS Learn 'can't call' bug).
 
     This no longer touches agents.mcp at all: _connect talks straight to the mcp

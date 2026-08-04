@@ -206,6 +206,33 @@ def test_tools_call_error_is_iserror(client):
     assert payload["result"]["isError"] is True
 
 
+def test_tools_call_unknown_tool_is_iserror_not_jsonrpc_error(client):
+    """Critical regression guard: an unknown tool name must come back as an
+    isError CallToolResult, NOT a JSON-RPC error envelope.
+
+    tools.call() -> tools._BY_NAME[name] raises a bare KeyError for any
+    unregistered/typo'd/stale tool name (mcp_server/tools.py). That is not a
+    tools.McpToolError, so it only exercises the generic `except Exception`
+    fallback added to server._call -- the existing
+    test_tools_call_error_is_iserror only covers the McpToolError branch and
+    would stay green even if that fallback were deleted.
+
+    Goes over real HTTP (not the raw handler) because the property under test
+    is what an external client actually receives on the wire: mcp 2.0's
+    runner.py converts an uncaught non-MCPError/ValidationError exception into
+    a JSON-RPC `error` object (see mcp/server/runner.py serve_one's
+    `except Exception` branch) -- that would show up as `payload["error"]`,
+    not `payload["result"]`, if the fallback were missing.
+    """
+    tok = _mk_token()
+    r = _rpc("tools/call",
+             {"name": "no_such_tool", "arguments": {}},
+             token=tok, _id=99, client=client)
+    payload = _extract_json(r)
+    assert "error" not in payload, f"got a JSON-RPC error envelope, not isError: {payload}"
+    assert payload["result"]["isError"] is True
+
+
 def _get_raw_call_handler():
     """Recover the `_call` handler registered by `_build_lowlevel`.
 

@@ -39,6 +39,21 @@ def _build_lowlevel() -> Server:
             return mtypes.CallToolResult(
                 content=[mtypes.TextContent(type="text", text=str(e))],
                 isError=True)
+        except Exception as e:
+            # mcp 1.x's @server.call_tool() decorator wrapped every handler in a
+            # generic `except Exception` that turned an escaping error into an
+            # isError result. mcp 2.0's constructor injection stores the handler
+            # verbatim (no decorator wrapping survives), so any exception that
+            # is not McpToolError — an unknown tool name raising KeyError out of
+            # tools._BY_NAME, or a bug inside a handler — now escapes uncaught
+            # and mcp/server/runner.py converts it into a JSON-RPC protocol
+            # error instead. External MCP clients (Claude Desktop, Cursor) treat
+            # a JSON-RPC error as a protocol failure, not as tool output to feed
+            # back to the model — this restores the 1.x semantics that upgrade
+            # was supposed to preserve unchanged.
+            return mtypes.CallToolResult(
+                content=[mtypes.TextContent(type="text", text=str(e))],
+                isError=True)
         return mtypes.CallToolResult(content=render_result(res))
 
     return Server("nimoos-mcp", on_list_tools=_list, on_call_tool=_call)

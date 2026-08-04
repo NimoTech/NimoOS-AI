@@ -58,7 +58,13 @@ def test_memory_stream_helper():
 def test_netns_framing_symbols_still_exist():
     import mcp.types as types
     from mcp.shared.message import SessionMessage
-    assert hasattr(types, "JSONRPCMessage")
+    # NOT `hasattr(types, "JSONRPCMessage")` -- that's trivially true in mcp 2.0
+    # (it's a types.UnionType alias, not something production code calls) and
+    # would pass even if the real dependency below broke. netns_stdio.py:72
+    # actually calls `types.jsonrpc_message_adapter.validate_json(...)` to parse
+    # framed JSON-RPC lines off the wire -- pin THAT symbol instead.
+    assert hasattr(types, "jsonrpc_message_adapter")
+    assert hasattr(types.jsonrpc_message_adapter, "validate_json")
     assert SessionMessage is not None
 
 
@@ -73,12 +79,3 @@ def test_server_side_symbols_unchanged():
     params = inspect.signature(StreamableHTTPSessionManager.__init__).parameters
     assert "json_response" in params and "stateless" in params
     assert Server is not None
-
-
-def test_agents_import_does_not_pull_agents_mcp_server():
-    import sys
-
-    sys.modules.pop("agents.mcp.server", None)
-    from agents import Agent, FunctionTool, Runner  # noqa: F401
-
-    assert "agents.mcp.server" not in sys.modules
