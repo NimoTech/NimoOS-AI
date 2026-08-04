@@ -34,7 +34,20 @@ def flatten_result(result: Any) -> str:
             else:
                 parts.append(str(block))
     body = "\n".join(parts)
-    if getattr(result, "isError", False):
+    # mcp 2.0's mcp_types.CallToolResult exposes this as the Python attribute
+    # `is_error` (snake_case) — `isError` is only the wire-format alias, NOT a
+    # Python attribute on the model (verified empirically: getattr(result,
+    # "isError", ...) returns the default on a real CallToolResult instance, same
+    # as the Tool.inputSchema/input_schema mismatch found in mcp_client/client.py's
+    # _extract_meta). Reading the wrong name here doesn't raise — it just silently
+    # returns the False default, so a real tool-call error would be swallowed:
+    # the LLM sees ordinary-looking output text with no "[tool error]" marker and
+    # cannot tell the call failed. Try the real SDK name first; fall back to the
+    # camelCase name so pre-upgrade test doubles that still set `.isError` keep working.
+    is_error = getattr(result, "is_error", None)
+    if is_error is None:
+        is_error = getattr(result, "isError", False)
+    if is_error:
         body = f"[tool error] {body}".strip()
     # Third-party MCP server output is untrusted external content — fence it as
     # data so an injected instruction in a tool result can't drive the agent.
