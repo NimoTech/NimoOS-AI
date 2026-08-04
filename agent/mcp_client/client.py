@@ -13,9 +13,11 @@ from contextlib import AsyncExitStack
 
 import anyio
 from agents import FunctionTool
-from mcp.client import Client
+from mcp.client import Client, InputRequiredRoundsExceededError
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_REQUEST
 
 from mcp_client.schema import sanitize_schema, flatten_result
 
@@ -249,6 +251,33 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     return confirmed
 
 
+def _input_required_msg(server_name: str) -> str:
+    """Wording matters: the model must understand this is NOT an argument problem.
+    Same shape as the connect-failure message below, for the same reason — otherwise
+    the model burns turns retrying with different arguments."""
+    return (f'[MCP error] MCP server "{server_name}" needs interactive input to complete '
+            "this call, which is not supported. This is a server-side capability issue "
+            "unrelated to the call arguments — do NOT retry with different arguments; "
+            "tell the user to check that MCP server's configuration.")
+
+
+def _is_unsupported_capability(err) -> bool:
+    """True when the server requested a capability we deliberately never declare
+    (elicitation / sampling / roots). The SDK's built-in default callbacks answer
+    those with ErrorData(code=INVALID_REQUEST, message="... not supported").
+
+    code is the PRIMARY discriminator: a remote tool's business failure comes back
+    as isError=True inside the result, not as a JSON-RPC error. The message suffix
+    narrows the false-positive surface. tests/test_mcp_mrtr.py pins the SDK's three
+    sentinel strings so a rewording fails loudly instead of silently degrading here.
+    """
+    data = getattr(err, "error", None)
+    if data is None:
+        return False
+    return (getattr(data, "code", None) == INVALID_REQUEST
+            and str(getattr(data, "message", "")).endswith("not supported"))
+
+
 def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
     slug = _slug(server["name"])
     tool_name = meta["name"]
@@ -274,6 +303,12 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
                     "do NOT retry with different arguments; tell the user to check that MCP server.")
         try:
             result = await conn.call_tool(tool_name, args)   # tool execution layer
+        except InputRequiredRoundsExceededError:
+            return _input_required_msg(server["name"])
+        except MCPError as e:
+            if _is_unsupported_capability(e):
+                return _input_required_msg(server["name"])
+            return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         return flatten_result(result)
