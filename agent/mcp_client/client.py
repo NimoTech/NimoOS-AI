@@ -501,8 +501,13 @@ async def _cold_fetch(server: dict):
     closed immediately (real calls use the per-run lazy connection)."""
     conn = await _connect(server)
     try:
-        metas, ttl = await asyncio.wait_for(conn.list_tools(),
-                                            timeout=MCP_COLD_TOTAL_TIMEOUT)
+        # No wait_for here — the caller (_metas_for_server) wraps the whole _cold_fetch
+        # in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the complete cold path
+        # (connect + list). Wrapping again here with the same constant would create dead code:
+        # the outer deadline (started before _connect) always fires first, so the inner
+        # wait_for would never actually timeout. Per-request read timeouts are separately
+        # bounded by Client(read_timeout_seconds=...) in _connect.
+        metas, ttl = await conn.list_tools()
     finally:
         await conn.aclose()
     _cache_put(server["id"], metas, _fingerprint(server), ttl)
