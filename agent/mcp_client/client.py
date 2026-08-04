@@ -136,15 +136,14 @@ def _extract_meta(mcp_tool) -> dict:
     # mcp 2.0's mcp_types.Tool exposes the JSON Schema via the Python attribute
     # `input_schema` (snake_case) — `inputSchema` is only the wire-format alias,
     # NOT a Python attribute on the model (verified empirically: getattr(tool,
-    # "inputSchema", ...) returns the default on a real Tool instance). Try the
-    # real SDK name first; fall back to the camelCase name so pre-upgrade test
-    # doubles that still set `.inputSchema` keep working unchanged.
-    schema = getattr(mcp_tool, "input_schema", None)
-    if schema is None:
-        schema = getattr(mcp_tool, "inputSchema", None)
+    # "inputSchema", ...) returns the default on a real Tool instance). No
+    # camelCase fallback here on purpose: a fallback that's never exercised by a
+    # real Tool would silently keep working even if this line regressed back to
+    # the wrong name — see test_extract_meta_real_tool, which uses a real
+    # mcp_types.Tool precisely so that regression can't hide.
     return {"name": mcp_tool.name,
             "description": getattr(mcp_tool, "description", "") or "",
-            "input_schema": schema}
+            "input_schema": getattr(mcp_tool, "input_schema", None)}
 
 
 def _cache_put(server_id: int, metas, fingerprint, ttl) -> None:
@@ -377,9 +376,15 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     """Build a transport, wrap it in an SDK Client, and hand back a McpConn whose
     aclose() unwinds the whole stack (Client → transport → socket/subprocess).
 
-    connect_timeout caps the handshake; callers apply it with asyncio.wait_for.
-    The run-start cold path uses the short default (_connect_timeout) to stay
-    non-blocking; call-time / background / test callers pass a generous value.
+    connect_timeout is only actually ENFORCED for the stdio branch (passed straight
+    through to netns start_mcp_stdio). For http/sse, no caller currently wraps this
+    call in asyncio.wait_for: _get_run_conn / _revalidate / _cold_fetch all call
+    _connect() directly and the handshake is bounded only by the generous
+    httpx2 AsyncClient(timeout=session_to) built in _build_transport. test_server is
+    the one exception — it wraps the whole connect+list probe (_test_server_inner)
+    in an outer asyncio.wait_for, so a hung http/sse connect IS bounded there.
+    Closing this gap for the run-start cold path (a real wait_for around connect+list
+    together) is Task 5's job (see MCP_COLD_TOTAL_TIMEOUT), not this one's.
     """
     connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
     session_to = _session_timeout(server)
@@ -406,9 +411,12 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     except BaseException:
         # Shielded: the caller's asyncio.wait_for cancels us mid-handshake on timeout —
         # the single most common failure here. A bare await would be re-cancelled and
-        # leak the unix socket or the stdio subprocess.
+        # leak the unix socket or the stdio subprocess. move_on_after mirrors
+        # McpConn.aclose(): shielding turns "remote hangs" from "gets cancelled" into
+        # "waits forever" — this caps that new risk the same way aclose() does.
         with anyio.CancelScope(shield=True):
-            await stack.aclose()
+            with anyio.move_on_after(MCP_CLOSE_TIMEOUT):
+                await stack.aclose()
         raise
     return McpConn(server=server, client=client, stack=stack)
 

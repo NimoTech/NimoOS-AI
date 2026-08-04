@@ -22,7 +22,7 @@ def test_flatten_text_content():
         def __init__(self, text): self.type = "text"; self.text = text
     class Res:
         content = [Block("hello"), Block("world")]
-        isError = False
+        is_error = False
     out = flatten_result(Res())
     # untrusted MCP output is fenced as data, content preserved intact
     assert "hello\nworld" in out
@@ -33,7 +33,7 @@ def test_flatten_text_content():
 def test_flatten_error_marks_error():
     class Res:
         content = []
-        isError = True
+        is_error = True
     out = flatten_result(Res())
     assert "error" in out.lower()
 

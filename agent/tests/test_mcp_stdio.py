@@ -43,6 +43,18 @@ async def test_connect_stdio_branch(monkeypatch):
     import mcp_client.netns_stdio as ns_mod
     monkeypatch.setattr(ns_mod, "netns_stdio_transport", fake_netns_stdio_transport)
 
+    # Positive assertion that the SDK's OWN stdio transport (which spawns the
+    # subprocess directly, bypassing the netns sandbox) is never even reached: an
+    # implementation that went through netns AND also fell through to the SDK's
+    # stdio_client would still pass every assertion above without this stub — it
+    # closes exactly the gap the security property depends on.
+    def _boom_sdk_stdio_client(*a, **k):
+        raise AssertionError("SDK's own stdio_client must never be called — "
+                              "stdio subprocesses must be spawned via the netns sandbox")
+
+    import mcp.client.stdio as sdk_stdio_mod
+    monkeypatch.setattr(sdk_stdio_mod, "stdio_client", _boom_sdk_stdio_client)
+
     class _FakeClientCM:
         async def __aenter__(self): return self
         async def __aexit__(self, *exc): return False
@@ -65,6 +77,15 @@ async def test_connect_stdio_branch(monkeypatch):
 
 
 def test_connect_timeout_per_transport():
+    # NOTE: this only pins the _connect_timeout() lookup table, not enforcement.
+    # MCP_CONNECT_TIMEOUT is actually ENFORCED only on the stdio branch (passed
+    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse,
+    # nothing currently wraps _connect() in asyncio.wait_for(..., timeout=connect_to)
+    # — the handshake is bounded only by the generous httpx2 AsyncClient(timeout=
+    # session_to) built in _build_transport (~60s), not this constant. Closing that
+    # gap for the run-start cold path is Task 5's job (MCP_COLD_TOTAL_TIMEOUT wraps
+    # connect+list together in _metas_for_server); reading this assertion as "http/sse
+    # connects are capped at MCP_CONNECT_TIMEOUT today" would be wrong.
     assert mc._connect_timeout({"transport": "stdio"}) == mc.STDIO_CONNECT_TIMEOUT
     assert mc._connect_timeout({"transport": "http"}) == mc.MCP_CONNECT_TIMEOUT
     assert mc._connect_timeout({}) == mc.MCP_CONNECT_TIMEOUT
