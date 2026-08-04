@@ -96,7 +96,15 @@ def _stdio_env(user_env: dict) -> dict:
     return env
 
 
-SCHEMA_TTL = 600        # 秒;超过则 stale(仍可用,触发后台 revalidate)
+# Default entry lifetime when the server gives no hint (i.e. every legacy-protocol
+# server, and any 2026-07-28 server that leaves ttlMs at its default 0).
+SCHEMA_TTL = 600
+# Floor for a server-declared ttlMs. A server declaring something tiny would punch
+# through the zero-connection warm path that is the whole reason this cache exists.
+# Worst case is a manifest up to a minute stale — we explicitly do not subscribe to
+# change notifications anyway, so that window is already accepted. Config changes
+# still invalidate instantly via the fingerprint, unaffected by this floor.
+SCHEMA_TTL_MIN = 60
 SCHEMA_CACHE_MAX = 256  # LRU 容量上限,兜住内存
 
 # MRTR round cap. The SDK default is 10. We register no elicitation/sampling/roots
@@ -113,8 +121,15 @@ MCP_CLOSE_TIMEOUT = 5
 
 
 def _resolve_ttl(raw_ttl_ms) -> int:
-    """Server-declared ttlMs -> our cache entry lifetime, in seconds."""
-    return SCHEMA_TTL
+    """Server-declared ttlMs -> our cache entry lifetime, in seconds.
+
+    "Absent" and "0" converge for free: legacy responses have no such field and the
+    SDK model defaults it to 0, so neither needs special-casing. Applied once, at
+    write time — see _cache_put.
+    """
+    if not isinstance(raw_ttl_ms, (int, float)) or raw_ttl_ms <= 0:
+        return SCHEMA_TTL
+    return max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN)
 
 
 class _CacheEntry:
