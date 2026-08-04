@@ -12,6 +12,7 @@ US IMPORTING IT, which is independent of what protocol upstream speaks. Do not
 delete it when openai-agents catches up.
 """
 import pathlib
+import subprocess
 import sys
 
 FORBIDDEN = (
@@ -38,9 +39,25 @@ def test_no_agents_mcp_transport_symbols_in_source():
 
 
 def test_importing_our_client_never_loads_agents_mcp_server():
-    """Stronger than the grep: catches an INDIRECT import too."""
-    sys.modules.pop("agents.mcp.server", None)
-    import agent  # noqa: F401
-    import mcp_client.client  # noqa: F401
+    """Stronger than the grep: catches an INDIRECT import too.
 
-    assert "agents.mcp.server" not in sys.modules
+    Runs in a FRESH interpreter on purpose. In-process this assertion would be
+    vacuous during a full-suite run: pytest has already imported these modules
+    for earlier test files, so the imports here would be sys.modules cache hits
+    that execute nothing — and an indirect pull-in would have happened back then,
+    before this test could observe it.
+    """
+    code = (
+        "import sys\n"
+        "import agent, mcp_client.client\n"
+        "agents_mods = [m for m in sys.modules if m.startswith('agents')]\n"
+        "assert 'agents.mcp.server' not in sys.modules, "
+        "f'agents.mcp.server found in sys.modules: {agents_mods}'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(AGENT_ROOT),
+        capture_output=True,
+        text=True
+    )
+    assert proc.returncode == 0, f"Import check failed:\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
