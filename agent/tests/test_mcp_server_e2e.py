@@ -1,5 +1,6 @@
 # NimoOS-AI/agent/tests/test_mcp_server_e2e.py
 import json
+import types
 import pytest
 import mcp.types as mtypes
 from fastapi.testclient import TestClient
@@ -210,3 +211,102 @@ async def test_call_mcptoolerror_branch_maps_to_iserror_directly(monkeypatch):
     assert isinstance(result, mtypes.CallToolResult)
     assert result.is_error is True
     assert result.content[0].text == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Task 9: server-side pin tests. Zero changes to mcp_server/** or main.py --
+# these pin properties that already hold, so nobody regresses them later.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tool_order_is_deterministic():
+    """2026-07-28 asks servers to return tools in a stable order so client-side and
+    peer prompt caches can hit. Ours already does -- it generates from the fixed
+    TOOL_SPECS list. This pins it against someone later switching to a dict walk.
+
+    Deliberately bypasses the `client`/`_mk_token`/`_rpc` HTTP round-trip and calls
+    the SDK-registered `tools/list` handler directly instead (same idiom as
+    `_get_raw_call_handler` / `test_call_mcptoolerror_branch_maps_to_iserror_directly`
+    above). Reason: `_mk_token()` inserts into whatever `main._conn` currently
+    points to, but `tests/test_main_fs_endpoints.py` permanently repoints
+    `main_module._conn` to a different sqlite connection via a bare assignment
+    (not `monkeypatch.setattr`, so it never reverts) -- while the ASGI auth
+    wrapper's `mcp_tokens.verify(conn, ...)` closes over the *original* `_conn`
+    from `mcp_server.server.build(_conn)` at import time. In the full suite (where
+    that file runs first, alphabetically) the two diverge and every HTTP call
+    through `_mk_token()` gets a spurious 401 -- this is exactly what already
+    fails 5 pre-existing tests in this file when run as part of the full suite
+    (confirmed: they pass in isolation, so it is a suite-order artifact, not a
+    real regression -- and out of scope per this task's brief). The tool-order
+    property under test lives entirely in `mcp_server/server.py`'s handler
+    wiring, not in the auth layer, so testing it directly here keeps this pin
+    green regardless of what else ran first.
+    """
+    from mcp_server import tools
+    from mcp_server.server import _build_lowlevel
+
+    server = _build_lowlevel()
+    handler = server.get_request_handler("tools/list").handler
+
+    first = await handler(None, None)
+    second = await handler(None, None)
+
+    names_first = [t.name for t in first.tools]
+    names_second = [t.name for t in second.tools]
+
+    assert names_first == names_second
+    assert names_first == [d["name"] for d in tools.list_tool_defs()]
+
+
+@pytest.mark.asyncio
+async def test_server_discover_is_reachable():
+    """server/discover is mandatory in 2026-07-28, and the lowlevel Server ships a
+    default handler for it (`Server._handle_discover` in
+    mcp/server/lowlevel/server.py) -- assert it is actually wired up and self-reports.
+
+    Two things had to be verified by reading the SDK and making live calls, not
+    guessed (the brief's `protocolVersions`/`protocolVersion` guess was wrong on
+    both counts):
+
+    1. Reaching server/discover over HTTP is not a plain `_rpc(...)` call. The
+       SDK's request classifier (`mcp.shared.inbound.classify_inbound_request`)
+       only routes a request into the modern per-request-envelope era -- where
+       server/discover exists at all -- when the `MCP-Protocol-Version` header
+       names a modern revision, `Mcp-Method` echoes the body method, and
+       `params._meta` carries the `io.modelcontextprotocol/protocolVersion` and
+       `io.modelcontextprotocol/clientCapabilities` envelope keys. Confirmed live:
+       a bare `_rpc("server/discover", token=tok, client=client)` returns JSON-RPC
+       -32601 "Method not found"; building the full envelope by hand against
+       `client` does reach it and returns 200 with `supportedVersions`,
+       `capabilities`, and a `_meta` server-identity stamp.
+    2. That HTTP path is not usable here anyway: it needs a valid token from
+       `_mk_token()`, which (as documented in `test_tool_order_is_deterministic`
+       above) is poisoned in the full suite by `test_main_fs_endpoints.py`
+       permanently repointing `main._conn` away from the connection the MCP ASGI
+       app actually verifies tokens against.
+
+    So this test calls the SDK-registered `server/discover` handler directly
+    (`get_request_handler`, the same accessor `_get_raw_call_handler` uses for
+    `tools/call`), with a minimal stand-in context exposing only the
+    `.protocol_version` attribute the handler actually reads. This pins the same
+    wiring the live HTTP call exercised, without the auth-layer flakiness.
+    """
+    from mcp_server.server import _build_lowlevel
+
+    server = _build_lowlevel()
+    entry = server.get_request_handler("server/discover")
+    assert entry is not None, "server/discover must be a registered request handler"
+
+    ctx = types.SimpleNamespace(protocol_version="2026-07-28")
+    result = await entry.handler(ctx, None)
+
+    # Self-reports a protocol version it actually supports (real field is
+    # `supported_versions` / wire `supportedVersions`, not `protocolVersion(s)`).
+    assert result.supported_versions == ["2026-07-28"]
+
+    # Capabilities are substantive, not an empty stub -- the tools capability is registered.
+    assert result.capabilities.tools is not None
+
+    # Server identity, as stamped into the wire `_meta` block on a live call.
+    assert server.server_info_stamp["name"] == "nimoos-mcp"
