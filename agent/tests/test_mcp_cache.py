@@ -22,12 +22,13 @@ def test_extract_meta():
 def test_cache_put_get_lru(monkeypatch):
     mc._SCHEMA_CACHE.clear()
     monkeypatch.setattr(mc, "SCHEMA_CACHE_MAX", 2)
-    mc._cache_put(1, [{"name": "a"}], "fp1")
-    mc._cache_put(2, [{"name": "b"}], "fp2")
+    mc._cache_put(1, [{"name": "a"}], "fp1", mc.SCHEMA_TTL)
+    mc._cache_put(2, [{"name": "b"}], "fp2", mc.SCHEMA_TTL)
     assert mc._cache_get(1) is not None          # touch 1 -> most-recent
-    mc._cache_put(3, [{"name": "c"}], "fp3")      # over cap -> evict LRU (id 2)
+    mc._cache_put(3, [{"name": "c"}], "fp3", mc.SCHEMA_TTL)      # over cap -> evict LRU (id 2)
     assert mc._cache_get(2) is None
     assert mc._cache_get(1) is not None
     assert mc._cache_get(3) is not None
     e = mc._cache_get(1)
     assert e.metas == [{"name": "a"}] and e.fingerprint == "fp1"
+    assert e.ttl == mc.SCHEMA_TTL

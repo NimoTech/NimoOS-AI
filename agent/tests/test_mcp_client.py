@@ -22,6 +22,9 @@ class FakeConn:
         class Block: type = "text"; text = "RESULT"
         class Res: content = [Block()]; isError = False
         return Res()
+    async def list_tools(self):
+        return [{"name": "search", "description": "does a thing",
+                 "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}], mc.SCHEMA_TTL
     async def aclose(self): pass
 
 
