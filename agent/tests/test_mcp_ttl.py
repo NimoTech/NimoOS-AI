@@ -66,3 +66,32 @@ async def test_short_ttl_entry_is_stale_and_triggers_single_revalidate(monkeypat
     assert all(r == [{"name": "a"}] for r in results)   # stale served, never blocked
     await asyncio.sleep(0.1)
     assert started == [1], f"single-flight broken: {len(started)} concurrent refreshes"
+
+
+@pytest.mark.asyncio
+async def test_cold_path_has_a_single_total_budget(monkeypatch):
+    """Raising the connect leg to 8s must not double the run-start worst case.
+    connect + list share ONE budget, so the cold path still gives up around 10s."""
+    import time
+
+    mc._SCHEMA_CACHE.clear()
+    mc._REVALIDATING.clear()
+    mc.EVENT_QUEUE_VAR.set(None)
+    monkeypatch.setattr(mc, "MCP_COLD_TOTAL_TIMEOUT", 0.1)
+
+    async def never_connects(server, connect_timeout=None):
+        await asyncio.sleep(30)
+
+    async def noop_revalidate(s):
+        return None
+
+    monkeypatch.setattr(mc, "_connect", never_connects)
+    monkeypatch.setattr(mc, "_revalidate", noop_revalidate)
+
+    started = time.monotonic()
+    metas = await mc._metas_for_server(
+        {"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    elapsed = time.monotonic() - started
+
+    assert metas == []                    # give up rather than block run start
+    assert elapsed < 1.0, f"cold path was not capped by the total budget ({elapsed:.2f}s)"

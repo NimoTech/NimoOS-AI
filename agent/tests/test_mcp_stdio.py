@@ -79,13 +79,14 @@ async def test_connect_stdio_branch(monkeypatch):
 def test_connect_timeout_per_transport():
     # NOTE: this only pins the _connect_timeout() lookup table, not enforcement.
     # MCP_CONNECT_TIMEOUT is actually ENFORCED only on the stdio branch (passed
-    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse,
-    # nothing currently wraps _connect() in asyncio.wait_for(..., timeout=connect_to)
+    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse in
+    # _get_run_conn and _revalidate, _connect() is not wrapped in asyncio.wait_for
     # — the handshake is bounded only by the generous httpx2 AsyncClient(timeout=
-    # session_to) built in _build_transport (~60s), not this constant. Closing that
-    # gap for the run-start cold path is Task 5's job (MCP_COLD_TOTAL_TIMEOUT wraps
-    # connect+list together in _metas_for_server); reading this assertion as "http/sse
-    # connects are capped at MCP_CONNECT_TIMEOUT today" would be wrong.
+    # session_to) built in _build_transport (~60s), not this constant. For the
+    # run-start cold path, _metas_for_server wraps _cold_fetch in asyncio.wait_for
+    # with MCP_COLD_TOTAL_TIMEOUT, capping both connect and list together. Reading
+    # "http/sse connects are capped at MCP_CONNECT_TIMEOUT today" would be wrong
+    # outside the cold-path context.
     assert mc._connect_timeout({"transport": "stdio"}) == mc.STDIO_CONNECT_TIMEOUT
     assert mc._connect_timeout({"transport": "http"}) == mc.MCP_CONNECT_TIMEOUT
     assert mc._connect_timeout({}) == mc.MCP_CONNECT_TIMEOUT

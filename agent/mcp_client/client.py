@@ -392,14 +392,14 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     aclose() unwinds the whole stack (Client → transport → socket/subprocess).
 
     connect_timeout is only actually ENFORCED for the stdio branch (passed straight
-    through to netns start_mcp_stdio). For http/sse, no caller currently wraps this
-    call in asyncio.wait_for: _get_run_conn / _revalidate / _cold_fetch all call
-    _connect() directly and the handshake is bounded only by the generous
-    httpx2 AsyncClient(timeout=session_to) built in _build_transport. test_server is
-    the one exception — it wraps the whole connect+list probe (_test_server_inner)
-    in an outer asyncio.wait_for, so a hung http/sse connect IS bounded there.
-    Closing this gap for the run-start cold path (a real wait_for around connect+list
-    together) is Task 5's job (see MCP_COLD_TOTAL_TIMEOUT), not this one's.
+    through to netns start_mcp_stdio). For http/sse, the connect is bounded
+    differently in different callers: _get_run_conn and _revalidate do NOT wrap
+    _connect() in asyncio.wait_for, so the handshake is bounded only by the generous
+    httpx2 AsyncClient(timeout=session_to) built in _build_transport. For the
+    run-start cold path, _metas_for_server wraps _cold_fetch (which calls _connect)
+    in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the entire connect+list
+    sequence together. test_server also wraps its connect+list probe in an outer
+    asyncio.wait_for.
     """
     connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
     session_to = _session_timeout(server)
@@ -526,9 +526,12 @@ async def _metas_for_server(server: dict):
                             "stdio tools are initializing in the background for first use; retry shortly")
         return []
     try:
-        return await _cold_fetch(server)        # http/sse:内联快取(短超时,不阻塞 run 启动)
+        # ONE budget for the whole cold path (connect + list). The connect leg alone
+        # is now 8s for mode="auto"'s extra server/discover round trip; without this
+        # cap the run-start worst case would grow from 5+5 to 8+8.
+        return await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
     except Exception as e:
-        # 冷取超时多半是慢链路下的冷连接(>5s)。后台用宽松超时预热缓存,下次 run 即有工具。
+        # 冷取超时多半是慢链路下的冷连接。后台用宽松超时预热缓存,下次 run 即有工具。
         _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
         return []
