@@ -10,6 +10,11 @@ surface as TWO DIFFERENT exceptions — hence two branches, not one catch-all:
   gap 2  a non-compliant server sends inputRequests anyway: the SDK's built-in
          default callback answers ErrorData(INVALID_REQUEST, "... not supported")
          and _dispatch_all raises MCPError on round ONE — it never reaches the cap.
+  gap 3  a COMPLIANT server refuses up front with MISSING_REQUIRED_CLIENT_CAPABILITY
+         (-32021) + data.requiredCapabilities. This is the shape we actually meet in
+         the field, and it must reach the same "needs interactive input" message —
+         otherwise the model gets a generic failure and may keep retrying a call that
+         can never succeed.
 """
 import json
 
@@ -17,6 +22,7 @@ import pytest
 from mcp.client import InputRequiredRoundsExceededError
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST, INTERNAL_ERROR
+from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY
 
 import mcp_client.client as mc
 
@@ -36,6 +42,28 @@ def test_round_cap_is_one():
 def test_recognises_undeclared_capability(message):
     err = MCPError(code=INVALID_REQUEST, message=message)
     assert mc._is_unsupported_capability(err) is True
+
+
+def test_recognises_compliant_missing_capability_refusal():
+    """gap 3: a compliant 2026-07-28 server refuses with -32021 rather than asking a
+    client that never declared the capability. Verified against a real test server whose
+    reply was `{"code": -32021, "message": "greet needs to elicit a name from the user",
+    "data": {"requiredCapabilities": {"elicitation": {"form": {}}}}}`.
+
+    The server's own message carries no "not supported" suffix, so ONLY the code can
+    classify this — which is fine: -32021 is a dedicated code meaning exactly this.
+    """
+    err = MCPError(code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+                   message="greet needs to elicit a name from the user",
+                   data={"requiredCapabilities": {"elicitation": {"form": {}}}})
+    assert mc._is_unsupported_capability(err) is True
+
+
+def test_missing_capability_code_comes_from_the_sdk():
+    """Pin the numeric code to the SDK constant rather than hardcoding -32021 here, so
+    a spec/SDK renumbering surfaces as a failure instead of silent misclassification."""
+    assert MISSING_REQUIRED_CLIENT_CAPABILITY == -32021
+    assert mc.MISSING_REQUIRED_CLIENT_CAPABILITY is MISSING_REQUIRED_CLIENT_CAPABILITY
 
 
 def test_sdk_sentinel_messages_are_pinned():
@@ -89,8 +117,11 @@ class _RaisingConn:
 @pytest.mark.parametrize("exc", [
     InputRequiredRoundsExceededError("too many rounds"),
     MCPError(code=INVALID_REQUEST, message="Elicitation not supported"),
+    MCPError(code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+             message="greet needs to elicit a name from the user",
+             data={"requiredCapabilities": {"elicitation": {"form": {}}}}),
 ])
-async def test_both_gaps_produce_the_same_do_not_retry_message(exc):
+async def test_all_gaps_produce_the_same_do_not_retry_message(exc):
     _setup_run(_RaisingConn(exc))
     tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
     out = await tool.on_invoke_tool(None, json.dumps({}))

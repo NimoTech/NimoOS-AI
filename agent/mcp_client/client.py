@@ -18,6 +18,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST
+from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY
 
 from mcp_client.schema import sanitize_schema, flatten_result
 
@@ -275,19 +276,34 @@ def _input_required_msg(server_name: str) -> str:
 
 
 def _is_unsupported_capability(err) -> bool:
-    """True when the server requested a capability we deliberately never declare
-    (elicitation / sampling / roots). The SDK's built-in default callbacks answer
-    those with ErrorData(code=INVALID_REQUEST, message="... not supported").
+    """True when a tool call cannot proceed because it needs a client capability we
+    deliberately never declare (elicitation / sampling / roots).
 
-    code is the PRIMARY discriminator: a remote tool's business failure comes back
-    as isError=True inside the result, not as a JSON-RPC error. The message suffix
-    narrows the false-positive surface. tests/test_mcp_mrtr.py pins the SDK's three
-    sentinel strings so a rewording fails loudly instead of silently degrading here.
+    Two wire shapes mean this, and BOTH must be recognised — they come from opposite
+    kinds of server:
+
+    1. `MISSING_REQUIRED_CLIENT_CAPABILITY` (-32021) — how a **compliant** 2026-07-28
+       server says "this call needs a capability you did not declare", carrying
+       `data.requiredCapabilities`. This is the case we actually meet in the field, and
+       the code alone is a sufficient discriminator: it is a dedicated code with exactly
+       this meaning.
+    2. `INVALID_REQUEST` (-32600) + a message ending in "not supported" — produced by the
+       SDK's own built-in default callbacks when a **non-compliant** server sends
+       `inputRequests` to a client that never declared the capability. Here the code is
+       generic, so the message suffix is needed to narrow the false-positive surface;
+       tests/test_mcp_mrtr.py pins the SDK's three sentinel strings so a rewording fails
+       loudly instead of silently degrading to the generic error path.
+
+    In both cases a remote tool's ordinary business failure is NOT at risk of being
+    misread: those arrive as `isError=True` inside a result, never as a JSON-RPC error.
     """
     data = getattr(err, "error", None)
     if data is None:
         return False
-    return (getattr(data, "code", None) == INVALID_REQUEST
+    code = getattr(data, "code", None)
+    if code == MISSING_REQUIRED_CLIENT_CAPABILITY:
+        return True
+    return (code == INVALID_REQUEST
             and str(getattr(data, "message", "")).endswith("not supported"))
 
 
