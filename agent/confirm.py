@@ -116,6 +116,15 @@ class ConfirmManager:
             # propagate on its own, contradicting the "CancelledError 天然向上传播"
             # assumption in the plan's own note. Task.cancelling() (3.11+) is the
             # sanctioned way to detect a swallowed cancellation and re-raise it.
+            # CORRECTION RECORD (do not "fix" this back): the plan's inline note
+            # asserting natural propagation is simply wrong for this one path —
+            # confirmed by code review (task-3-report.md, fix round 2) — so this
+            # guard is required, not optional polish. Its behaviour under a real
+            # anyio task group (the shape Task 4's SDK callback actually runs in,
+            # where Task.cancelling() being a whole-task counter could in
+            # principle misfire on an unrelated outer cancellation) is pinned by
+            # tests/test_confirm_elicit.py::test_wait_elicit_completes_normally_inside_a_live_anyio_task_group
+            # and ::test_wait_elicit_cancelled_by_a_task_group_scope_propagates_and_clears_memory.
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 raise asyncio.CancelledError()

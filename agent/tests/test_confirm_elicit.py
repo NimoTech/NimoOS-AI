@@ -6,6 +6,7 @@
 import asyncio
 import sqlite3
 
+import anyio
 import pytest
 
 import confirm as C
@@ -134,6 +135,64 @@ async def test_cancelling_the_waiter_does_not_leave_the_answer_in_memory():
     assert mgr._contents == {} and mgr._actions == {}
 
 
+# ── wait_elicit() 在真实 anyio task group 里的行为 ──────────────────────────────
+#
+# Task 4 will call wait_elicit from inside the MCP SDK's own dispatch loop, which
+# runs under anyio task groups (the SDK depends on anyio for exactly this), not a
+# bare asyncio.create_task(). Task.cancelling() is a whole-TASK counter, not scoped
+# to a single await — the risk the reviewer named is that an unrelated outer
+# cancellation (e.g. a sibling in the same task group, or a scope that already
+# fired and was handled elsewhere in the same task) could leave the counter
+# nonzero and make wait_elicit's guard (confirm.py's Task.cancelling() check,
+# added because plain asyncio.wait_for swallows a same-tick CancelledError — see
+# the comment on wait_elicit) misfire and turn a legitimately-obtained answer into
+# a spurious CancelledError. These two tests pin that anyio's asyncio backend does
+# NOT leave that stale state behind: a normal completion inside a live task group
+# returns the answer without raising, and an actual cancel-scope cancellation both
+# propagates AND leaves no answer in memory.
+
+@pytest.mark.asyncio
+async def test_wait_elicit_completes_normally_inside_a_live_anyio_task_group():
+    mgr, _ = _mgr()
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+    result = {}
+
+    async def waiter():
+        result["got"] = await mgr.wait_elicit(cid)
+
+    async def answer():
+        await anyio.sleep(0)
+        mgr.resolve(cid, True, action="accept", content={"a": "b"})
+
+    # No cancellation anywhere in this test. If Task.cancelling() ever reported
+    # a stale nonzero count on a task that merely happens to run inside an anyio
+    # task group, this would spuriously raise CancelledError instead of returning.
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(waiter)
+        tg.start_soon(answer)
+
+    assert result["got"] == ("accept", {"a": "b"})
+
+
+@pytest.mark.asyncio
+async def test_wait_elicit_cancelled_by_a_task_group_scope_propagates_and_clears_memory():
+    mgr, _ = _mgr(timeout=10)
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+    # Never resolved: the waiter is still genuinely pending when the scope below
+    # cancels it, which is the real-world shape of "user closed the SSE stream" /
+    # "session cancelled" while a form is still outstanding.
+
+    async def waiter():
+        await mgr.wait_elicit(cid)
+
+    with anyio.move_on_after(0.05):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(waiter)
+            await anyio.sleep(3600)  # outlives the 0.05s deadline; scope cancels both
+
+    assert mgr._actions == {} and mgr._contents == {}
+
+
 # ── 既有二态路径不得回归 ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -150,29 +209,27 @@ async def test_the_existing_boolean_path_is_untouched():
     assert mgr.consume_remember(cid) is True
 
 
-# NOTE ON FIXTURE (deviation from the brief's inline snippet, not from its intent):
+# NOTE ON TestClient (deviation from the brief's inline snippet, not from its intent):
 # main.py holds a module-level StreamableHTTPSessionManager singleton whose .run()
-# "can only be called once per instance" (verified empirically). Opening a fresh
-# `with TestClient(main_module.app) as client:` in each test function starts that
-# lifespan twice in one process and the second one raises RuntimeError. The brief's
-# own prose says to get the app "the way tests/test_mcp_server_e2e.py does it" —
-# that file dodges exactly this by entering the TestClient context once behind a
-# session-scoped fixture. Reusing that pattern here; test bodies/assertions below
-# are otherwise verbatim.
-@pytest.fixture(scope="session")
-def _confirm_endpoint_client():
+# "can only be called once per instance" (verified empirically). Entering
+# `with TestClient(main_module.app) as client:` runs the app's ASGI lifespan
+# (startup/shutdown), and a *second* such block anywhere else in the same test
+# process — including tests/test_mcp_server_e2e.py's own session-scoped `client`
+# fixture, which also wraps main.app — hits that guard and raises RuntimeError,
+# regardless of run order. `/confirm` and `_confirm_mgr` are fully initialised at
+# import time (main.py:56-57), not by a startup hook, so the endpoint under test
+# needs none of the lifespan machinery. Constructing TestClient WITHOUT entering
+# it as a context manager sidesteps the lifespan entirely (verified: two separate
+# such instances used back-to-back do not collide), so that's what these two tests
+# do. Everything else — requests sent, bodies, assertions — is verbatim.
+def test_confirm_endpoint_passes_action_and_content_through(monkeypatch):
     from fastapi.testclient import TestClient
     import main as main_module
-    with TestClient(main_module.app) as c:
-        yield c, main_module
-
-
-def test_confirm_endpoint_passes_action_and_content_through(monkeypatch, _confirm_endpoint_client):
-    client, main_module = _confirm_endpoint_client
 
     calls = []
     monkeypatch.setattr(main_module._confirm_mgr, "resolve",
                         lambda *a, **k: calls.append((a, k)))
+    client = TestClient(main_module.app)
     r = client.post("/agent/sessions/s1/confirm",
                     headers={"X-User-Id": "1"},
                     json={"confirm_id": "c1", "confirmed": True,
@@ -182,11 +239,13 @@ def test_confirm_endpoint_passes_action_and_content_through(monkeypatch, _confir
     assert calls[0][1]["content"] == {"name": "Nimo"}
 
 
-def test_confirm_endpoint_rejects_an_unknown_action(monkeypatch, _confirm_endpoint_client):
-    client, main_module = _confirm_endpoint_client
+def test_confirm_endpoint_rejects_an_unknown_action(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main as main_module
 
     monkeypatch.setattr(main_module._confirm_mgr, "resolve",
                         lambda *a, **k: pytest.fail("must not reach resolve"))
+    client = TestClient(main_module.app)
     r = client.post("/agent/sessions/s1/confirm",
                     headers={"X-User-Id": "1"},
                     json={"confirm_id": "c1", "action": "approve"})
