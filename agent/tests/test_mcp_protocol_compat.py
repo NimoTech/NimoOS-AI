@@ -3,11 +3,13 @@
 This is the core promise of the mcp-2.0-upgrade: our client code (`_connect`/
 `McpConn` in mcp_client/client.py) must be able to talk to BOTH a legacy
 (pre-2026-07-28 initialize-handshake) server and a modern (2026-07-28
-per-request-envelope) server, and it must do so *without declaring*
-elicitation/sampling/roots — because we pass no callbacks for them, and the
-spec forbids a server from asking a client that never declared a capability.
-That is documented behaviour of the SDK; this file is what turns it into a
-lock rather than an assumption.
+per-request-envelope) server. As of phase 2 it declares elicitation (both the
+form and url sub-capabilities — see `test_we_declare_both_elicitation_modes_
+but_still_no_sampling_or_roots` below) because `_connect` now passes an
+`elicitation_callback`; sampling and roots stay undeclared, since we pass no
+callbacks for them and the spec forbids a server from asking a client that
+never declared a capability. That is documented behaviour of the SDK; this
+file is what turns it into a lock rather than an assumption.
 
 Scaffolding note (read before touching this file): the task-7 brief drafted
 this test against decorator-style `@server.list_tools()` registration and a
@@ -62,13 +64,13 @@ the real SDK:
 
 None of this loosens the three assertions the brief pins down as
 non-negotiable: both modes list AND call; an un-hinted server's ttl resolves
-to `SCHEMA_TTL`; and `clientCapabilities` on the wire has no elicitation/
-sampling/roots key. See mcp/client/session.py::_build_capabilities +
-adopt()/send_discover() for why reading `ClientCapabilities.model_dump(...,
-exclude_none=True)` (rather than eyeballing which attributes are `None`) is
-the faithful "on the wire" check: that exact call, with that exact flag, is
-literally what the SDK serializes into `params._meta.clientCapabilities` for
-every modern request.
+to `SCHEMA_TTL`; and `clientCapabilities` on the wire has both elicitation
+sub-capabilities (`form`, `url`) but no sampling/roots key. See
+mcp/client/session.py::_build_capabilities + adopt()/send_discover() for why
+reading `ClientCapabilities.model_dump(..., exclude_none=True)` (rather than
+eyeballing which attributes are `None`) is the faithful "on the wire" check:
+that exact call, with that exact flag, is literally what the SDK serializes
+into `params._meta.clientCapabilities` for every modern request.
 """
 from contextlib import AsyncExitStack
 

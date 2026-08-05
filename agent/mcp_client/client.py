@@ -347,10 +347,16 @@ def _is_legacy_url_elicitation(err) -> bool:
 
 def _is_unsupported_capability(err) -> bool:
     """True when a tool call cannot proceed because it needs a client capability we
-    deliberately never declare (elicitation / sampling / roots).
+    deliberately never declare (sampling / roots).
 
-    Two wire shapes mean this, and BOTH must be recognised — they come from opposite
-    kinds of server:
+    Elicitation is NOT in that set as of phase 2 — `_connect` now passes an
+    `elicitation_callback`, so a compliant server asking for it succeeds via the normal
+    MRTR path instead of landing here. This function still matters for elicitation in
+    one narrow case: a legacy/non-compliant server that sends `inputRequests` in a shape
+    our declared capability doesn't cover, or before capability negotiation settles.
+
+    Two wire shapes mean "capability not supported", and BOTH must be recognised — they
+    come from opposite kinds of server:
 
     1. `MISSING_REQUIRED_CLIENT_CAPABILITY` (-32021) — how a **compliant** 2026-07-28
        server says "this call needs a capability you did not declare", carrying
@@ -359,7 +365,9 @@ def _is_unsupported_capability(err) -> bool:
        this meaning.
     2. `INVALID_REQUEST` (-32600) + a message ending in "not supported" — produced by the
        SDK's own built-in default callbacks when a **non-compliant** server sends
-       `inputRequests` to a client that never declared the capability. Here the code is
+       `inputRequests` to a client that never declared the capability. This shape no
+       longer applies to elicitation (we declare it, so the SDK's default callback is
+       never in play for it) — it now only fires for sampling/roots. Here the code is
        generic, so the message suffix is needed to narrow the false-positive surface;
        tests/test_mcp_mrtr.py pins the SDK's three sentinel strings so a rewording fails
        loudly instead of silently degrading to the generic error path.
