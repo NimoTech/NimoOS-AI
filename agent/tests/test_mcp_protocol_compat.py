@@ -151,29 +151,43 @@ async def test_list_and_call_over_both_protocol_paths(mode):
 
 
 @pytest.mark.asyncio
-async def test_we_do_not_declare_elicitation_sampling_or_roots():
-    """Not passing the callbacks means the SDK does not DECLARE the
-    capabilities, and the spec forbids a server from asking a client that has
-    not declared them. This is the whole of our phase-1 MRTR position, so
-    assert it on the wire rather than resting on "the SDK docs say so"."""
+async def test_we_declare_both_elicitation_modes_but_still_no_sampling_or_roots():
+    """Phase 2 reverses exactly one third of the phase-1 assertion.
+
+    Both sub-capabilities must be pinned, not just "elicitation is non-empty": the
+    whole justification for shipping the form card AND the url card together is that
+    mcp/client/session.py::_build_capabilities constructs
+    `ElicitationCapability(form=FormElicitationCapability(),
+                           url=UrlElicitationCapability())`
+    unconditionally the moment the callback differs from the SDK default — there is no
+    form-only setting. If a future SDK makes them separately selectable, this test must
+    go RED first, rather than letting the URL card quietly become dead code that never
+    receives a request. (Empirically verified today: the server observes
+    `{'elicitation': {'form': {}, 'url': {}}}`.)
+
+    sampling / roots stay undeclared: sampling would let a third-party server spend our
+    model budget and inject prompts into our model, and not declaring is the strongest
+    defence there is — a compliant server then never asks.
+    """
     capture: dict = {}
     server = _build_server(capture)
     transport = InMemoryTransport(server, raise_exceptions=True)
 
+    async def _cb(context, params):
+        return mtypes.ElicitResult(action="decline")
+
     async with Client(transport, mode="auto",
                       read_timeout_seconds=5,
                       input_required_max_rounds=mc.MCP_INPUT_REQUIRED_ROUNDS,
-                      cache=None) as client:
+                      cache=None,
+                      elicitation_callback=_cb) as client:
         await client.list_tools()
 
     caps = capture.get("caps")
     assert caps is not None, "server never observed a clientCapabilities envelope"
-    # This is the exact serialization the SDK itself puts on the wire in
-    # params._meta.clientCapabilities for every modern request (mcp/client/
-    # session.py: `self._build_capabilities(version).model_dump(by_alias=True,
-    # mode="json", exclude_none=True)`), so checking key-absence here is a
-    # faithful "on the wire" check, not an inference from unrelated attributes.
-    caps_keys = set(caps.model_dump(exclude_none=True).keys())
-    assert "elicitation" not in caps_keys
-    assert "sampling" not in caps_keys
-    assert "roots" not in caps_keys
+    dumped = caps.model_dump(exclude_none=True)
+    assert dumped.get("elicitation") == {"form": {}, "url": {}}
+    assert caps.elicitation.form is not None
+    assert caps.elicitation.url is not None
+    assert "sampling" not in dumped
+    assert "roots" not in dumped

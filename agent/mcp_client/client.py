@@ -21,6 +21,7 @@ from mcp.types import INVALID_REQUEST
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY
 
 from mcp_client.schema import sanitize_schema, flatten_result
+from mcp_client.elicitation import make_elicitation_callback
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -519,9 +520,26 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             # two semantics the SDK's lacks (config-fingerprint invalidation and
             # stale-while-revalidate), and two caches would fight.
             cache=None,
-            # No elicitation/sampling/roots callbacks: not passing them means the SDK
-            # does not DECLARE those capabilities, and the spec forbids a server from
-            # asking a client that has not declared them.
+            # This single argument declares BOTH elicitation sub-capabilities.
+            # mcp/client/session.py::_build_capabilities builds
+            #   ElicitationCapability(form=FormElicitationCapability(),
+            #                         url=UrlElicitationCapability())
+            # unconditionally whenever the callback differs from the SDK default —
+            # there is no form-only setting. And the spec says servers MUST NOT send a
+            # mode the client did not declare, so declaring `url` obliges us to have a
+            # url card. That is why the two cards shipped together rather than in two
+            # phases. Pinned by test_mcp_protocol_compat.py::
+            # test_we_declare_both_elicitation_modes_but_still_no_sampling_or_roots.
+            #
+            # Still NO sampling / roots callback, on purpose: sampling would let a
+            # third-party server spend our model budget and inject prompts into our
+            # model. Not declaring is the strongest defence — a compliant server never
+            # asks — and _is_unsupported_capability still covers the rest.
+            elicitation_callback=make_elicitation_callback(
+                server,
+                session_id_var=SESSION_ID_VAR,
+                queue_var=EVENT_QUEUE_VAR,
+                mgr_var=CONFIRM_MGR_VAR),
         ))
     except BaseException:
         # Shielded: the caller's asyncio.wait_for cancels us mid-handshake on timeout —
