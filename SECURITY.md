@@ -27,23 +27,21 @@ receives security fixes. There is no long-term support branch yet.
 
 ## Known limitations
 
-NimoOS supports multiple user accounts — each account gets its own role, its
-own Linux system user, and its own data directory. However, two subsystems do
-**not** currently enforce that boundary:
+The Photos and Search subsystems (separate NimoOS services this agent's
+skills can query on a user's behalf) do not yet enforce per-user data
+isolation — see [NimoOS's Known
+limitations](https://github.com/NimoTech/NimoOS/blob/main/SECURITY.md#known-limitations)
+for details. Until that's closed, don't expose search/photo-retrieval skills
+to untrusted users sharing an instance.
 
-- **Photos** — the photo library is global. Every user account sees the same
-  albums. There is no per-user filtering at the data layer.
-- **Search** — the filename index is global and is not filtered by per-user
-  permissions.
+## Auth model
 
-This means NimoOS is currently suitable for **single-user deployments, or
-multi-user deployments where all users are fully trusted with each other's
-photos and filenames**. Do not use it for multi-tenant scenarios, and do not
-expose an instance to untrusted users or to the public internet.
-
-Closing these two gaps is on the roadmap; the shared prerequisite is
-consolidating the service-to-service identity chain. See
-[ROADMAP.md](https://github.com/NimoTech/NimoOS/blob/main/ROADMAP.md).
+Unlike most other NimoOS services, `nimoos-ai` does **not** exempt localhost
+callers from JWT validation — every `/v1/ai` route requires a valid user
+token. This is deliberate: the service proxies each user's own cloud provider
+API keys, so even a same-host caller must authenticate as that user before it
+can use them. (A small set of `/_internal/*` paths are the exception, used
+only for trusted service-to-service calls such as the wiki-summary worker.)
 
 ## AI agent security model
 
