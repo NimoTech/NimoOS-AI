@@ -18,7 +18,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST
-from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY
+from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
@@ -312,6 +312,39 @@ def _unsupported_capability_msg(server_name: str) -> str:
             "tell the user to check that MCP server's configuration.")
 
 
+def _legacy_url_elicitation_msg(server_name: str) -> str:
+    """The 2025-11-25 URL-authorization flow, which we deliberately do not implement.
+
+    Elicitation is two entirely different wire mechanisms across the two protocol
+    versions. Under 2026-07-28 a URL request rides inside `InputRequiredResult`.
+    Under 2025-11-25 it is an ERROR (-32042) carrying `data.elicitations`, and the
+    completion signal is a `notifications/elicitation/complete` naming an
+    `elicitationId` — a notification the client side of the SDK has no handler for at
+    all (grep over mcp/client/ and mcp/shared/ finds nothing; only mcp/server/* sends
+    it). We could show the card, but we could never learn that the user finished.
+
+    We reach here at all because _connect uses mode="auto", so a legacy session is a
+    live possibility. Phase 1 let this fall into the generic "[MCP error] ... failed"
+    branch, which told the user nothing. Being unsupported is fine; being unsupported
+    silently is not.
+    """
+    return (f'[MCP error] MCP server "{server_name}" is asking for authorization using '
+            "the legacy (2025-11-25) URL elicitation flow, which this client does not "
+            "support. This is a protocol-version issue unrelated to the call arguments "
+            "— do NOT retry with different arguments; tell the user this server needs "
+            "to support MCP 2026-07-28 for authorization to work.")
+
+
+def _is_legacy_url_elicitation(err) -> bool:
+    """True for URL_ELICITATION_REQUIRED (-32042), the 2025-11-25-only shape.
+
+    Code alone is a sufficient discriminator — it is a dedicated code with exactly this
+    meaning, mirroring how _is_unsupported_capability treats -32021.
+    """
+    data = getattr(err, "error", None)
+    return data is not None and getattr(data, "code", None) == URL_ELICITATION_REQUIRED
+
+
 def _is_unsupported_capability(err) -> bool:
     """True when a tool call cannot proceed because it needs a client capability we
     deliberately never declare (elicitation / sampling / roots).
@@ -372,6 +405,8 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
         except InputRequiredRoundsExceededError:
             return _rounds_exceeded_msg(server["name"])
         except MCPError as e:
+            if _is_legacy_url_elicitation(e):
+                return _legacy_url_elicitation_msg(server["name"])
             if _is_unsupported_capability(e):
                 return _unsupported_capability_msg(server["name"])
             return f"[MCP error] MCP tool {tool_name} failed: {e}"

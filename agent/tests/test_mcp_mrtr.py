@@ -193,3 +193,55 @@ async def test_ordinary_failure_still_uses_the_generic_message():
 
     assert "MCP tool search failed" in out
     assert "needs interactive input" not in out
+
+
+# ── legacy(2025-11-25) 的 URL 授权是另一套机制 ─────────────────────────────────
+
+def test_legacy_url_elicitation_code_comes_from_the_sdk():
+    from mcp_types.jsonrpc import URL_ELICITATION_REQUIRED
+    assert URL_ELICITATION_REQUIRED == -32042
+    assert mc.URL_ELICITATION_REQUIRED is URL_ELICITATION_REQUIRED
+
+
+def test_recognises_the_legacy_url_elicitation_error():
+    """2025-11-25 用一个错误码要 URL 授权,2026-07-28 用 MRTR。前者还需要
+    notifications/elicitation/complete 才能知道授权完成了,而客户端侧 SDK 根本没有
+    这个通知的处理(mcp/client/ 与 mcp/shared/ grep 零命中)。所以我们不支持它 ——
+    但要明说,不能静默掉进通用错误。"""
+    from mcp.shared.exceptions import UrlElicitationRequiredError
+    from mcp.types import ElicitRequestURLParams
+
+    # 用 SDK 自己的异常类构造,而不是手搓一个 code=-32042 的 MCPError:
+    # 这样 SDK 若改变 data 形状或码值,这条测试会红
+    err = UrlElicitationRequiredError([ElicitRequestURLParams(
+        message="Authorize", url="https://example.com/oauth",
+        elicitationId="auth-001")])
+    assert err.error.code == -32042
+    assert mc._is_legacy_url_elicitation(err) is True
+    # 它不该被前面那条"缺失能力"路径顺手认领
+    assert mc._is_unsupported_capability(err) is False
+
+
+def test_other_errors_are_not_mistaken_for_legacy_url_elicitation():
+    assert mc._is_legacy_url_elicitation(
+        MCPError(code=INVALID_REQUEST, message="bad")) is False
+    assert mc._is_legacy_url_elicitation(RuntimeError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_url_elicitation_gets_its_own_message():
+    from mcp.shared.exceptions import UrlElicitationRequiredError
+    from mcp.types import ElicitRequestURLParams
+
+    _setup_run(_RaisingConn(UrlElicitationRequiredError([
+        ElicitRequestURLParams(message="Authorize", url="https://example.com/oauth")])))
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    out = await tool.on_invoke_tool(None, json.dumps({}))
+
+    assert "notion" in out
+    assert "do NOT retry with different arguments" in out
+    assert "legacy" in out.lower()
+    # 不得退化成第一期那两条里的任何一条,也不得掉进通用 "MCP tool ... failed"
+    assert out != mc._rounds_exceeded_msg("notion")
+    assert out != mc._unsupported_capability_msg("notion")
+    assert "MCP tool search failed" not in out
