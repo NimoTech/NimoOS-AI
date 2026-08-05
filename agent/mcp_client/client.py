@@ -123,12 +123,29 @@ SCHEMA_TTL = 600
 SCHEMA_TTL_MIN = 60
 SCHEMA_CACHE_MAX = 256  # LRU 容量上限,兜住内存
 
-# MRTR round cap. The SDK default is 10. We register no elicitation/sampling/roots
-# callback this phase, so an "input required" loop cannot possibly converge — 1
-# still grants the one free retry that covers a server saying "warming up", while
-# a non-compliant server that asks for an undeclared capability throws on round 1
-# instead of burning ten round trips.
-MCP_INPUT_REQUIRED_ROUNDS = 1
+# MRTR round cap = the SDK default (mcp/client/_input_required.py::
+# DEFAULT_INPUT_REQUIRED_MAX_ROUNDS). A "round" is a REQUEST/RETRY round trip, not a
+# question put to the user: the user pondering a card burns none of these — our
+# callback simply hasn't returned yet and _dispatch_all keeps awaiting it, with the
+# round counter frozen and only our own 24h confirm timeout running.
+#
+# What DOES burn rounds is the state-only leg: an InputRequiredResult carrying only
+# requestState and no inputRequests. The spec treats that as a first-class shape (a
+# server MUST include at least one of the two) and it is how a server says "the
+# out-of-band authorization you accepted hasn't landed yet, ask me again". The SDK
+# answers it with a bare sleep — 50ms, doubling, capped at 250ms — and retries. So a
+# cap of 3, as the phase-2 handoff originally suggested, is spent in 0.05+0.1+0.2 =
+# 350ms and would throw InputRequiredRoundsExceededError at a perfectly compliant
+# server. 10 buys 0.05+0.1+0.2+0.25*7 = 2.1s.
+#
+# 2.1s does NOT make out-of-band OAuth work — nobody completes a login in two
+# seconds. That is a deliberate, documented phase-2 trade-off (see the handoff's
+# §4 correction): the URL card returns "accept" the moment the user consents to
+# open the link, and a real OAuth server will still be waiting when the rounds run
+# out. Raising the cap stops us from breaking COMPLIANT servers; it does not
+# implement the wait. The fix for that is the deferred "I finished authorizing"
+# card, which moves the wait inside our own callback where no round cap applies.
+MCP_INPUT_REQUIRED_ROUNDS = 10
 
 # Upper bound on aclose(). aclose() shields itself from cancellation (see McpConn),
 # which turns "remote hangs" from "gets cancelled" into "waits forever" — this caps
@@ -265,10 +282,29 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     return confirmed
 
 
-def _input_required_msg(server_name: str) -> str:
-    """Wording matters: the model must understand this is NOT an argument problem.
-    Same shape as the connect-failure message below, for the same reason — otherwise
-    the model burns turns retrying with different arguments."""
+def _rounds_exceeded_msg(server_name: str) -> str:
+    """MRTR rounds exhausted AFTER we already asked the user and they answered.
+
+    Phase 1 reused the "capability not supported" wording here, and in phase 2 that
+    is simply false: elicitation IS supported now. The real meaning is "we asked, the
+    user answered, the server still isn't ready" — overwhelmingly an out-of-band
+    authorization that hasn't completed. Telling the model to check the server's
+    CONFIGURATION would send the user off fixing the wrong thing.
+    """
+    return (f'[MCP error] MCP server "{server_name}" asked for input, the user answered, '
+            "and the server is still not ready. This is almost always an out-of-band "
+            "authorization that has not finished yet — it is NOT a problem with the call "
+            "arguments, so do NOT retry with different arguments. Tell the user to finish "
+            "the authorization in the page that was opened, then ask you to retry.")
+
+
+def _unsupported_capability_msg(server_name: str) -> str:
+    """A capability we deliberately never declare (sampling / roots) was required.
+
+    Wording is phase 1's, unchanged and still accurate for those two: we really do not
+    support them, and the server really does need reconfiguring. Only the elicitation
+    half of the old shared message moved out (see _rounds_exceeded_msg).
+    """
     return (f'[MCP error] MCP server "{server_name}" needs interactive input to complete '
             "this call, which is not supported. This is a server-side capability issue "
             "unrelated to the call arguments — do NOT retry with different arguments; "
@@ -333,10 +369,10 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
         try:
             result = await conn.call_tool(tool_name, args)   # tool execution layer
         except InputRequiredRoundsExceededError:
-            return _input_required_msg(server["name"])
+            return _rounds_exceeded_msg(server["name"])
         except MCPError as e:
             if _is_unsupported_capability(e):
-                return _input_required_msg(server["name"])
+                return _unsupported_capability_msg(server["name"])
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"

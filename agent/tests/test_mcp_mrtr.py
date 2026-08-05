@@ -30,8 +30,49 @@ META = {"name": "search", "description": "d",
         "input_schema": {"type": "object", "properties": {}}}
 
 
-def test_round_cap_is_one():
-    assert mc.MCP_INPUT_REQUIRED_ROUNDS == 1
+def test_round_cap_is_the_sdk_default():
+    """第二期声明了 elicitation，MRTR 循环可以靠自己走通，所以放开到 SDK 默认的 10。
+
+    为什么不是交接文档原本建议的 3：mcp/client/_input_required.py:88-95 里，
+    只带 requestState、不带 inputRequests 的响应**也算一轮**，而它不弹卡、不问用户，
+    只 sleep 一下就重发（50ms 起、翻倍、250ms 封顶）。规范把这种响应当一等模式
+    （服务端 MUST include at least one of inputRequests or requestState），
+    它正是"授权还没完成，再来问"的标准表达。
+    3 轮在 0.05+0.1+0.2 = 350ms 内就烧光，会对一个正常轮询的合规服务端直接抛
+    InputRequiredRoundsExceededError —— 那是误伤，不是保护。
+
+    轮次不进模型上下文、不消耗 agent turn：整个 MRTR 循环发生在 client.py 里
+    那**一个** `await conn.call_tool(...)` 内部，SDK 消化掉全部中间轮次。
+    1 → 10 不增加一个 token，成本纯粹是网络往返。
+    """
+    from mcp.client._input_required import DEFAULT_INPUT_REQUIRED_MAX_ROUNDS
+    assert mc.MCP_INPUT_REQUIRED_ROUNDS == 10
+    assert mc.MCP_INPUT_REQUIRED_ROUNDS == DEFAULT_INPUT_REQUIRED_MAX_ROUNDS
+
+
+def test_rounds_exceeded_and_unsupported_capability_say_different_things():
+    """两条分岔在第二期含义完全不同，共用一条文案会让模型给出错误建议。
+
+    - 轮次耗尽：elicitation **已经支持**，问过用户、用户答了、服务端还是没就绪。
+      正确的话是"去完成授权，然后重试"，不是"去改服务器配置"。
+    - 缺失能力（sampling / roots）：我们确实没声明，"检查该 MCP 服务配置"仍然准确。
+    """
+    exceeded = mc._rounds_exceeded_msg("notion")
+    unsupported = mc._unsupported_capability_msg("notion")
+
+    assert exceeded != unsupported
+    for msg in (exceeded, unsupported):
+        assert "notion" in msg
+        assert "do NOT retry with different arguments" in msg
+
+    # 轮次耗尽这条不得再说"不支持"或"去改配置"
+    assert "not supported" not in exceeded
+    assert "configuration" not in exceeded
+    assert "authorization" in exceeded.lower()
+
+    # 缺失能力这条保留第一期措辞（对 sampling / roots 仍然准确）
+    assert "not supported" in unsupported
+    assert "configuration" in unsupported
 
 
 @pytest.mark.parametrize("message", [
@@ -114,21 +155,34 @@ class _RaisingConn:
 
 
 @pytest.mark.asyncio
+async def test_rounds_exceeded_tells_the_model_to_wait_for_authorization():
+    _setup_run(_RaisingConn(InputRequiredRoundsExceededError(10)))
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    out = await tool.on_invoke_tool(None, json.dumps({}))
+
+    assert "do NOT retry with different arguments" in out
+    assert "notion" in out
+    assert "authorization" in out.lower()
+    assert "configuration" not in out
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exc", [
-    InputRequiredRoundsExceededError("too many rounds"),
-    MCPError(code=INVALID_REQUEST, message="Elicitation not supported"),
+    MCPError(code=INVALID_REQUEST, message="Sampling not supported"),
+    MCPError(code=INVALID_REQUEST, message="List roots not supported"),
     MCPError(code=MISSING_REQUIRED_CLIENT_CAPABILITY,
-             message="greet needs to elicit a name from the user",
-             data={"requiredCapabilities": {"elicitation": {"form": {}}}}),
+             message="this call needs a capability you did not declare",
+             data={"requiredCapabilities": {"sampling": {}}}),
 ])
-async def test_all_gaps_produce_the_same_do_not_retry_message(exc):
+async def test_undeclared_capability_still_points_at_server_configuration(exc):
+    """第二期仍然不声明 sampling / roots —— 这条路径必须原样活着。"""
     _setup_run(_RaisingConn(exc))
     tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
     out = await tool.on_invoke_tool(None, json.dumps({}))
 
     assert "needs interactive input" in out
     assert "do NOT retry with different arguments" in out
-    assert "notion" in out
+    assert "configuration" in out
 
 
 @pytest.mark.asyncio
