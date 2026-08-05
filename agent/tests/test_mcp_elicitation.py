@@ -219,8 +219,169 @@ async def test_https_ascii_host_raises_neither_flag():
         message="Authorize", url="https://accounts.example.com/oauth")))
     card = await asyncio.wait_for(queue.get(), timeout=2)
     assert (card["punycode"], card["insecure"]) == (False, False)
+    assert card["host_ascii"] == ""     # 没有"看不出来的另一种拼法"要展示
     mgr.resolve(card["confirm_id"], False, action="cancel")
     await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_unicode_homograph_host_raises_the_punycode_flag():
+    """真正危险的那一半：urlsplit().hostname **不做** IDNA 编码,所以西里尔字母的
+    "аpple.com" 原样到达,卡片还把它加粗高亮 —— 而这正是用户被要求判断的东西。
+    只匹配 "xn--" 等于"看得出可疑的会警告,看不出的不警告",把功能做反了。
+    host_ascii 带上编码后的拼法,让卡片能把两种写法并排给用户看。"""
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://аpple.com/oauth")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+
+    assert card["host"] == "аpple.com"
+    assert card["punycode"] is True
+    assert card["host_ascii"] == "xn--pple-43d.com"
+    assert card["insecure"] is False
+    mgr.resolve(card["confirm_id"], False, action="cancel")
+    await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_insecure_is_parsed_not_string_prefixed():
+    """`str(url).lower().startswith("https://")` 把 urlsplit（和浏览器）都能接受的
+    前导空白判成不安全,于是一条好好的 HTTPS 链接顶着一条"不要在这里输入凭据"的
+    红色警告 —— 警告一旦会误报,用户就学会忽略它。"""
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="  https://ok.example/x")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    assert card["insecure"] is False
+    mgr.resolve(card["confirm_id"], False, action="cancel")
+    await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "javascript:alert(document.domain)",
+    "data:text/html,<script>1</script>",
+    "blob:https://evil.example/9f2",
+    "file:///etc/passwd",
+    "nimoos-app://install?pkg=x",       # 注册过的自定义协议 = 拉起本地程序
+    "/oauth/start",                     # 根本没有 scheme
+])
+async def test_a_non_http_scheme_is_refused_without_a_card(url):
+    """卡片上那一下点击会把一个**完全由第三方服务端控制**的字符串交给
+    window.open。javascript: 在若干浏览器里会在继承 opener 源的文档里执行;data:
+    / blob: 渲染的是攻击者的 HTML,而用户读到的是"NimoOS 给我打开的页面";自定义
+    协议直接拉起本地程序。这些都不是"去外部站点完成授权",而卡片上的 HTTPS 提示
+    是警告不是关卡 —— 所以关卡在这里：连卡片都不生成。
+
+    并且必须是 decline 而不是 ErrorData(规则 1),否则同一轮里其他卡片被连坐取消。"""
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    result = await asyncio.wait_for(
+        cb(None, T.ElicitRequestURLParams(message="Authorize", url=url)), timeout=2)
+
+    assert result.action == "decline"
+    event = await asyncio.wait_for(queue.get(), timeout=2)
+    # 用户得知道为什么什么都没发生 —— 形状与 MAX_ANSWER_ATTEMPTS 耗尽那条一致
+    assert event["type"] == "mcp_warning" and event["server"] == "notion"
+    assert "scheme" in event["error"]
+    assert queue.empty(), "被拒的 scheme 不该顺带生成一张可点的卡片"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://plain.example/oauth",
+                                 "https://ok.example/oauth"])
+async def test_http_and_https_still_get_a_card(url):
+    """scheme 关卡不能顺手把正常的授权链接也挡掉。"""
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url=url)))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    assert card["kind"] == "mcp_elicit_url" and card["url"] == url
+    mgr.resolve(card["confirm_id"], False, action="cancel")
+    await asyncio.wait_for(task, timeout=2)
+
+
+# ── 回调绝不抛：一轮里多张卡是并发派发的 ──────────────────────────────────────
+
+class _LockedOnMatch(ConfirmManager):
+    """一张卡的簿记会失败,形状就是 SQLite 被锁住/写满时的样子。
+
+    register() 与 wait_elicit() 里的 _cleanup() 都是裸的 execute+commit,自己不带
+    任何 except —— 在加保护之前,这一下会直接从回调里逃出去。
+    """
+
+    def __init__(self, db, *, poison: str, gate: asyncio.Event):
+        super().__init__(db, timeout=5)
+        self._poison, self._gate = poison, gate
+        self._poisoned: set[str] = set()
+
+    def register(self, session_id, action, description, command):
+        confirm_id = super().register(session_id, action, description, command)
+        if command == self._poison:
+            self._poisoned.add(confirm_id)
+        return confirm_id
+
+    async def wait_elicit(self, confirm_id):
+        if confirm_id in self._poisoned:
+            await self._gate.wait()     # 等兄弟卡先把用户答案交上来
+            raise sqlite3.OperationalError("database is locked")
+        return await super().wait_elicit(confirm_id)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_in_one_card_does_not_destroy_a_siblings_answer():
+    """一轮 inputRequests 可以带**多个** key,_dispatch_all 是并发跑它们的。
+
+    这条是唯一能量出真实爆炸半径的测试：任何一个回调抛异常,都会变成
+    _dispatch_all 的 ExceptionGroup,整轮连同已经收好的兄弟答复一起作废 —— 用户
+    在另一张卡上敲进去的字就这么没了。跑在真实的 _dispatch_all 上,不是模拟。
+    """
+    from mcp.client._input_required import _dispatch_all
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE pending_confirmations (confirm_id TEXT, session_id TEXT, "
+               "action TEXT, description TEXT, command TEXT, created_at INT)")
+    gate = asyncio.Event()
+    mgr = _LockedOnMatch(db, poison="Question B", gate=gate)
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    async def dispatch(key, req):
+        return await cb(None, req.params)
+
+    def _req(message):
+        return T.ElicitRequest(method="elicitation/create",
+                               params=T.ElicitRequestFormParams(
+                                   message=message, requestedSchema=FORM_SCHEMA))
+
+    task = asyncio.create_task(
+        _dispatch_all({"a": _req("Question A"), "b": _req("Question B")}, dispatch))
+
+    cards = {}
+    for _ in range(2):
+        card = await asyncio.wait_for(queue.get(), timeout=2)
+        cards[card["message"]] = card
+    assert set(cards) == {"Question A", "Question B"}
+
+    # 用户在 A 上填好并提交,然后 B 的簿记炸了
+    mgr.resolve(cards["Question A"]["confirm_id"], True,
+                action="accept", content={"name": "Nimo"})
+    gate.set()
+
+    responses = await asyncio.wait_for(task, timeout=3)
+
+    assert responses["a"].action == "accept"
+    assert responses["a"].content == {"name": "Nimo"}, "用户已经填好的答案必须原样活下来"
+    assert responses["b"].action == "decline"          # 坏掉的那张自己安静地退场
 
 
 # ── 真实 SDK 对象上的端到端 ────────────────────────────────────────────────────

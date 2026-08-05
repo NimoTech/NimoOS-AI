@@ -8,7 +8,11 @@ Two rules that are easy to break by accident, both load-bearing:
      key in one round, and the first task to return ErrorData calls
      `tg.cancel_scope.cancel()` on its siblings. Refusing that way would throw away
      answers the user had already typed into the OTHER cards of the same round.
-     Refusal is `ElicitResult(action="decline")`.
+     Refusal is `ElicitResult(action="decline")`. A RAISE is just as fatal — it comes
+     out of the task group as an ExceptionGroup with the same blast radius — so
+     `_elicit` wraps its whole body in a catch-all that degrades to decline. An
+     absolute invariant needs a structural guarantee, not a docstring; pinned by
+     test_a_failure_in_one_card_does_not_destroy_a_siblings_answer.
 
   2. The user's ANSWER never touches disk. We persist the QUESTION — so a card
      survives a reconnect, which the spec's "provide manual controls that let the user
@@ -23,11 +27,15 @@ own vars instead of mutating module state.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from urllib.parse import urlsplit
 
 from mcp.types import ElicitRequestURLParams, ElicitResult
 
 from mcp_client.elicitation_schema import render_fields, validate_content
+
+logger = logging.getLogger(__name__)
 
 
 # How many times we re-ask when the answer fails validation, before giving up.
@@ -51,28 +59,77 @@ from mcp_client.elicitation_schema import render_fields, validate_content
 MAX_ANSWER_ATTEMPTS = 3
 
 
-def _has_punycode(host: str) -> bool:
-    """True when any label is an `xn--` IDN in ASCII form.
+# The only two schemes a URL elicitation may carry.
+#
+# `window.open(url)` in the card navigates a real browser to a fully SERVER-CONTROLLED
+# string. `javascript:` executes in a document that inherits the opener's origin in
+# several browsers; `data:` and `blob:` render attacker HTML that the user reads as
+# "a page NimoOS opened for me"; a registered custom protocol handler launches a native
+# app. None of that is "authorize on an external site", which is the entire meaning of
+# this elicitation mode. The card's HTTPS notice is a WARNING, not a gate, so the gate
+# has to be here — and mirrored in the card, because the two ship from independent
+# repos and either one can be an older build.
+_ALLOWED_URL_SCHEMES = ("http", "https")
 
-    We do not block these — plenty are legitimate. We make the card SAY so, because an
-    IDN label can render as a homograph of a brand domain, and the one thing the user
-    is being asked to judge here is "do I trust this site with my account".
+
+def _split(url):
+    """`urlsplit` that never raises — a malformed URL must degrade, not kill the call.
+
+    (urlsplit itself raises ValueError on e.g. an unterminated IPv6 literal.)
     """
-    return any(label.startswith("xn--") for label in (host or "").lower().split("."))
+    try:
+        return urlsplit(str(url))
+    except Exception:
+        return urlsplit("")
+
+
+def _host_flags(host: str) -> tuple[bool, str]:
+    """(punycode, ascii_form) for the host we are about to ask the user to judge.
+
+    `punycode` is True when the host is an IDN in EITHER form: an ASCII `xn--` label, or
+    non-ASCII characters that IDNA would encode into one. Both carry the same risk — a
+    label that renders as a homograph of a brand domain — and the second is the one that
+    actually bites: `urlsplit().hostname` does NOT idna-encode, so a Cyrillic
+    "аpple.com" arrives verbatim and the card renders it in bold highlight,
+    indistinguishable from the real thing. Matching only "xn--" warned about the
+    visibly-suspicious spelling and stayed silent on the invisible one, which inverts
+    the feature.
+
+    `ascii_form` is the punycode spelling, and is non-empty ONLY when it differs from
+    what the card renders — i.e. exactly when the user cannot tell by looking. The card
+    shows it next to the pretty form.
+
+    We still do not BLOCK IDNs: plenty are legitimate. We make the card say so.
+    """
+    host = host or ""
+    if not host:
+        return False, ""
+    if host.isascii():
+        return any(lbl.startswith("xn--") for lbl in host.lower().split(".")), ""
+    try:
+        ascii_form = host.encode("idna").decode("ascii")
+    except Exception:
+        # Not IDNA-encodable (empty/overlong label, disallowed codepoint). Still
+        # non-ASCII, so still worth warning about; we just cannot show the ASCII form.
+        return True, ""
+    return True, ascii_form if ascii_form.lower() != host.lower() else ""
 
 
 def _url_card(server: dict, params) -> tuple[dict, str]:
-    try:
-        host = urlsplit(params.url).hostname or ""
-    except Exception:
-        host = ""
+    parts = _split(params.url)
+    host = parts.hostname or ""
+    punycode, host_ascii = _host_flags(host)
     card = {"type": "confirmation_required", "kind": "mcp_elicit_url",
             "server": server.get("name", "mcp"),
             "message": params.message,
             "url": params.url,
             "host": host,
-            "punycode": _has_punycode(host),
-            "insecure": not str(params.url).lower().startswith("https://")}
+            "punycode": punycode,
+            "host_ascii": host_ascii,
+            # Parsed, not string-prefixed: `"  https://ok.example/x".startswith(...)`
+            # is False and used to flag a perfectly good HTTPS URL as insecure, while
+            # urlsplit tolerates the same leading whitespace the browser does.
+            "insecure": parts.scheme.lower() != "https"}
     return card, f"{params.message} [{params.url}]"
 
 
@@ -92,6 +149,28 @@ def make_elicitation_callback(server: dict, *, session_id_var, queue_var, mgr_va
     """
 
     async def _elicit(context, params):
+        # Rule 1 is stated as an ABSOLUTE, and a docstring cannot hold an absolute — the
+        # body below reaches SQLite (mgr.register / wait_elicit's _cleanup both
+        # execute+commit with no handler of their own, so a locked or full database
+        # raises here) and pydantic (ElicitResult construction). Any of those escaping
+        # becomes an ExceptionGroup out of _dispatch_all, which cancels every SIBLING
+        # card of the same round and destroys answers the user already typed. So the
+        # invariant gets a structural guarantee, not a promise.
+        #
+        # CancelledError is re-raised on purpose: that is the task group legitimately
+        # tearing us down, and swallowing it would break cancellation.
+        try:
+            return await _elicit_inner(context, params)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never silent: this path means a bug or a broken database, and a card that
+            # just quietly declines with no trace is the worst possible failure mode.
+            logger.warning("elicitation callback for server %r failed; declining",
+                           server.get("name", "mcp"), exc_info=True)
+            return ElicitResult(action="decline")
+
+    async def _elicit_inner(context, params):
         mgr = mgr_var.get()
         queue = queue_var.get()
         session_id = session_id_var.get()
@@ -104,6 +183,21 @@ def make_elicitation_callback(server: dict, *, session_id_var, queue_var, mgr_va
             return ElicitResult(action="decline")
 
         is_url = isinstance(params, ElicitRequestURLParams)
+
+        if is_url:
+            scheme = _split(params.url).scheme.lower()
+            if scheme not in _ALLOWED_URL_SCHEMES:
+                # Do not build the card at all — a card is an invitation to click, and
+                # there is no answer to this question we would be willing to act on.
+                # Note the ordering: this sits AFTER the no-run-context guard above, so
+                # `queue` is never None here.
+                await queue.put({
+                    "type": "mcp_warning", "server": server.get("name", "mcp"),
+                    "error": f"refused an authorization link with an unsupported "
+                             f"scheme ({scheme or 'none'}): only http and https can be "
+                             f"opened"})
+                return ElicitResult(action="decline")
+
         card, question = (_url_card(server, params) if is_url
                           else _form_card(server, params))
 

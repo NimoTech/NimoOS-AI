@@ -73,6 +73,28 @@ def _num_or_none(v: Any) -> float | int | None:
     return v
 
 
+def _is_scalar(v: Any) -> bool:
+    """True for the value types `ElicitResult.content` can actually carry.
+
+    Why this gate exists, and why it DROPS rather than stringifies: a server-supplied
+    `const` of `{"a": 1}` used to be copied through verbatim, and every downstream check
+    waved it past — `_validate_one`'s enum rule is pure membership, so a value that came
+    OUT of the schema always passes going back IN. The first thing that noticed was
+    pydantic, at `ElicitResult(action="accept", content=...)`, i.e. INSIDE the
+    elicitation callback, where a raise becomes an ExceptionGroup out of `_dispatch_all`
+    and cancels every sibling card in the round.
+
+    Stringifying (what the array branch does) would be the other option, but it is only
+    right there: arrays are pinned to `list[str]` by the model, so a non-string element
+    genuinely cannot exist. Scalar fields have no such pin — `{"const": 1}` round-trips
+    as the integer 1 today, and stringifying would silently change the value the server
+    receives. Dropping loses nothing that was ever selectable.
+
+    bool is deliberately included: `ElicitResult.content` accepts it.
+    """
+    return isinstance(v, (str, int, float, bool))
+
+
 def _options(node: dict) -> list[dict] | None:
     """Pull a choice list out of `node`, or None if it isn't a choice at all.
 
@@ -82,6 +104,10 @@ def _options(node: dict) -> list[dict] | None:
     A oneOf/anyOf branch missing `const` is NOT the elicitation choice shape (it is
     some richer JSON Schema construct we do not model), so we bail to None and the
     caller degrades the field to free text rather than silently dropping branches.
+
+    A branch whose `const` is not a scalar IS dropped (see `_is_scalar`), and when that
+    leaves nothing we return None so the caller degrades the field to free text —
+    never nothing. An unanswerable card is worse than a loosely-typed one.
     """
     for kw in ("oneOf", "anyOf"):
         branch = node.get(kw)
@@ -90,15 +116,18 @@ def _options(node: dict) -> list[dict] | None:
             for b in branch:
                 if not isinstance(b, dict) or "const" not in b:
                     return None
+                if not _is_scalar(b["const"]):
+                    continue
                 out.append({"value": b["const"],
                             "title": str(b.get("title") or b["const"])})
-            return out
+            return out or None
     enum = node.get("enum")
     if isinstance(enum, list) and enum:
         names = node.get("enumNames")
         names = names if isinstance(names, list) and len(names) == len(enum) else None
-        return [{"value": v, "title": str(names[i]) if names else str(v)}
-                for i, v in enumerate(enum)]
+        out = [{"value": v, "title": str(names[i]) if names else str(v)}
+               for i, v in enumerate(enum) if _is_scalar(v)]
+        return out or None
     return None
 
 

@@ -1,8 +1,14 @@
 """MRTR (server asks the client for more input) — phase 1 behaviour.
 
-We register no elicitation/sampling/roots callbacks, so the SDK does not declare
-those capabilities and a compliant server will never ask. Two gaps remain, and they
-surface as TWO DIFFERENT exceptions — hence two branches, not one catch-all:
+Read this as PHASE 1's world, which is what the three gaps below are about. As of
+phase 2 we DO register an elicitation callback (form + url — see
+mcp_client/elicitation.py and test_mcp_protocol_compat.py), so a compliant server
+asking for elicitation is answered through the normal MRTR path and reaches none of
+these branches. Sampling and roots stay undeclared: we register no callbacks for
+them, so the SDK does not declare those capabilities and a compliant server will
+never ask for them. The gaps below are still live for sampling/roots, and gap 1/gap 3
+are capability-agnostic. They surface as DIFFERENT exceptions — hence separate
+branches, not one catch-all:
 
   gap 1  InputRequiredResult carrying only requestState ("warming up, retry"):
          the SDK retries by itself; with max_rounds=1 a second one throws

@@ -55,6 +55,43 @@ def test_titled_enum_via_anyOf_too():
     assert f["type"] == "enum" and f["options"] == [{"value": 1, "title": "One"}]
 
 
+@pytest.mark.parametrize("node", [
+    {"oneOf": [{"const": {"a": 1}, "title": "Weird"}]},
+    {"anyOf": [{"const": ["a", "b"], "title": "Weird"}]},
+    {"enum": [{"a": 1}]},
+    {"enum": [["a"]]},
+])
+def test_a_non_scalar_const_never_becomes_a_selectable_option(node):
+    """ElicitResult.content 是 dict[str, str|int|float|bool|list[str]|None] —— pydantic
+    拒 dict 和 list 值。而 _validate_one 的 enum 规则是纯成员判断,所以**从 schema 里
+    出来的**值回填时必定通过校验。于是一个 {"const": {"a": 1}} 会一路绿灯走到
+    ElicitResult(action="accept", content=...) 才炸,而那已经在回调里面了：
+    抛出去就是 _dispatch_all 的 ExceptionGroup,同一轮别的卡全部陪葬。
+
+    候选项没了就退化成自由文本框（本模块一贯的"宁可松,不可丢字段"）。"""
+    f = render_fields({"properties": {"p": node}})[0]
+    assert f["type"] == "string", "候选全被丢掉后必须退化成自由文本,而不是空下拉"
+    assert f["options"] is None
+
+
+def test_a_non_scalar_const_alongside_good_ones_only_drops_itself():
+    f = render_fields({"properties": {"p": {"oneOf": [
+        {"const": "free", "title": "Free"},
+        {"const": {"a": 1}, "title": "Weird"},
+        {"const": 2, "title": "Two"}]}}})[0]
+    assert f["type"] == "enum"
+    assert f["options"] == [{"value": "free", "title": "Free"},
+                            {"value": 2, "title": "Two"}]
+
+
+def test_scalar_consts_keep_their_type_rather_than_being_stringified():
+    """丢弃而不是 str() 化：数组分支 str() 是因为 content 把数组钉死成 list[str],
+    标量字段没有这个约束 —— {"const": 1} 今天就是以整数 1 回到服务端的,把它变成
+    "1" 是在服务端背后偷偷改值。"""
+    f = render_fields({"properties": {"p": {"enum": [1, 2.5, True, "x"]}}})[0]
+    assert [o["value"] for o in f["options"]] == [1, 2.5, True, "x"]
+
+
 def test_bare_enum_uses_the_value_as_its_own_title():
     f = render_fields({"properties": {"c": {"type": "string", "enum": ["red", "blue"]}}})[0]
     assert f["type"] == "enum"
@@ -237,10 +274,53 @@ def test_uri_is_the_one_format_with_no_native_backstop():
     assert validate_content(schema, {"u": "not a uri"}) is not None
 
 
-def test_every_valid_answer_survives_the_real_ElicitResult_model():
+# 覆盖到每一种描述符类型,外加几种"服务端可以合法塞进 schema 的怪东西"。
+#
+# 这条测试的名字断言的是一条**全称命题**（"every valid answer"）,但它原先只查了一个
+# 手挑的 content —— 于是 Critical 2 活着的时候它照样是绿的：一个 {"const": {"a": 1}}
+# 的 oneOf 通过了 validate_content,却在 ElicitResult 上抛 ValidationError。名字
+# 承诺的性质必须由用例覆盖来兑现,否则它就只是一句祝愿。
+_ROUND_TRIP_CASES = [
+    ("string",        {"n": {"type": "string"}},                     {"n": "Nimo"}),
+    ("string-format", {"n": {"type": "string", "format": "email"}},  {"n": "a@b.co"}),
+    ("integer",       {"n": {"type": "integer"}},                    {"n": 3}),
+    ("number",        {"n": {"type": "number"}},                     {"n": 1.5}),
+    ("boolean",       {"n": {"type": "boolean"}},                    {"n": True}),
+    ("enum-str",      {"n": {"enum": ["a", "b"]}},                   {"n": "a"}),
+    ("enum-int",      {"n": {"enum": [1, 2]}},                       {"n": 1}),
+    ("enum-float",    {"n": {"enum": [1.5]}},                        {"n": 1.5}),
+    ("enum-bool",     {"n": {"enum": [True, False]}},                {"n": True}),
+    ("oneOf-const",   {"n": {"oneOf": [{"const": "pro", "title": "P"}]}}, {"n": "pro"}),
+    ("multi_enum",    {"n": {"type": "array", "items": {"enum": ["r", "w"]}}},
+                      {"n": ["r", "w"]}),
+    ("multi_enum-nonstr-const",
+                      {"n": {"type": "array", "items": {"enum": [1, 2]}}}, {"n": ["1"]}),
+    ("unknown-type-degrades", {"n": {"type": "object"}},             {"n": "text"}),
+    # Critical 2 的原样复现：非标量 const。渲染时被丢掉 -> 字段退化成自由文本 ->
+    # 那个 dict 再也不是"被提供的候选",校验会拒它,于是永远走不到 ElicitResult。
+    ("non-scalar-const-degrades",
+                      {"n": {"oneOf": [{"const": {"a": 1}, "title": "W"}]}}, {"n": "a"}),
+    ("optional-null", {"n": {"type": "string"}},                     {"n": None}),
+    ("empty",         {"n": {"type": "string"}},                     {}),
+]
+
+
+@pytest.mark.parametrize("props,content",
+                         [(p, c) for _, p, c in _ROUND_TRIP_CASES],
+                         ids=[i for i, _, _ in _ROUND_TRIP_CASES])
+def test_every_valid_answer_survives_the_real_ElicitResult_model(props, content):
     """校验器放行的东西必须真能构造出 ElicitResult —— 否则我们只是把
     ValidationError 从校验时挪到了发送时,而那时用户的答案已经没救了。
     跑在真实 SDK 模型上,不是鸭子类型假对象（交接文档 §8）。"""
+    from mcp.types import ElicitResult
+
+    schema = {"type": "object", "properties": props}
+    assert validate_content(schema, content) is None
+    assert ElicitResult(action="accept", content=content).content == content
+
+
+def test_every_valid_answer_survives_it_for_the_full_mixed_schema():
+    """单字段之外再钉一次组合形态 —— 原来那条手挑用例,保留。"""
     from mcp.types import ElicitResult
 
     content = {"name": "Nimo", "email": "a@b.co", "age": 3, "ok": True,
