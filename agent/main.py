@@ -29,6 +29,7 @@ import context_compaction
 import mcp_tokens
 import memory_store
 from agent import AgentRunner
+import confirm as _confirm_mod
 from confirm import ConfirmManager
 from openai import AsyncOpenAI
 from run_sink import RunSink, load_events_from_db
@@ -2408,6 +2409,8 @@ async def confirm_session(
     confirmed = True
     remember = False
     confirm_id = ""
+    action = None
+    content = None
     body = await request.body()
     if body:
         try:
@@ -2416,13 +2419,24 @@ async def confirm_session(
             confirmed = bool(data.get("confirmed", True))
             remember = bool(data.get("remember", False))
             confirm_id = str(data.get("confirm_id") or "")
+            # MCP elicitation extension. Absent for every pre-existing card type,
+            # which keeps taking the two-state path untouched.
+            raw_action = data.get("action")
+            if raw_action is not None:
+                action = str(raw_action)
+            raw_content = data.get("content")
+            if isinstance(raw_content, dict):
+                content = raw_content
         except Exception:
             pass
     if not confirm_id:
         raise HTTPException(status_code=400, detail="confirm_id_required")
+    if action is not None and action not in _confirm_mod.ELICIT_ACTIONS:
+        raise HTTPException(status_code=400, detail="bad_action")
     try:
         _confirm_mgr.resolve(confirm_id, confirmed, remember=remember,
-                             expected_session_id=session_id)
+                             expected_session_id=session_id,
+                             action=action, content=content)
     except KeyError as e:
         # confirm_expired (id unknown / already resolved / agent restarted) or
         # confirm_session_mismatch (id belongs to another session). Both are 409.
