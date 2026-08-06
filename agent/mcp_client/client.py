@@ -730,7 +730,12 @@ async def build_mcp_tools(servers: list[dict]) -> list:
     return tools
 
 
-TEST_TIMEOUT = 9  # seconds; must be < the Go caller’s timeout (10s), so Python actively cancels and releases after Go gives up
+# 9→20: a cold probe of a remote http server (DNS + TLS + mode="auto"'s
+# server/discover → legacy initialize fallback + a large tools/list) routinely
+# exceeds 9s, so the first probe always timed out and only the second one passed.
+# This widens the PROBE only: the run-start path keeps MCP_COLD_TOTAL_TIMEOUT at
+# 10s deliberately, so a slow server never stalls the start of every conversation.
+TEST_TIMEOUT = 20  # seconds; must be < the Go caller’s timeout (25s), so Python actively cancels and releases after Go gives up
 STDIO_TEST_TIMEOUT = 90  # seconds; the first stdio package fetch is slow; the Go /test client timeout must be > this value
 
 
