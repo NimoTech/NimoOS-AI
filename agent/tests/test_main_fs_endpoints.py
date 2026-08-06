@@ -15,10 +15,25 @@ def client(tmp_path, monkeypatch):
     snap_root = str(tmp_path / "snap")
     monkeypatch.setenv("AGENT_DB_PATH", db_path)
     monkeypatch.setenv("AGENT_SNAPSHOTS_ROOT", snap_root)
-    # Force module re-init against the fresh tmp DB
-    main_module._conn = db_module.init_db(db_path, snapshots_root=snap_root)
+    # Force module re-init against the fresh tmp DB. Routed through
+    # monkeypatch.setattr (not a bare `main_module._conn = ...` assignment) so
+    # it reverts to the original `_conn` when this test ends, same as the env
+    # vars above. A bare assignment here used to permanently repoint the
+    # shared `main_module._conn` for the rest of the pytest session (nothing
+    # to revert it), which silently broke every other test module's use of
+    # `main._conn` for the remainder of a full-suite run -- notably the MCP
+    # server's token verification in mcp_server/server.py::build(conn), which
+    # closes over `_conn` once at import time and therefore never followed
+    # the repoint, so tokens written via the module attribute after this test
+    # ran no longer verified. Explicitly close the tmp-DB connection once the
+    # test is done so it isn't just a dangling sqlite3.Connection left for GC.
+    conn = db_module.init_db(db_path, snapshots_root=snap_root)
+    monkeypatch.setattr(main_module, "_conn", conn)
     main_module._snapshots_root = snap_root
-    return TestClient(main_module.app)
+    try:
+        yield TestClient(main_module.app)
+    finally:
+        conn.close()
 
 
 def _create_session(client, user_id="42"):

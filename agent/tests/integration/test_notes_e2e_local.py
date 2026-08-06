@@ -51,21 +51,21 @@ def test_full_note_lifecycle(tmp_path, monkeypatch):
     notes_skills.EVENT_QUEUE_VAR.set(_Sink())
 
     out = json.loads(asyncio.run(notes_skills._write_note_impl(
-        "NAS 选型结论", "选 X 型号,理由……", "note", ["hardware"], [])))
+        "NAS selection conclusion", "Chose model X, reasoning...", "note", ["hardware"], [])))
     assert out["ok"] and out["status"] == "curated"
 
-    # Qdrant payload 契约
+    # Qdrant payload contract
     up = cap.upserts[0]
     assert up["user_id"] == "1" and up["note_type"] == "note"
-    assert up["chunks"][0]["text"].startswith("# NAS 选型结论")
+    assert up["chunks"][0]["text"].startswith("# NAS selection conclusion")
 
-    # 人在外部编辑同一文件 → 扫描应升 revision 并重索引
+    # someone edits the same file externally → scan should bump revision and re-index
     n = store.list_notes(conn, "1")[0]
     p = store.note_abs_path(conn, n)
     with open(p, encoding="utf-8") as f:
         meta, _ = parse_note_text(f.read())
     with open(p, "w", encoding="utf-8") as f:
-        f.write(serialize_note_text(meta, "人工修订后的内容"))
+        f.write(serialize_note_text(meta, "manually revised content"))
     stats = asyncio.run(sync.scan_once(conn))
     assert stats["updated"] == 1
     assert len(cap.upserts) == 2

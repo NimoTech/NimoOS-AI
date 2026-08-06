@@ -3,13 +3,16 @@ import agent as agent_mod
 
 
 def test_turn1_general_tool_schema_under_budget():
-    """第 1 轮 general 的工具 schema 序列化体量要小(防止有人往常驻集乱加工具导致第 1 轮 prompt 反弹)。
+    """The serialized tool-schema size for turn 1 of a general profile must stay
+    small (prevents someone from bloating turn-1 prompt size by carelessly
+    adding tools to the always-on set).
 
-    只统计第 1 轮模型实际会看到的工具(常驻 + expand_tools);门控工具虽在列表里
-    但 is_enabled 为 False,不进 prompt。阈值按字符数粗算(~4 char/token)。
+    Only counts tools the model actually sees on turn 1 (always-on + expand_tools);
+    gated tools are in the list but have is_enabled False, so they don't enter the
+    prompt. Threshold is a rough char-count estimate (~4 char/token).
     """
     from skills import tool_gating as tg
-    tg.UNLOCKED_VAR.set(set())          # 空解锁集 = 第 1 轮
+    tg.UNLOCKED_VAR.set(set())          # empty unlocked set = turn 1
     tools = agent_mod.select_tools_for_run([], session_id="s1", profile=None)
     visible = [t for t in tools
                if getattr(t, "is_enabled", True) is True
@@ -22,5 +25,6 @@ def test_turn1_general_tool_schema_under_budget():
         schema = getattr(t, "params_json_schema", None)
         if schema:
             size += len(json.dumps(schema, ensure_ascii=False))
-    # 6 常驻 + expand_tools 的 schema 远小于此;留足余量,阈值约 ~2k token。
-    assert size < 8000, f"第 1 轮工具 schema 体量过大: {size} 字符"
+    # the schema for the 6 always-on tools + expand_tools is far smaller than this;
+    # leaves plenty of margin, threshold is roughly ~2k tokens.
+    assert size < 8000, f"turn-1 tool schema size too large: {size} chars"

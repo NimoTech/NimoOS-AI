@@ -8,7 +8,7 @@ ExecStart=/usr/bin/nimoos-ai -c /etc/nimoos/ai.conf
 PIDFile=/var/run/nimoos/ai.pid
 Restart=always
 Type=notify
-# Go 网关正常 <300MB;上限防未知泄漏拖垮整机(2026-07-28 OOM 复盘)。
+# The Go gateway normally stays under 300MB; this cap guards against an unknown leak taking down the whole machine (2026-07-28 OOM postmortem).
 MemoryAccounting=yes
 MemoryHigh=2G
 MemoryMax=3G

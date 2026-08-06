@@ -52,8 +52,8 @@ def test_reasoning_summary_list_and_str():
 def test_standard_message_unchanged():
     assert cc._message_text({"role": "user", "content": "hello"}) == "user: hello"
     m = {"type": "message", "role": "assistant",
-         "content": [{"type": "output_text", "text": "你好"}]}
-    assert "你好" in cc._message_text(m)
+         "content": [{"type": "output_text", "text": "hello"}]}
+    assert "hello" in cc._message_text(m)
 
 
 def test_unknown_item_returns_empty():
@@ -64,10 +64,10 @@ def test_unknown_item_returns_empty():
 def test_estimate_counts_tool_output_far_above_content_only():
     big_out = "x" * 8000
     history = [
-        {"role": "user", "content": "看看目录"},
+        {"role": "user", "content": "look at the directory"},
         {"type": "function_call", "name": "list_dir", "arguments": "{}"},
         {"type": "function_call_output", "output": big_out},
         {"type": "message", "role": "assistant",
-         "content": [{"type": "output_text", "text": "好的"}]},
+         "content": [{"type": "output_text", "text": "OK"}]},
     ]
     assert cc.estimate_messages_tokens(history) > 1500   # ~8000/4*1.15

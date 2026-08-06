@@ -1,12 +1,13 @@
 name: nimoos-agent
 
-# NimoOS Agent — 离线镜像部署(image 由 script/package-agent.sh 打的 tar 经
-# docker load 注入,pull_policy: never)。AppManagement 经 labels 识别为系统 app。
+# NimoOS Agent — offline image deployment (the image is injected via docker load from
+# the tar built by script/package-agent.sh, pull_policy: never). AppManagement
+# recognizes it as a system app via labels.
 services:
   agent:
     image: localhost/nimoos-agent:bundled
     pull_policy: never
-    network_mode: host          # 绑 127.0.0.1:8282,nimoos-ai 反代不变
+    network_mode: host          # binds 127.0.0.1:8282, unchanged for the nimoos-ai reverse proxy
     # netns egress isolation caps. SYS_ADMIN is REQUIRED: the executor's
     # unshare(CLONE_NEWNET) that creates the per-command network namespace needs
     # CAP_SYS_ADMIN — spike-verified 2026-07-16 (cap-drop=ALL → unshare EPERM;
@@ -22,8 +23,9 @@ services:
     mem_limit: 2g
     pids_limit: 1024
     cpus: "2.0"
-    # executor 的 pid/socket 与 MCP per-server socket 必须落在【可写】挂载;
-    # /var/run/nimoos 是只读服务发现目录(executor 写它会 EROFS),改指 rw 的 ai/agent 卷。
+    # The executor's pid/socket and the MCP per-server socket must live on a [writable]
+    # mount; /var/run/nimoos is a read-only service-discovery directory (the executor
+    # writing to it would get EROFS), so point them at the rw ai/agent volume instead.
     environment:
       NIMOOS_EXEC_SOCK: /var/lib/nimoos/ai/agent/agent-exec.sock
       NIMOOS_EXEC_PID_FILE: /var/lib/nimoos/ai/agent/agent-exec.pid
@@ -37,18 +39,21 @@ services:
       PHOENIX_OTLP_ENDPOINT: "${PHOENIX_OTLP_ENDPOINT:-http://127.0.0.1:6006/v1/traces}"
       PHOENIX_PROJECT: "${PHOENIX_PROJECT:-nimoos-agent}"
     volumes:
-      # rslave:容器能看到容器启动后宿主新挂载(USB→/media、阵列→/DATA);单向、不反向泄漏。
+      # rslave: lets the container see new host mounts made after the container starts
+      # (USB→/media, array→/DATA); one-directional, nothing leaks back.
       - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }
       - { type: bind, source: /media, target: /media, bind: { propagation: rslave } }
       - { type: bind, source: /mnt,   target: /mnt,   bind: { propagation: rslave } }
       - { type: bind, source: /var/run/nimoos, target: /var/run/nimoos, read_only: true }
       - { type: bind, source: /var/lib/nimoos/ai/agent, target: /var/lib/nimoos/ai/agent }
-      # skills 根目录:Go(host)在此播种 builtin/ 并建 .runtime/<user>/ symlink 视图;
-      # 容器内 Python list_skills/read_skill_file 只读扫描,故 read_only。
+      # skills root: Go (host) seeds builtin/ here and builds the .runtime/<user>/ symlink
+      # view; the container's Python list_skills/read_skill_file only scans read-only, hence read_only.
       - { type: bind, source: /var/lib/nimoos/ai/skills, target: /var/lib/nimoos/ai/skills, read_only: true }
-      # NOTE: /etc/nimoos 不再挂载(P2c)。agent 配置全走 NIMOOS_* env,从不读 /etc/nimoos;
-      # 该挂载曾把 ai_master.key/服务配置暴露给 root 命令。mount 遮蔽被 docker-default
-      # AppArmor 拦死(§14.5),故直接去挂载消除暴露。宿主真实 /etc/nimoos 及其他服务不受影响。
+      # NOTE: /etc/nimoos is no longer mounted (P2c). Agent config goes entirely through
+      # NIMOOS_* env vars and never reads /etc/nimoos; this mount used to expose
+      # ai_master.key/service config to root commands. Mount masking is hard-blocked by
+      # the docker-default AppArmor profile (§14.5), so removing the mount directly
+      # eliminates the exposure. The host's real /etc/nimoos and other services are unaffected.
     restart: unless-stopped
     logging:
       driver: json-file

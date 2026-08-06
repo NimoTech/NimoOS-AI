@@ -110,11 +110,11 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
         granted = await mgr.wait(confirm_id)
         _record_decision(ctx, confirm_id, "granted" if granted else "denied")
         if granted:
-            _insert_visible_resource(ctx, abs_path, kind)   # 先落库
+            _insert_visible_resource(ctx, abs_path, kind)   # persist first
         else:
             _denied.add(cache_key)
         if not fut.done():
-            fut.set_result(granted)                          # 再广播给并发等待者
+            fut.set_result(granted)                          # then broadcast to concurrent waiters
         return granted
     except BaseException as e:
         # Cancelled/interrupted before a decision: mark the row so no NULL
@@ -125,10 +125,10 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
             except Exception:
                 pass
         if not fut.done():
-            fut.set_exception(e)                             # 异常也广播,防死锁
+            fut.set_exception(e)                             # broadcast the exception too, to avoid a deadlock
         raise
     finally:
-        _pending_requests.pop(cache_key, None)               # 必清理
+        _pending_requests.pop(cache_key, None)               # must always clean up
 
 
 def _infer_kind(abs_path: str) -> str:

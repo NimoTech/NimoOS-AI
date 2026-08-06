@@ -102,7 +102,7 @@ func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body
 			"error": map[string]interface{}{
 				"code":    "backend_disabled",
 				"type":    "service_unavailable",
-				"message": "OpenVINO 后端已禁用",
+				"message": "OpenVINO backend is disabled",
 			},
 		})
 	}
@@ -130,7 +130,7 @@ func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body
 			"error": map[string]interface{}{
 				"code":    "model_load_failed",
 				"type":    "service_unavailable",
-				"message": "OpenVINO 模型加载失败: " + err.Error(),
+				"message": "OpenVINO model load failed: " + err.Error(),
 			},
 		})
 	}
@@ -145,7 +145,7 @@ func (h *ChatHandler) forwardToOpenVINO(c echo.Context, target modelTarget, body
 			"error": map[string]interface{}{
 				"code":    "backend_unavailable",
 				"type":    "service_unavailable",
-				"message": "OpenVINO 服务未就绪",
+				"message": "OpenVINO service is not ready",
 			},
 		})
 	}
@@ -329,7 +329,7 @@ type modelTarget struct {
 	backend    service.Backend
 	providerID int64
 	bareModel  string
-	device     string // 仅 openvino 后端使用;"" 表示用默认设备
+	device     string // only used by the openvino backend; "" means use the default device
 }
 
 // parseModelTarget reads the model field, classifies the routing target, and

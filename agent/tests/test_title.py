@@ -250,7 +250,7 @@ async def test_regenerate_title_uses_reasoning_content_when_content_empty(client
 
     fake_choice = type(
         "C", (),
-        {"message": type("M", (), {"content": "", "reasoning_content": "推理模型标题"})()},
+        {"message": type("M", (), {"content": "", "reasoning_content": "Reasoning model title"})()},
     )()
     fake_resp = type("R", (), {"choices": [fake_choice]})()
 
@@ -263,4 +263,4 @@ async def test_regenerate_title_uses_reasoning_content_when_content_empty(client
         )
     body = resp.json()
     assert body["fallback"] is False
-    assert body["title"] == "推理模型标题"
+    assert body["title"] == "Reasoning model title"

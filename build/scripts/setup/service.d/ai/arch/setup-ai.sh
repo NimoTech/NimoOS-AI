@@ -31,11 +31,11 @@ systemctl enable --force --no-ask-password "${APP_NAME}.service"
 #echo "Starting service..."
 #systemctl start --force --no-ask-password "${APP_NAME}.service"
 
-# OpenVINO Model Server (OVMS): 安装二进制 + 启服务(尽力而为,失败只告警不阻断)
+# OpenVINO Model Server (OVMS): install binary + start service (best-effort, failure only warns, never blocks)
 echo "Installing OVMS (OpenVINO Model Server)..."
 bash "$(dirname "${BASH_SOURCE[0]}")/../install-ovms.sh" || echo "⚠ OVMS install step failed; OpenVINO unavailable until installed."
 
-# 模型目录 + servable 仓库目录(用户把模型 IR 放进 models/)
+# Model directory + servable repo directory (user drops model IR files into models/)
 mkdir -p /var/lib/nimoos/ai/models /var/lib/nimoos/ai/openvino/models
 
 echo "Enabling and starting nimoos-openvino service..."

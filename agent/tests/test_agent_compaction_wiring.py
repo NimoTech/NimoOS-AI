@@ -55,7 +55,7 @@ async def test_make_summarize_fn_calls_client():
 async def test_run_injects_summary_and_uses_compacted_history(runner, monkeypatch):
     # force compaction to return a known summary block + a tiny send_history
     async def fake_compact(conn, **kw):
-        return ("[对话历史摘要(较早内容已压缩)]\nSUM", [{"role": "user", "content": "kept"}])
+        return ("[Conversation history summary (earlier content compacted)]\nSUM", [{"role": "user", "content": "kept"}])
     monkeypatch.setattr(cc, "compact_for_run", fake_compact)
 
     seen = {}
@@ -75,7 +75,7 @@ async def test_run_injects_summary_and_uses_compacted_history(runner, monkeypatc
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         sink = _CollectSink()
         await runner.run(
-            session_id="s1", user_id="u1", message="新问题", sink=sink,
+            session_id="s1", user_id="u1", message="new question", sink=sink,
             provider_key="k", provider_url="http://x", model_name="qwen")
 
     assert "SUM" in seen["instructions"]

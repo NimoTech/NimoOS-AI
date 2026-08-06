@@ -1,0 +1,12 @@
+# openai-agents 全历史版本都声明 mcp<2（含最新 0.19.3），但这个冲突只存在于
+# 元数据里，不存在于代码里：
+#   · 真正 import mcp 1.x 专有符号的 agents/mcp/server.py 是惰性加载的
+#     （≥0.14.3 用 _LAZY_EXPORTS；更早版本把急加载包在 try/except ImportError 里），
+#     我们不引用它的任何名字 → 运行时永不触发。
+#   · 唯一急加载的触点在 agents/mcp/util.py，本身包在 try/except ImportError 里
+#     （作者注释：mcp is optional）。mcp 2.0 把 McpError 改名为 MCPError，
+#     该 import 失配后降级为 _McpError=None，使用处已做 None 判空。
+# 已在 0.13.0 与 0.19.3 两端实测：mcp 2.0 在场时 from agents import Agent/Runner/
+# FunctionTool 全部正常，且 agents.mcp.server 从未进入 sys.modules。
+# 上游若将来放宽到 mcp>=2，本文件可直接删除，无需其他改动。
+mcp>=2.0.0,<3

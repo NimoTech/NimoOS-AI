@@ -29,6 +29,7 @@ import context_compaction
 import mcp_tokens
 import memory_store
 from agent import AgentRunner
+import confirm as _confirm_mod
 from confirm import ConfirmManager
 from openai import AsyncOpenAI
 from run_sink import RunSink, load_events_from_db
@@ -2187,7 +2188,8 @@ async def run_session(
 ):
     _assert_owns_session(session_id, x_user_id)
     if not (req.model or "").strip():
-        # 没有有效模型名:明确报错,而不是悄悄用某个默认名去打后端(会得到迷惑性的 404)。
+        # No valid model name: fail loudly instead of silently hitting the backend
+        # with some default name (which would produce a confusing 404).
         raise HTTPException(status_code=400,
                             detail="no model selected — pick a model before sending")
     if req.kind == "init" and _session_agent_type(session_id) != "general":
@@ -2408,6 +2410,8 @@ async def confirm_session(
     confirmed = True
     remember = False
     confirm_id = ""
+    action = None
+    content = None
     body = await request.body()
     if body:
         try:
@@ -2416,13 +2420,24 @@ async def confirm_session(
             confirmed = bool(data.get("confirmed", True))
             remember = bool(data.get("remember", False))
             confirm_id = str(data.get("confirm_id") or "")
+            # MCP elicitation extension. Absent for every pre-existing card type,
+            # which keeps taking the two-state path untouched.
+            raw_action = data.get("action")
+            if raw_action is not None:
+                action = str(raw_action)
+            raw_content = data.get("content")
+            if isinstance(raw_content, dict):
+                content = raw_content
         except Exception:
             pass
     if not confirm_id:
         raise HTTPException(status_code=400, detail="confirm_id_required")
+    if action is not None and action not in _confirm_mod.ELICIT_ACTIONS:
+        raise HTTPException(status_code=400, detail="bad_action")
     try:
         _confirm_mgr.resolve(confirm_id, confirmed, remember=remember,
-                             expected_session_id=session_id)
+                             expected_session_id=session_id,
+                             action=action, content=content)
     except KeyError as e:
         # confirm_expired (id unknown / already resolved / agent restarted) or
         # confirm_session_mismatch (id belongs to another session). Both are 409.
@@ -2664,7 +2679,7 @@ async def put_notes_settings(request: Request, body: NotesSettingsPayload):
                 os.makedirs(new, exist_ok=True)
                 for entry in sorted(os.listdir(old)) if os.path.isdir(old) else []:
                     shutil.move(os.path.join(old, entry), os.path.join(new, entry))
-            notes_store.set_notes_root(conn, new)   # rel path 不变,身份靠 frontmatter id
+            notes_store.set_notes_root(conn, new)   # rel path unchanged, identity tracked via frontmatter id
     if body.distill_roots is not None:
         notes_store.set_distill_roots(conn, uid, body.distill_roots)
     if body.distill_daily_cap is not None:

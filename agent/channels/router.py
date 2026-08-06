@@ -32,19 +32,19 @@ def _prune(d: dict, cap: int | None = None) -> None:
         for k in list(d.keys())[: len(d) - limit // 2]:
             d.pop(k, None)
 
-MSG_UNPAIRED = ("此账号尚未配对。请在 NimoOS 设置页(AI → Channels)生成配对码,"
-                "然后发送 /pair <配对码>。(Not paired — send /pair <code>.)")
-MSG_PAIR_USAGE = "用法: /pair <配对码> (usage: /pair <code>)"
-MSG_PAIR_OK = "配对成功!现在可以直接发消息和你的 NimoOS AI 对话。(Paired.)"
-MSG_PAIR_BAD = "配对码无效或已过期。(Invalid or expired code.)"
-MSG_NO_MODEL = ("尚未为此渠道选择模型。请在 NimoOS 设置页(AI → Channels)"
-                "为该绑定选择默认模型。(No default model configured.)")
-MSG_CREDS_FAILED = ("无法解析该模型的凭据,请检查模型/供应商设置。"
-                    "(Could not resolve provider credentials.)")
-MSG_BUSY = "消息太多啦,请等当前回复完成后再发。(Too many pending messages.)"
-MSG_NEW = "已开启新会话。(Started a new session.)"
-MSG_STOP_OK = "已停止当前任务。(Stopped.)"
-MSG_STOP_NONE = "当前没有正在运行的任务。(Nothing to stop.)"
+MSG_UNPAIRED = ("This account is not paired yet. Generate a pairing code on the "
+                "NimoOS settings page (AI → Channels), then send /pair <code>.")
+MSG_PAIR_USAGE = "Usage: /pair <code>"
+MSG_PAIR_OK = "Paired! You can now chat directly with your NimoOS AI."
+MSG_PAIR_BAD = "Invalid or expired pairing code."
+MSG_NO_MODEL = ("No model selected for this channel yet. Choose a default model "
+                "for this binding on the NimoOS settings page (AI → Channels).")
+MSG_CREDS_FAILED = ("Could not resolve credentials for this model — check the "
+                    "model/provider settings.")
+MSG_BUSY = "Too many pending messages — please wait for the current reply to finish."
+MSG_NEW = "Started a new session."
+MSG_STOP_OK = "Stopped the current task."
+MSG_STOP_NONE = "No task is currently running."
 
 
 class ChannelRouter:
@@ -86,7 +86,7 @@ class ChannelRouter:
         if text == "/whoami":
             await self._send_text(adapter, msg.external_chat_id,
                                   f"NimoOS user: {binding['user_id']}\n"
-                                  f"model: {binding['default_model'] or '未设置 (not set)'}")
+                                  f"model: {binding['default_model'] or 'not set'}")
             return
         if text == "/new":
             await self._cmd_new(adapter, msg, binding)
@@ -186,7 +186,7 @@ class ChannelRouter:
                 self._conn, data_root, session_id, ddir, msg.attachments)
             if skipped:
                 await self._send_text(adapter, msg.external_chat_id,
-                                      f"部分文件超出限制已跳过 (skipped): {', '.join(skipped)}")
+                                      f"Some files exceeded the limit and were skipped: {', '.join(skipped)}")
         run_text = msg.text
         if not run_text and not attachment_ids:
             # Nothing to run: no text, and no attachment was actually
@@ -240,17 +240,17 @@ class ChannelRouter:
 
     def _format_confirm(self, ev: dict) -> str:
         if ev.get("type") == "access_request":
-            return (f"🔐 权限请求 (permission request): {ev.get('reason', '')}\n"
-                    f"路径 (path): {ev.get('path', '')}")
+            return (f"🔐 Permission request: {ev.get('reason', '')}\n"
+                    f"Path: {ev.get('path', '')}")
         row = self._conn.execute(
             "SELECT action, description, command FROM pending_confirmations "
             "WHERE confirm_id=?", (ev.get("confirm_id"),)).fetchone()
         if row is not None:
-            text = f"⚠️ 确认 (confirm): {row['description'] or row['action']}"
+            text = f"⚠️ Confirm: {row['description'] or row['action']}"
             if row["command"]:
                 text += f"\n{row['command']}"
             return text
-        return "⚠️ 需要你的确认 (confirm required)"
+        return "⚠️ Confirmation required"
 
     def _deny(self, confirm_id: str, session_id: str) -> None:
         if self._resolve_confirm is None:
@@ -271,7 +271,7 @@ class ChannelRouter:
         text = self._format_confirm(ev)
         try:
             mid = await adapter.send_buttons(chat_id, text,
-                [("✅ 允许 Allow", f"cf:{confirm_id}:a"), ("❌ 拒绝 Deny", f"cf:{confirm_id}:d")])
+                [("✅ Allow", f"cf:{confirm_id}:a"), ("❌ Deny", f"cf:{confirm_id}:d")])
         except Exception:
             # Never let a send failure kill the driver and hang the run on
             # mgr.wait — degrade to deny.
@@ -297,7 +297,7 @@ class ChannelRouter:
         self._deny(confirm_id, entry["session_id"])
         try:
             await entry["adapter"].edit_to_resolved(
-                entry["chat_id"], entry["message_id"], "⏱ 已超时,视为拒绝 (timed out → denied)")
+                entry["chat_id"], entry["message_id"], "⏱ Timed out → denied")
         except Exception:
             _LOG.exception("edit_to_resolved on timeout failed")
 
@@ -327,7 +327,7 @@ class ChannelRouter:
             try:
                 await adapter.edit_to_resolved(
                     chat_id, entry["message_id"],
-                    "✅ 已允许 (allowed)" if allow else "❌ 已拒绝 (denied)")
+                    "✅ Allowed" if allow else "❌ Denied")
             except Exception:
                 _LOG.exception("edit_to_resolved failed")
         except Exception:

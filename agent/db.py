@@ -581,7 +581,7 @@ import json as _json
 
 
 def get_unlocked_categories(session_id: str, conn=None) -> list[str]:
-    """返回该会话已解锁的工具类别(NULL/缺失→[])。"""
+    """Return the tool categories unlocked for this session (NULL/missing → [])."""
     conn = conn or get_connection()
     row = conn.execute(
         "SELECT unlocked_tool_categories FROM sessions WHERE id=?",
@@ -597,7 +597,7 @@ def get_unlocked_categories(session_id: str, conn=None) -> list[str]:
 
 
 def set_unlocked_categories(session_id: str, categories: list[str], conn=None) -> None:
-    """覆盖写该会话的已解锁类别(去重排序后存 JSON 数组)。"""
+    """Overwrite the unlocked categories for this session (dedup + sort, stored as a JSON array)."""
     conn = conn or get_connection()
     payload = _json.dumps(sorted(set(categories)))
     conn.execute(

@@ -1,11 +1,16 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 openai-agents>=0.0.19
-mcp>=1.0
+mcp>=2.0.0,<3
 openai>=1.60
 httpx>=0.27
 pytest>=8.0
-pytest-asyncio>=0.24
+# 上界不是随手加的：pytest-asyncio >=0.25 改了事件循环生命周期，不再为主线程
+# 保留 current loop，本仓库依赖旧行为的同步固件（如 netns/client.py 注释提到的
+# asyncio.get_event_loop() 用法）会连锁失败 45 条——单独跑全绿、合跑全红。
+# 本次升级的目标是"只升 mcp、别的不动"，测试工具链现代化不在范围内，
+# 需要时另开工单。实验矩阵见 .superpowers 的 progress.md。
+pytest-asyncio>=0.24,<0.25
 pathspec>=0.12
 python-magic
 pypdf>=4.0

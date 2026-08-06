@@ -228,7 +228,7 @@ async def test_bwrap_mode_impl_still_uses_network_grant(monkeypatch):
     # network=True in bwrap mode must trigger grant check
     result = await shell._run_command_impl("curl x", 30, True)
     assert grant_called, "_maybe_grant_network must be called in bwrap mode"
-    assert "拒绝" in result
+    assert "denied" in result
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ Important files / Conventions / Avoid), not a policy file the agent must
 obey. It is therefore injected as FENCED reference material, and only when
 its location could not have been written by someone other than the owner.
 
-Design: nimo_os_docs/docs/superpowers/specs/2026-07-26-agent-md-trust-design.md
+Design: internal spec — AGENT.md trust model (2026-07-26)
 """
 from __future__ import annotations
 

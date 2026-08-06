@@ -20,10 +20,10 @@ async def _fake_indexer_ok(note, body):
 
 def test_prompt_redacts_fenced_and_lists_existing():
     history = [{"role": "user", "content":
-                "<untrusted-data source=\"web\">SECRET-INJECTED</untrusted-data> 结论:买 64G"}]
-    p = notes_extract.build_extraction_prompt(history, ["旧笔记标题"])
+                "<untrusted-data source=\"web\">SECRET-INJECTED</untrusted-data> Conclusion: buy 64GB"}]
+    p = notes_extract.build_extraction_prompt(history, ["old note title"])
     assert "SECRET-INJECTED" not in p
-    assert "旧笔记标题" in p
+    assert "old note title" in p
     assert "[external-data omitted]" in p
 
 
@@ -69,7 +69,7 @@ def test_apply_creates_draft_insight(tmp_path):
     conn = _conn(tmp_path)
     created = asyncio.run(notes_extract.apply_extraction(
         conn, "1", "sess-1",
-        [{"title": "内存结论", "description": "d", "body": "买 64G", "tags": ["hw"]}],
+        [{"title": "RAM conclusion", "description": "d", "body": "buy 64GB", "tags": ["hw"]}],
         note_indexer=_fake_indexer_ok))
     assert len(created) == 1
     row = conn.execute("SELECT type, status, created_by, source_refs_json "
@@ -81,7 +81,7 @@ def test_apply_creates_draft_insight(tmp_path):
 
 def test_apply_dedups_by_session_title(tmp_path):
     conn = _conn(tmp_path)
-    note = [{"title": "同题", "description": "", "body": "v1", "tags": []}]
+    note = [{"title": "same title", "description": "", "body": "v1", "tags": []}]
     asyncio.run(notes_extract.apply_extraction(
         conn, "1", "sess-1", note, note_indexer=_fake_indexer_ok))
     again = asyncio.run(notes_extract.apply_extraction(
@@ -99,7 +99,7 @@ def test_apply_index_failure_sets_sentinel(tmp_path):
 
     created = asyncio.run(notes_extract.apply_extraction(
         conn, "1", "sess-1",
-        [{"title": "哨兵", "description": "", "body": "b", "tags": []}],
+        [{"title": "sentinel", "description": "", "body": "b", "tags": []}],
         note_indexer=bad_indexer))
     row = conn.execute("SELECT content_hash FROM notes WHERE id=?",
                        (created[0]["id"],)).fetchone()
@@ -138,8 +138,8 @@ def test_worker_end_to_end_creates_draft(tmp_path):
 
     async def llm(job, prompt):
         assert "Conversation" in prompt
-        return json.dumps({"notes": [{"title": "结论", "description": "d",
-                                      "body": "买 64G", "tags": []}]})
+        return json.dumps({"notes": [{"title": "conclusion", "description": "d",
+                                      "body": "buy 64GB", "tags": []}]})
 
     ran = asyncio.run(notes_extract.process_pending_once(
         conn, llm_call=llm, history_loader=lambda sid: [{"role": "user", "content": "hi"}],
