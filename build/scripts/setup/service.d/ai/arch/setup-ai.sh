@@ -38,6 +38,16 @@ bash "$(dirname "${BASH_SOURCE[0]}")/../install-ovms.sh" || echo "⚠ OVMS insta
 # Model directory + servable repo directory (user drops model IR files into models/)
 mkdir -p /var/lib/nimoos/ai/models /var/lib/nimoos/ai/openvino/models
 
-echo "Enabling and starting nimoos-openvino service..."
-systemctl enable --force --no-ask-password nimoos-openvino.service || echo "⚠ enable nimoos-openvino failed"
-systemctl start --force --no-ask-password nimoos-openvino.service || echo "⚠ start nimoos-openvino failed (OVMS binary missing or GPU/driver issue?)"
+# Only enable the unit if the binary is actually runnable here. It was enabled
+# unconditionally before, so a host where OVMS could not be installed — or
+# where it installed but cannot load its libraries, which is every Debian 12
+# box, see install-ovms.sh — got a unit restarting every five seconds forever.
+# A feature that is unavailable should be absent, not permanently crashing.
+if [ -x /opt/ovms/bin/ovms ] && /opt/ovms/bin/ovms --version >/dev/null 2>&1; then
+    echo "Enabling and starting nimoos-openvino service..."
+    systemctl enable --force --no-ask-password nimoos-openvino.service || echo "⚠ enable nimoos-openvino failed"
+    systemctl start --force --no-ask-password nimoos-openvino.service || echo "⚠ start nimoos-openvino failed (GPU/driver issue?)"
+else
+    echo "⚠ OVMS is not runnable on this host; leaving nimoos-openvino disabled."
+    systemctl disable --now nimoos-openvino.service 2>/dev/null || true
+fi
