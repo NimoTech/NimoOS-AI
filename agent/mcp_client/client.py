@@ -53,7 +53,7 @@ MCP_COLD_TOTAL_TIMEOUT = 10
 # every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
 MCP_SESSION_TIMEOUT = 60  # seconds
 
-STDIO_CONNECT_TIMEOUT = 90  # 秒;stdio 首次 npx/uvx 下包可能很慢(下完本地缓存,后续快)
+STDIO_CONNECT_TIMEOUT = 90  # seconds; the first stdio npx/uvx package fetch can be slow (cached locally after, then fast)
 
 # ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
 # A registered stdio MCP server spawns command+args directly in the netns
@@ -84,7 +84,7 @@ def _assert_stdio_command_allowed(command: str) -> None:
         f"MCP stdio launch command not allowed: {cmd!r}. Launch the server via "
         f"an MCP launcher (npx/uvx/uv/node/python …).")
 
-# 透传给 stdio 子进程的运行时变量(缺了会乱码/时区/临时目录出错)
+# runtime vars passed through to the stdio subprocess (missing these causes mojibake/timezone/tmpdir errors)
 _ENV_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 
 
@@ -99,8 +99,9 @@ def _session_timeout(server: dict) -> int:
 
 
 def _stdio_env(user_env: dict) -> dict:
-    """子进程环境 = 白名单透传 ⊕ 用户 env ⊕ 受保护核心变量(核心最后应用,用户不可覆盖)。
-    不整体继承 os.environ,避免泄漏 agent 的敏感变量。"""
+    """Subprocess env = allow-listed passthrough ⊕ user env ⊕ protected core vars
+    (core applied last, not overridable by the user).
+    Does not inherit os.environ wholesale, to avoid leaking the agent’s sensitive vars."""
     env = {k: os.environ[k] for k in _ENV_PASSTHROUGH if k in os.environ}
     env.update(user_env or {})
     core = {
@@ -114,7 +115,8 @@ def _stdio_env(user_env: dict) -> dict:
 
 
 # Default entry lifetime when the server gives no hint (i.e. every legacy-protocol
-# server, and any 2026-07-28 server that leaves ttlMs at its default 0).
+# server, and any 2026-07-28 server that leaves ttlMs at its default 0). Past this
+# an entry goes stale (still usable, triggers a background revalidate).
 SCHEMA_TTL = 600
 # Floor for a server-declared ttlMs. A server declaring something tiny would punch
 # through the zero-connection warm path that is the whole reason this cache exists.
@@ -122,7 +124,7 @@ SCHEMA_TTL = 600
 # change notifications anyway, so that window is already accepted. Config changes
 # still invalidate instantly via the fingerprint, unaffected by this floor.
 SCHEMA_TTL_MIN = 60
-SCHEMA_CACHE_MAX = 256  # LRU 容量上限,兜住内存
+SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 
 # MRTR round cap = the SDK default (mcp/client/_input_required.py::
 # DEFAULT_INPUT_REQUIRED_MAX_ROUNDS). A "round" is a REQUEST/RETRY round trip, not a
@@ -177,8 +179,8 @@ class _CacheEntry:
 
 
 _SCHEMA_CACHE: "OrderedDict[int, _CacheEntry]" = OrderedDict()  # key = server["id"], LRU
-_REVALIDATING: set = set()             # 防重入:同一 server 同时只有一个后台刷新
-_BACKGROUND_TASKS: set = set()         # 强引用,防 asyncio.create_task 被 GC
+_REVALIDATING: set = set()             # re-entrancy guard: only one background refresh per server at a time
+_BACKGROUND_TASKS: set = set()         # strong refs so asyncio.create_task tasks aren’t GC’d
 
 
 def _extract_meta(mcp_tool) -> dict:
@@ -199,7 +201,7 @@ def _cache_put(server_id: int, metas, fingerprint, ttl) -> None:
     _SCHEMA_CACHE[server_id] = _CacheEntry(metas, time.monotonic(), fingerprint, ttl)
     _SCHEMA_CACHE.move_to_end(server_id)
     while len(_SCHEMA_CACHE) > SCHEMA_CACHE_MAX:
-        _SCHEMA_CACHE.popitem(last=False)   # 淘汰最久未用
+        _SCHEMA_CACHE.popitem(last=False)   # evict least-recently-used
 
 
 def _cache_get(server_id: int):
@@ -685,9 +687,9 @@ async def _metas_for_server(server: dict):
         if time.monotonic() - entry.fetched_at > entry.ttl:
             _schedule_revalidate(server)        # stale-while-revalidate
         return entry.metas
-    # 冷 / fingerprint 变:
+    # cold / fingerprint changed:
     if server.get("transport") == "stdio":
-        _schedule_revalidate(server)            # 后台单飞自愈预热(连+列+写缓存),不阻塞 run 启动
+        _schedule_revalidate(server)            # background single-flight self-healing warmup (connect+list+cache), does not block run startup
         await _emit_warning(server.get("name", "mcp"),
                             "stdio tools are initializing in the background for first use; retry shortly")
         return []
@@ -697,7 +699,8 @@ async def _metas_for_server(server: dict):
         # cap the run-start worst case would grow from 5+5 to 8+8.
         return await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
     except Exception as e:
-        # 冷取超时多半是慢链路下的冷连接。后台用宽松超时预热缓存,下次 run 即有工具。
+        # A cold-fetch timeout is usually a cold connection on a slow link.
+        # Warm the cache in the background with a generous timeout; tools are ready by the next run.
         _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
         return []
@@ -727,8 +730,8 @@ async def build_mcp_tools(servers: list[dict]) -> list:
     return tools
 
 
-TEST_TIMEOUT = 9  # 秒;须 < Go 调用方超时(10s),Go 放弃后 Python 主动取消释放
-STDIO_TEST_TIMEOUT = 90  # 秒;stdio 首次下包慢;Go /test client 超时须 > 此值
+TEST_TIMEOUT = 9  # seconds; must be < the Go caller’s timeout (10s), so Python actively cancels and releases after Go gives up
+STDIO_TEST_TIMEOUT = 90  # seconds; the first stdio package fetch is slow; the Go /test client timeout must be > this value
 
 
 async def test_server(server: dict) -> dict:

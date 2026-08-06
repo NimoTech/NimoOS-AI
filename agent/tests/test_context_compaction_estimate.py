@@ -15,7 +15,7 @@ def test_estimate_ascii_and_cjk_bounds():
 
 def test_estimate_messages_sums_role_and_content():
     msgs = [{"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "世界"}]
+            {"role": "assistant", "content": "world"}]
     total = cc.estimate_messages_tokens(msgs)
     assert total >= cc.estimate_tokens("user: hello") - 1
 
@@ -23,7 +23,7 @@ def test_estimate_messages_sums_role_and_content():
 def test_estimate_handles_nonstring_content():
     # multimodal content (list of blocks) must not crash
     msgs = [{"role": "user",
-             "content": [{"type": "input_text", "text": "查日志"}]}]
+             "content": [{"type": "input_text", "text": "check logs"}]}]
     assert cc.estimate_messages_tokens(msgs) > 0
 
 

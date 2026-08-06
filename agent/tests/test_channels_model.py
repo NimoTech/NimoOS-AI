@@ -44,7 +44,7 @@ def test_inbound_attachment_and_message_field():
     assert (a.filename, a.mime, a.tmp_path, a.size) == ("x.png", "image/png", "/tmp/x", 12)
     m = InboundMessage(channel_type="telegram", instance_id="i", external_chat_id="c",
                        external_user_id="u", external_username=None, message_id="1", text="")
-    assert m.attachments == []          # 默认空,不破坏 M1 构造
+    assert m.attachments == []          # defaults to empty, doesn't break the M1 constructor
     m.attachments.append(a)
     assert m.attachments[0].size == 12
 

@@ -1,7 +1,7 @@
 #!/bin/bash
-# 幂等安装 OVMS(OpenVINO Model Server)裸二进制到 /opt/ovms,部署时由 setup-ai.sh 调用。
-# 机器同构,固定 ubuntu24 / python_off 包(Debian13 缺 libpython,python_on 不可用)。
-# 失败只告警并 exit 0,绝不阻断 AI 服务安装。安装上下文以 root 运行,无需 sudo。
+# Idempotently install the OVMS (OpenVINO Model Server) bare binary to /opt/ovms; called by setup-ai.sh during deploy.
+# Machines are homogeneous, so pin the ubuntu24 / python_off package (Debian13 lacks libpython, so python_on won't work).
+# Failure only warns and exits 0 — must never block the AI service install. Runs as root, no sudo needed.
 set -u
 
 DEST="/opt/ovms"
@@ -11,13 +11,13 @@ URL="${OVMS_URL:-https://storage.openvinotoolkit.org/repositories/openvino_model
 WORK="/tmp/ovms-dl"
 
 if [ -x "${DEST}/bin/ovms" ]; then
-    echo "✅ OVMS 已存在于 ${DEST}/bin/ovms,跳过下载。"
+    echo "✅ OVMS already present at ${DEST}/bin/ovms, skipping download."
     exit 0
 fi
 
-echo "==> 安装 OVMS:${PKG}"
-mkdir -p "${WORK}" || { echo "⚠ 无法创建 ${WORK},跳过 OVMS 安装。"; exit 0; }
-cd "${WORK}" || { echo "⚠ 无法进入 ${WORK},跳过 OVMS 安装。"; exit 0; }
+echo "==> Installing OVMS: ${PKG}"
+mkdir -p "${WORK}" || { echo "⚠ Failed to create ${WORK}, skipping OVMS install."; exit 0; }
+cd "${WORK}" || { echo "⚠ Failed to enter ${WORK}, skipping OVMS install."; exit 0; }
 
 dl() {
     local url="$1" out="$2"
@@ -31,30 +31,30 @@ dl() {
 }
 
 if ! dl "${URL}" "${PKG}"; then
-    echo "⚠ OVMS 下载失败(${URL});跳过。可稍后重跑安装或手动安装。"
+    echo "⚠ OVMS download failed (${URL}); skipping. Rerun the install later or install manually."
     exit 0
 fi
 if ! tar tzf "${PKG}" >/dev/null 2>&1; then
-    echo "⚠ 下载的 ${PKG} 不是有效 gzip(可能错误页);跳过 OVMS 安装。"
+    echo "⚠ Downloaded ${PKG} is not a valid gzip (possibly an error page); skipping OVMS install."
     exit 0
 fi
 
 rm -rf "${WORK}/extract"; mkdir -p "${WORK}/extract"
 if ! tar xzf "${PKG}" -C "${WORK}/extract"; then
-    echo "⚠ 解压 ${PKG} 失败;跳过。"; exit 0
+    echo "⚠ Failed to extract ${PKG}; skipping."; exit 0
 fi
 ovms_bin="$(find "${WORK}/extract" -type f -path '*/bin/ovms' | head -1)"
 if [ -z "${ovms_bin}" ]; then
-    echo "⚠ 解压后未找到 bin/ovms;跳过。"; exit 0
+    echo "⚠ bin/ovms not found after extraction; skipping."; exit 0
 fi
-binroot="$(dirname "$(dirname "${ovms_bin}")")"   # 含 bin/ 与 lib/ 的目录
+binroot="$(dirname "$(dirname "${ovms_bin}")")"   # directory containing bin/ and lib/
 rm -rf "${DEST}"
 if ! cp -a "${binroot}" "${DEST}"; then
-    echo "⚠ 复制到 ${DEST} 失败;跳过。"; exit 0
+    echo "⚠ Failed to copy to ${DEST}; skipping."; exit 0
 fi
 if [ -x "${DEST}/bin/ovms" ]; then
-    echo "✅ OVMS 已安装到 ${DEST}。"
+    echo "✅ OVMS installed to ${DEST}."
 else
-    echo "⚠ ${DEST}/bin/ovms 不在位,安装可能不完整。"
+    echo "⚠ ${DEST}/bin/ovms is missing; install may be incomplete."
 fi
 exit 0

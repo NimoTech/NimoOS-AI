@@ -1,4 +1,4 @@
-"""M1 新表存在性 + 关键列。"""
+"""M1 new-table existence + key columns."""
 import db as db_module
 
 

@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// ── 纯函数:用户名 ↔ OVMS 内部名映射 ──────────────────────────
+// ── pure functions: user-facing name ↔ OVMS internal name mapping ──────────
 
 // OVMSModelName maps a user-facing (model, device) pair to the OVMS internal
 // servable name. "qwen3-vl-int4","GPU.1" → "qwen3-vl-int4-gpu1";
@@ -67,7 +67,7 @@ func ovmsDisplayName(internal string) string {
 	return internal
 }
 
-// ── OpenVINOChecker:健康监控(对称 OllamaChecker) ───────────
+// ── OpenVINOChecker: health monitoring (mirrors OllamaChecker) ─────────────
 
 // OpenVINOChecker polls OVMS readiness and fires callbacks on state changes.
 // OVMS is managed by systemd; this checker only monitors.
@@ -133,7 +133,7 @@ func (o *OpenVINOChecker) Start(ctx context.Context) {
 	}
 }
 
-// ── OpenVINOAdapter:代理 + 设备集 + 列模型 ──────────────────
+// ── OpenVINOAdapter: proxy + device set + model listing ────────────────────
 
 // OpenVINOAdapter proxies LLM requests to a local OVMS instance. Models are NOT
 // pre-loaded: they live as IR dirs under srcModelsPath and are listed as options;
@@ -149,11 +149,12 @@ type OpenVINOAdapter struct {
 	loadMu        sync.Mutex
 	client        *http.Client
 
-	// 多模型驻留 + 空闲回收(对齐 Ollama)。loaded 是写入 config.json 的常驻集,唯一事实源;
-	// 所有读写都在 loadMu 下。
+	// Multi-model residency + idle reaping (mirrors Ollama). loaded is the resident
+	// set written to config.json, the single source of truth; all reads/writes happen
+	// under loadMu.
 	loaded    map[string]*loadedModel
-	maxLoaded int           // 同时最多驻留数,默认 3
-	idleTTL   time.Duration // 空闲多久卸载;0=永不卸载
+	maxLoaded int           // max number resident at once, default 3
+	idleTTL   time.Duration // how long idle before unloading; 0 = never unload
 }
 
 const (
@@ -164,8 +165,10 @@ const (
 
 // NewOpenVINOAdapter builds an adapter. devicesCSV is the comma-separated
 // selectable device list (config OpenVINODevices), e.g. "GPU.1" or "GPU.1,GPU.0".
-// maxLoaded 是同时最多驻留的模型数(<=0 视作默认 3);idleTTLMinutes 是空闲卸载分钟数
-// (0 = 永不卸载)。构造时按 OVMS 实时服务集重建驻留集(reconcileFromOVMS)。
+// maxLoaded is the max number of models resident at once (<=0 is treated as the
+// default 3); idleTTLMinutes is the idle-unload minutes (0 = never unload).
+// The resident set is rebuilt from OVMS's live serving set at construction time
+// (reconcileFromOVMS).
 func NewOpenVINOAdapter(baseURL, devicesCSV string, maxLoaded, idleTTLMinutes int) *OpenVINOAdapter {
 	var devs []string
 	for _, d := range strings.Split(devicesCSV, ",") {

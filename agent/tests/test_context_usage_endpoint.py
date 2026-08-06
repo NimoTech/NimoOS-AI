@@ -63,8 +63,8 @@ async def test_seeded_session_returns_nonzero_tokens(tmp_path, monkeypatch):
     conn = main_module._db()
     _sess(conn, sid="s1", user="u1")
     _snapshot(conn, "s1", [
-        {"role": "user", "content": "你好" * 50},
-        {"role": "assistant", "content": "回答" * 50},
+        {"role": "user", "content": "hello" * 50},
+        {"role": "assistant", "content": "answer" * 50},
     ])
 
     transport = ASGITransport(app=main_module.app)

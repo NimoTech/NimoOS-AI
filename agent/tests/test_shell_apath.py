@@ -170,8 +170,8 @@ async def test_external_upload_rules_block_refuses(monkeypatch):
 
     assert not nc_calls, "netns_client.run_command must NOT be called when blocked"
     assert result  # non-empty refusal message
-    # Message should mention why (privacy/隐私/policy/block)
-    assert any(kw in result for kw in ["隐私", "privacy", "block", "拦截", "拒绝"])
+    # Message should mention why (privacy/policy/block)
+    assert any(kw in result for kw in ["privacy", "block"])
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ async def test_suspect_judge_block_refuses(monkeypatch):
     )
 
     assert not nc_calls
-    assert any(kw in result for kw in ["隐私", "privacy", "block", "拦截", "拒绝"])
+    assert any(kw in result for kw in ["privacy", "block"])
 
 
 # ---------------------------------------------------------------------------

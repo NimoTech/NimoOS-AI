@@ -2,7 +2,7 @@ from skills import tool_gating as tg
 
 
 def test_current_unlocked_default_empty():
-    # 未 set 时返回空集,不抛 LookupError
+    # returns an empty set when unset, does not raise LookupError
     tg.UNLOCKED_VAR.set(set())
     assert tg.current_unlocked() == set()
 
@@ -20,5 +20,5 @@ def test_is_enabled_sees_in_place_mutation():
     tg.UNLOCKED_VAR.set(s)
     check = tg.make_is_enabled("wiki")
     assert check(None, None) is False
-    s.add("wiki")                      # 原地修改
+    s.add("wiki")                      # in-place mutation
     assert check(None, None) is True

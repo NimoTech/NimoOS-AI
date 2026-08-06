@@ -117,14 +117,17 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 	}
 
 	providerType := c.Request().Header.Get("X-Agent-Provider-Type")
-	// OpenVINO(OVMS):agent 路由不像 chat.go 有模型名前缀路由,这里检测 run body 里
-	// 形如 "name@GPU.1" 的 OVMS 设备后缀模型,把 agent 指向 OVMS(OpenAI 兼容,无鉴权),
-	// 并把 model 改写成 OVMS 内部 servable 名("name-gpu1")。优先级高于 provider_type。
+	// OpenVINO (OVMS): unlike chat.go, the agent route has no model-name-prefix
+	// routing, so this detects an OVMS device-suffixed model like "name@GPU.1" in
+	// the run body, points the agent at OVMS (OpenAI-compatible, no auth), and
+	// rewrites model to the OVMS internal servable name ("name-gpu1"). This takes
+	// priority over provider_type.
 	if h.routeOpenVINO(c) {
 		c.Request().Header.Set("X-Agent-Provider-Key", "openvino")
 		c.Request().Header.Set("X-Agent-Provider-Url", config.Cfg.OpenVINOURL+"/v3")
-		// 让 Python 侧据此套用 Qwen 系的思考开关(think/enable_thinking),
-		// UI 关闭思考时模型才会跳过冗长 reasoning、直接产出工具调用/答案。
+		// Lets the Python side apply the Qwen-family thinking toggle (think/enable_thinking)
+		// based on this, so when the UI turns thinking off the model skips verbose reasoning
+		// and goes straight to tool calls/answers.
 		c.Request().Header.Set("X-Agent-Provider-Type", "openvino")
 	} else if providerType == "ollama" {
 		c.Request().Header.Set("X-Agent-Provider-Key", "ollama")
@@ -205,9 +208,10 @@ func (h *AgentHandler) routeOpenVINO(c echo.Context) bool {
 		restore(body)
 		return false
 	}
-	// UI 从本地模型列表选 OpenVINO 模型时,model 形如 "openvino:<dir>@<device>"
-	// (model_manager 的 provider 前缀)。必须先剥掉 "openvino:",否则 ':' 会被
-	// sanitize 成 '-',servable 多出 "openvino-" 头,OVMS 找不到 graph → 404。
+	// When the UI picks an OpenVINO model from the local model list, model looks
+	// like "openvino:<dir>@<device>" (model_manager's provider prefix). Must strip
+	// "openvino:" first, otherwise ':' gets sanitized to '-', the servable gets an
+	// extra "openvino-" prefix, and OVMS can't find the graph → 404.
 	model = strings.TrimPrefix(model, "openvino:")
 	bare, device, ok := parseOVMSDeviceSuffix(model)
 	if !ok {

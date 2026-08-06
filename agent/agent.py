@@ -331,11 +331,12 @@ def compact_image_blocks(history, *, image_id_resolver):
 
 
 def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
-    """组装本次 run 的工具。
+    """Assemble the tools for this run.
 
-    pinned profile(profile.tools 非空):原样返回固定集,不门控。
-    general profile:常驻工具(原对象,is_enabled 默认 True)+ expand_tools +
-    其余工具的门控副本(dataclasses.replace 注入 is_enabled,不改共享原件)。
+    pinned profile (profile.tools non-empty): returns the fixed set as-is, no gating.
+    general profile: always-on tools (original object, is_enabled defaults to True) +
+    expand_tools + gated copies of the remaining tools (dataclasses.replace injects
+    is_enabled, without mutating the shared original).
     """
     import dataclasses
     from skills import tool_registry as _reg
@@ -356,7 +357,7 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
 
     tools = core + [_gat.expand_tools] + gated
 
-    # 条件附加 read_attachment(常驻,沿用原逻辑)
+    # conditionally append read_attachment (always-on, follows the original logic)
     rows = _fetch_attachments(attachment_ids, session_id)
     if any(r["kind"] != "image" for r in rows):
         from skills.attachments import read_attachment
@@ -377,7 +378,7 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
 
 
 def gate_runtime_tools(tools, category: str):
-    """给运行时工具(如 MCP)套上某类别的 is_enabled 门控副本。"""
+    """Wrap runtime tools (e.g. MCP) with a gated is_enabled copy for a category."""
     import dataclasses
     from skills import tool_gating as _gat
     return [dataclasses.replace(t, is_enabled=_gat.make_is_enabled(category))
@@ -950,7 +951,8 @@ class AgentRunner:
                 except Exception:
                     pass
             except MaxTurnsExceeded:
-                # 触顶不是错误,是"暂停":落库 + 发可继续事件,不发红色 error。
+                # Hitting the cap isn't an error, it's a "pause": persist + emit a
+                # resumable event, don't emit a red error.
                 try:
                     if stream is not None:
                         partial = self._finalize_history(

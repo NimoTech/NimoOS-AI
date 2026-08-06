@@ -42,7 +42,7 @@ func TestParserClient_GetStatePassesThrough(t *testing.T) {
 func TestParserClient_RereadsDiscoveryOnConnError(t *testing.T) {
 	dir := t.TempDir()
 	discovery := filepath.Join(dir, "parser.url")
-	// 先指向无效 URL
+	// first point at an invalid URL
 	os.WriteFile(discovery, []byte("http://127.0.0.1:1"), 0644)
 
 	srvOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,9 +51,9 @@ func TestParserClient_RereadsDiscoveryOnConnError(t *testing.T) {
 	defer srvOK.Close()
 
 	pc := NewParserClient(discovery)
-	// 第一次会失败 — 但失败时应重读 discovery,所以我们在调用 Get 前更新文件
-	// 模拟实际场景:文件已更新,client 缓存还是旧的
-	pc.SetCachedBaseURL("http://127.0.0.1:1") // 显式注入坏 cache
+	// the first call fails — but on failure it should re-read discovery, so we update the file before calling Get
+	// simulate a real scenario: the file has been updated, but the client cache is still stale
+	pc.SetCachedBaseURL("http://127.0.0.1:1") // explicitly inject a bad cache
 	os.WriteFile(discovery, []byte(srvOK.URL), 0644)
 
 	body, status, err := pc.Get("/anything")

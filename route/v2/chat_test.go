@@ -69,9 +69,9 @@ func TestSetModelField(t *testing.T) {
 	}
 }
 
-// TestForwardToOpenVINODisabled 验证 OpenVINOEnabled=false 时 forwardToOpenVINO 返回 503+backend_disabled。
+// TestForwardToOpenVINODisabled verifies that when OpenVINOEnabled=false, forwardToOpenVINO returns 503+backend_disabled.
 func TestForwardToOpenVINODisabled(t *testing.T) {
-	// 保存并还原 config.Cfg,避免影响其他测试。
+	// Save and restore config.Cfg, to avoid affecting other tests.
 	orig := config.Cfg
 	defer func() { config.Cfg = orig }()
 
@@ -85,8 +85,9 @@ func TestForwardToOpenVINODisabled(t *testing.T) {
 	h := &ChatHandler{svc: svc}
 
 	e := echo.New()
-	// body 直接作为参数传给 forwardToOpenVINO;disabled 守卫在消费 body 之前就返回,
-	// 故 request 自身的 body 刻意置 nil。
+	// body is passed directly as an argument to forwardToOpenVINO; the disabled
+	// guard returns before the body is consumed, so the request's own body is
+	// deliberately left nil.
 	body := []byte(`{"model":"openvino:qwen3-vl-int4@GPU.1","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	rec := httptest.NewRecorder()
@@ -105,7 +106,7 @@ func TestForwardToOpenVINODisabled(t *testing.T) {
 	var resp map[string]interface{}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	errObj, ok := resp["error"].(map[string]interface{})
-	require.True(t, ok, "响应应包含 error 对象")
+	require.True(t, ok, "response should contain an error object")
 	require.Equal(t, "backend_disabled", errObj["code"])
 }
 

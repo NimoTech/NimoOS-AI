@@ -73,13 +73,13 @@ def env_confirm_no_buttons(tmp_path):
 async def test_surface_confirm_then_handle_allow(env_confirm):
     router, adapter, resolves, edits = env_confirm
     ev = {"type": "access_request", "confirm_id": "c1",
-          "path": "/DATA/x", "reason": "读取"}
+          "path": "/DATA/x", "reason": "read access"}
     await router._surface_confirm(adapter, "55", "s1", ev)
     assert adapter.buttons and adapter.buttons[-1][2][0][1] == "cf:c1:a"  # callback_data
     # user taps allow
     await router.handle_confirm(adapter, "55", "cf:c1:a")
     assert resolves == [("c1", True, "s1")]        # resolved True with expected_session_id
-    assert edits and "允许" in edits[-1][2]
+    assert edits and "Allowed" in edits[-1][2]
     assert "c1" not in router._confirms             # entry cleared
 
 
@@ -196,7 +196,7 @@ async def test_unpaired_message_gets_single_rate_limited_hint(env):
     await router.handle(a, _msg("hi", instance=inst["id"]))
     await router.handle(a, _msg("hi again", instance=inst["id"]))
     assert len(a.sent) == 1  # second hint suppressed by rate limit
-    assert "配对" in a.sent[0][1]
+    assert "paired" in a.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -282,7 +282,7 @@ async def test_credentials_failure_reports_error(env):
     store.set_binding_model(conn, "u1", b["id"], "broken")
     await router.handle(a, _msg("hello", instance=inst["id"]))
     assert calls["runs"] == []
-    assert "模型" in a.sent[-1][1] or "provider" in a.sent[-1][1]
+    assert "provider" in a.sent[-1][1]
 
 
 class GatedSink:
@@ -424,7 +424,7 @@ async def test_all_attachments_skipped_and_no_text_does_not_start_run(env, monke
                                     "tmp_path": "/tmp/big.bin", "size": 999})()]
     await router.handle(a, m)
     assert calls["runs"] == []                                  # no run started
-    assert any("skipped" in t or "跳过" in t for _c, t in a.sent)  # skip notice sent
+    assert any("skipped" in t for _c, t in a.sent)  # skip notice sent
 
 
 @pytest.mark.asyncio

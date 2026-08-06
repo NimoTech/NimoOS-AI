@@ -18,8 +18,8 @@ def test_save_ingest_moves_to_download_dir_and_cleans_tmp(tmp_path):
     ids, skipped = save_and_ingest(conn, str(tmp_path / "ad"), "s", ddir, atts,
                                    max_file=100, max_total=1000, max_count=10)
     assert len(ids) == 1 and skipped == []
-    assert os.path.isfile(os.path.join(ddir, "a.txt"))   # 真文件落 download_dir
-    assert not os.path.exists(t1)                        # tmp 清理
+    assert os.path.isfile(os.path.join(ddir, "a.txt"))   # actual file lands in download_dir
+    assert not os.path.exists(t1)                        # tmp cleaned up
 
 
 def test_limits_skip_and_collision_rename(tmp_path):
@@ -30,12 +30,12 @@ def test_limits_skip_and_collision_rename(tmp_path):
     ok1 = _mk_tmp(tmp_path, "n.txt", b"1"); ok2 = _mk_tmp(tmp_path, "n2.txt", b"2")
     atts = [InboundAttachment("big.bin", "application/octet-stream", big, 50),
             InboundAttachment("n.txt", "text/plain", ok1, 1),
-            InboundAttachment("n.txt", "text/plain", ok2, 1)]   # 同名
+            InboundAttachment("n.txt", "text/plain", ok2, 1)]   # same name
     ids, skipped = save_and_ingest(conn, str(tmp_path / "ad"), "s", ddir, atts,
                                    max_file=10, max_total=1000, max_count=10)
     assert "big.bin" in skipped and len(ids) == 2
     names = sorted(os.listdir(ddir))
-    assert names == ["n (1).txt", "n.txt"]               # 重名追加后缀
+    assert names == ["n (1).txt", "n.txt"]               # duplicate name gets suffix appended
 
 
 def test_cap_uses_real_bytes_not_claimed_size(tmp_path):

@@ -4,20 +4,24 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# 每次(含开机/崩溃自动重启)启动前把 config.json 重置为只读空配置模板,保证 OVMS 自身绝不
-# 在启动时自动加载任何模型——config.json 是 nimoos-ai 持久化"当前驻留模型"的文件,整机重启
-# 后若不清空,OVMS 会直接按上次会话的内容自动加载(还会因双卡同载在开机内存高峰期触发 OOM
-# 循环)。模型只应经 nimoos-ai 的按需加载(EnsureLoaded)由用户/Agent 实际请求时才挂载。
-# 用 cp 复制模板而非内联 shell 写文件:避免 systemd 对引号/%的二次解析破坏 JSON。
+# Reset config.json to an empty read-only config template before every start (including
+# boot and crash auto-restart), ensuring OVMS itself never auto-loads any model on
+# startup — config.json is the file nimoos-ai uses to persist "currently resident
+# models"; if not cleared after a full machine reboot, OVMS would auto-load whatever
+# was in the last session (and dual-GPU simultaneous loading during the boot memory
+# spike could trigger an OOM loop). Models should only be mounted via nimoos-ai's
+# on-demand loading (EnsureLoaded) when actually requested by a user/agent.
+# Use cp to copy the template rather than writing the file inline via shell: this avoids
+# systemd's secondary parsing of quotes/% from corrupting the JSON.
 ExecStartPre=/bin/mkdir -p /var/lib/nimoos/ai/openvino
 ExecStartPre=/bin/cp -f /usr/share/nimoos/openvino/empty-config.json /var/lib/nimoos/ai/openvino/config.json
-# OVMS 二进制路径按 deploy-openvino.sh 安装位置;默认 /opt/ovms/bin/ovms
+# OVMS binary path follows deploy-openvino.sh's install location; defaults to /opt/ovms/bin/ovms
 ExecStart=/opt/ovms/bin/ovms --config_path /var/lib/nimoos/ai/openvino/config.json --rest_port 9100 --rest_bind_address 127.0.0.1
-# 访问 Intel GPU 需在 render/video 组
+# Accessing the Intel GPU requires being in the render/video groups
 SupplementaryGroups=render video
 Restart=always
 RestartSec=5
-# OVMS 依赖其安装目录下的共享库
+# OVMS depends on shared libraries under its install directory
 Environment=LD_LIBRARY_PATH=/opt/ovms/lib
 
 [Install]

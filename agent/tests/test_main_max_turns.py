@@ -37,14 +37,14 @@ def test_put_negative_rejected():
     assert r.status_code == 422
 
 
-# 追加到 NimoOS-AI/agent/tests/test_main_max_turns.py
+# Appended to NimoOS-AI/agent/tests/test_main_max_turns.py
 from unittest.mock import patch, MagicMock
 
 
 def test_run_resolves_unlimited_and_passes_none():
     c = _client()
     user = "mtrun1"
-    # 用户设无限
+    # user sets unlimited
     c.put("/agent/user-settings/max-turns", json={"max_turns": 0},
           headers={"X-User-Id": user})
     sid = c.post("/agent/sessions", headers={"X-User-Id": user}).json()["session_id"]

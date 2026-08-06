@@ -75,5 +75,5 @@ import agent as agent_module
 
 def test_system_prompt_allows_attempting_and_stops_on_deny():
     p = agent_module.SYSTEM_PROMPT
-    assert "授权" in p or "access" in p.lower()      # mentions auto access-request
-    assert "停止" in p or "stop" in p.lower()         # deny-stop instruction
+    assert "access" in p.lower()      # mentions auto access-request
+    assert "stop" in p.lower()         # deny-stop instruction

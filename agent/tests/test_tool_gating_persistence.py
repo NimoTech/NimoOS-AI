@@ -30,6 +30,6 @@ def test_round_trip(tmp_path):
 def test_migration_idempotent(tmp_path):
     p = str(tmp_path / "t.db")
     db_module.init_db(p)
-    conn2 = db_module.init_db(p)            # 二次不应报错
+    conn2 = db_module.init_db(p)            # second time must not raise
     cols = {r["name"] for r in conn2.execute("PRAGMA table_info(sessions)")}
     assert "unlocked_tool_categories" in cols

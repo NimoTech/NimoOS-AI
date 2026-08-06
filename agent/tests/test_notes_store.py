@@ -69,7 +69,7 @@ def test_cross_user_invisible(conn):
     n = store.create_note(conn, "1", title="t", body="b")
     assert store.get_note(conn, "2", n["id"]) is None
     assert store.list_notes(conn, "2") == []
-    with pytest.raises(KeyError):   # update 也按 user 作用域
+    with pytest.raises(KeyError):   # update is also scoped by user
         store.update_note(conn, "2", n["id"], expected_revision=1, body="x")
 
 
@@ -117,5 +117,5 @@ def test_atomic_write_preserves_mode_and_chown(monkeypatch, conn):
     st_before = os.stat(p)
     store.update_note(conn, "1", n["id"], expected_revision=1, body="v2")
     st_after = os.stat(p)
-    assert (st_after.st_mode & 0o777) == 0o640          # 覆盖保留原 mode
-    assert chowns and chowns[-1][1] == st_before.st_uid  # 覆盖回写原属主
+    assert (st_after.st_mode & 0o777) == 0o640          # overwrite preserves original mode
+    assert chowns and chowns[-1][1] == st_before.st_uid  # overwrite restores original owner

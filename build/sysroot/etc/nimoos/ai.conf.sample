@@ -14,12 +14,16 @@ OllamaURL = http://127.0.0.1:11434
 [openvino]
 URL = http://127.0.0.1:9100
 Enabled = true
-# 常驻设备(逗号分隔),第一个为省略 @device 时的默认。默认只常驻独显 GPU.1;
-# 要同时常驻核显写 "GPU.1,GPU.0"(核显吃 32GB 共享内存,偏紧)。
+# Resident devices (comma-separated); the first one is the default when @device is
+# omitted. By default only the discrete GPU.1 stays resident; to also keep the
+# integrated GPU resident, write "GPU.1,GPU.0" (the iGPU eats 32GB of shared memory,
+# so this is tight).
 Devices = GPU.1
-# 同时最多驻留几个模型(对齐 Ollama OLLAMA_MAX_LOADED_MODELS);受显存约束,超出按 LRU 卸载。
+# Max number of models resident at once (mirrors Ollama's OLLAMA_MAX_LOADED_MODELS);
+# constrained by VRAM, excess is evicted LRU-style.
 MaxLoadedModels = 3
-# 空闲多少分钟后自动卸载释放显存(对齐 Ollama keep_alive 默认 5 分钟);0 = 永不卸载。
+# Auto-unload after this many idle minutes to free VRAM (mirrors Ollama's keep_alive
+# default of 5 minutes); 0 = never unload.
 IdleTTLMinutes = 5
 
 # Attachment limits (override via env NIMOOS_MAX_ATTACHMENT_SIZE etc.)
