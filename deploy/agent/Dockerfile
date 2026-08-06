@@ -53,8 +53,16 @@ RUN set -eux; cd /tmp; \
 # PIP_INDEX_URL: defaults to the official source; for mainland-China/slow-network
 # builds, pass --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple to speed things up.
 ARG PIP_INDEX_URL=https://pypi.org/simple
-COPY agent/requirements.txt /usr/share/nimoos/agent/requirements.txt
-RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r /usr/share/nimoos/agent/requirements.txt
+# 装 lock 文件(定版,无区间可冲突,故不需要 --override)。uv 已在上面的
+# "Node + uv" 层装过。requirements.txt / overrides.txt 是源文件,只在重新
+# 解析依赖时用到,不进镜像。
+# --no-deps:requirements.lock 是 `uv pip compile` 产出的完整传递闭包,安装阶段
+# 只需照单物化,不该再重新解析一次依赖图 —— 重新解析会撞上 openai-agents 包元数据
+# 里那条 `mcp<2` 声明(该冲突只存在于元数据、不存在于代码,依据见 overrides.txt),
+# 即使 lock 里每一行都已是 `==` 精确版本也会被判定为 ResolutionImpossible。
+COPY agent/requirements.lock /usr/share/nimoos/agent/requirements.lock
+RUN uv pip install --system --no-cache --no-deps -i "${PIP_INDEX_URL}" \
+      -r /usr/share/nimoos/agent/requirements.lock
 COPY agent/ /usr/share/nimoos/agent/
 
 WORKDIR /usr/share/nimoos/agent

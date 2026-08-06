@@ -18,47 +18,75 @@ def test_stdio_env_protects_core_and_passthrough(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_connect_stdio_branch(monkeypatch):
-    """stdio transport branch uses MCPServerNetnsStdio via netns executor."""
+    """stdio transport branch must NOT spawn the subprocess directly — it has to
+    go through the netns executor (start_mcp_stdio) and connect over the Unix
+    socket via netns_stdio_transport. This is a security property (sandboxed
+    subprocess), not just plumbing, so it must survive the SDK-client rewrite."""
     captured = {}
-
-    class FakeNetnsStdio:
-        def __init__(self, socket_path=None, name=None,
-                     cache_tools_list=False,
-                     client_session_timeout_seconds=None, **kwargs):
-            captured["socket_path"] = socket_path
-            captured["name"] = name
-            captured["timeout"] = client_session_timeout_seconds
-
-        async def connect(self):
-            captured["connected"] = True
-
-    import mcp_client.netns_stdio as ns_mod
-    monkeypatch.setattr(ns_mod, "MCPServerNetnsStdio", FakeNetnsStdio)
-
-    import netns.client as netns_client_mod
 
     async def fake_start_mcp_stdio(command, args, env, **kwargs):
         captured["command"] = command
         captured["args"] = args
         captured["env"] = env
+        captured["connect_timeout"] = kwargs.get("connect_timeout")
         return "/var/run/nimoos/agent-mcp-fake.sock"
 
+    import netns.client as netns_client_mod
     monkeypatch.setattr(netns_client_mod, "start_mcp_stdio", fake_start_mcp_stdio)
+
+    transport_calls = []
+
+    def fake_netns_stdio_transport(socket_path):
+        transport_calls.append(socket_path)
+        return object()
+
+    import mcp_client.netns_stdio as ns_mod
+    monkeypatch.setattr(ns_mod, "netns_stdio_transport", fake_netns_stdio_transport)
+
+    # Positive assertion that the SDK's OWN stdio transport (which spawns the
+    # subprocess directly, bypassing the netns sandbox) is never even reached: an
+    # implementation that went through netns AND also fell through to the SDK's
+    # stdio_client would still pass every assertion above without this stub — it
+    # closes exactly the gap the security property depends on.
+    def _boom_sdk_stdio_client(*a, **k):
+        raise AssertionError("SDK's own stdio_client must never be called — "
+                              "stdio subprocesses must be spawned via the netns sandbox")
+
+    import mcp.client.stdio as sdk_stdio_mod
+    monkeypatch.setattr(sdk_stdio_mod, "stdio_client", _boom_sdk_stdio_client)
+
+    class _FakeClientCM:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    monkeypatch.setattr(mc, "Client", lambda *a, **k: _FakeClientCM())
 
     server = {"id": 1, "name": "fs", "transport": "stdio",
               "command": "npx", "args": ["-y", "x"], "env": {"K": "V"}}
     conn = await mc._connect(server)
-    assert captured["connected"] is True
-    assert captured["command"] == "npx"
-    assert captured["args"] == ["-y", "x"]
-    assert captured["env"]["K"] == "V"
-    assert "PATH" in captured["env"]
-    assert captured["socket_path"] == "/var/run/nimoos/agent-mcp-fake.sock"
-    assert captured["name"] == "fs"
-    assert captured["timeout"] == mc.STDIO_CONNECT_TIMEOUT
+    try:
+        # never spawned directly: the subprocess lives in the sandboxed netns
+        assert captured["command"] == "npx"
+        assert captured["args"] == ["-y", "x"]
+        assert captured["env"]["K"] == "V"
+        assert "PATH" in captured["env"]
+        assert captured["connect_timeout"] == mc.STDIO_CONNECT_TIMEOUT
+        assert transport_calls == ["/var/run/nimoos/agent-mcp-fake.sock"]
+    finally:
+        await conn.aclose()
 
 
 def test_connect_timeout_per_transport():
+    # NOTE: this only pins the _connect_timeout() lookup table, not enforcement.
+    # MCP_CONNECT_TIMEOUT is actually ENFORCED only on the stdio branch (passed
+    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse in
+    # _get_run_conn and _revalidate, _connect() is not wrapped in asyncio.wait_for
+    # — the handshake is bounded only by the generous httpx2 AsyncClient(timeout=
+    # session_to) built in _build_transport (~60s), not this constant. For the
+    # run-start cold path, _metas_for_server wraps _cold_fetch in asyncio.wait_for
+    # with MCP_COLD_TOTAL_TIMEOUT, capping both connect and list together. Reading
+    # "http/sse connects are capped at MCP_CONNECT_TIMEOUT today" would be wrong
+    # outside the cold-path context.
     assert mc._connect_timeout({"transport": "stdio"}) == mc.STDIO_CONNECT_TIMEOUT
     assert mc._connect_timeout({"transport": "http"}) == mc.MCP_CONNECT_TIMEOUT
     assert mc._connect_timeout({}) == mc.MCP_CONNECT_TIMEOUT
@@ -66,7 +94,7 @@ def test_connect_timeout_per_transport():
 
 def test_session_timeout_per_transport():
     # The per-request (list/call) read timeout is decoupled from the connect cap:
-    # remote tool calls (e.g. MS Learn semantic search) routinely exceed the 5s
+    # remote tool calls (e.g. MS Learn semantic search) routinely exceed the 8s
     # connect cap, so the session timeout must be generous.
     assert mc._session_timeout({"transport": "http"}) == mc.MCP_SESSION_TIMEOUT
     assert mc._session_timeout({"transport": "sse"}) == mc.MCP_SESSION_TIMEOUT
@@ -78,24 +106,34 @@ def test_session_timeout_per_transport():
 
 @pytest.mark.asyncio
 async def test_connect_http_uses_session_timeout_not_connect_cap(monkeypatch):
-    """http session timeout (client_session_timeout_seconds) must be the generous
-    MCP_SESSION_TIMEOUT, not the 5s connect cap — otherwise slow remote tool calls
-    get cancelled mid-call (the MS Learn 'can't call' bug)."""
+    """Client's read_timeout_seconds (bounds every list/call JSON-RPC request) must
+    be the generous MCP_SESSION_TIMEOUT, not the 8s connect cap — otherwise slow
+    remote tool calls get cancelled mid-call (the MS Learn 'can't call' bug).
+
+    This no longer touches agents.mcp at all: _connect talks straight to the mcp
+    2.0 SDK now, so agents.mcp.MCPServerStreamableHttp is not even imported by the
+    code under test."""
     captured = {}
 
-    class FakeHttpSrv:
-        def __init__(self, params=None, client_session_timeout_seconds=None, name=None):
-            captured["timeout"] = client_session_timeout_seconds
-        async def connect(self): captured["connected"] = True
+    async def fake_build_transport(server, stack, connect_to, session_to):
+        captured["session_to"] = session_to
+        return object()
 
-    import agents.mcp as am
-    monkeypatch.setattr(am, "MCPServerStreamableHttp", FakeHttpSrv, raising=False)
+    class FakeClient:
+        def __init__(self, transport, **kwargs):
+            captured["read_timeout_seconds"] = kwargs.get("read_timeout_seconds")
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    monkeypatch.setattr(mc, "_build_transport", fake_build_transport)
+    monkeypatch.setattr(mc, "Client", FakeClient)
 
     server = {"id": 2, "name": "ms-learn", "transport": "http",
               "url": "https://learn.microsoft.com/api/mcp", "headers": {}}
-    await mc._connect(server)
-    assert captured["connected"] is True
-    assert captured["timeout"] == mc.MCP_SESSION_TIMEOUT
+    conn = await mc._connect(server)
+    assert captured["session_to"] == mc.MCP_SESSION_TIMEOUT
+    assert captured["read_timeout_seconds"] == mc.MCP_SESSION_TIMEOUT
+    await conn.aclose()
 
 
 @pytest.fixture
@@ -170,8 +208,8 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
         async def list_tools(self):
             import asyncio
             await asyncio.sleep(10)
-        async def cleanup(self): pass
-    async def fake_connect(s, connect_timeout=None): return mc.McpConn(server=s, srv=SlowSrv())
+        async def aclose(self): pass
+    async def fake_connect(s, connect_timeout=None): return SlowSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)   # http probe budget tiny -> list times out fast
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
@@ -180,16 +218,16 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
 
 @pytest.mark.asyncio
 async def test_stdio_conn_cleanup_called_on_close(monkeypatch):
-    """Our run path must trigger the SDK's cleanup() for stdio conns (which is
-    where the SDK does the process-group kill). Full no-orphan check is manual."""
+    """Our run path must trigger aclose(), i.e. the AsyncExitStack unwinding in
+    reverse (Client -> transport -> socket/subprocess) — which is where the stdio
+    subprocess actually gets killed. Full no-orphan check is manual."""
     cleaned = {"n": 0}
 
     class FakeStdioSrv:
-        async def connect(self): pass
-        async def cleanup(self): cleaned["n"] += 1   # SDK group-kill happens here
+        async def aclose(self): cleaned["n"] += 1   # stack unwind happens here
 
     async def fake_connect(server, connect_timeout=None):
-        return mc.McpConn(server=server, srv=FakeStdioSrv())
+        return FakeStdioSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
     mc._RUN_CONNS_VAR.set({})

@@ -9,16 +9,46 @@ import re
 import time
 from collections import OrderedDict
 from contextvars import ContextVar
+from contextlib import AsyncExitStack
 
+import anyio
 from agents import FunctionTool
+from mcp.client import Client, InputRequiredRoundsExceededError
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_REQUEST
+from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 
 from mcp_client.schema import sanitize_schema, flatten_result
+from mcp_client.elicitation import make_elicitation_callback
 
-MCP_CONNECT_TIMEOUT = 5  # seconds; hard cap on the run-start CONNECT path (keeps startup non-blocking)
+# Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
+# server/discover and falls back to the legacy initialize handshake on old
+# servers, i.e. one extra round trip before we can list anything).
+#
+# CURRENTLY INERT as a runtime bound, though: it only flows into
+# _build_transport's `connect_to` parameter, and that parameter is only
+# consumed by the stdio branch (netns_client.start_mcp_stdio(connect_timeout=
+# connect_to)) — the http branch builds its httpx2.AsyncClient with
+# `timeout=session_to`, and the sse branch passes `timeout=session_to` to
+# sse_client, neither touches connect_to. So today the 5→8 change has zero
+# runtime effect; the actual upper bounds are: http/sse's run-start cold path
+# is capped at the _metas_for_server layer by MCP_COLD_TOTAL_TIMEOUT, and
+# stdio is capped by STDIO_CONNECT_TIMEOUT (via _connect_timeout()), not this
+# constant. Not deleted — tests/test_mcp_stdio.py pins _connect_timeout()'s
+# lookup table against it, and it is still the value _cold_fetch's default
+# `connect_timeout=None` resolves to.
+MCP_CONNECT_TIMEOUT = 8
+
+# Single hard cap on the WHOLE run-start cold path (connect + list). Without it,
+# raising the connect leg to 8s would push the worst case from 5+5 to 8+8 and make
+# run start noticeably slower; this keeps it exactly where it was.
+MCP_COLD_TOTAL_TIMEOUT = 10
 
 # ClientSession read timeout — bounds each JSON-RPC request (list_tools AND call_tool),
 # NOT just the connect. Must be generous: remote tool calls (e.g. MS Learn semantic
-# search) routinely take several seconds, far past the 5s connect cap. call_tool has no
+# search) routinely take several seconds, far past the 8s connect cap. call_tool has no
 # outer wait_for, so it is bounded ONLY by this value — too small here silently cancels
 # every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
 MCP_SESSION_TIMEOUT = 60  # seconds
@@ -84,17 +114,68 @@ def _stdio_env(user_env: dict) -> dict:
     return env
 
 
-SCHEMA_TTL = 600        # seconds; past this it goes stale (still usable, triggers a background revalidate)
+# Default entry lifetime when the server gives no hint (i.e. every legacy-protocol
+# server, and any 2026-07-28 server that leaves ttlMs at its default 0). Past this
+# an entry goes stale (still usable, triggers a background revalidate).
+SCHEMA_TTL = 600
+# Floor for a server-declared ttlMs. A server declaring something tiny would punch
+# through the zero-connection warm path that is the whole reason this cache exists.
+# Worst case is a manifest up to a minute stale — we explicitly do not subscribe to
+# change notifications anyway, so that window is already accepted. Config changes
+# still invalidate instantly via the fingerprint, unaffected by this floor.
+SCHEMA_TTL_MIN = 60
 SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
+
+# MRTR round cap = the SDK default (mcp/client/_input_required.py::
+# DEFAULT_INPUT_REQUIRED_MAX_ROUNDS). A "round" is a REQUEST/RETRY round trip, not a
+# question put to the user: the user pondering a card burns none of these — our
+# callback simply hasn't returned yet and _dispatch_all keeps awaiting it, with the
+# round counter frozen and only our own 24h confirm timeout running.
+#
+# What DOES burn rounds is the state-only leg: an InputRequiredResult carrying only
+# requestState and no inputRequests. The spec treats that as a first-class shape (a
+# server MUST include at least one of the two) and it is how a server says "the
+# out-of-band authorization you accepted hasn't landed yet, ask me again". The SDK
+# answers it with a bare sleep — 50ms, doubling, capped at 250ms — and retries. So a
+# cap of 3, as the phase-2 handoff originally suggested, is spent in 0.05+0.1+0.2 =
+# 350ms and would throw InputRequiredRoundsExceededError at a perfectly compliant
+# server. 10 buys 0.05+0.1+0.2+0.25*7 = 2.1s.
+#
+# 2.1s does NOT make out-of-band OAuth work — nobody completes a login in two
+# seconds. That is a deliberate, documented phase-2 trade-off (see the handoff's
+# §4 correction): the URL card returns "accept" the moment the user consents to
+# open the link, and a real OAuth server will still be waiting when the rounds run
+# out. Raising the cap stops us from breaking COMPLIANT servers; it does not
+# implement the wait. The fix for that is the deferred "I finished authorizing"
+# card, which moves the wait inside our own callback where no round cap applies.
+MCP_INPUT_REQUIRED_ROUNDS = 10
+
+# Upper bound on aclose(). aclose() shields itself from cancellation (see McpConn),
+# which turns "remote hangs" from "gets cancelled" into "waits forever" — this caps
+# that new risk. Shielding only blocks the OUTER cancel; this inner deadline still fires.
+MCP_CLOSE_TIMEOUT = 5
+
+
+def _resolve_ttl(raw_ttl_ms) -> int:
+    """Server-declared ttlMs -> our cache entry lifetime, in seconds.
+
+    "Absent" and "0" converge for free: legacy responses have no such field and the
+    SDK model defaults it to 0, so neither needs special-casing. Applied once, at
+    write time — see _cache_put.
+    """
+    if not isinstance(raw_ttl_ms, (int, float)) or raw_ttl_ms <= 0:
+        return SCHEMA_TTL
+    return max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN)
 
 
 class _CacheEntry:
-    __slots__ = ("metas", "fetched_at", "fingerprint")
+    __slots__ = ("metas", "fetched_at", "fingerprint", "ttl")
 
-    def __init__(self, metas, fetched_at, fingerprint):
+    def __init__(self, metas, fetched_at, fingerprint, ttl):
         self.metas = metas              # list[dict]: {"name","description","input_schema"}
         self.fetched_at = fetched_at    # time.monotonic()
         self.fingerprint = fingerprint
+        self.ttl = ttl                  # seconds; resolved at WRITE time (see _resolve_ttl)
 
 
 _SCHEMA_CACHE: "OrderedDict[int, _CacheEntry]" = OrderedDict()  # key = server["id"], LRU
@@ -103,13 +184,21 @@ _BACKGROUND_TASKS: set = set()         # strong refs so asyncio.create_task task
 
 
 def _extract_meta(mcp_tool) -> dict:
+    # mcp 2.0's mcp_types.Tool exposes the JSON Schema via the Python attribute
+    # `input_schema` (snake_case) — `inputSchema` is only the wire-format alias,
+    # NOT a Python attribute on the model (verified empirically: getattr(tool,
+    # "inputSchema", ...) returns the default on a real Tool instance). No
+    # camelCase fallback here on purpose: a fallback that's never exercised by a
+    # real Tool would silently keep working even if this line regressed back to
+    # the wrong name — see test_extract_meta_real_tool, which uses a real
+    # mcp_types.Tool precisely so that regression can't hide.
     return {"name": mcp_tool.name,
             "description": getattr(mcp_tool, "description", "") or "",
-            "input_schema": getattr(mcp_tool, "inputSchema", None)}
+            "input_schema": getattr(mcp_tool, "input_schema", None)}
 
 
-def _cache_put(server_id: int, metas, fingerprint) -> None:
-    _SCHEMA_CACHE[server_id] = _CacheEntry(metas, time.monotonic(), fingerprint)
+def _cache_put(server_id: int, metas, fingerprint, ttl) -> None:
+    _SCHEMA_CACHE[server_id] = _CacheEntry(metas, time.monotonic(), fingerprint, ttl)
     _SCHEMA_CACHE.move_to_end(server_id)
     while len(_SCHEMA_CACHE) > SCHEMA_CACHE_MAX:
         _SCHEMA_CACHE.popitem(last=False)   # evict least-recently-used
@@ -196,6 +285,108 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     return confirmed
 
 
+def _rounds_exceeded_msg(server_name: str) -> str:
+    """MRTR rounds exhausted AFTER we already asked the user and they answered.
+
+    Phase 1 reused the "capability not supported" wording here, and in phase 2 that
+    is simply false: elicitation IS supported now. The real meaning is "we asked, the
+    user answered, the server still isn't ready" — overwhelmingly an out-of-band
+    authorization that hasn't completed. Telling the model to check the server's
+    CONFIGURATION would send the user off fixing the wrong thing.
+    """
+    return (f'[MCP error] MCP server "{server_name}" asked for input, the user answered, '
+            "and the server is still not ready. This is almost always an out-of-band "
+            "authorization that has not finished yet — it is NOT a problem with the call "
+            "arguments, so do NOT retry with different arguments. Tell the user to finish "
+            "the authorization in the page that was opened, then ask you to retry.")
+
+
+def _unsupported_capability_msg(server_name: str) -> str:
+    """A capability we deliberately never declare (sampling / roots) was required.
+
+    Wording is phase 1's, unchanged and still accurate for those two: we really do not
+    support them, and the server really does need reconfiguring. Only the elicitation
+    half of the old shared message moved out (see _rounds_exceeded_msg).
+    """
+    return (f'[MCP error] MCP server "{server_name}" needs interactive input to complete '
+            "this call, which is not supported. This is a server-side capability issue "
+            "unrelated to the call arguments — do NOT retry with different arguments; "
+            "tell the user to check that MCP server's configuration.")
+
+
+def _legacy_url_elicitation_msg(server_name: str) -> str:
+    """The 2025-11-25 URL-authorization flow, which we deliberately do not implement.
+
+    Elicitation is two entirely different wire mechanisms across the two protocol
+    versions. Under 2026-07-28 a URL request rides inside `InputRequiredResult`.
+    Under 2025-11-25 it is an ERROR (-32042) carrying `data.elicitations`, and the
+    completion signal is a `notifications/elicitation/complete` naming an
+    `elicitationId` — a notification the client side of the SDK has no handler for at
+    all (grep over mcp/client/ and mcp/shared/ finds nothing; only mcp/server/* sends
+    it). We could show the card, but we could never learn that the user finished.
+
+    We reach here at all because _connect uses mode="auto", so a legacy session is a
+    live possibility. Phase 1 let this fall into the generic "[MCP error] ... failed"
+    branch, which told the user nothing. Being unsupported is fine; being unsupported
+    silently is not.
+    """
+    return (f'[MCP error] MCP server "{server_name}" is asking for authorization using '
+            "the legacy (2025-11-25) URL elicitation flow, which this client does not "
+            "support. This is a protocol-version issue unrelated to the call arguments "
+            "— do NOT retry with different arguments; tell the user this server needs "
+            "to support MCP 2026-07-28 for authorization to work.")
+
+
+def _is_legacy_url_elicitation(err) -> bool:
+    """True for URL_ELICITATION_REQUIRED (-32042), the 2025-11-25-only shape.
+
+    Code alone is a sufficient discriminator — it is a dedicated code with exactly this
+    meaning, mirroring how _is_unsupported_capability treats -32021.
+    """
+    data = getattr(err, "error", None)
+    return data is not None and getattr(data, "code", None) == URL_ELICITATION_REQUIRED
+
+
+def _is_unsupported_capability(err) -> bool:
+    """True when a tool call cannot proceed because it needs a client capability we
+    deliberately never declare (sampling / roots).
+
+    Elicitation is NOT in that set as of phase 2 — `_connect` now passes an
+    `elicitation_callback`, so a compliant server asking for it succeeds via the normal
+    MRTR path instead of landing here. This function still matters for elicitation in
+    one narrow case: a legacy/non-compliant server that sends `inputRequests` in a shape
+    our declared capability doesn't cover, or before capability negotiation settles.
+
+    Two wire shapes mean "capability not supported", and BOTH must be recognised — they
+    come from opposite kinds of server:
+
+    1. `MISSING_REQUIRED_CLIENT_CAPABILITY` (-32021) — how a **compliant** 2026-07-28
+       server says "this call needs a capability you did not declare", carrying
+       `data.requiredCapabilities`. This is the case we actually meet in the field, and
+       the code alone is a sufficient discriminator: it is a dedicated code with exactly
+       this meaning.
+    2. `INVALID_REQUEST` (-32600) + a message ending in "not supported" — produced by the
+       SDK's own built-in default callbacks when a **non-compliant** server sends
+       `inputRequests` to a client that never declared the capability. This shape no
+       longer applies to elicitation (we declare it, so the SDK's default callback is
+       never in play for it) — it now only fires for sampling/roots. Here the code is
+       generic, so the message suffix is needed to narrow the false-positive surface;
+       tests/test_mcp_mrtr.py pins the SDK's three sentinel strings so a rewording fails
+       loudly instead of silently degrading to the generic error path.
+
+    In both cases a remote tool's ordinary business failure is NOT at risk of being
+    misread: those arrive as `isError=True` inside a result, never as a JSON-RPC error.
+    """
+    data = getattr(err, "error", None)
+    if data is None:
+        return False
+    code = getattr(data, "code", None)
+    if code == MISSING_REQUIRED_CLIENT_CAPABILITY:
+        return True
+    return (code == INVALID_REQUEST
+            and str(getattr(data, "message", "")).endswith("not supported"))
+
+
 def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
     slug = _slug(server["name"])
     tool_name = meta["name"]
@@ -221,6 +412,14 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
                     "do NOT retry with different arguments; tell the user to check that MCP server.")
         try:
             result = await conn.call_tool(tool_name, args)   # tool execution layer
+        except InputRequiredRoundsExceededError:
+            return _rounds_exceeded_msg(server["name"])
+        except MCPError as e:
+            if _is_legacy_url_elicitation(e):
+                return _legacy_url_elicitation_msg(server["name"])
+            if _is_unsupported_capability(e):
+                return _unsupported_capability_msg(server["name"])
+            return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         return flatten_result(result)
@@ -235,20 +434,46 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
 
 
 class McpConn:
-    """Holds a live agents.mcp server. `srv` exposes connect/list_tools/
-    call_tool/cleanup (the agents.mcp server interface)."""
-    __slots__ = ("server", "srv")
+    """Holds a credential-configured MCP client instance for one run.
 
-    def __init__(self, server: dict, srv):
+    There is NO protocol session under MCP 2026-07-28. The lifecycle managed here
+    exists for two unrelated reasons:
+      (a) stdio: a real local subprocess needs someone to start and kill it;
+      (b) http/sse: the SDK takes user auth headers on the pre-built httpx client,
+          not per call — so the credentials need somewhere to live.
+    It is not protocol state, and TCP reuse is only an incidental benefit.
+    """
+    __slots__ = ("server", "client", "stack")
+
+    def __init__(self, server: dict, client, stack):
         self.server = server
-        self.srv = srv
+        self.client = client
+        self.stack = stack
 
     async def call_tool(self, name: str, args: dict):
-        return await self.srv.call_tool(name, args)
+        return await self.client.call_tool(name, args)
+
+    async def list_tools(self) -> tuple[list[dict], int]:
+        """Return (tool metas, cache ttl in seconds) — exactly what the schema
+        cache stores, so callers never touch the SDK result object.
+
+        cacheScope is deliberately NOT read: it constrains shared intermediary
+        proxies, and we are an end client — storing a field we never act on would
+        only make a later reader guess what it is for.
+        """
+        result = await self.client.list_tools()
+        metas = [_extract_meta(t) for t in result.tools]
+        return metas, _resolve_ttl(getattr(result, "ttl_ms", None))
 
     async def aclose(self):
         try:
-            await self.srv.cleanup()
+            # Shielded: _cold_fetch's finally and test_server both call this from
+            # inside an outer asyncio.wait_for. A bare await would be re-cancelled
+            # on the spot, leaving the Client context unexited (leaked httpx client
+            # / unix socket). move_on_after keeps the shield from waiting forever.
+            with anyio.CancelScope(shield=True):
+                with anyio.move_on_after(MCP_CLOSE_TIMEOUT):
+                    await self.stack.aclose()
         except Exception:
             pass
 
@@ -260,29 +485,38 @@ async def _emit_warning(server_name: str, err) -> None:
     await queue.put({"type": "mcp_warning", "server": server_name, "error": str(err)})
 
 
-async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
+async def _build_transport(server: dict, stack: AsyncExitStack,
+                           connect_to: int, session_to: int):
+    """Pick and construct the SDK transport for this server. Anything needing
+    explicit teardown is registered on *stack* so a failed connect still releases it.
+
+    NOTE (deviation from the task-3 brief, verified empirically — see
+    task-3-report.md): the brief's draft passes `http_client=` to BOTH
+    streamable_http_client and sse_client. That only exists on
+    streamable_http_client — sse_client's real signature is
+    `sse_client(url, headers=None, timeout=5.0, sse_read_timeout=300.0,
+    httpx_client_factory=..., auth=None, on_session_created=None)`, i.e. it takes
+    headers/timeout directly and has no http_client= parameter at all; passing one
+    would raise TypeError. So sse gets its auth headers via its own headers=
+    kwarg instead of a pre-built httpx2 client — there is nothing of ours to
+    register on stack for that branch.
+    """
     transport = server.get("transport", "http")
-    # connect_timeout caps the TCP+TLS+initialize handshake. The run-start cold path
-    # uses the short default (_connect_timeout) to stay non-blocking; call-time /
-    # background / test callers pass a generous value because a COLD connect to a
-    # remote server can take several seconds (measured ~5.6s to learn.microsoft.com)
-    # — well past the 5s run-start cap. session timeout bounds each request after
-    # connect (list/call); see MCP_SESSION_TIMEOUT.
-    connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
-    session_to = _session_timeout(server)
-    if transport in ("http", "sse"):
-        from agents.mcp import MCPServerStreamableHttp, MCPServerSse
-        cls = MCPServerStreamableHttp if transport == "http" else MCPServerSse
-        srv = cls(
-            params={"url": server["url"], "headers": server.get("headers", {})},
-            client_session_timeout_seconds=session_to,
-            name=server.get("name", "mcp"),
-        )
-    elif transport == "stdio":
+    headers = server.get("headers", {}) or {}
+    if transport == "http":
+        import httpx2
+        # The user's auth headers can ONLY be supplied through a pre-built httpx
+        # client here — streamable_http_client takes no headers= parameter.
+        http_client = await stack.enter_async_context(
+            httpx2.AsyncClient(headers=headers, timeout=session_to))
+        return streamable_http_client(server["url"], http_client=http_client)
+    if transport == "sse":
+        return sse_client(server["url"], headers=headers, timeout=session_to)
+    if transport == "stdio":
         # Deny-by-default gate: the stdio command spawns directly in the netns
         # executor, bypassing the shell guard — never spawn an off-list command.
         _assert_stdio_command_allowed(server.get("command", ""))
-        from mcp_client.netns_stdio import MCPServerNetnsStdio
+        from mcp_client.netns_stdio import netns_stdio_transport
         import netns.client as netns_client
         socket_path = await netns_client.start_mcp_stdio(
             command=server["command"],
@@ -290,16 +524,79 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             env=_stdio_env(server.get("env", {})),
             connect_timeout=connect_to,
         )
-        srv = MCPServerNetnsStdio(
-            socket_path=socket_path,
-            name=server.get("name", "mcp"),
-            cache_tools_list=False,
-            client_session_timeout_seconds=session_to,
-        )
-    else:
-        raise ValueError(f"unsupported transport: {transport}")
-    await asyncio.wait_for(srv.connect(), timeout=connect_to)
-    return McpConn(server=server, srv=srv)
+        return netns_stdio_transport(socket_path)
+    raise ValueError(f"unsupported transport: {transport}")
+
+# NOTE (unchanged behaviour, called out so nobody "fixes" it here): start_mcp_stdio
+# spawns the subprocess BEFORE the transport is opened, so if Client construction
+# fails the subprocess is reclaimed by the netns executor's own timeout, not by us.
+# That is exactly how it worked before this upgrade; changing it is out of scope.
+
+
+async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
+    """Build a transport, wrap it in an SDK Client, and hand back a McpConn whose
+    aclose() unwinds the whole stack (Client → transport → socket/subprocess).
+
+    connect_timeout is only actually ENFORCED for the stdio branch (passed straight
+    through to netns start_mcp_stdio). For http/sse, the connect is bounded
+    differently in different callers: _get_run_conn and _revalidate do NOT wrap
+    _connect() in asyncio.wait_for, so the handshake is bounded only by the generous
+    httpx2 AsyncClient(timeout=session_to) built in _build_transport. For the
+    run-start cold path, _metas_for_server wraps _cold_fetch (which calls _connect)
+    in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the entire connect+list
+    sequence together. test_server also wraps its connect+list probe in an outer
+    asyncio.wait_for.
+    """
+    connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
+    session_to = _session_timeout(server)
+
+    stack = AsyncExitStack()
+    try:
+        transport = await _build_transport(server, stack, connect_to, session_to)
+        client = await stack.enter_async_context(Client(
+            transport,
+            # mode="auto" IS the dual-protocol support: probe server/discover, fall
+            # back to the legacy initialize handshake on old servers. We write no
+            # protocol-version logic of our own.
+            mode="auto",
+            read_timeout_seconds=session_to,
+            input_required_max_rounds=MCP_INPUT_REQUIRED_ROUNDS,
+            # SDK-side response caching is off: this project's own manifest cache has
+            # two semantics the SDK's lacks (config-fingerprint invalidation and
+            # stale-while-revalidate), and two caches would fight.
+            cache=None,
+            # This single argument declares BOTH elicitation sub-capabilities.
+            # mcp/client/session.py::_build_capabilities builds
+            #   ElicitationCapability(form=FormElicitationCapability(),
+            #                         url=UrlElicitationCapability())
+            # unconditionally whenever the callback differs from the SDK default —
+            # there is no form-only setting. And the spec says servers MUST NOT send a
+            # mode the client did not declare, so declaring `url` obliges us to have a
+            # url card. That is why the two cards shipped together rather than in two
+            # phases. Pinned by test_mcp_protocol_compat.py::
+            # test_we_declare_both_elicitation_modes_but_still_no_sampling_or_roots.
+            #
+            # Still NO sampling / roots callback, on purpose: sampling would let a
+            # third-party server spend our model budget and inject prompts into our
+            # model. Not declaring is the strongest defence — a compliant server never
+            # asks — and _is_unsupported_capability still covers the rest.
+            elicitation_callback=make_elicitation_callback(
+                server,
+                session_id_var=SESSION_ID_VAR,
+                queue_var=EVENT_QUEUE_VAR,
+                mgr_var=CONFIRM_MGR_VAR),
+        ))
+    except BaseException:
+        # Shielded: the caller's asyncio.wait_for cancels us mid-handshake on timeout —
+        # the single most common failure here. A bare await would be re-cancelled and
+        # leak the unix socket or the stdio subprocess. move_on_after mirrors
+        # McpConn.aclose(): shielding turns "remote hangs" from "gets cancelled" into
+        # "waits forever" — this caps that new risk the same way aclose() does.
+        with anyio.CancelScope(shield=True):
+            with anyio.move_on_after(MCP_CLOSE_TIMEOUT):
+                await stack.aclose()
+        raise
+    return McpConn(server=server, client=client, stack=stack)
 
 
 async def _get_run_conn(server: dict) -> "McpConn":
@@ -317,7 +614,7 @@ async def _get_run_conn(server: dict) -> "McpConn":
         if sid in conns:                 # double-check after acquiring
             return conns[sid]
         # call-time: the user is actively invoking the tool — tolerate a cold/slow
-        # connect (generous cap) instead of failing the call at the 5s run-start cap.
+        # connect (generous cap) instead of failing the call at the 8s run-start cap.
         conn = await _connect(server, connect_timeout=_session_timeout(server))
         conns[sid] = conn
         return conn
@@ -349,12 +646,13 @@ def _schedule_revalidate(server: dict) -> None:
 async def _revalidate(server: dict) -> None:
     try:
         # background: not blocking any run, so use the generous session budget for
-        # both connect and list (tolerates a cold remote connect that the 5s
+        # both connect and list (tolerates a cold remote connect that the 8s
         # run-start cap would reject). This is what self-heals a slow server.
         conn = await _connect(server, connect_timeout=_session_timeout(server))
         try:
-            tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_session_timeout(server))
-            _cache_put(server["id"], [_extract_meta(t) for t in tools], _fingerprint(server))
+            metas, ttl = await asyncio.wait_for(conn.list_tools(),
+                                                timeout=_session_timeout(server))
+            _cache_put(server["id"], metas, _fingerprint(server), ttl)
         finally:
             await conn.aclose()
     except Exception:
@@ -366,14 +664,16 @@ async def _cold_fetch(server: dict):
     closed immediately (real calls use the per-run lazy connection)."""
     conn = await _connect(server)
     try:
-        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=_connect_timeout(server))
+        # No wait_for here — the caller (_metas_for_server) wraps the whole _cold_fetch
+        # in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the complete cold path
+        # (connect + list). Wrapping again here with the same constant would create dead code:
+        # the outer deadline (started before _connect) always fires first, so the inner
+        # wait_for would never actually timeout. Per-request read timeouts are separately
+        # bounded by Client(read_timeout_seconds=...) in _connect.
+        metas, ttl = await conn.list_tools()
     finally:
-        try:
-            await conn.aclose()
-        except Exception:
-            pass
-    metas = [_extract_meta(t) for t in tools]
-    _cache_put(server["id"], metas, _fingerprint(server))
+        await conn.aclose()
+    _cache_put(server["id"], metas, _fingerprint(server), ttl)
     return metas
 
 
@@ -384,7 +684,7 @@ async def _metas_for_server(server: dict):
     fp = _fingerprint(server)
     entry = _cache_get(server["id"])
     if entry is not None and entry.fingerprint == fp:
-        if time.monotonic() - entry.fetched_at > SCHEMA_TTL:
+        if time.monotonic() - entry.fetched_at > entry.ttl:
             _schedule_revalidate(server)        # stale-while-revalidate
         return entry.metas
     # cold / fingerprint changed:
@@ -394,9 +694,12 @@ async def _metas_for_server(server: dict):
                             "stdio tools are initializing in the background for first use; retry shortly")
         return []
     try:
-        return await _cold_fetch(server)        # http/sse: fetch inline (short timeout, does not block run startup)
+        # ONE budget for the whole cold path (connect + list). The connect leg alone
+        # is now 8s for mode="auto"'s extra server/discover round trip; without this
+        # cap the run-start worst case would grow from 5+5 to 8+8.
+        return await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
     except Exception as e:
-        # A cold-fetch timeout is usually a cold connection on a slow link (>5s).
+        # A cold-fetch timeout is usually a cold connection on a slow link.
         # Warm the cache in the background with a generous timeout; tools are ready by the next run.
         _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
@@ -427,7 +730,12 @@ async def build_mcp_tools(servers: list[dict]) -> list:
     return tools
 
 
-TEST_TIMEOUT = 9  # seconds; must be < the Go caller’s timeout (10s), so Python actively cancels and releases after Go gives up
+# 9→20: a cold probe of a remote http server (DNS + TLS + mode="auto"'s
+# server/discover → legacy initialize fallback + a large tools/list) routinely
+# exceeds 9s, so the first probe always timed out and only the second one passed.
+# This widens the PROBE only: the run-start path keeps MCP_COLD_TOTAL_TIMEOUT at
+# 10s deliberately, so a slow server never stalls the start of every conversation.
+TEST_TIMEOUT = 20  # seconds; must be < the Go caller’s timeout (25s), so Python actively cancels and releases after Go gives up
 STDIO_TEST_TIMEOUT = 90  # seconds; the first stdio package fetch is slow; the Go /test client timeout must be > this value
 
 
@@ -442,22 +750,29 @@ async def test_server(server: dict) -> dict:
 async def _test_server_inner(server: dict) -> dict:
     # The probe's overall bound is the outer test_server wait_for(budget). Use that
     # same budget for the inner connect + list so a cold remote connect (~5.6s) isn't
-    # rejected by the short 5s run-start cap; the outer wait_for is the real ceiling.
+    # rejected by the short 8s run-start cap; the outer wait_for is the real ceiling.
     budget = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
     try:
         conn = await _connect(server, connect_timeout=budget)
     except Exception as e:
         return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
+    # The outer test_server wraps this whole coroutine in asyncio.wait_for(timeout).
+    # Its inner wait_for below starts later, so the OUTER deadline fires first on a
+    # slow list_tools -- and CancelledError is a BaseException, which neither
+    # `except asyncio.TimeoutError` nor `except Exception` below can catch. Without
+    # this try/finally, that path (surfaced to the caller as test_server's own
+    # "Probe timed out" result) never reaches conn.aclose(), leaking the Client
+    # context + AsyncExitStack (httpx2 client / unix socket / stdio bridge).
     try:
-        tools = await asyncio.wait_for(conn.srv.list_tools(), timeout=budget)
-    except asyncio.TimeoutError:
+        try:
+            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=budget)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
+        except Exception as e:
+            return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
+                    "detail": str(e)}
+    finally:
         await conn.aclose()
-        return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
-    except Exception as e:
-        await conn.aclose()
-        return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed", "detail": str(e)}
-    await conn.aclose()
-    metas = [_extract_meta(t) for t in tools]
     if "id" in server:
-        _cache_put(server["id"], metas, _fingerprint(server))
+        _cache_put(server["id"], metas, _fingerprint(server), ttl)
     return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas]}

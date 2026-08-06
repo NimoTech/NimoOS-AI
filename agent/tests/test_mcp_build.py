@@ -6,15 +6,14 @@ META = {"name": "search", "description": "d",
         "input_schema": {"type": "object", "properties": {}}}
 
 
-class GoodSrv:
-    async def connect(self): pass
-    async def list_tools(self):
-        class T:
-            name = "search"; description = "d"
-            inputSchema = {"type": "object", "properties": {}}
-        return [T()]
+class GoodConn:
+    """Matches the new McpConn contract: call_tool / list_tools / aclose."""
+    def __init__(self): self.closed = False
     async def call_tool(self, name, args): ...
-    async def cleanup(self): pass
+    async def list_tools(self):
+        return [{"name": "search", "description": "d",
+                 "input_schema": {"type": "object", "properties": {}}}], mc.SCHEMA_TTL
+    async def aclose(self): self.closed = True
 
 
 @pytest.fixture(autouse=True)
@@ -29,7 +28,7 @@ def _clear_cache():
 
 @pytest.mark.asyncio
 async def test_cache_hit_does_not_connect(monkeypatch):
-    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "x"}))
+    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "x"}), mc.SCHEMA_TTL)
     async def boom(s): raise AssertionError("must not connect on cache hit")
     monkeypatch.setattr(mc, "_connect", boom)
     tools = await mc.build_mcp_tools([{"id": 1, "name": "x"}])
@@ -41,7 +40,7 @@ async def test_cold_fetch_connects_and_caches(monkeypatch):
     connects = {"n": 0}
     async def fake_connect(s):
         connects["n"] += 1
-        return mc.McpConn(server=s, srv=GoodSrv())
+        return GoodConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     tools = await mc.build_mcp_tools([{"id": 1, "name": "x"}])
     assert [t.name for t in tools] == ["mcp__x__search"]
@@ -63,7 +62,7 @@ async def test_cold_fetch_failure_skips(monkeypatch):
 @pytest.mark.asyncio
 async def test_stale_serves_cache_and_revalidates(monkeypatch):
     fp = mc._fingerprint({"id": 1, "name": "x"})
-    mc._cache_put(1, [META], fp)
+    mc._cache_put(1, [META], fp, mc.SCHEMA_TTL)
     mc._SCHEMA_CACHE[1].fetched_at = time.monotonic() - mc.SCHEMA_TTL - 1
     scheduled = {"n": 0}
     monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.__setitem__("n", scheduled["n"] + 1))
@@ -76,11 +75,11 @@ async def test_stale_serves_cache_and_revalidates(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fingerprint_change_refetches(monkeypatch):
-    mc._cache_put(1, [META], "STALE_FP")
+    mc._cache_put(1, [META], "STALE_FP", mc.SCHEMA_TTL)
     connects = {"n": 0}
     async def fake_connect(s):
         connects["n"] += 1
-        return mc.McpConn(server=s, srv=GoodSrv())
+        return GoodConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     await mc.build_mcp_tools([{"id": 1, "name": "x", "url": "https://new"}])
     assert connects["n"] == 1

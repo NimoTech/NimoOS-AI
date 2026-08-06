@@ -341,7 +341,7 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		"env":     h.decryptMap(m.Env),
 		"headers": h.decryptMap(m.Headers),
 	})
-	timeout := 12 * time.Second
+	timeout := 25 * time.Second // > Python TEST_TIMEOUT(20s), so Python cancels and frees first
 	if m.Transport == "stdio" {
 		timeout = 100 * time.Second // stdio first npx/uvx download is slow; > Python STDIO_TEST_TIMEOUT(90s)
 	}

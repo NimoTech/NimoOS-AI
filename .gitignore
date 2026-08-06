@@ -16,3 +16,6 @@ CLAUDE.md
 
 # Superpowers specs/plans — local only, not committed to git
 docs/superpowers/
+
+# Superpowers 子代理执行工作区(ledger/brief/review package)— 仅本地
+.superpowers/
