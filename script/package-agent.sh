@@ -3,7 +3,12 @@
 # tar it up together with compose/install.sh.
 # Usage: bash script/package-agent.sh <version>   (run from the NimoOS-AI repo root)
 # Output: dist/nimoos-agent-<version>.tar.gz
-#   Upload to: NimoTech/NimoOS-AI/releases/download/agent-<version>/nimoos-agent-<version>.tar.gz
+#   Upload to: <S3_PREFIX>/NimoOS-AI/releases/download/agent-<version>/nimoos-agent-<version>.tar.gz
+#   where S3_PREFIX comes from NimoOS-Build/release/versions.conf ("nimoos"), i.e.
+#   the exact key install-ai.sh fetches. There is no "NimoTech/" segment: that
+#   was a leftover prefix already removed from the download side (see the note in
+#   NimoOS-Build/scripts/lib/stack-fetch.sh), and following the old instruction
+#   here put the bundle at a key the installer never looks at.
 set -euo pipefail
 
 VERSION="${1:?usage: package-agent.sh <version>}"
@@ -50,4 +55,4 @@ echo "==> Packaging ${TARBALL} ..."
 tar -czf "${TARBALL}" -C "${STAGE}" agent-image.tar docker-compose.yml install.sh
 
 echo "✓ Output: ${TARBALL}"
-echo "  Upload: oss://nimoos/NimoTech/NimoOS-AI/releases/download/agent-${VERSION}/$(basename "${TARBALL}")"
+echo "  Upload: <bucket>/nimoos/NimoOS-AI/releases/download/agent-${VERSION}/$(basename "${TARBALL}")"
