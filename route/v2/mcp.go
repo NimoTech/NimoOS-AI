@@ -316,7 +316,7 @@ func (h *MCPHandler) decryptMap(enc string) map[string]string {
 
 // Test handles POST /v1/ai/mcp/servers/:id/test — connectivity probe. Go can't
 // speak MCP, so it decrypts the saved config and forwards to the Python agent's
-// /agent/mcp/test, returning the agent's {ok,tool_count,tools,error} verbatim.
+// /agent/mcp/test, returning the agent's {ok,tool_count,tools,protocol_era,protocol_version,supported_versions,error} verbatim.
 func (h *MCPHandler) Test(c echo.Context) error {
 	uid, err := h.userID(c)
 	if err != nil {
@@ -341,9 +341,14 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		"env":     h.decryptMap(m.Env),
 		"headers": h.decryptMap(m.Headers),
 	})
-	timeout := 25 * time.Second // > Python TEST_TIMEOUT(20s), so Python cancels and frees first
+	// Must exceed Python's outer backstop (client.py: TEST_TIMEOUT=38 /
+	// STDIO_TEST_TIMEOUT=115) so Python cancels first and releases the subprocess and
+	// socket, rather than Go abandoning a request that keeps running. Those Python
+	// values are themselves connect phase + list phase + slack -- see the constant
+	// block in client.py.
+	timeout := 43 * time.Second
 	if m.Transport == "stdio" {
-		timeout = 100 * time.Second // stdio first npx/uvx download is slow; > Python STDIO_TEST_TIMEOUT(90s)
+		timeout = 125 * time.Second
 	}
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Post(h.agentURL+"/agent/mcp/test", "application/json", bytes.NewReader(payload))
