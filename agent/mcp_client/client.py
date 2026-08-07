@@ -743,9 +743,10 @@ PROBE_LIST_TIMEOUT = 15
 STDIO_PROBE_LIST_TIMEOUT = 20       # by now the subprocess is up; only tools/list is left
 
 # Outer backstop. Must be >= connect + list, or it truncates a phase that is still
-# inside its own budget; and must stay < the Go caller's timeout
-# (route/v2/mcp.go:344-347: 43s / 125s) so Python cancels first and releases the
-# subprocess and socket instead of Go abandoning a request that keeps running.
+# inside its own budget; and must stay below the Go caller's timeout in
+# route/v2/mcp.go, which this same change set raises to 43s / 125s, so Python
+# cancels first and releases the subprocess and socket instead of Go abandoning a
+# request that keeps running.
 TEST_TIMEOUT = 38          # 20 + 15 + 3
 STDIO_TEST_TIMEOUT = 115   # 90 + 20 + 5
 
