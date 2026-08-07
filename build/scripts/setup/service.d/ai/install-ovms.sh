@@ -15,6 +15,36 @@ if [ -x "${DEST}/bin/ovms" ]; then
     exit 0
 fi
 
+# OVMS exists to serve models on Intel GPUs. On a machine without one it is 432
+# MB of download that can never be useful — a clean install on an AMD box
+# (Ryzen AI MAX+ 395 / Radeon 8060S, no /dev/dri at all) pulled the whole thing
+# down and enabled the service anyway.
+#
+# Read the PCI class and vendor out of sysfs rather than shelling out to lspci,
+# which minimal images often do not ship. Class 0x03xxxx is the display
+# controller class; 0x8086 is Intel.
+#
+# No Intel GPU and no way to tell means skip: installing an Intel-only component
+# on a machine where nothing indicates an Intel GPU is the wrong default, and
+# OVMS_FORCE=1 is there for anyone who knows better than the probe.
+has_intel_gpu() {
+    local dev vendor class
+    for dev in /sys/bus/pci/devices/*; do
+        [ -r "${dev}/vendor" ] && [ -r "${dev}/class" ] || continue
+        read -r vendor < "${dev}/vendor" || continue
+        [ "${vendor}" = "0x8086" ] || continue
+        read -r class < "${dev}/class" || continue
+        case "${class}" in 0x03*) return 0 ;; esac
+    done
+    return 1
+}
+
+if [ "${OVMS_FORCE:-0}" != "1" ] && ! has_intel_gpu; then
+    echo "⚠ No Intel GPU found on this host; skipping OVMS (it only serves models on Intel GPUs)."
+    echo "  Set OVMS_FORCE=1 to install it anyway."
+    exit 0
+fi
+
 # The pinned package is built for Ubuntu 24.04 and its libraries want glibc
 # 2.38. Debian 12 bookworm — which nimoos-install.sh supports and which most
 # NAS boxes run — ships 2.36. The download and extract both succeed there, so
