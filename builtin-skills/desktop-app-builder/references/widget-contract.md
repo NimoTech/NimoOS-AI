@@ -49,12 +49,12 @@ allow-top-navigation).
 
 | class | purpose | minimal example |
 |---|---|---|
-| `.nk-title` | small section title | `<p class="nk-title">下载任务</p>` |
-| `.nk-stat` | big number (unit in nested `<small>`) | `<div class="nk-stat">3<small>个进行中</small></div>` |
-| `.nk-label` | dimmed small label | `<span class="nk-label">今日</span>` |
-| `.nk-list` + `.nk-row` (value in `.nk-value`) | key-value rows | `<ul class="nk-list"><li class="nk-row"><span>速度</span><span class="nk-value">2.1 MB/s</span></li></ul>` |
+| `.nk-title` | small section title | `<p class="nk-title">Downloads</p>` |
+| `.nk-stat` | big number (unit in nested `<small>`) | `<div class="nk-stat">3<small>active</small></div>` |
+| `.nk-label` | dimmed small label | `<span class="nk-label">Today</span>` |
+| `.nk-list` + `.nk-row` (value in `.nk-value`) | key-value rows | `<ul class="nk-list"><li class="nk-row"><span>Speed</span><span class="nk-value">2.1 MB/s</span></li></ul>` |
 | `.nk-progress` (with `<i style="width:62%">`) | progress bar | `<div class="nk-progress"><i style="width:62%"></i></div>` |
-| `.nk-badge` (optionally `.good`/`.bad`) | status dot | `<span class="nk-badge good">健康</span>` |
+| `.nk-badge` (optionally `.good`/`.bad`) | status dot | `<span class="nk-badge good">Healthy</span>` |
 | `.nk-accent`/`.nk-good`/`.nk-bad` | text emphasis colors | `<span class="nk-value nk-accent">2.1 MB/s</span>` |
 
 Available tokens (auto-switch between dark/light): `--nk-fg / --nk-muted / --nk-faint / --nk-accent / --nk-good / --nk-bad / --nk-divider / --nk-track / --nk-radius / --nk-font / --nk-num-font`.
@@ -126,12 +126,12 @@ and resize the window — the window is the iframe viewport.
   @media (max-height: 90px) { .rows, .nk-progress { display: none; } }
 </style>
 </head><body>
-  <p class="nk-title">演示任务</p>
-  <div class="nk-stat">3<small>个进行中</small></div>
+  <p class="nk-title">Demo tasks</p>
+  <div class="nk-stat">3<small>active</small></div>
   <div class="nk-progress" style="margin:8px 0"><i style="width:62%"></i></div>
   <ul class="nk-list rows">
-    <li class="nk-row"><span>速度</span><span class="nk-value nk-accent">2.1 MB/s</span></li>
-    <li class="nk-row"><span>状态</span><span class="nk-badge good">健康</span></li>
+    <li class="nk-row"><span>Speed</span><span class="nk-value nk-accent">2.1 MB/s</span></li>
+    <li class="nk-row"><span>Status</span><span class="nk-badge good">Healthy</span></li>
   </ul>
 </body></html>
 ```
