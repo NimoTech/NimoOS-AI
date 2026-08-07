@@ -216,3 +216,129 @@ async def test_connect_still_receives_the_stdio_enforced_budget(monkeypatch):
 
     await mc.test_server({"id": 1, "name": "x", "transport": "stdio", "command": "npx"})
     assert seen["ct"] == mc.STDIO_PROBE_CONNECT_TIMEOUT
+
+
+class _FakeDiscover:
+    def __init__(self, versions): self.supported_versions = versions
+
+
+class _FakeSession:
+    def __init__(self, discover_result): self.discover_result = discover_result
+
+
+class _FakeClient:
+    def __init__(self, version, discover_result):
+        self.protocol_version = version
+        self.session = _FakeSession(discover_result)
+
+
+def _conn_with(version, discover_result):
+    return mc.McpConn(server={"id": 1}, client=_FakeClient(version, discover_result), stack=None)
+
+
+def test_protocol_info_modern_reports_the_servers_own_version_list():
+    conn = _conn_with("2026-07-28", _FakeDiscover(["2026-07-28", "2025-11-25"]))
+    assert conn.protocol_info() == {
+        "protocol_era": "modern",
+        "protocol_version": "2026-07-28",
+        "supported_versions": ["2026-07-28", "2025-11-25"],
+    }
+
+
+def test_protocol_info_legacy_reports_only_the_negotiated_revision():
+    """Legacy has no enumeration primitive. Never infer "it also supports the earlier
+    revisions" from protocol_version."""
+    conn = _conn_with("2025-06-18", None)
+    assert conn.protocol_info() == {
+        "protocol_era": "legacy",
+        "protocol_version": "2025-06-18",
+        "supported_versions": ["2025-06-18"],
+    }
+
+
+def test_protocol_info_copies_the_sdk_list():
+    """The returned list must be a copy: it gets serialized into the HTTP response and
+    must not be a live reference into the SDK result object."""
+    dr = _FakeDiscover(["2026-07-28"])
+    out = _conn_with("2026-07-28", dr).protocol_info()
+    out["supported_versions"].append("tampered")
+    assert dr.supported_versions == ["2026-07-28"]
+
+
+@pytest.mark.asyncio
+async def test_test_server_surfaces_the_protocol_fields(monkeypatch):
+    class ModernConn:
+        async def list_tools(self): return [{"name": "t", "description": "", "input_schema": {}}], mc.SCHEMA_TTL
+        async def aclose(self): pass
+        def protocol_info(self):
+            return {"protocol_era": "modern", "protocol_version": "2026-07-28",
+                    "supported_versions": ["2026-07-28", "2025-11-25"]}
+
+    async def fake_connect(s, connect_timeout=None): return ModernConn()
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+
+    out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    assert out["ok"] is True
+    assert out["protocol_era"] == "modern"
+    assert out["supported_versions"] == ["2026-07-28", "2025-11-25"]
+
+
+@pytest.mark.asyncio
+async def test_a_broken_version_readout_never_fails_the_probe(monkeypatch):
+    """The server is fine and the tools listed; only the version readout broke -- the
+    result must still be ok:True. Hard constraint: a purely cosmetic field must never
+    reduce the availability of the connectivity test."""
+    class WeirdConn:
+        async def list_tools(self): return [{"name": "t", "description": "", "input_schema": {}}], mc.SCHEMA_TTL
+        async def aclose(self): pass
+        def protocol_info(self): raise RuntimeError("sdk moved the attribute")
+
+    async def fake_connect(s, connect_timeout=None): return WeirdConn()
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+
+    out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    assert out["ok"] is True and out["tool_count"] == 1
+    assert out["protocol_era"] == "unknown"
+    assert out["supported_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_protocol_fields_are_read_before_the_connection_closes(monkeypatch):
+    """Read order matters: the SDK's session attributes are not guaranteed readable
+    after aclose()."""
+    order = []
+
+    class OrderConn:
+        async def list_tools(self): return [], mc.SCHEMA_TTL
+        async def aclose(self): order.append("close")
+        def protocol_info(self):
+            order.append("read")
+            return {"protocol_era": "legacy", "protocol_version": "2025-11-25",
+                    "supported_versions": ["2025-11-25"]}
+
+    async def fake_connect(s, connect_timeout=None): return OrderConn()
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+
+    await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    assert order == ["read", "close"]
+
+
+@pytest.mark.asyncio
+async def test_version_fields_do_not_enter_the_schema_cache(monkeypatch):
+    """The cache holds the tool manifest, not protocol metadata. Storing the latter
+    would blur what _fingerprint-based invalidation actually means."""
+    class ModernConn:
+        async def list_tools(self): return [{"name": "t", "description": "", "input_schema": {}}], mc.SCHEMA_TTL
+        async def aclose(self): pass
+        def protocol_info(self):
+            return {"protocol_era": "modern", "protocol_version": "2026-07-28",
+                    "supported_versions": ["2026-07-28"]}
+
+    async def fake_connect(s, connect_timeout=None): return ModernConn()
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+
+    await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    entry = mc._cache_get(1)
+    assert entry is not None
+    assert not hasattr(entry, "protocol_era")
+    assert entry.metas == [{"name": "t", "description": "", "input_schema": {}}]

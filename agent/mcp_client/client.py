@@ -477,6 +477,44 @@ class McpConn:
         except Exception:
             pass
 
+    # --- McpConn method, same pattern as list_tools: keep the SDK result objects away
+    #     from callers ---
+    def protocol_info(self) -> dict:
+        """What the connect-time negotiation settled on. Synchronous: it only reads
+        attributes Client.__aenter__ already populated, so there is no I/O.
+
+        The era discriminator is `discover_result is not None`, and it is authoritative:
+        mcp/client/_probe.py::negotiate_auto calls session.adopt(result) -- the one
+        place that sets _discover_result (session.py:661) -- only on the modern path,
+        while every fallback path goes through session.initialize(), which clears the
+        field back to None (session.py:668). "The server answered discover but
+        advertised no modern version" also takes a fallback branch, so it reads None
+        too. That is why we need no version table of our own here: no import of
+        mcp_types.version, no string comparison, no date ordering.
+        """
+        session = self.client.session
+        dr = session.discover_result
+        version = self.client.protocol_version
+        if dr is not None:
+            return {"protocol_era": "modern", "protocol_version": version,
+                    "supported_versions": list(dr.supported_versions)}
+        # Legacy has no enumeration primitive: initialize returns exactly one negotiated
+        # revision. Reporting [version] is the whole truth available without
+        # re-handshaking at each of the four handshake revisions. The UI must therefore
+        # word this as "negotiated X", never "supports X".
+        return {"protocol_era": "legacy", "protocol_version": version,
+                "supported_versions": [version]}
+
+
+# --- module level ---
+def _protocol_fields(conn) -> dict:
+    """A version readout must never turn a successful probe into a failed one."""
+    try:
+        return conn.protocol_info()
+    except Exception:
+        return {"protocol_era": "unknown", "protocol_version": None,
+                "supported_versions": []}
+
 
 async def _emit_warning(server_name: str, err) -> None:
     queue = EVENT_QUEUE_VAR.get()
@@ -797,8 +835,9 @@ async def _test_server_inner(server: dict) -> dict:
         except Exception as e:
             return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
                     "detail": str(e)}
+        proto = _protocol_fields(conn)
     finally:
         await conn.aclose()
     if "id" in server:
         _cache_put(server["id"], metas, _fingerprint(server), ttl)
-    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas]}
+    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas], **proto}
