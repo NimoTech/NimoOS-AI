@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -22,8 +25,22 @@ func TestFileReaderSkillEmbedded(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestBuiltinSeedVersionBumped(t *testing.T) {
-	require.Equal(t, "8", service.BuiltinSeedVersion)
+// Deliberately not pinned to a literal version. The previous form asserted
+// == "8" and went stale the moment the catalog moved on: v9, v10 and v11 all
+// landed without anyone updating it, and it only surfaced once CI existed to
+// run it. What actually has to hold is that the constant is a usable version
+// and that seeding records exactly it — if the recorded value ever diverged,
+// SeedBuiltinSkills would either re-extract on every start or, worse, never
+// re-extract after a catalog update.
+func TestBuiltinSeedVersionRecordedOnDisk(t *testing.T) {
+	require.Regexp(t, `^[0-9]+$`, service.BuiltinSeedVersion)
+
+	root := t.TempDir()
+	require.NoError(t, service.SeedBuiltinSkills(root, builtinSkillsFS))
+
+	b, err := os.ReadFile(filepath.Join(root, ".version"))
+	require.NoError(t, err)
+	require.Equal(t, service.BuiltinSeedVersion, strings.TrimSpace(string(b)))
 }
 
 func TestDesktopAppBuilderSkillEmbedded(t *testing.T) {
