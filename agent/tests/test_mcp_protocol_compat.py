@@ -144,6 +144,13 @@ async def test_list_and_call_over_both_protocol_paths(mode):
 
         conn = mc.McpConn(server={"id": 1, "name": "t"}, client=client, stack=stack)
 
+        # protocol_info() reads session.discover_result directly, and _protocol_fields
+        # swallows any exception from it -- so if a future SDK renames or re-times that
+        # attribute, every fake-based test still passes while production quietly drops
+        # the protocol line. This is the only assertion on it against the real SDK.
+        info = conn.protocol_info()
+        assert info["protocol_era"] == ("legacy" if mode == "legacy" else "modern")
+
         metas, ttl = await conn.list_tools()
         assert [m["name"] for m in metas] == ["echo"]
         assert ttl == mc.SCHEMA_TTL          # server sets no ttlMs -> our default

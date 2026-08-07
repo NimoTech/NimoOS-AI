@@ -185,7 +185,7 @@ func TestMcpHandler_TestProxiesToAgent(t *testing.T) {
 			gotAuth, _ = h["Authorization"].(string)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"tool_count":2,"tools":["a","b"]}`))
+		_, _ = w.Write([]byte(`{"ok":true,"tool_count":2,"tools":["a","b"],"protocol_era":"modern","protocol_version":"2026-07-28","supported_versions":["2026-07-28","2025-11-25"]}`))
 	}))
 	defer agent.Close()
 
@@ -205,6 +205,24 @@ func TestMcpHandler_TestProxiesToAgent(t *testing.T) {
 	}
 	if gotAuth != "Bearer S" {
 		t.Fatalf("agent did not receive decrypted header, got %q", gotAuth)
+	}
+
+	// Task 3: the handler proxies the agent's JSON verbatim (c.JSONBlob), so
+	// new protocol-version fields must pass through untouched rather than
+	// being silently dropped by some future typed deserialization.
+	var respBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if respBody["protocol_era"] != "modern" {
+		t.Fatalf("expected protocol_era to pass through, got %v", respBody["protocol_era"])
+	}
+	if respBody["protocol_version"] != "2026-07-28" {
+		t.Fatalf("expected protocol_version to pass through, got %v", respBody["protocol_version"])
+	}
+	supported, ok := respBody["supported_versions"].([]any)
+	if !ok || len(supported) != 2 || supported[0] != "2026-07-28" || supported[1] != "2025-11-25" {
+		t.Fatalf("expected supported_versions to pass through, got %v", respBody["supported_versions"])
 	}
 }
 

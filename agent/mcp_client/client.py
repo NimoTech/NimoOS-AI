@@ -477,6 +477,44 @@ class McpConn:
         except Exception:
             pass
 
+    # --- McpConn method, same pattern as list_tools: keep the SDK result objects away
+    #     from callers ---
+    def protocol_info(self) -> dict:
+        """What the connect-time negotiation settled on. Synchronous: it only reads
+        attributes Client.__aenter__ already populated, so there is no I/O.
+
+        The era discriminator is `discover_result is not None`, and it is authoritative:
+        mcp/client/_probe.py::negotiate_auto calls session.adopt(result) -- the one
+        place that sets _discover_result (session.py:661) -- only on the modern path,
+        while every fallback path goes through session.initialize(), which clears the
+        field back to None (session.py:668). "The server answered discover but
+        advertised no modern version" also takes a fallback branch, so it reads None
+        too. That is why we need no version table of our own here: no import of
+        mcp_types.version, no string comparison, no date ordering.
+        """
+        session = self.client.session
+        dr = session.discover_result
+        version = self.client.protocol_version
+        if dr is not None:
+            return {"protocol_era": "modern", "protocol_version": version,
+                    "supported_versions": list(dr.supported_versions)}
+        # Legacy has no enumeration primitive: initialize returns exactly one negotiated
+        # revision. Reporting [version] is the whole truth available without
+        # re-handshaking at each of the four handshake revisions. The UI must therefore
+        # word this as "negotiated X", never "supports X".
+        return {"protocol_era": "legacy", "protocol_version": version,
+                "supported_versions": [version]}
+
+
+# --- module level ---
+def _protocol_fields(conn) -> dict:
+    """A version readout must never turn a successful probe into a failed one."""
+    try:
+        return conn.protocol_info()
+    except Exception:
+        return {"protocol_era": "unknown", "protocol_version": None,
+                "supported_versions": []}
+
 
 async def _emit_warning(server_name: str, err) -> None:
     queue = EVENT_QUEUE_VAR.get()
@@ -730,13 +768,36 @@ async def build_mcp_tools(servers: list[dict]) -> list:
     return tools
 
 
-# 9→20: a cold probe of a remote http server (DNS + TLS + mode="auto"'s
-# server/discover → legacy initialize fallback + a large tools/list) routinely
-# exceeds 9s, so the first probe always timed out and only the second one passed.
-# This widens the PROBE only: the run-start path keeps MCP_COLD_TOTAL_TIMEOUT at
-# 10s deliberately, so a slow server never stalls the start of every conversation.
-TEST_TIMEOUT = 20  # seconds; must be < the Go caller’s timeout (25s), so Python actively cancels and releases after Go gives up
-STDIO_TEST_TIMEOUT = 90  # seconds; the first stdio package fetch is slow; the Go /test client timeout must be > this value
+# The probe budget is PER PHASE, not one flat ceiling. The connect phase has to
+# accommodate the SDK's full two-stage negotiation: mode="auto" spends up to
+# DISCOVER_TIMEOUT_SECONDS (10s, mcp/client/session.py:67) on server/discover and only
+# falls back to the legacy initialize handshake after an MCPError -- which includes
+# -32001, the probe's own timeout. One flat budget lets a stalled discover eat the
+# whole probe and starve that fallback, and the fallback is exactly the case this
+# feature has to report correctly.
+PROBE_CONNECT_TIMEOUT = 20
+STDIO_PROBE_CONNECT_TIMEOUT = 90    # the first npx/uvx package fetch dominates; process spawn does not
+PROBE_LIST_TIMEOUT = 15
+STDIO_PROBE_LIST_TIMEOUT = 20       # by now the subprocess is up; only tools/list is left
+
+# Outer backstop. Must be >= connect + list + close, or it truncates a phase that is
+# still inside its own budget. The close phase counts: _test_server_inner's
+# `finally: await conn.aclose()` runs INSIDE this wait_for and is itself bounded by
+# MCP_CLOSE_TIMEOUT (5s), so a hung teardown on an otherwise successful probe would
+# eat the slack and surface as probe_timeout, discarding a result we already had.
+# The backstop must also stay below the Go caller's timeout in route/v2/mcp.go
+# (43s http / 125s stdio, route/v2/mcp.go:349), so Python cancels first and releases
+# the subprocess and socket instead of Go abandoning a request that keeps running.
+TEST_TIMEOUT = 41          # 20 + 15 + 5 (close) + 1
+STDIO_TEST_TIMEOUT = 120   # 90 + 20 + 5 (close) + 5
+
+
+def _probe_connect_timeout(server: dict) -> int:
+    return STDIO_PROBE_CONNECT_TIMEOUT if server.get("transport") == "stdio" else PROBE_CONNECT_TIMEOUT
+
+
+def _probe_list_timeout(server: dict) -> int:
+    return STDIO_PROBE_LIST_TIMEOUT if server.get("transport") == "stdio" else PROBE_LIST_TIMEOUT
 
 
 async def test_server(server: dict) -> dict:
@@ -748,12 +809,18 @@ async def test_server(server: dict) -> dict:
 
 
 async def _test_server_inner(server: dict) -> dict:
-    # The probe's overall bound is the outer test_server wait_for(budget). Use that
-    # same budget for the inner connect + list so a cold remote connect (~5.6s) isn't
-    # rejected by the short 8s run-start cap; the outer wait_for is the real ceiling.
-    budget = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
+    connect_to = _probe_connect_timeout(server)
+    list_to = _probe_list_timeout(server)
     try:
-        conn = await _connect(server, connect_timeout=budget)
+        # Both layers are needed: connect_timeout= is the only bound actually enforced
+        # on the stdio branch (see _connect's docstring), while the surrounding wait_for
+        # is the real ceiling for http/sse. Dropping either leaves an unbounded path.
+        conn = await asyncio.wait_for(_connect(server, connect_timeout=connect_to),
+                                      timeout=connect_to)
+    except asyncio.TimeoutError:
+        # MUST precede `except Exception`: in 3.11 asyncio.TimeoutError is the builtin
+        # TimeoutError, a subclass of OSError and therefore of Exception.
+        return {"ok": False, "error": "Connection timed out", "error_key": "connect_timeout"}
     except Exception as e:
         return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
     # The outer test_server wraps this whole coroutine in asyncio.wait_for(timeout).
@@ -765,14 +832,15 @@ async def _test_server_inner(server: dict) -> dict:
     # context + AsyncExitStack (httpx2 client / unix socket / stdio bridge).
     try:
         try:
-            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=budget)
+            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=list_to)
         except asyncio.TimeoutError:
             return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
         except Exception as e:
             return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
                     "detail": str(e)}
+        proto = _protocol_fields(conn)
     finally:
         await conn.aclose()
     if "id" in server:
         _cache_put(server["id"], metas, _fingerprint(server), ttl)
-    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas]}
+    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas], **proto}

@@ -211,9 +211,13 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
         async def aclose(self): pass
     async def fake_connect(s, connect_timeout=None): return SlowSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
-    monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)   # http probe budget tiny -> list times out fast
+    monkeypatch.setattr(mc, "PROBE_LIST_TIMEOUT", 0.05)   # only the list phase is squeezed
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
-    assert out["ok"] is False and "timed out" in out["error"]
+    # Pin the phase, not just "timed out": probe_timeout carries that substring too,
+    # which is how this test silently stopped covering the list phase once the budget
+    # was split.
+    assert out["ok"] is False and out["error_key"] == "list_timeout"
+    assert "timed out" in out["error"]
 
 
 @pytest.mark.asyncio
