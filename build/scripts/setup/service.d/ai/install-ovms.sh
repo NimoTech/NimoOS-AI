@@ -15,6 +15,26 @@ if [ -x "${DEST}/bin/ovms" ]; then
     exit 0
 fi
 
+# The pinned package is built for Ubuntu 24.04 and its libraries want glibc
+# 2.38. Debian 12 bookworm — which nimoos-install.sh supports and which most
+# NAS boxes run — ships 2.36. The download and extract both succeed there, so
+# 432 MB lands in /opt/ovms and every single start fails with
+#   /opt/ovms/bin/ovms: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38'
+#   not found (required by /opt/ovms/lib/libopenvino.so.2621)
+# under Restart=always/RestartSec=5, i.e. twelve times a minute forever.
+#
+# The header above says "machines are homogeneous", and that was true while
+# this only ran on our own boxes. It stops being true the moment anyone else
+# installs NimoOS.
+need_glibc="2.38"
+have_glibc="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$')"
+if [ -n "${have_glibc}" ] \
+   && [ "$(printf '%s\n%s\n' "${need_glibc}" "${have_glibc}" | sort -V | head -1)" != "${need_glibc}" ]; then
+    echo "⚠ OVMS ${VERSION} needs glibc >= ${need_glibc}, this host has ${have_glibc}; skipping."
+    echo "  OpenVINO stays unavailable. Nothing else depends on it."
+    exit 0
+fi
+
 echo "==> Installing OVMS: ${PKG}"
 mkdir -p "${WORK}" || { echo "⚠ Failed to create ${WORK}, skipping OVMS install."; exit 0; }
 cd "${WORK}" || { echo "⚠ Failed to enter ${WORK}, skipping OVMS install."; exit 0; }
