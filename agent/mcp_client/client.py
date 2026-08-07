@@ -780,13 +780,16 @@ STDIO_PROBE_CONNECT_TIMEOUT = 90    # the first npx/uvx package fetch dominates;
 PROBE_LIST_TIMEOUT = 15
 STDIO_PROBE_LIST_TIMEOUT = 20       # by now the subprocess is up; only tools/list is left
 
-# Outer backstop. Must be >= connect + list, or it truncates a phase that is still
-# inside its own budget; and must stay below the Go caller's timeout in
-# route/v2/mcp.go, which this same change set raises to 43s / 125s, so Python
-# cancels first and releases the subprocess and socket instead of Go abandoning a
-# request that keeps running.
-TEST_TIMEOUT = 38          # 20 + 15 + 3
-STDIO_TEST_TIMEOUT = 115   # 90 + 20 + 5
+# Outer backstop. Must be >= connect + list + close, or it truncates a phase that is
+# still inside its own budget. The close phase counts: _test_server_inner's
+# `finally: await conn.aclose()` runs INSIDE this wait_for and is itself bounded by
+# MCP_CLOSE_TIMEOUT (5s), so a hung teardown on an otherwise successful probe would
+# eat the slack and surface as probe_timeout, discarding a result we already had.
+# The backstop must also stay below the Go caller's timeout in route/v2/mcp.go
+# (43s http / 125s stdio, route/v2/mcp.go:349), so Python cancels first and releases
+# the subprocess and socket instead of Go abandoning a request that keeps running.
+TEST_TIMEOUT = 41          # 20 + 15 + 5 (close) + 1
+STDIO_TEST_TIMEOUT = 120   # 90 + 20 + 5 (close) + 5
 
 
 def _probe_connect_timeout(server: dict) -> int:

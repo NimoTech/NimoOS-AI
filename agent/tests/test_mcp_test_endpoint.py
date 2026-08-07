@@ -128,8 +128,14 @@ def test_probe_budget_invariant_holds_for_both_transports():
     reports probe_timeout", it only shows up on slow servers, and it is miserable to
     track down. Two independently editable numbers on each side, so pin the relation.
     """
-    assert mc.TEST_TIMEOUT >= mc.PROBE_CONNECT_TIMEOUT + mc.PROBE_LIST_TIMEOUT
-    assert mc.STDIO_TEST_TIMEOUT >= mc.STDIO_PROBE_CONNECT_TIMEOUT + mc.STDIO_PROBE_LIST_TIMEOUT
+    # The close phase counts too: _test_server_inner's `finally: await conn.aclose()`
+    # runs inside the outer wait_for and is bounded by MCP_CLOSE_TIMEOUT, so a slow
+    # teardown on an otherwise successful probe must not be able to exhaust the
+    # backstop and throw the already-computed result away.
+    assert mc.TEST_TIMEOUT >= (
+        mc.PROBE_CONNECT_TIMEOUT + mc.PROBE_LIST_TIMEOUT + mc.MCP_CLOSE_TIMEOUT)
+    assert mc.STDIO_TEST_TIMEOUT >= (
+        mc.STDIO_PROBE_CONNECT_TIMEOUT + mc.STDIO_PROBE_LIST_TIMEOUT + mc.MCP_CLOSE_TIMEOUT)
 
 
 def test_connect_budget_leaves_room_for_the_legacy_fallback():

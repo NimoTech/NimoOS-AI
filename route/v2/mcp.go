@@ -341,11 +341,11 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		"env":     h.decryptMap(m.Env),
 		"headers": h.decryptMap(m.Headers),
 	})
-	// Must exceed Python's outer backstop (client.py: TEST_TIMEOUT=38 /
-	// STDIO_TEST_TIMEOUT=115) so Python cancels first and releases the subprocess and
+	// Must exceed Python's outer backstop (client.py: TEST_TIMEOUT=41 /
+	// STDIO_TEST_TIMEOUT=120) so Python cancels first and releases the subprocess and
 	// socket, rather than Go abandoning a request that keeps running. Those Python
-	// values are themselves connect phase + list phase + slack -- see the constant
-	// block in client.py.
+	// values are themselves connect phase + list phase + close phase + slack -- see
+	// the constant block in client.py.
 	timeout := 43 * time.Second
 	if m.Transport == "stdio" {
 		timeout = 125 * time.Second
