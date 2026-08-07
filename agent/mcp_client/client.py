@@ -730,13 +730,32 @@ async def build_mcp_tools(servers: list[dict]) -> list:
     return tools
 
 
-# 9→20: a cold probe of a remote http server (DNS + TLS + mode="auto"'s
-# server/discover → legacy initialize fallback + a large tools/list) routinely
-# exceeds 9s, so the first probe always timed out and only the second one passed.
-# This widens the PROBE only: the run-start path keeps MCP_COLD_TOTAL_TIMEOUT at
-# 10s deliberately, so a slow server never stalls the start of every conversation.
-TEST_TIMEOUT = 20  # seconds; must be < the Go caller’s timeout (25s), so Python actively cancels and releases after Go gives up
-STDIO_TEST_TIMEOUT = 90  # seconds; the first stdio package fetch is slow; the Go /test client timeout must be > this value
+# The probe budget is PER PHASE, not one flat ceiling. The connect phase has to
+# accommodate the SDK's full two-stage negotiation: mode="auto" spends up to
+# DISCOVER_TIMEOUT_SECONDS (10s, mcp/client/session.py:67) on server/discover and only
+# falls back to the legacy initialize handshake after an MCPError -- which includes
+# -32001, the probe's own timeout. One flat budget lets a stalled discover eat the
+# whole probe and starve that fallback, and the fallback is exactly the case this
+# feature has to report correctly.
+PROBE_CONNECT_TIMEOUT = 20
+STDIO_PROBE_CONNECT_TIMEOUT = 90    # the first npx/uvx package fetch dominates; process spawn does not
+PROBE_LIST_TIMEOUT = 15
+STDIO_PROBE_LIST_TIMEOUT = 20       # by now the subprocess is up; only tools/list is left
+
+# Outer backstop. Must be >= connect + list, or it truncates a phase that is still
+# inside its own budget; and must stay < the Go caller's timeout
+# (route/v2/mcp.go:344-347: 43s / 125s) so Python cancels first and releases the
+# subprocess and socket instead of Go abandoning a request that keeps running.
+TEST_TIMEOUT = 38          # 20 + 15 + 3
+STDIO_TEST_TIMEOUT = 115   # 90 + 20 + 5
+
+
+def _probe_connect_timeout(server: dict) -> int:
+    return STDIO_PROBE_CONNECT_TIMEOUT if server.get("transport") == "stdio" else PROBE_CONNECT_TIMEOUT
+
+
+def _probe_list_timeout(server: dict) -> int:
+    return STDIO_PROBE_LIST_TIMEOUT if server.get("transport") == "stdio" else PROBE_LIST_TIMEOUT
 
 
 async def test_server(server: dict) -> dict:
@@ -748,12 +767,18 @@ async def test_server(server: dict) -> dict:
 
 
 async def _test_server_inner(server: dict) -> dict:
-    # The probe's overall bound is the outer test_server wait_for(budget). Use that
-    # same budget for the inner connect + list so a cold remote connect (~5.6s) isn't
-    # rejected by the short 8s run-start cap; the outer wait_for is the real ceiling.
-    budget = STDIO_TEST_TIMEOUT if server.get("transport") == "stdio" else TEST_TIMEOUT
+    connect_to = _probe_connect_timeout(server)
+    list_to = _probe_list_timeout(server)
     try:
-        conn = await _connect(server, connect_timeout=budget)
+        # Both layers are needed: connect_timeout= is the only bound actually enforced
+        # on the stdio branch (see _connect's docstring), while the surrounding wait_for
+        # is the real ceiling for http/sse. Dropping either leaves an unbounded path.
+        conn = await asyncio.wait_for(_connect(server, connect_timeout=connect_to),
+                                      timeout=connect_to)
+    except asyncio.TimeoutError:
+        # MUST precede `except Exception`: in 3.11 asyncio.TimeoutError is the builtin
+        # TimeoutError, a subclass of OSError and therefore of Exception.
+        return {"ok": False, "error": "Connection timed out", "error_key": "connect_timeout"}
     except Exception as e:
         return {"ok": False, "error": f"Connection failed: {e}", "error_key": "connect_failed", "detail": str(e)}
     # The outer test_server wraps this whole coroutine in asyncio.wait_for(timeout).
@@ -765,7 +790,7 @@ async def _test_server_inner(server: dict) -> dict:
     # context + AsyncExitStack (httpx2 client / unix socket / stdio bridge).
     try:
         try:
-            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=budget)
+            metas, ttl = await asyncio.wait_for(conn.list_tools(), timeout=list_to)
         except asyncio.TimeoutError:
             return {"ok": False, "error": "Listing tools timed out", "error_key": "list_timeout"}
         except Exception as e:
