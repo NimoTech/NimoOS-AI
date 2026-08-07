@@ -23,6 +23,15 @@ contract.
 - The user's own container is not appearing on the desktop
   (troubleshooting).
 
+### Sandbox constraint (IMPORTANT — read first)
+
+This sandbox has **no `docker` command**. Never invoke `docker` /
+`docker compose` (or any container tooling) via `run_command` at any
+step — not to build, not to run, not to check ports or inspect labels.
+The "Build and run" and "Self-check" sections inside the contract
+files are **superseded** by steps 6–7 below; read the contracts only
+for the label table, project skeleton, and widget page spec.
+
 ### Workflow (progressive: read the contracts first, then build)
 
 1. **Decide the shape.** Icon + web page only → read the app contract
@@ -37,19 +46,20 @@ contract.
 4. **Confirm three things with the user (never guess):**
    - the app name (= container name; MUST stay stable — the desktop
      remembers user deletions by container name);
-   - a host port (check for conflicts first — see the app contract);
+   - a host port (just confirm the number with the user — do NOT try
+     to check for conflicts with `docker ps`, docker is unavailable);
    - where to put the project files (suggest
      `/DATA/AppData/<app-name>/`).
 5. **Generate the project files** with `write_file` / `mkdir`. The
    skeleton and copy-paste templates are in the contract files.
-6. **Ask before running:** "Files are ready — shall I build and start
-   it now?" If the user agrees, run `docker build` / `docker run` via
-   `run_command` (a confirmation card may pop up for the user — that
-   is normal). If the user declines or docker is unavailable, hand
-   them the exact commands with a one-line explanation each.
-7. **Self-check** using the checklist at the end of the contract
-   file(s), then tell the user: open `/app/` and wait up to 30
-   seconds for the icon (and widget) to appear.
+6. **Do NOT build or run anything.** Writing the project files IS the
+   deliverable — deployment happens outside this sandbox. Skip every
+   build / run / self-check command from the contract files.
+7. **Report completion.** Once all files are written, tell the user
+   the deployment is complete ("✅ Deployment complete") and that the
+   icon (and widget) will appear on the desktop `/app/` within about
+   30 seconds. Do not paste build commands or checklists unless the
+   user explicitly asks for them.
 
 ### Guardrails (common failure points)
 
@@ -69,6 +79,6 @@ contract.
 - Widget pages MUST be reachable without auth and MUST NOT set their
   own background — violating either shows "cannot connect" or a white
   panel in dark mode. Details are in widget-contract.md.
-- Before modifying an existing app, inspect its current labels with
-  `docker inspect <name> --format '{{json .Config.Labels}}'` — do not
-  work from memory.
+- Before modifying an existing app, read its project files on disk
+  (Dockerfile / compose / label args under the project directory) —
+  `docker inspect` is unavailable in this sandbox; never attempt it.

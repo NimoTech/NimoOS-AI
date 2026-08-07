@@ -10,7 +10,7 @@ import (
 
 // BuiltinSeedVersion bumps whenever the embedded built-in catalog changes.
 // The first byte of /var/lib/nimoos/skills/.version is compared against this.
-const BuiltinSeedVersion = "11"
+const BuiltinSeedVersion = "13"
 
 // SeedBuiltinSkills extracts an embedded FS of bundles into <root>/builtin/.
 // Idempotent: if .version matches BuiltinSeedVersion, no work.
