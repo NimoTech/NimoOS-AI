@@ -20,31 +20,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # A single checkout is enough. go.mod used to redirect
+      # github.com/NimoTech/NimoOS-Common to ../NimoOS-Common, so CI had to
+      # clone that sibling — with a token, because it was private. The
+      # dependency is an ordinary published module now, so there is no sibling
+      # to reproduce and no secret to hand out.
+      #
+      # That also makes this job build the same way an outside contributor's
+      # clone does. Nothing here has access to a local NimoOS-Common, so if
+      # go.mod ever names a version that does not exist or is too old, CI is
+      # where it surfaces.
       - name: Check out NimoOS-AI
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          path: NimoOS-AI
-
-      # go.mod redirects github.com/NimoTech/NimoOS-Common to
-      # ../NimoOS-Common and nothing is vendored, so a lone checkout of
-      # this repository cannot build. CI has to reproduce the sibling
-      # layout that a developer checkout has.
-      - name: Check out NimoOS-Common
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: NimoTech/NimoOS-Common
-          path: NimoOS-Common
-          # Only needed while these repositories are private. Once they are
-          # public the default job token suffices and this secret can go.
-          token: ${{ secrets.CI_SIBLING_TOKEN || github.token }}
 
       # Take the toolchain from go.mod so this workflow cannot drift from what
       # the module actually declares.
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: NimoOS-AI/go.mod
-          cache-dependency-path: NimoOS-AI/go.sum
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       # CGO_ENABLED=1 matches NimoOS-Build/scripts/deploy.sh, which is what
       # builds the shipped binary. This service also compiles with
@@ -52,13 +47,11 @@ jobs:
       # the moment it touches the database, so building any other way would
       # make a green run meaningless.
       - name: Build
-        working-directory: NimoOS-AI
         env:
           CGO_ENABLED: "1"
         run: go build ./...
 
       - name: Vet
-        working-directory: NimoOS-AI
         env:
           CGO_ENABLED: "1"
         run: go vet ./...
@@ -71,7 +64,6 @@ jobs:
       # Pre-existing: the tests were not updated when the base URL started
       # carrying the /v1 prefix. Fix the tests and delete this skip.
       - name: Test
-        working-directory: NimoOS-AI
         env:
           CGO_ENABLED: "1"
         run: go test -skip '^(TestOpenAIAdapter_ForwardsRequest|TestAnthropicAdapter_ChatCompletions_SetsHeaders)$' ./...

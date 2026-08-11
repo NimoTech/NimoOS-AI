@@ -3,7 +3,7 @@ module github.com/NimoTech/NimoOS-AI
 go 1.21
 
 require (
-	github.com/NimoTech/NimoOS-Common v0.0.0-00010101000000-000000000000
+	github.com/NimoTech/NimoOS-Common v1.9.4-alpha2
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/labstack/echo/v4 v4.12.0
 	github.com/mattn/go-sqlite3 v1.14.42
@@ -62,4 +62,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/NimoTech/NimoOS-Common => ../NimoOS-Common
