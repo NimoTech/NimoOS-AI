@@ -60,6 +60,19 @@ def _persist(categories: list[str]) -> None:
         db.set_unlocked_categories(session_id, categories)
 
 
+def _mcp_runtime_lines() -> list[str]:
+    """Render the per-run MCP snapshot (same data as the system-prompt status
+    line, at action-level detail). The static CATEGORY_TOOLS table only knows
+    mcp_register_server — rendering it alone told the model no servers were
+    connected (defect 2). On ANY failure fall back to a line that promises
+    nothing rather than one that lies."""
+    try:
+        from mcp_client import status as _st
+        return _st.render_expand_section(_st.MCP_STATUS_VAR.get())
+    except Exception:
+        return ["MCP runtime tools, if any, appear in your tool list on the next step."]
+
+
 def expand_categories(categories: list[str]) -> str:
     """Pure logic: unlock the given categories, return the text shown to the model. Wrapped by expand_tools."""
     if not categories:
@@ -80,6 +93,8 @@ def expand_categories(categories: list[str]) -> str:
     for c in categories:
         for t in _reg.CATEGORY_TOOLS[c]:
             lines.append(f"- {_name(t)}")
+        if c == "mcp":
+            lines.extend(_mcp_runtime_lines())
     if not newly:
         lines.append("(these categories were already unlocked)")
     return "\n".join(lines)
