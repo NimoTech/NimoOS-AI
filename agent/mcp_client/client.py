@@ -17,7 +17,7 @@ from mcp.client import Client, InputRequiredRoundsExceededError
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
-from mcp.types import INVALID_REQUEST
+from mcp.types import INVALID_REQUEST, METHOD_NOT_FOUND
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 
 from mcp_client.schema import sanitize_schema, flatten_result
@@ -422,6 +422,27 @@ def _is_unsupported_capability(err) -> bool:
             and str(getattr(data, "message", "")).endswith("not supported"))
 
 
+_UNKNOWN_TOOL_RE = re.compile(r"unknown tool|tool\b.{0,80}?\b(not found|does not exist)",
+                              re.IGNORECASE)
+
+
+def _is_unknown_tool(err) -> bool:
+    """True when a call failed because the server no longer has the tool.
+
+    Deliberately narrow — ONLY this signature may drop the schema cache;
+    invalidating on any MCPError would let plain argument errors punch through
+    the warm path the cache exists to provide (defect-① review note). Two
+    shapes are recognised: JSON-RPC METHOD_NOT_FOUND (-32601), and the common
+    "Unknown tool …" / "tool … not found" wordings servers put on generic codes.
+    """
+    data = getattr(err, "error", None)
+    if data is None:
+        return False
+    if getattr(data, "code", None) == METHOD_NOT_FOUND:
+        return True
+    return bool(_UNKNOWN_TOOL_RE.search(str(getattr(data, "message", ""))))
+
+
 def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
     slug = _slug(server["name"])
     tool_name = meta["name"]
@@ -454,6 +475,18 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
                 return _legacy_url_elicitation_msg(server["name"])
             if _is_unsupported_capability(e):
                 return _unsupported_capability_msg(server["name"])
+            if _is_unknown_tool(e):
+                # Defect ①: within the TTL the manifest keeps advertising a tool
+                # the server has removed, and nothing ever corrected it. Drop the
+                # entry and refresh in the background. The run's tool set is
+                # immutable (an SDK decision), so the refresh helps the NEXT run
+                # — the message states that honestly.
+                _SCHEMA_CACHE.pop(server["id"], None)
+                _schedule_revalidate(server)
+                return (f'[MCP error] MCP server "{server["name"]}" no longer recognizes '
+                        f"tool {tool_name} — it may have been removed on the server side. "
+                        "The tool list will be refreshed for your next message; do NOT "
+                        "retry this call with different arguments.")
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"

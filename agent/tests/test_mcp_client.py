@@ -136,3 +136,72 @@ async def test_connect_failure_message_distinct(monkeypatch):
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert out.startswith("[MCP error]")
     assert "cannot connect" in out and "do NOT retry" in out
+
+
+# --- defect ①: unknown-tool errors must invalidate the schema cache ---
+
+from mcp.shared.exceptions import MCPError
+from mcp.types import INTERNAL_ERROR, METHOD_NOT_FOUND
+
+
+def test_is_unknown_tool_signatures():
+    assert mc._is_unknown_tool(MCPError(code=METHOD_NOT_FOUND, message="x")) is True
+    assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="Unknown tool: search")) is True
+    assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="Tool 'search' not found")) is True
+    assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="bad argument foo")) is False
+    assert mc._is_unknown_tool(RuntimeError("Unknown tool")) is False   # not an MCPError shape
+
+
+def _approve_first(mgr, q):
+    async def approve():
+        for _ in range(50):
+            if q.events: break
+            await asyncio.sleep(0.01)
+        mgr.resolve(q.events[-1]["confirm_id"], confirmed=True, remember=False,
+                    expected_session_id="s1")
+    return approve
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
+    class UnknownToolConn:
+        async def call_tool(self, name, args):
+            raise MCPError(code=METHOD_NOT_FOUND, message="Unknown tool: search")
+        async def aclose(self): pass
+
+    mgr, q = _setup(conn=UnknownToolConn())
+    mc._SCHEMA_CACHE.clear()
+    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
+    scheduled = []
+    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+
+    asyncio.create_task(_approve_first(mgr, q)())
+    out = await tool.on_invoke_tool(None, '{"q":"hi"}')
+    assert "no longer recognizes" in out and "do NOT" in out
+    assert "next message" in out                # run 中途工具集不可变是 SDK 决定的,如实表述
+    assert mc._cache_get(1) is None             # stale entry dropped
+    assert scheduled == [1]                     # refresh scheduled for the next run
+
+
+@pytest.mark.asyncio
+async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
+    # Invalidating on ANY MCPError would let plain argument errors punch
+    # through the warm path this cache exists to provide.
+    class ArgErrorConn:
+        async def call_tool(self, name, args):
+            raise MCPError(code=INTERNAL_ERROR, message="invalid value for argument q")
+        async def aclose(self): pass
+
+    mgr, q = _setup(conn=ArgErrorConn())
+    mc._SCHEMA_CACHE.clear()
+    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
+    scheduled = []
+    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+
+    asyncio.create_task(_approve_first(mgr, q)())
+    out = await tool.on_invoke_tool(None, '{"q":"hi"}')
+    assert out.startswith("[MCP error] MCP tool search failed")
+    assert mc._cache_get(1) is not None        # cache untouched
+    assert scheduled == []
