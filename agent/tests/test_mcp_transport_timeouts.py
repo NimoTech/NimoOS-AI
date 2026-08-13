@@ -141,6 +141,12 @@ async def test_an_idle_http_session_can_still_complete_a_tool_call(caplog):
     # _session_timeout() 在调用时读模块级常量(client.py:98),所以直接改模块属性
     # 就同时压低了 httpx client 的 timeout 和 read_timeout_seconds。本地服务端的
     # list_tools / call_tool 都是毫秒级,2 秒对它们绰绰有余。
+    #
+    # 这 2 秒同时覆盖 connect **和整个 legacy initialize 握手**,不只是读超时。所以
+    # 这条测试在高负载机器上变红说明的是**机器负载**,不是被测机制失效 —— 别用"把
+    # 超时调大"来修:上面那段 5s-vs-8s 的算术就是靠这个值成立的,调大它会让 8 秒空闲
+    # 走不完两次重连尝试,测试于此静默退化成"什么都没测到还是绿的"。真要动,先把整段
+    # 算术连同空闲时长一起重算。
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(mc, "MCP_SESSION_TIMEOUT", 2)
 

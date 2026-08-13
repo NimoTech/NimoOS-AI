@@ -143,7 +143,8 @@ SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 # DEFAULT_INPUT_REQUIRED_MAX_ROUNDS). A "round" is a REQUEST/RETRY round trip, not a
 # question put to the user: the user pondering a card burns none of these — our
 # callback simply hasn't returned yet and _dispatch_all keeps awaiting it, with the
-# round counter frozen and only our own 24h confirm timeout running.
+# round counter frozen and only our own confirm timeout running (24h for a form card,
+# elicitation.py::URL_ELICIT_WAIT = 180s for a URL authorization card).
 #
 # What DOES burn rounds is the state-only leg: an InputRequiredResult carrying only
 # requestState and no inputRequests. The spec treats that as a first-class shape (a
@@ -154,13 +155,22 @@ SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 # 350ms and would throw InputRequiredRoundsExceededError at a perfectly compliant
 # server. 10 buys 0.05+0.1+0.2+0.25*7 = 2.1s.
 #
-# 2.1s does NOT make out-of-band OAuth work — nobody completes a login in two
-# seconds. That is a deliberate, documented phase-2 trade-off (see the handoff's
-# §4 correction): the URL card returns "accept" the moment the user consents to
-# open the link, and a real OAuth server will still be waiting when the rounds run
-# out. Raising the cap stops us from breaking COMPLIANT servers; it does not
-# implement the wait. The fix for that is the deferred "I finished authorizing"
-# card, which moves the wait inside our own callback where no round cap applies.
+# 2.1s is NOT the out-of-band OAuth budget, and no longer needs to be. The wait for a
+# third-party authorization happens INSIDE our elicitation callback, where no round cap
+# applies (see elicitation.py::URL_ELICIT_WAIT). Phase 2 returned "accept" the moment
+# the user consented to open the link, which is exactly why it always landed here with
+# the login unfinished; that behaviour is gone — the card now sends "accept" only when
+# the user comes back and says they finished, so the retry usually gets a terminal
+# result in a single round.
+#
+# What the cap still governs is the legs that do not ask the user: the state-only
+# polling ones above, and above all the TIMEOUT path. URL_ELICIT_WAIT expiring sends
+# "accept" with no user answer behind it (see the on_timeout rationale in
+# elicitation.py), so the server may still be unauthorized and answer with state-only
+# rounds — 2.1s of them, then InputRequiredRoundsExceededError and the
+# _rounds_exceeded_msg wording below. That is the accepted landing spot for a genuinely
+# abandoned card, not a reason to raise this number: a bigger cap only lengthens a
+# poll the user is no longer participating in.
 MCP_INPUT_REQUIRED_ROUNDS = 10
 
 # Upper bound on aclose(). aclose() shields itself from cancellation (see McpConn),
@@ -299,15 +309,21 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
 
 
 def _rounds_exceeded_msg(server_name: str) -> str:
-    """MRTR rounds exhausted AFTER we already asked the user and they answered.
+    """MRTR rounds exhausted AFTER we already put the question to the user.
 
     Phase 1 reused the "capability not supported" wording here, and in phase 2 that
-    is simply false: elicitation IS supported now. The real meaning is "we asked, the
-    user answered, the server still isn't ready" — overwhelmingly an out-of-band
+    is simply false: elicitation IS supported now. The real meaning is "we asked, we
+    answered the server, it still isn't ready" — overwhelmingly an out-of-band
     authorization that hasn't completed. Telling the model to check the server's
     CONFIGURATION would send the user off fixing the wrong thing.
+
+    The premise is deliberately vaguer than "the user answered", because it has to
+    cover the URL card's timeout path too: there, URL_ELICIT_WAIT expired and we sent
+    `accept` with no user answer behind it (see elicitation.py). Both paths land here
+    for the same underlying reason and want the same advice, so only the actionable
+    half is stated as fact.
     """
-    return (f'[MCP error] MCP server "{server_name}" asked for input, the user answered, '
+    return (f'[MCP error] MCP server "{server_name}" asked for input, we responded, '
             "and the server is still not ready. This is almost always an out-of-band "
             "authorization that has not finished yet — it is NOT a problem with the call "
             "arguments, so do NOT retry with different arguments. Tell the user to finish "

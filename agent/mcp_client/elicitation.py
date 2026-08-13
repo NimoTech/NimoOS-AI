@@ -79,6 +79,17 @@ MAX_ANSWER_ATTEMPTS = 3
 #
 # What happens at the deadline is `on_timeout="accept"`, not "cancel" — see the
 # wait_elicit call below.
+#
+# KNOWN UNBOUNDED WORST CASE (documented, deliberately not mitigated): nothing in our
+# code caps one tool call at URL_ELICIT_WAIT × the MRTR round cap. `conn.call_tool` has
+# no outer `wait_for` and there is no run-level deadline (only max_turns). Trigger: a
+# server that answers our timeout-`accept` by RE-ISSUING the URL elicitation instead of
+# returning state-only. This callback then fires again -> mgr.register -> a new card ->
+# another 180s, up to MCP_INPUT_REQUIRED_ROUNDS (10) times = a ~30-minute hung turn with
+# ten stacked cards (the UI appends), the first nine 409-ing when clicked. The common
+# case is benign: a state-only reply burns the remaining rounds in ~2.1s. The real fix
+# (a per-call ContextVar so rounds 2+ use a short wait) is design work, deferred — see
+# the phase-2 handoff §4.
 URL_ELICIT_WAIT = 180
 
 
@@ -242,15 +253,21 @@ def make_elicitation_callback(server: dict, *, session_id_var, queue_var, mgr_va
                 #
                 #   - URL_ELICIT_WAIT, not the manager's 24h: the server's
                 #     `requestState` has a short TTL. See the constant's comment.
-                #   - on_timeout="accept", not the default "cancel": the user
-                #     consented to open the page, and per spec `accept` asserts ONLY
-                #     that consent — *"The response with action: 'accept' indicates
-                #     that the user has consented to the interaction. It does not mean
-                #     that the interaction is complete."* So it is still true after a
-                #     timeout, and sending it is what gives a long-polling or
-                #     state-only server the chance to return a terminal result.
-                #     Sending "cancel" instead would kill a call whose authorization
-                #     may well have succeeded in the browser.
+                #   - on_timeout="accept", not the default "cancel": at the deadline
+                #     we know NOTHING about what the user did. The card sends nothing
+                #     when it opens the link, so "opened it and is still authorizing"
+                #     and "never touched the card" are indistinguishable from here.
+                #     `accept` is the cheaper guess, not the true one: "cancel"
+                #     definitively kills a call whose browser-side authorization may
+                #     already have succeeded, while a stray "accept" costs at most one
+                #     wasted MRTR loop ending in an accurate error message
+                #     (client.py::_rounds_exceeded_msg) and cannot induce a grant by
+                #     itself — the server validates its own `requestState` and auth
+                #     state, so no grant exists without a real browser flow. Per spec
+                #     `accept` claims only consent anyway — *"The response with
+                #     action: 'accept' indicates that the user has consented to the
+                #     interaction. It does not mean that the interaction is
+                #     complete."*
                 #
                 # A user who explicitly cancels still gets "cancel" — wait_elicit only
                 # applies on_timeout on a real timeout.

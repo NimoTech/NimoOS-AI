@@ -105,12 +105,17 @@ class ConfirmManager:
 
         `on_timeout` is what a timeout MEANS to this caller, and it exists for the
         same reason. For a form card a timeout is "cancel": we have no answer, so
-        there is nothing to submit. For a URL card a timeout is "accept": the user
-        already consented to open the page, `accept` per spec asserts ONLY that
-        consent ("It does not mean that the interaction is complete"), so it stays
-        true whether or not they finished — and sending it gives a long-polling or
-        state-only server its chance instead of failing the call outright. An
-        explicit user answer always wins; this only fires on a real timeout.
+        there is nothing to submit. For a URL card a timeout is "accept" — and NOT
+        because we know the user consented. The card POSTs nothing when it opens the
+        link, so at the deadline we have received zero bytes and cannot tell "opened
+        it and is mid-OAuth" from "never touched the card". `accept` is simply the
+        cheaper of two guesses: "cancel" definitively kills a call whose
+        browser-side authorization may already have succeeded, while a stray
+        "accept" costs at most one wasted protocol loop ending in an accurate error
+        message, and cannot induce anything by itself (a server must validate its
+        own requestState and auth state, so no grant exists without a real browser
+        flow). An explicit user answer always wins; this only fires on a real
+        timeout.
         """
         if on_timeout not in ELICIT_ACTIONS:
             raise ValueError(f"unknown elicitation action: {on_timeout!r}")
