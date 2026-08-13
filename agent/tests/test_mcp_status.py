@@ -1,0 +1,103 @@
+from mcp_client import status as st
+
+
+def _snap(*servers, config_error=""):
+    return st.McpStatusSnapshot(servers=list(servers), config_error=config_error)
+
+
+def test_status_constants():
+    assert (st.OK, st.FAILED, st.WARMING, st.CONFIG_ERROR) == (
+        "ok", "failed", "warming", "config_error")
+
+
+# --- render_prompt_line ---
+
+def test_prompt_line_none_snapshot_is_empty():
+    assert st.render_prompt_line(None) == ""
+
+
+def test_prompt_line_no_servers_is_empty():
+    # no servers configured: inject nothing (zero cost)
+    assert st.render_prompt_line(_snap()) == ""
+
+
+def test_prompt_line_mixed_statuses():
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, tool_names=["a"] * 32),
+        st.ServerStatus(name="supabase", status=st.FAILED, detail="timeout"),
+        st.ServerStatus(name="fs", status=st.WARMING),
+        st.ServerStatus(name="old", status=st.CONFIG_ERROR, detail="decrypt failed"),
+    ))
+    assert line.startswith("[MCP servers: ") and line.endswith("]")
+    assert "Mygithub: 32 tools ready" in line
+    assert "supabase: failed to load (timeout)" in line
+    assert "fs: starting up" in line
+    assert "old: configuration error (decrypt failed)" in line
+
+
+def test_prompt_line_config_unavailable():
+    line = st.render_prompt_line(_snap(config_error="HTTP 500"))
+    assert "configuration could not be fetched" in line
+    assert "HTTP 500" in line
+    assert "do not register new" in line.lower()
+
+
+def test_prompt_line_detail_truncated():
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="x", status=st.FAILED, detail="e" * 500)))
+    assert len(line) < 220          # status line's token cost must stay bounded (~20-40 tokens)
+
+
+# --- render_expand_section ---
+
+def test_expand_none_snapshot_falls_back():
+    # 2B fallback: never lie when snapshot is missing, never fall back to static table
+    lines = st.render_expand_section(None)
+    assert lines == ["MCP runtime tools, if any, appear in your tool list on the next step."]
+
+
+def test_expand_no_servers():
+    assert st.render_expand_section(_snap()) == ["No MCP servers are configured."]
+
+
+def test_expand_ok_server_lists_tools():
+    lines = st.render_expand_section(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK,
+                        tool_names=["mcp__mygithub__search", "mcp__mygithub__get_issue"])))
+    joined = "\n".join(lines)
+    assert '"Mygithub" (2 tools)' in joined
+    assert "mcp__mygithub__search" in joined and "mcp__mygithub__get_issue" in joined
+    # each server's tool list ends with ";" so the model can tell where one
+    # server's list stops and the next line begins
+    assert lines[0].endswith(";")
+
+
+def test_expand_long_tool_list_not_truncated():
+    # every tool must be listed by name — an elided "… (40 total)" hid names
+    # from the model, so it couldn't call them and drifted to other tools
+    names = [f"mcp__s__tool{i}" for i in range(40)]
+    joined = "\n".join(st.render_expand_section(_snap(
+        st.ServerStatus(name="s", status=st.OK, tool_names=names))))
+    for n in names:
+        assert n in joined
+    assert "…" not in joined
+    assert "(40 tools)" in joined and joined.rstrip().endswith(";")
+
+
+def test_expand_failed_server_discloses_and_warns():
+    joined = "\n".join(st.render_expand_section(_snap(
+        st.ServerStatus(name="supabase", status=st.FAILED, detail="timeout"))))
+    assert '"supabase"' in joined and "timeout" in joined
+    assert "Do not register replacement" in joined   # guards against duplicate-registration behavior in field
+
+
+def test_expand_warming_server():
+    joined = "\n".join(st.render_expand_section(_snap(
+        st.ServerStatus(name="fs", status=st.WARMING))))
+    assert '"fs"' in joined and "later message" in joined
+
+
+def test_expand_config_unavailable():
+    joined = "\n".join(st.render_expand_section(_snap(config_error="no ticket")))
+    assert "could not be fetched" in joined and "no ticket" in joined
+    assert "registering" in joined      # also discourages registering new servers

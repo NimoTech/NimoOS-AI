@@ -59,6 +59,40 @@ logger = logging.getLogger(__name__)
 MAX_ANSWER_ATTEMPTS = 3
 
 
+# How long a URL authorization card waits before we send `accept` anyway.
+#
+# The whole point of the URL card is that the WAIT happens here rather than in the
+# protocol loop: `_dispatch_all` awaits this callback with no deadline, the MRTR round
+# counter only ticks on `retry`, and while we are awaiting there is no in-flight
+# request at all (the server already answered with a complete InputRequiredResult), so
+# the 60s per-round read timeout is not running either. The only clock is this one.
+#
+# Why not the 24h DEFAULT_TIMEOUT the form card uses: the card holds the server's
+# `requestState`, and the spec advises servers to give that a SHORT TTL and validate it
+# on arrival. An `accept` sent a day later lands on expired state — strictly worse than
+# one sent in three minutes.
+#
+# Why not shorter: login + MFA + a consent screen on a slow phone is minutes, not
+# seconds. Three is comfortably past the realistic median and still well inside our
+# own 900s sse idle read timeout (see client.py::MCP_SSE_READ_TIMEOUT for why that
+# matters — that value is our own explicit override, not the SDK's 300s default).
+#
+# What happens at the deadline is `on_timeout="accept"`, not "cancel" — see the
+# wait_elicit call below.
+#
+# KNOWN UNBOUNDED WORST CASE (documented, deliberately not mitigated): nothing in our
+# code caps one tool call at URL_ELICIT_WAIT × the MRTR round cap. `conn.call_tool` has
+# no outer `wait_for` and there is no run-level deadline (only max_turns). Trigger: a
+# server that answers our timeout-`accept` by RE-ISSUING the URL elicitation instead of
+# returning state-only. This callback then fires again -> mgr.register -> a new card ->
+# another 180s, up to MCP_INPUT_REQUIRED_ROUNDS (10) times = a ~30-minute hung turn with
+# ten stacked cards (the UI appends), the first nine 409-ing when clicked. The common
+# case is benign: a state-only reply burns the remaining rounds in ~2.1s. The real fix
+# (a per-call ContextVar so rounds 2+ use a short wait) is design work, deferred — see
+# the phase-2 handoff §4.
+URL_ELICIT_WAIT = 180
+
+
 # The only two schemes a URL elicitation may carry.
 #
 # `window.open(url)` in the card navigates a real browser to a fully SERVER-CONTROLLED
@@ -211,19 +245,39 @@ def make_elicitation_callback(server: dict, *, session_id_var, queue_var, mgr_va
             card = dict(card, confirm_id=confirm_id, error=reason)
             await queue.put(card)
 
+            if is_url:
+                # A URL card never re-asks (there is nothing to validate), so this
+                # branch always returns on the first pass through the loop. It waits
+                # DIFFERENTLY from a form card, which is why it has its own
+                # wait_elicit call instead of sharing the one below:
+                #
+                #   - URL_ELICIT_WAIT, not the manager's 24h: the server's
+                #     `requestState` has a short TTL. See the constant's comment.
+                #   - on_timeout="accept", not the default "cancel": at the deadline
+                #     we know NOTHING about what the user did. The card sends nothing
+                #     when it opens the link, so "opened it and is still authorizing"
+                #     and "never touched the card" are indistinguishable from here.
+                #     `accept` is the cheaper guess, not the true one: "cancel"
+                #     definitively kills a call whose browser-side authorization may
+                #     already have succeeded, while a stray "accept" costs at most one
+                #     wasted MRTR loop ending in an accurate error message
+                #     (client.py::_rounds_exceeded_msg) and cannot induce a grant by
+                #     itself — the server validates its own `requestState` and auth
+                #     state, so no grant exists without a real browser flow. Per spec
+                #     `accept` claims only consent anyway — *"The response with
+                #     action: 'accept' indicates that the user has consented to the
+                #     interaction. It does not mean that the interaction is
+                #     complete."*
+                #
+                # A user who explicitly cancels still gets "cancel" — wait_elicit only
+                # applies on_timeout on a real timeout.
+                action, _ = await mgr.wait_elicit(
+                    confirm_id, timeout=URL_ELICIT_WAIT, on_timeout="accept")
+                return ElicitResult(action=action)
+
             action, content = await mgr.wait_elicit(confirm_id)
             if action != "accept":
                 return ElicitResult(action=action)
-
-            if is_url:
-                # Per spec, "accept" on a URL elicitation means only that the user
-                # consented to open the link — explicitly NOT that the interaction
-                # completed. There is nothing to carry back or validate, and the server
-                # is expected to keep saying "not ready" until the out-of-band
-                # authorization lands. Phase 2 accepts that this usually ends in
-                # InputRequiredRoundsExceededError; mcp_client/client.py::
-                # _rounds_exceeded_msg is what makes that legible.
-                return ElicitResult(action="accept")
 
             reason = validate_content(params.requested_schema, content or {})
             if reason is None:

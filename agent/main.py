@@ -2071,7 +2071,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                context_album=None,
                auth_header: str = "",
                user_lang: str = "",
-               mcp_servers: list | None = None,
+               mcp_servers: "list | ConfigUnavailable | None" = None,
                channel_send_file=None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""

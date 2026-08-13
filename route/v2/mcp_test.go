@@ -91,6 +91,9 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	if len(out.Servers) != 1 || out.Servers[0].Headers["Authorization"] != "Bearer SECRET" {
 		t.Fatalf("runtime did not decrypt: %+v", out)
 	}
+	if strings.Contains(rec.Body.String(), "config_error") {
+		t.Fatalf("healthy server must not carry config_error: %s", rec.Body.String())
+	}
 
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -98,6 +101,45 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	_ = h.Runtime(e.NewContext(req2, rec2))
 	if rec2.Code != http.StatusUnauthorized {
 		t.Fatalf("reused ticket should 401, got %d", rec2.Code)
+	}
+}
+
+func TestMcpHandler_RuntimeMarksUndecryptableConfig(t *testing.T) {
+	svc := mcpTestSvc(t)
+	ts := NewTicketStore(time.Minute)
+	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
+	e := echo.New()
+
+	// Headers is non-empty but NOT ciphertext produced by this master key, so
+	// decryption fails — the defect-1 silent point 3 scenario.
+	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+		UserID: "u1", Name: "broken", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Headers: "garbage-not-ciphertext", Enabled: true,
+	})
+
+	tok := ts.Mint("u1")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Agent-MCP-Ticket", tok)
+	rec := httptest.NewRecorder()
+	if err := h.Runtime(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("runtime: %v", err)
+	}
+	var out struct {
+		Servers []struct {
+			Name        string            `json:"name"`
+			Headers     map[string]string `json:"headers"`
+			ConfigError string            `json:"config_error"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(out.Servers) != 1 || out.Servers[0].ConfigError == "" {
+		t.Fatalf("expected config_error to be set: %s", rec.Body.String())
+	}
+	if len(out.Servers[0].Headers) != 0 {
+		t.Fatalf("an undecryptable config must not ship (unauthenticated) headers: %+v",
+			out.Servers[0].Headers)
 	}
 }
 

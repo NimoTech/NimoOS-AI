@@ -250,3 +250,47 @@ def test_confirm_endpoint_rejects_an_unknown_action(monkeypatch):
                     headers={"X-User-Id": "1"},
                     json={"confirm_id": "c1", "action": "approve"})
     assert r.status_code == 400
+
+
+# ── per-call 超时与超时语义（URL 授权卡需要"走开了也把 accept 发出去"）─────────
+
+@pytest.mark.asyncio
+async def test_wait_elicit_honours_a_per_call_timeout_shorter_than_the_managers():
+    """URL 授权卡等 3 分钟,表单卡等 24 小时,两者共用一个 ConfirmManager。"""
+    mgr, _ = _mgr(timeout=3600)
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+    assert await mgr.wait_elicit(cid, timeout=0.05) == ("cancel", None)
+
+
+@pytest.mark.asyncio
+async def test_on_timeout_lets_the_caller_choose_what_a_timeout_means():
+    """策略属于调用方:URL 卡要的是"用户走开了也把 accept 发出去"(让服务端有机会
+    长轮询或回 state-only),普通卡要的是 cancel。confirm.py 只提供开关。"""
+    mgr, _ = _mgr(timeout=3600)
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+    assert await mgr.wait_elicit(cid, timeout=0.05, on_timeout="accept") == ("accept", None)
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_user_answer_still_wins_over_on_timeout():
+    """on_timeout 只在真的超时时生效 —— 用户点了取消就是取消,不能被"超时算 accept"
+    覆盖成"同意"。"""
+    mgr, _ = _mgr(timeout=3600)
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+
+    async def answer():
+        await asyncio.sleep(0)
+        mgr.resolve(cid, False, action="cancel")
+
+    got, _ = await asyncio.gather(
+        mgr.wait_elicit(cid, timeout=5, on_timeout="accept"), answer())
+    assert got == ("cancel", None)
+
+
+@pytest.mark.asyncio
+async def test_a_bogus_on_timeout_fails_fast_instead_of_three_minutes_later():
+    """timeout=3600 是故意的:如果校验放在等待之后,这个测试会挂一小时而不是立刻红。"""
+    mgr, _ = _mgr(timeout=3600)
+    cid = mgr.register("s1", "mcp_elicit:1", "d", "q")
+    with pytest.raises(ValueError):
+        await mgr.wait_elicit(cid, timeout=3600, on_timeout="approve")

@@ -59,7 +59,8 @@ def test_round_cap_is_the_sdk_default():
 def test_rounds_exceeded_and_unsupported_capability_say_different_things():
     """两条分岔在第二期含义完全不同，共用一条文案会让模型给出错误建议。
 
-    - 轮次耗尽：elicitation **已经支持**，问过用户、用户答了、服务端还是没就绪。
+    - 轮次耗尽：elicitation **已经支持**，问过用户（或等到超时自动作答）、我们答复了、
+      服务端还是没就绪。
       正确的话是"去完成授权，然后重试"，不是"去改服务器配置"。
     - 缺失能力（sampling / roots）：我们确实没声明，"检查该 MCP 服务配置"仍然准确。
     """

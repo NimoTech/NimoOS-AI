@@ -41,6 +41,8 @@ import context_compaction
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
+from mcp_client import status as mcp_status
+from mcp_client.runtime import ConfigUnavailable
 from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
@@ -425,13 +427,32 @@ def format_context_lines(context_photo=None, context_album=None) -> str:
 
 async def _build_mcp_for_run(mcp_servers):
     """Build cache-backed, confirm-gated MCP tools for this run. Never raises —
-    MCP is additive. Returns a flat list of FunctionTools."""
+    MCP is additive. Returns (FunctionTool list, McpStatusSnapshot | None);
+    a None snapshot means MCP is not in play (or the pipeline errored), which
+    renders as no prompt line + the fallback expand_tools wording."""
+    if isinstance(mcp_servers, ConfigUnavailable):
+        return [], mcp_status.McpStatusSnapshot(config_error=mcp_servers.reason)
+    if mcp_servers is None:
+        return [], None
     if not mcp_servers:
-        return []
+        return [], mcp_status.McpStatusSnapshot()
     try:
-        return await mcp_client.build_mcp_tools(mcp_servers)
+        tools, statuses = await mcp_client.build_mcp_tools(mcp_servers)
+        return tools, mcp_status.McpStatusSnapshot(servers=statuses)
     except Exception:
-        return []
+        return [], None
+
+
+def _apply_mcp_status(full_prompt: str, snapshot) -> str:
+    """Publish the per-run MCP status snapshot (read back by expand_tools) and
+    append its one-line summary to the system prompt (defect 1A: the first-turn
+    routing signal). Never raises — extends _build_mcp_for_run's contract."""
+    try:
+        mcp_status.MCP_STATUS_VAR.set(snapshot)
+        line = mcp_status.render_prompt_line(snapshot)
+    except Exception:
+        return full_prompt
+    return (full_prompt + "\n\n" + line) if line else full_prompt
 
 
 class AgentRunner:
@@ -552,7 +573,7 @@ class AgentRunner:
         context_album=None,
         auth_header: str = "",
         user_lang: str = "",
-        mcp_servers: list | None = None,
+        mcp_servers: "list | ConfigUnavailable | None" = None,
         channel_send_file=None,
     ) -> None:
         lock = _get_lock(session_id)
@@ -794,7 +815,8 @@ class AgentRunner:
             # without opening any connections, so pinned profiles incur zero
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
-            mcp_tools = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            mcp_tools, mcp_snapshot = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            full_prompt = _apply_mcp_status(full_prompt, mcp_snapshot)
             run_tools = (select_tools_for_run(attachment_ids,
                                               session_id=session_id, profile=profile)
                          + (gate_runtime_tools(mcp_tools, "mcp")

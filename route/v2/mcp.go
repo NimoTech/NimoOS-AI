@@ -299,18 +299,29 @@ type runtimeServer struct {
 	Args      []string          `json:"args"`
 	Env       map[string]string `json:"env"`
 	Headers   map[string]string `json:"headers"`
+	// Set when the stored env/headers ciphertext failed to decrypt. The agent
+	// must not connect with an unauthenticated config — a 401 at call time
+	// would mask the real cause (the stored credentials are broken).
+	ConfigError string `json:"config_error,omitempty"`
 }
 
-func (h *MCPHandler) decryptMap(enc string) map[string]string {
+func (h *MCPHandler) decryptMapErr(enc string) (map[string]string, error) {
 	out := map[string]string{}
 	if enc == "" || enc == "{}" {
-		return out
+		return out, nil
 	}
 	plain, err := h.svc.MasterKey().Decrypt(enc)
 	if err != nil {
-		return out
+		return out, err
 	}
 	_ = json.Unmarshal([]byte(plain), &out)
+	return out, nil
+}
+
+// decryptMap keeps the old silent behaviour for callers where a partial
+// result is acceptable (the /test probe surfaces its own failure).
+func (h *MCPHandler) decryptMap(enc string) map[string]string {
+	out, _ := h.decryptMapErr(enc)
 	return out
 }
 
@@ -469,12 +480,18 @@ func (h *MCPHandler) Runtime(c echo.Context) error {
 	for _, m := range rows {
 		var args []string
 		_ = json.Unmarshal([]byte(m.Args), &args)
-		servers = append(servers, runtimeServer{
+		env, envErr := h.decryptMapErr(m.Env)
+		headers, hdrErr := h.decryptMapErr(m.Headers)
+		rs := runtimeServer{
 			ID: m.ID, Name: m.Name, Transport: m.Transport, URL: m.URL,
 			Command: m.Command, Args: args,
-			Env:     h.decryptMap(m.Env),
-			Headers: h.decryptMap(m.Headers),
-		})
+			Env: env, Headers: headers,
+		}
+		if envErr != nil || hdrErr != nil {
+			rs.Env, rs.Headers = map[string]string{}, map[string]string{}
+			rs.ConfigError = "stored credentials could not be decrypted; ask the user to re-save this server's headers/env"
+		}
+		servers = append(servers, rs)
 	}
 	return c.JSON(http.StatusOK, map[string]any{"servers": servers})
 }

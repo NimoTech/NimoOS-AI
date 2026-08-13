@@ -82,7 +82,8 @@ class ConfirmManager:
 
         return self._results.pop(confirm_id, False)
 
-    async def wait_elicit(self, confirm_id: str) -> tuple[str, dict | None]:
+    async def wait_elicit(self, confirm_id: str, *, timeout: float | None = None,
+                          on_timeout: str = "cancel") -> tuple[str, dict | None]:
         """Three-state sibling of wait(), for MCP elicitation.
 
         Returns (action, content). Anything that is not an explicit user choice —
@@ -91,18 +92,45 @@ class ConfirmManager:
         "the user said no".
 
         There is no SDK-side deadline on the elicitation callback (the MRTR driver's
-        _dispatch_all awaits it unbounded), so the 24h DEFAULT_TIMEOUT here is the
-        real one. That is intentional: the spec wants the user to be able to walk
-        away, authorize out of band, and come back.
+        _dispatch_all awaits it unbounded), so the timeout here is the real one.
+        That is intentional: the spec wants the user to be able to walk away,
+        authorize out of band, and come back.
+
+        `timeout` overrides the manager-wide DEFAULT_TIMEOUT for THIS wait only.
+        A URL authorization card cannot use the 24h default: it holds a server's
+        `requestState`, which the spec advises servers to give a SHORT TTL and to
+        validate on arrival. Sending `accept` a day later means sending it against
+        expired state — strictly worse than sending it in three minutes. Form cards
+        keep the 24h default (nothing there expires).
+
+        `on_timeout` is what a timeout MEANS to this caller, and it exists for the
+        same reason. For a form card a timeout is "cancel": we have no answer, so
+        there is nothing to submit. For a URL card a timeout is "accept" — and NOT
+        because we know the user consented. The card POSTs nothing when it opens the
+        link, so at the deadline we have received zero bytes and cannot tell "opened
+        it and is mid-OAuth" from "never touched the card". `accept` is simply the
+        cheaper of two guesses: "cancel" definitively kills a call whose
+        browser-side authorization may already have succeeded, while a stray
+        "accept" costs at most one wasted protocol loop ending in an accurate error
+        message, and cannot induce anything by itself (a server must validate its
+        own requestState and auth state, so no grant exists without a real browser
+        flow). An explicit user answer always wins; this only fires on a real
+        timeout.
         """
+        if on_timeout not in ELICIT_ACTIONS:
+            raise ValueError(f"unknown elicitation action: {on_timeout!r}")
         pending = self._pending.get(confirm_id)
         if pending is None:
             return ("cancel", None)
         try:
             try:
-                await asyncio.wait_for(pending.event.wait(), timeout=self._timeout)
+                await asyncio.wait_for(
+                    pending.event.wait(),
+                    timeout=self._timeout if timeout is None else timeout)
             except asyncio.TimeoutError:
-                return ("cancel", None)
+                # content is unconditionally None: a timeout means no answer exists,
+                # whatever we map the ACTION to.
+                return (on_timeout, None)
             finally:
                 self._cleanup(confirm_id)
                 self._results.pop(confirm_id, None)

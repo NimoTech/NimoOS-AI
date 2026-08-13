@@ -20,7 +20,9 @@ import mcp_client.client as mc
     (500, 60),          # sub-second declaration is floored, not honoured
     (30_000, 60),       # 30s -> floor
     (60_000, 60),       # exactly the floor
-    (3_600_000, 3600),  # honoured as-is
+    (3_600_000, 3600),  # exactly the ceiling
+    (7_200_000, 3600),  # 2h -> ceiling: a huge ttlMs must not pin a stale manifest
+    (86_400_000, 3600), # 24h -> ceiling (the defect-② scenario)
 ])
 def test_resolve_ttl(raw_ms, expected):
     assert mc._resolve_ttl(raw_ms) == expected
@@ -29,6 +31,7 @@ def test_resolve_ttl(raw_ms, expected):
 def test_resolve_ttl_uses_named_constants():
     assert mc.SCHEMA_TTL == 600
     assert mc.SCHEMA_TTL_MIN == 60
+    assert mc.SCHEMA_TTL_MAX == 3600
 
 
 def test_ttl_is_stored_at_write_time_not_recomputed_on_read():
@@ -63,7 +66,7 @@ async def test_short_ttl_entry_is_stale_and_triggers_single_revalidate(monkeypat
     monkeypatch.setattr(mc, "_revalidate", fake_revalidate)
 
     results = await asyncio.gather(*[mc._metas_for_server(server) for _ in range(5)])
-    assert all(r == [{"name": "a"}] for r in results)   # stale served, never blocked
+    assert all(r == ([{"name": "a"}], mc.OK, "") for r in results)   # stale served, never blocked
     await asyncio.sleep(0.1)
     assert started == [1], f"single-flight broken: {len(started)} concurrent refreshes"
 
@@ -89,9 +92,10 @@ async def test_cold_path_has_a_single_total_budget(monkeypatch):
     monkeypatch.setattr(mc, "_revalidate", noop_revalidate)
 
     started = time.monotonic()
-    metas = await mc._metas_for_server(
+    metas, status, detail = await mc._metas_for_server(
         {"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     elapsed = time.monotonic() - started
 
     assert metas == []                    # give up rather than block run start
+    assert status == mc.FAILED and detail # the failure is now visible to the model
     assert elapsed < 1.0, f"cold path was not capped by the total budget ({elapsed:.2f}s)"

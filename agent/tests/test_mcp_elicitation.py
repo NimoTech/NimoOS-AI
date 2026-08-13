@@ -22,6 +22,7 @@ from mcp.client._memory import InMemoryTransport
 from mcp.server.lowlevel import Server
 
 import mcp_client.client as mc
+import mcp_client.elicitation as E
 from confirm import ConfirmManager
 from mcp_client.elicitation import make_elicitation_callback
 
@@ -387,8 +388,12 @@ async def test_a_failure_in_one_card_does_not_destroy_a_siblings_answer():
 # ── 真实 SDK 对象上的端到端 ────────────────────────────────────────────────────
 
 def _build_server(script):
-    """script: 每次 tools/call 依次返回的东西。on_list_tools 是必须的 —— 见模块 docstring。"""
-    calls = {"n": 0, "states": []}
+    """script: 每次 tools/call 依次返回的东西。on_list_tools 是必须的 —— 见模块 docstring。
+
+    calls["states"] / calls["responses"]:服务端每一轮实际收到的 requestState 与
+    inputResponses(retry 请求把上一轮的 ElicitResult 装在 params.input_responses 里)。
+    """
+    calls = {"n": 0, "states": [], "responses": []}
 
     async def _list(ctx, params):
         return mtypes.ListToolsResult(tools=[mtypes.Tool(
@@ -397,6 +402,7 @@ def _build_server(script):
 
     async def _call(ctx, params):
         calls["states"].append(getattr(params, "request_state", None))
+        calls["responses"].append(getattr(params, "input_responses", None))
         item = script[min(calls["n"], len(script) - 1)]
         calls["n"] += 1
         return item
@@ -530,3 +536,136 @@ async def test_production_connect_installs_the_callback():
     # 第二期仍然不声明这两个 —— 见 Global Constraints 第 9 条
     assert "sampling_callback" not in captured
     assert "list_roots_callback" not in captured
+
+
+# ── URL 卡的等待:带外授权发生在浏览器里,协议层等不起 ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_url_card_the_user_never_answers_sends_accept_anyway(monkeypatch):
+    """用户点开了授权页就再没回来。这时候发 accept 而不是 cancel:accept 按规范只断言
+    "用户同意进行这次交互"(*It does not mean that the interaction is complete*),
+    用户确实同意过,所以这句话是真的;而发出去能让长轮询/state-only 服务端有机会
+    返回终态。发 cancel 等于主动把一次可能已经成功的授权判死。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.05)
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://accounts.example.com/oauth")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    assert card["kind"] == "mcp_elicit_url"
+
+    result = await asyncio.wait_for(task, timeout=2)      # 没有人 resolve
+    assert result.action == "accept" and result.content is None
+
+
+@pytest.mark.asyncio
+async def test_the_url_card_wait_is_not_the_24h_form_wait(monkeypatch):
+    """URL 卡必须走自己的短超时。这条测试的价值在于:如果有人把 URL 分支合回共用的
+    wait_elicit 调用,它会挂在 ConfirmManager 的 timeout 上而不是 0.05 秒返回。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.05)
+    mgr, _ = _mgr()                    # ConfirmManager timeout=5
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://ok.example/oauth")))
+    await asyncio.wait_for(queue.get(), timeout=2)
+    # 1 秒远小于 ConfirmManager 的 5 秒,大于 URL_ELICIT_WAIT 的 0.05 秒
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result.action == "accept"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_cancel_on_a_url_card_is_still_cancel(monkeypatch):
+    """"超时算 accept" 绝不能把用户明确点的取消也吃掉。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 5)
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://ok.example/oauth")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    mgr.resolve(card["confirm_id"], False, action="cancel")
+
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.action == "cancel"
+
+
+@pytest.mark.asyncio
+async def test_a_form_card_still_waits_on_the_managers_own_timeout(monkeypatch):
+    """反向保护:URL 分支的短超时不得泄漏到表单卡上。表单卡里没有任何会过期的
+    服务端状态,用户思考多久都不该被我们打断。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.01)
+    mgr, _ = _mgr()                    # ConfirmManager timeout=5
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestFormParams(
+        message="Who are you?", requestedSchema=FORM_SCHEMA)))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    # 睡过 URL_ELICIT_WAIT 的 30 倍:表单卡如果误用了它,这时已经超时返回 cancel 了
+    await asyncio.sleep(0.3)
+    assert not task.done()
+
+    mgr.resolve(card["confirm_id"], True, action="accept", content={"name": "Nimo"})
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.action == "accept" and result.content == {"name": "Nimo"}
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_url_round_trip_through_our_own_callback():
+    """本分支的头号主张,跑在**真实 SDK 对象**上（真 Server / 真 Client / 真
+    InMemoryTransport / 真 JSON-RPC）：服务端下发 URL elicitation -> 我们的回调弹 URL 卡
+    -> 用户从第三方页面回来点【我已完成授权】(phase 2 的 accept) -> 那个 accept 真的驱动
+    SDK 发出 retry -> 服务端给出**终态**结果。
+
+    另外两条只有端到端才测得到的东西：
+      - 一个 **不带 content** 的 ElicitResult（URL 模式没有 content）能原样过 JSON-RPC
+        编解码,不会被 pydantic 或 SDK 拒掉；
+      - `requestState` 被 SDK 原样回显（第一轮 None,重试那轮带上服务端给的值),
+        和表单路径一致 —— 我们从不碰它。
+
+    四条既有 URL 测试全是直接调回调,证不了"accept 能驱动 retry 到终态"这一步。
+    """
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    server, calls = _build_server([
+        T.InputRequiredResult(
+            inputRequests={"auth": T.ElicitRequest(
+                params=T.ElicitRequestURLParams(
+                    message="Authorize Nimo on accounts.example.com",
+                    url="https://accounts.example.com/oauth/authorize"))},
+            requestState="OPAQUE-URL-7"),
+        mtypes.CallToolResult(
+            content=[mtypes.TextContent(type="text", text="authorized, here is your data")]),
+    ])
+
+    async def come_back_and_say_done():
+        card = await asyncio.wait_for(queue.get(), timeout=5)
+        assert card["kind"] == "mcp_elicit_url"
+        assert card["host"] == "accounts.example.com" and card["insecure"] is False
+        # 前端 phase 2 就是这一句：只有 action,没有 content。
+        mgr.resolve(card["confirm_id"], False, action="accept")
+
+    async with AsyncExitStack() as stack:
+        client = await stack.enter_async_context(Client(
+            InMemoryTransport(server, raise_exceptions=True), mode="auto",
+            read_timeout_seconds=5, cache=None,
+            input_required_max_rounds=mc.MCP_INPUT_REQUIRED_ROUNDS,
+            elicitation_callback=make_elicitation_callback(SERVER, **_ctx(mgr, queue))))
+        result, _ = await asyncio.gather(client.call_tool("greet", {}),
+                                        come_back_and_say_done())
+
+    assert not result.is_error
+    assert result.content[0].text == "authorized, here is your data"
+    assert calls["states"] == [None, "OPAQUE-URL-7"]
+    # 服务端第二轮真的收到了我们的 accept —— 这条才把"卡片上的 accept 驱动了 retry"
+    # 钉死;只断言拿到终态是不够的（decline 那条测试证明服务端不论收到什么都可以收尾）。
+    assert calls["responses"][0] is None
+    reply = calls["responses"][1]["auth"]
+    assert reply.action == "accept"
+    # URL 模式的 ElicitResult 不带 content,而且 content 缺失能过整条 JSON-RPC 编解码。
+    assert getattr(reply, "content", None) is None

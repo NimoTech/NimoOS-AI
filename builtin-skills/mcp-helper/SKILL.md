@@ -1,20 +1,29 @@
 ## MCP helper
 
-Help the user connect external MCP (Model Context Protocol) servers and use
-the tools those servers expose. MCP lets Nimo borrow tools from a third party
-(docs search, a SaaS API, a local command-line server, ...).
+Set up and troubleshoot external MCP (Model Context Protocol) servers for the
+user. MCP lets Nimo borrow tools from a third party (docs search, a SaaS API,
+a local command-line server, ...).
+
+**If a server is already connected and the user wants to *use* it** ("search
+X for Y") — stop here: call `expand_tools(["mcp"])`, then call
+`mcp__<server-slug>__<tool>` directly. That request is an ordinary tool call;
+nothing below applies to it. Don't re-run setup steps or offer connection
+checks.
+
+### Scope — what this skill covers, and what to hand back
+- **Only the setup slice of a bigger request.** "Register X, then use it to do
+  Y": this skill governs getting X connected; carry out Y as a normal task.
+  Likewise, if the user pivots to a general question mid-troubleshooting
+  ("what's the difference between HTTP and SSE?"), just answer it and drop
+  the procedure.
+- **Only MCP servers.** If the thing that won't connect is not an MCP server
+  registered in Settings — Plex, SSH, SMB, anything else on the NAS — it's a
+  normal support question; keep it out of the troubleshooting list below.
 
 **Key fact, state it plainly:** you can **register** a server for the user via
-the `mcp_register_server` tool (it requires the user to approve a confirmation
+the `add_mcp_server` tool (it requires the user to approve a confirmation
 card). You cannot edit, delete, or test servers yourself — those remain UI/CLI
-operations; guide the user through them. For everything else, use whatever MCP
-tools become available once a server is live.
-
-### When to use
-- User asks how to add / install / connect an MCP server, says "MCP", or names
-  one ("add the Microsoft Learn MCP", "connect Notion over MCP").
-- A configured MCP server "isn't working" / "can't be called" / returns errors.
-- A `mcp__<server>__<tool>` tool is available and the user asks what it is.
+operations; guide the user through them.
 
 ### How to run
 
@@ -33,11 +42,12 @@ tools become available once a server is live.
    `Authorization: Bearer <token>`) or **Env** for stdio. Stored encrypted.
 4. Tell them to click **Test connection** on the server's detail panel — it
    lists the server's tools, confirming the connection works.
-5. Once the server is enabled, its tools appear to you as
+5. Once the server is enabled and you unlock the `mcp` tool category
+   (`expand_tools(["mcp"])`), its tools appear to you as
    `mcp__<server-slug>__<tool-name>` and you can call them like any other tool.
 
 **To register a server for the user yourself:** call the
-`mcp_register_server(command_line, name)` tool with the launch command the
+`add_mcp_server(command_line, name)` tool with the launch command the
 user gave (e.g. `npx -y @upstash/context7-mcp`, `uvx mcp-server-time`, a
 `codex mcp add ... -- ...` line, or a bare https URL). It shows the user a
 confirmation card with the exact command; on approval the server is saved and
@@ -66,7 +76,7 @@ Prefer this when the user explicitly asks you to install/add an MCP server.
   blank KEEPS the existing (encrypted) values — only fill them in to replace.
 
 ### Guardrails
-- You can register a server via `mcp_register_server` (the user must approve the
+- You can register a server via `add_mcp_server` (the user must approve the
   confirmation card). You cannot edit, delete, or test servers — those remain
   UI/CLI-only; for them, guide the user. Never claim a server is added until the
   tool returns success.

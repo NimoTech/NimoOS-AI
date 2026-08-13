@@ -17,11 +17,12 @@ from mcp.client import Client, InputRequiredRoundsExceededError
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
-from mcp.types import INVALID_REQUEST
+from mcp.types import INVALID_REQUEST, METHOD_NOT_FOUND
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
+from mcp_client.status import OK, FAILED, WARMING, CONFIG_ERROR, ServerStatus
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -53,12 +54,25 @@ MCP_COLD_TOTAL_TIMEOUT = 10
 # every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
 MCP_SESSION_TIMEOUT = 60  # seconds
 
+# sse 传输的空闲读超时。SDK 默认 300s（sse_client 的 sse_read_timeout 参数默认值，
+# 由 tests/test_mcp_transport_timeouts.py 钉住）。
+#
+# 为什么要显式覆盖：一次 elicitation 期间链路上没有任何 in-flight 请求 —— 服务端已经
+# 用完整的 InputRequiredResult 答复过了，我们在自己的回调里等用户。MCP_SESSION_TIMEOUT
+# 那 60 秒是**每个请求**的钟，此刻不计时；唯一还在跑的就是这个空闲钟。让它取一个我们
+# 不控制的 SDK 默认值，等于把 URL_ELICIT_WAIT（180s）能不能活下来交给运气。
+#
+# 900s 覆盖的是"用户去授权几分钟就回来"。它**不**覆盖表单卡的 24 小时
+# DEFAULT_TIMEOUT —— 那个上限在 sse 传输上今天就已经不成立（既有限制，不是本次引入），
+# 修法是重连后重发原调用，不是把这个数字调到 86400。
+MCP_SSE_READ_TIMEOUT = 900
+
 STDIO_CONNECT_TIMEOUT = 90  # seconds; the first stdio npx/uvx package fetch can be slow (cached locally after, then fast)
 
 # ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
 # A registered stdio MCP server spawns command+args directly in the netns
 # executor, bypassing the shell guard. Without this, a user tricked into
-# approving `mcp_register_server("bash -c 'rm -rf /DATA'")` would run an
+# approving `add_mcp_server("bash -c 'rm -rf /DATA'")` would run an
 # arbitrary destructive command on the next turn. Deny-by-default by BASENAME:
 # only known MCP launchers may spawn, at any path (`/usr/bin/npx` ok). A path
 # allow-by-directory rule was rejected — /bin, /usr/bin contain bash/rm/dd, so
@@ -124,13 +138,19 @@ SCHEMA_TTL = 600
 # change notifications anyway, so that window is already accepted. Config changes
 # still invalidate instantly via the fingerprint, unaffected by this floor.
 SCHEMA_TTL_MIN = 60
+# Ceiling for a server-declared ttlMs. Without it a server declaring 24h really
+# gets cached for 24h, which multiplies the staleness window of removed tools
+# (defect ①) — the unknown-tool invalidation self-heals mid-TTL, but only after
+# the model has already tripped over the missing tool once.
+SCHEMA_TTL_MAX = 3600
 SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 
 # MRTR round cap = the SDK default (mcp/client/_input_required.py::
 # DEFAULT_INPUT_REQUIRED_MAX_ROUNDS). A "round" is a REQUEST/RETRY round trip, not a
 # question put to the user: the user pondering a card burns none of these — our
 # callback simply hasn't returned yet and _dispatch_all keeps awaiting it, with the
-# round counter frozen and only our own 24h confirm timeout running.
+# round counter frozen and only our own confirm timeout running (24h for a form card,
+# elicitation.py::URL_ELICIT_WAIT = 180s for a URL authorization card).
 #
 # What DOES burn rounds is the state-only leg: an InputRequiredResult carrying only
 # requestState and no inputRequests. The spec treats that as a first-class shape (a
@@ -141,13 +161,22 @@ SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 # 350ms and would throw InputRequiredRoundsExceededError at a perfectly compliant
 # server. 10 buys 0.05+0.1+0.2+0.25*7 = 2.1s.
 #
-# 2.1s does NOT make out-of-band OAuth work — nobody completes a login in two
-# seconds. That is a deliberate, documented phase-2 trade-off (see the handoff's
-# §4 correction): the URL card returns "accept" the moment the user consents to
-# open the link, and a real OAuth server will still be waiting when the rounds run
-# out. Raising the cap stops us from breaking COMPLIANT servers; it does not
-# implement the wait. The fix for that is the deferred "I finished authorizing"
-# card, which moves the wait inside our own callback where no round cap applies.
+# 2.1s is NOT the out-of-band OAuth budget, and no longer needs to be. The wait for a
+# third-party authorization happens INSIDE our elicitation callback, where no round cap
+# applies (see elicitation.py::URL_ELICIT_WAIT). Phase 2 returned "accept" the moment
+# the user consented to open the link, which is exactly why it always landed here with
+# the login unfinished; that behaviour is gone — the card now sends "accept" only when
+# the user comes back and says they finished, so the retry usually gets a terminal
+# result in a single round.
+#
+# What the cap still governs is the legs that do not ask the user: the state-only
+# polling ones above, and above all the TIMEOUT path. URL_ELICIT_WAIT expiring sends
+# "accept" with no user answer behind it (see the on_timeout rationale in
+# elicitation.py), so the server may still be unauthorized and answer with state-only
+# rounds — 2.1s of them, then InputRequiredRoundsExceededError and the
+# _rounds_exceeded_msg wording below. That is the accepted landing spot for a genuinely
+# abandoned card, not a reason to raise this number: a bigger cap only lengthens a
+# poll the user is no longer participating in.
 MCP_INPUT_REQUIRED_ROUNDS = 10
 
 # Upper bound on aclose(). aclose() shields itself from cancellation (see McpConn),
@@ -165,7 +194,7 @@ def _resolve_ttl(raw_ttl_ms) -> int:
     """
     if not isinstance(raw_ttl_ms, (int, float)) or raw_ttl_ms <= 0:
         return SCHEMA_TTL
-    return max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN)
+    return min(max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN), SCHEMA_TTL_MAX)
 
 
 class _CacheEntry:
@@ -286,15 +315,21 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
 
 
 def _rounds_exceeded_msg(server_name: str) -> str:
-    """MRTR rounds exhausted AFTER we already asked the user and they answered.
+    """MRTR rounds exhausted AFTER we already put the question to the user.
 
     Phase 1 reused the "capability not supported" wording here, and in phase 2 that
-    is simply false: elicitation IS supported now. The real meaning is "we asked, the
-    user answered, the server still isn't ready" — overwhelmingly an out-of-band
+    is simply false: elicitation IS supported now. The real meaning is "we asked, we
+    answered the server, it still isn't ready" — overwhelmingly an out-of-band
     authorization that hasn't completed. Telling the model to check the server's
     CONFIGURATION would send the user off fixing the wrong thing.
+
+    The premise is deliberately vaguer than "the user answered", because it has to
+    cover the URL card's timeout path too: there, URL_ELICIT_WAIT expired and we sent
+    `accept` with no user answer behind it (see elicitation.py). Both paths land here
+    for the same underlying reason and want the same advice, so only the actionable
+    half is stated as fact.
     """
-    return (f'[MCP error] MCP server "{server_name}" asked for input, the user answered, '
+    return (f'[MCP error] MCP server "{server_name}" asked for input, we responded, '
             "and the server is still not ready. This is almost always an out-of-band "
             "authorization that has not finished yet — it is NOT a problem with the call "
             "arguments, so do NOT retry with different arguments. Tell the user to finish "
@@ -387,6 +422,36 @@ def _is_unsupported_capability(err) -> bool:
             and str(getattr(data, "message", "")).endswith("not supported"))
 
 
+_UNKNOWN_TOOL_RE = re.compile(
+    r"unknown tool"
+    r"|no such tool"
+    r"|tool\s+[\"'`]?[\w./-]+[\"'`]?\s+(not found|does not exist)",
+    re.IGNORECASE)
+
+
+def _is_unknown_tool(err) -> bool:
+    """True when a call failed because the server no longer has the tool.
+
+    Deliberately narrow — ONLY this signature may drop the schema cache;
+    invalidating on any MCPError would let plain argument errors punch through
+    the warm path the cache exists to provide (defect-① review note). Two
+    shapes are recognised: JSON-RPC METHOD_NOT_FOUND (-32601), and the common
+    "Unknown tool …" / "no such tool" / "tool <name> not found" wordings
+    servers put on generic codes. The tool-name form requires the name to sit
+    immediately next to "not found"/"does not exist" so that unrelated
+    resource errors merely mentioning a tool in passing (e.g. "Error
+    executing tool read_file: File not found") are not misclassified as a
+    missing tool — that would drop the schema cache and tell the model not to
+    retry, when a corrected argument is the right recovery.
+    """
+    data = getattr(err, "error", None)
+    if data is None:
+        return False
+    if getattr(data, "code", None) == METHOD_NOT_FOUND:
+        return True
+    return bool(_UNKNOWN_TOOL_RE.search(str(getattr(data, "message", ""))))
+
+
 def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
     slug = _slug(server["name"])
     tool_name = meta["name"]
@@ -419,6 +484,18 @@ def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
                 return _legacy_url_elicitation_msg(server["name"])
             if _is_unsupported_capability(e):
                 return _unsupported_capability_msg(server["name"])
+            if _is_unknown_tool(e):
+                # Defect ①: within the TTL the manifest keeps advertising a tool
+                # the server has removed, and nothing ever corrected it. Drop the
+                # entry and refresh in the background. The run's tool set is
+                # immutable (an SDK decision), so the refresh helps the NEXT run
+                # — the message states that honestly.
+                _SCHEMA_CACHE.pop(server["id"], None)
+                _schedule_revalidate(server)
+                return (f'[MCP error] MCP server "{server["name"]}" no longer recognizes '
+                        f"tool {tool_name} — it may have been removed on the server side. "
+                        "The tool list will be refreshed for your next message; do NOT "
+                        "retry this call with different arguments.")
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
@@ -549,7 +626,8 @@ async def _build_transport(server: dict, stack: AsyncExitStack,
             httpx2.AsyncClient(headers=headers, timeout=session_to))
         return streamable_http_client(server["url"], http_client=http_client)
     if transport == "sse":
-        return sse_client(server["url"], headers=headers, timeout=session_to)
+        return sse_client(server["url"], headers=headers, timeout=session_to,
+                          sse_read_timeout=MCP_SSE_READ_TIMEOUT)
     if transport == "stdio":
         # Deny-by-default gate: the stdio command spawns directly in the netns
         # executor, bypassing the shell guard — never spawn an off-list command.
@@ -716,46 +794,68 @@ async def _cold_fetch(server: dict):
 
 
 async def _metas_for_server(server: dict):
-    """Return tool metas for a server, preferring cache. Cold/changed -> fetch
-    inline; stale -> serve cached + background revalidate. Returns [] on failure
-    (and emits a warning)."""
+    """Return (tool metas, status, detail) for a server, preferring cache.
+    Cold/changed -> fetch inline; stale -> serve cached + background revalidate.
+    On failure returns ([], FAILED/WARMING, reason) and still emits the UI
+    warning event — the status return is the model-facing channel (defect 1),
+    the event is the UI-facing one; both render the same fact."""
     fp = _fingerprint(server)
     entry = _cache_get(server["id"])
     if entry is not None and entry.fingerprint == fp:
         if time.monotonic() - entry.fetched_at > entry.ttl:
             _schedule_revalidate(server)        # stale-while-revalidate
-        return entry.metas
+        return entry.metas, OK, ""
     # cold / fingerprint changed:
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # background single-flight self-healing warmup (connect+list+cache), does not block run startup
         await _emit_warning(server.get("name", "mcp"),
                             "stdio tools are initializing in the background for first use; retry shortly")
-        return []
+        return [], WARMING, "stdio server is initializing in the background"
     try:
         # ONE budget for the whole cold path (connect + list). The connect leg alone
         # is now 8s for mode="auto"'s extra server/discover round trip; without this
         # cap the run-start worst case would grow from 5+5 to 8+8.
-        return await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
+        metas = await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
+        return metas, OK, ""
     except Exception as e:
         # A cold-fetch timeout is usually a cold connection on a slow link.
         # Warm the cache in the background with a generous timeout; tools are ready by the next run.
         _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
-        return []
+        return [], FAILED, str(e) or type(e).__name__
 
 
-async def build_mcp_tools(servers: list[dict]) -> list:
+async def build_mcp_tools(servers: list[dict]) -> tuple:
     """Build confirm/blacklist-gated FunctionTools for this run from the schema
     cache (zero connection when warm). Connections are established lazily per
-    tool call (see _get_run_conn). Returns a flat list of FunctionTools."""
-    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in servers],
+    tool call (see _get_run_conn). Returns (flat FunctionTool list, per-server
+    ServerStatus list in the same order as *servers*) — the status side is the
+    defect-1 fix: load failures become visible to the model instead of only to
+    the UI event stream."""
+    probed = [s for s in servers if not s.get("config_error")]
+    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in probed],
                                      return_exceptions=True)
-    tools = []
+    results = iter(metas_per)
+    tools: list = []
+    statuses: list = []
     seen_names: set = set()
-    for s, metas in zip(servers, metas_per):
-        if isinstance(metas, Exception):
-            await _emit_warning(s.get("name", "mcp"), metas)
+    for s in servers:
+        name = s.get("name", "mcp")
+        if s.get("config_error"):
+            # Go flagged this server's stored credentials as undecryptable; do
+            # not connect with an unauthenticated config — a 401 at call time
+            # would mask the real cause.
+            statuses.append(ServerStatus(name=name, status=CONFIG_ERROR,
+                                         detail=str(s["config_error"])))
             continue
+        res = next(results)
+        if isinstance(res, Exception):
+            await _emit_warning(name, res)
+            statuses.append(ServerStatus(name=name, status=FAILED,
+                                         detail=str(res) or type(res).__name__))
+            continue
+        metas, status, detail = res
+        fq_names = []
         for meta in metas:
             tool = _wrap_tool(s, meta)
             if tool.name in seen_names:          # disambiguate cross-server collisions
@@ -765,7 +865,10 @@ async def build_mcp_tools(servers: list[dict]) -> list:
                 tool.name = f"{tool.name}_{suffix}"
             seen_names.add(tool.name)
             tools.append(tool)
-    return tools
+            fq_names.append(tool.name)
+        statuses.append(ServerStatus(name=name, status=status, detail=detail,
+                                     tool_names=fq_names))
+    return tools, statuses
 
 
 # The probe budget is PER PHASE, not one flat ceiling. The connect phase has to

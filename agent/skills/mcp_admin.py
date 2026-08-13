@@ -45,7 +45,7 @@ async def _register(base: str, user_id: str, command_line: str, name: str) -> di
 
 
 @function_tool
-async def mcp_register_server(command_line: str, name: str = "") -> str:
+async def add_mcp_server(command_line: str, name: str = "") -> str:
     """Register an external MCP server for the user from a one-line command.
 
     Use when the user asks to install/add/connect an MCP server and gives a
@@ -98,4 +98,4 @@ async def mcp_register_server(command_line: str, name: str = "") -> str:
             f"Its tools will be available from your next message.")
 
 
-ALL_TOOLS = [mcp_register_server]
+ALL_TOOLS = [add_mcp_server]
