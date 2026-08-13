@@ -20,7 +20,7 @@ class ConfigUnavailable:
     reason: str
 
 
-def parse_servers(payload: str):
+def parse_servers(payload: str) -> list[dict] | None:
     """Parse the runtime endpoint body into a list of server dicts, or None
     when the body is malformed — malformed is a failure, not "no servers"."""
     try:
@@ -41,7 +41,7 @@ def _read_ai_base() -> str | None:
         return None
 
 
-async def fetch_mcp_servers(ticket: str):
+async def fetch_mcp_servers(ticket: str) -> list[dict] | ConfigUnavailable:
     """Returns the enabled MCP servers (decrypted) for the run: a list on
     success ([] really means "no servers configured"), or ConfigUnavailable
     when the config could not be fetched. Never raises — MCP is additive."""

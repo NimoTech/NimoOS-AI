@@ -51,3 +51,59 @@ async def test_fetch_without_ai_url_is_config_unavailable(monkeypatch):
     monkeypatch.setattr(rt, "_read_ai_base", lambda: None)
     out = await fetch_mcp_servers("tok")
     assert isinstance(out, ConfigUnavailable) and "ai.url" in out.reason
+
+
+@pytest.mark.asyncio
+async def test_fetch_non_200_status_is_config_unavailable(monkeypatch):
+    # Mock _read_ai_base to return a fake base
+    monkeypatch.setattr(rt, "_read_ai_base", lambda: "http://127.0.0.1:1")
+
+    # Create a fake response object with status_code=500
+    class FakeResponse:
+        status_code = 500
+
+    # Create a fake AsyncClient that returns the fake response
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    # Mock httpx.AsyncClient
+    monkeypatch.setattr(rt.httpx, "AsyncClient", FakeAsyncClient)
+
+    out = await fetch_mcp_servers("tok")
+    assert isinstance(out, ConfigUnavailable) and "500" in out.reason
+
+
+@pytest.mark.asyncio
+async def test_fetch_request_exception_is_config_unavailable(monkeypatch):
+    # Mock _read_ai_base to return a fake base
+    monkeypatch.setattr(rt, "_read_ai_base", lambda: "http://127.0.0.1:1")
+
+    # Create a fake AsyncClient that raises an exception on get()
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    # Mock httpx.AsyncClient
+    monkeypatch.setattr(rt.httpx, "AsyncClient", FakeAsyncClient)
+
+    out = await fetch_mcp_servers("tok")
+    assert isinstance(out, ConfigUnavailable) and "boom" in out.reason
