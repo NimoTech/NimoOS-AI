@@ -53,6 +53,19 @@ MCP_COLD_TOTAL_TIMEOUT = 10
 # every slow tool call mid-flight (surfaces as httpx.ConnectTimeout/CancelledError).
 MCP_SESSION_TIMEOUT = 60  # seconds
 
+# sse 传输的空闲读超时。SDK 默认 300s（sse_client 的 sse_read_timeout 参数默认值，
+# 由 tests/test_mcp_transport_timeouts.py 钉住）。
+#
+# 为什么要显式覆盖：一次 elicitation 期间链路上没有任何 in-flight 请求 —— 服务端已经
+# 用完整的 InputRequiredResult 答复过了，我们在自己的回调里等用户。MCP_SESSION_TIMEOUT
+# 那 60 秒是**每个请求**的钟，此刻不计时；唯一还在跑的就是这个空闲钟。让它取一个我们
+# 不控制的 SDK 默认值，等于把 URL_ELICIT_WAIT（180s）能不能活下来交给运气。
+#
+# 900s 覆盖的是"用户去授权几分钟就回来"。它**不**覆盖表单卡的 24 小时
+# DEFAULT_TIMEOUT —— 那个上限在 sse 传输上今天就已经不成立（既有限制，不是本次引入），
+# 修法是重连后重发原调用，不是把这个数字调到 86400。
+MCP_SSE_READ_TIMEOUT = 900
+
 STDIO_CONNECT_TIMEOUT = 90  # seconds; the first stdio npx/uvx package fetch can be slow (cached locally after, then fast)
 
 # ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
@@ -549,7 +562,8 @@ async def _build_transport(server: dict, stack: AsyncExitStack,
             httpx2.AsyncClient(headers=headers, timeout=session_to))
         return streamable_http_client(server["url"], http_client=http_client)
     if transport == "sse":
-        return sse_client(server["url"], headers=headers, timeout=session_to)
+        return sse_client(server["url"], headers=headers, timeout=session_to,
+                          sse_read_timeout=MCP_SSE_READ_TIMEOUT)
     if transport == "stdio":
         # Deny-by-default gate: the stdio command spawns directly in the netns
         # executor, bypassing the shell guard — never spawn an off-list command.
