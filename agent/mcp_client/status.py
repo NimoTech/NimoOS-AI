@@ -40,7 +40,6 @@ class McpStatusSnapshot:
 MCP_STATUS_VAR: ContextVar = ContextVar("mcp_status_snapshot", default=None)
 
 _DETAIL_MAX = 80
-_EXPAND_TOOLS_MAX = 15
 
 FALLBACK_LINE = "MCP runtime tools, if any, appear in your tool list on the next step."
 
@@ -89,10 +88,13 @@ def render_expand_section(snapshot) -> list[str]:
     degraded = False
     for s in snapshot.servers:
         if s.status == OK:
-            listed = ", ".join(s.tool_names[:_EXPAND_TOOLS_MAX])
-            if len(s.tool_names) > _EXPAND_TOOLS_MAX:
-                listed += f", … ({len(s.tool_names)} total)"
-            lines.append(f'MCP server "{s.name}" ({len(s.tool_names)} tools): {listed}')
+            # list EVERY tool — an elided "… (40 total)" left the model unable
+            # to see (and thus call) the hidden names, so it drifted to other tools
+            listed = ", ".join(s.tool_names)
+            # trailing ";" terminates this server's tool list — without it,
+            # weaker models read the unbulleted server lines as sub-items of
+            # the preceding tool instead of parallel lists of callable tools
+            lines.append(f'MCP server "{s.name}" ({len(s.tool_names)} tools): {listed};')
         elif s.status == WARMING:
             lines.append(f'MCP server "{s.name}": starting up in the background; '
                          "its tools should appear on a later message.")

@@ -3,7 +3,7 @@
   "id": "mcp-helper",
   "name": "mcp-helper",
   "title": "MCP helper",
-  "description": "Help the user connect external MCP servers (in Settings) and use the tools they expose; troubleshoot when an MCP server won't work.",
+  "description": "Help the user add or configure an external MCP server in NimoOS Settings, and troubleshoot one that won't connect. Not for calling an already-connected mcp__ tool — call expand_tools([\"mcp\"]) and use the mcp__ tools directly.",
   "color": "green",
   "icon": "layers",
   "trigger": "auto",
@@ -13,6 +13,6 @@
     "What is this mcp__ tool?"
   ],
   "permissions": { "network": false, "writable_paths": [] },
-  "version": "0.1.0",
+  "version": "0.2.1",
   "author": "Nimo"
 }

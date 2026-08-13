@@ -72,7 +72,7 @@ STDIO_CONNECT_TIMEOUT = 90  # seconds; the first stdio npx/uvx package fetch can
 # ── stdio command allow-list (2026-07-16 hardening) ───────────────────────────
 # A registered stdio MCP server spawns command+args directly in the netns
 # executor, bypassing the shell guard. Without this, a user tricked into
-# approving `mcp_register_server("bash -c 'rm -rf /DATA'")` would run an
+# approving `add_mcp_server("bash -c 'rm -rf /DATA'")` would run an
 # arbitrary destructive command on the next turn. Deny-by-default by BASENAME:
 # only known MCP launchers may spawn, at any path (`/usr/bin/npx` ok). A path
 # allow-by-directory rule was rejected — /bin, /usr/bin contain bash/rm/dd, so

@@ -67,15 +67,21 @@ def test_expand_ok_server_lists_tools():
     joined = "\n".join(lines)
     assert '"Mygithub" (2 tools)' in joined
     assert "mcp__mygithub__search" in joined and "mcp__mygithub__get_issue" in joined
+    # each server's tool list ends with ";" so the model can tell where one
+    # server's list stops and the next line begins
+    assert lines[0].endswith(";")
 
 
-def test_expand_long_tool_list_truncated():
+def test_expand_long_tool_list_not_truncated():
+    # every tool must be listed by name — an elided "… (40 total)" hid names
+    # from the model, so it couldn't call them and drifted to other tools
     names = [f"mcp__s__tool{i}" for i in range(40)]
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="s", status=st.OK, tool_names=names))))
-    assert "mcp__s__tool0" in joined and "mcp__s__tool14" in joined
-    assert "mcp__s__tool15" not in joined      # truncates to first 15
-    assert "(40 total)" in joined              # + total count
+    for n in names:
+        assert n in joined
+    assert "…" not in joined
+    assert "(40 tools)" in joined and joined.rstrip().endswith(";")
 
 
 def test_expand_failed_server_discloses_and_warns():

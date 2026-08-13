@@ -63,7 +63,7 @@ def _persist(categories: list[str]) -> None:
 def _mcp_runtime_lines() -> list[str]:
     """Render the per-run MCP snapshot (same data as the system-prompt status
     line, at action-level detail). The static CATEGORY_TOOLS table only knows
-    mcp_register_server — rendering it alone told the model no servers were
+    add_mcp_server — rendering it alone told the model no servers were
     connected (defect 2). On ANY failure fall back to a line that promises
     nothing rather than one that lies."""
     try:
@@ -92,11 +92,20 @@ def expand_categories(categories: list[str]) -> str:
     lines = [f"Unlocked: {', '.join(categories)}. The following tools are now available:"]
     for c in categories:
         for t in _reg.CATEGORY_TOOLS[c]:
-            lines.append(f"- {_name(t)}")
+            if c == "mcp":
+                # label the admin tool and terminate with ";" so it reads as
+                # one line among peers, not as the sole tool that "owns" the
+                # server tool lists rendered below (doubao misread that layout
+                # and kept calling the register tool instead of mcp__* tools)
+                lines.append(f"System tool: {_name(t)};")
+            else:
+                lines.append(f"- {_name(t)}")
         if c == "mcp":
             lines.extend(_mcp_runtime_lines())
     if not newly:
-        lines.append("(these categories were already unlocked)")
+        lines.append("(these categories were already unlocked — every tool named "
+                      "above, with its full description, is ALREADY in your tool "
+                      "list; call it directly by that exact name)")
     return "\n".join(lines)
 
 

@@ -27,7 +27,7 @@ def test_partition_is_complete_and_disjoint():
     categorized = []
     for tools in tr.CATEGORY_TOOLS.values():
         categorized += [_name(t) for t in tools]
-    # the mcp category's only static member is mcp_register_server (runtime MCP tools are attached dynamically, not here)
+    # the mcp category's only static member is add_mcp_server (runtime MCP tools are attached dynamically, not here)
     covered = set(tr.CORE_TOOL_NAMES) | set(categorized)
     assert covered == set(all_names), (
         f"uncovered: {set(all_names) - covered}; extra: {covered - set(all_names)}")

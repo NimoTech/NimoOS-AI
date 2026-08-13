@@ -51,7 +51,7 @@ async def test_register_approved(monkeypatch):
         "transport": "stdio", "command": "npx", "args": ["-y", "@pkg"],
         "env": {}, "url": "", "suggested_name": "pkg"})
     task = asyncio.create_task(auto())
-    out = await ma.mcp_register_server.on_invoke_tool(
+    out = await ma.add_mcp_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
     await task
     assert "Registered MCP server" in out
@@ -67,7 +67,7 @@ async def test_register_denied(monkeypatch):
         "transport": "stdio", "command": "npx", "args": [], "env": {}, "url": "",
         "suggested_name": "pkg"})
     task = asyncio.create_task(auto())
-    out = await ma.mcp_register_server.on_invoke_tool(
+    out = await ma.add_mcp_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
     await task
     assert "declined" in out
@@ -80,7 +80,7 @@ async def test_register_parse_error(monkeypatch):
     async def boom_parse(base, cmd):
         raise ma.ParseError("empty command")
     monkeypatch.setattr(ma, "_parse", boom_parse)
-    out = await ma.mcp_register_server.on_invoke_tool(
+    out = await ma.add_mcp_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "   "}))
     assert "Parse failed" in out
 
@@ -88,6 +88,6 @@ async def test_register_parse_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_register_no_ai_base(monkeypatch):
     monkeypatch.setattr(ma, "_read_ai_base", lambda: None)
-    out = await ma.mcp_register_server.on_invoke_tool(
+    out = await ma.add_mcp_server.on_invoke_tool(
         MagicMock(), json.dumps({"command_line": "npx -y @pkg"}))
     assert "cannot locate" in out or "System error" in out
