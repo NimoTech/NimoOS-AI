@@ -154,8 +154,8 @@ async def test_cold_stdio_self_heals_not_inline(monkeypatch, _clear_cache):
     async def boom(s): raise AssertionError("stdio cold must NOT connect inline")
     monkeypatch.setattr(mc, "_connect", boom)
 
-    metas = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
-    assert metas == []
+    metas, status, detail = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
+    assert metas == [] and status == mc.WARMING
     assert scheduled["n"] == 1
     assert warns and ("initializing" in warns[-1][1] or "background" in warns[-1][1])
 
@@ -167,8 +167,8 @@ async def test_cold_http_still_inline(monkeypatch, _clear_cache):
         called["n"] += 1
         return [{"name": "t", "description": "", "input_schema": {"type": "object", "properties": {}}}]
     monkeypatch.setattr(mc, "_cold_fetch", fake_cold)
-    metas = await mc._metas_for_server({"id": 2, "name": "h", "transport": "http", "url": "https://x"})
-    assert called["n"] == 1 and len(metas) == 1
+    metas, status, _ = await mc._metas_for_server({"id": 2, "name": "h", "transport": "http", "url": "https://x"})
+    assert called["n"] == 1 and len(metas) == 1 and status == mc.OK
 
 
 @pytest.mark.asyncio
@@ -182,8 +182,9 @@ async def test_cold_http_failure_schedules_self_heal(monkeypatch, _clear_cache):
     monkeypatch.setattr(mc, "_emit_warning", fake_emit)
     async def boom_cold(s): raise TimeoutError()
     monkeypatch.setattr(mc, "_cold_fetch", boom_cold)
-    metas = await mc._metas_for_server({"id": 7, "name": "h", "transport": "http", "url": "https://x"})
-    assert metas == []
+    metas, status, detail = await mc._metas_for_server({"id": 7, "name": "h", "transport": "http", "url": "https://x"})
+    assert metas == [] and status == mc.FAILED
+    assert detail == "TimeoutError"     # str(TimeoutError()) is empty -> falls back to the class name
     assert scheduled["n"] == 1          # background self-heal scheduled
     assert warns                        # user warned
 

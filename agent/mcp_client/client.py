@@ -22,6 +22,7 @@ from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATIO
 
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
+from mcp_client.status import OK, FAILED, WARMING, CONFIG_ERROR, ServerStatus
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -751,46 +752,68 @@ async def _cold_fetch(server: dict):
 
 
 async def _metas_for_server(server: dict):
-    """Return tool metas for a server, preferring cache. Cold/changed -> fetch
-    inline; stale -> serve cached + background revalidate. Returns [] on failure
-    (and emits a warning)."""
+    """Return (tool metas, status, detail) for a server, preferring cache.
+    Cold/changed -> fetch inline; stale -> serve cached + background revalidate.
+    On failure returns ([], FAILED/WARMING, reason) and still emits the UI
+    warning event — the status return is the model-facing channel (defect 1),
+    the event is the UI-facing one; both render the same fact."""
     fp = _fingerprint(server)
     entry = _cache_get(server["id"])
     if entry is not None and entry.fingerprint == fp:
         if time.monotonic() - entry.fetched_at > entry.ttl:
             _schedule_revalidate(server)        # stale-while-revalidate
-        return entry.metas
+        return entry.metas, OK, ""
     # cold / fingerprint changed:
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # background single-flight self-healing warmup (connect+list+cache), does not block run startup
         await _emit_warning(server.get("name", "mcp"),
                             "stdio tools are initializing in the background for first use; retry shortly")
-        return []
+        return [], WARMING, "stdio server is initializing in the background"
     try:
         # ONE budget for the whole cold path (connect + list). The connect leg alone
         # is now 8s for mode="auto"'s extra server/discover round trip; without this
         # cap the run-start worst case would grow from 5+5 to 8+8.
-        return await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
+        metas = await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
+        return metas, OK, ""
     except Exception as e:
         # A cold-fetch timeout is usually a cold connection on a slow link.
         # Warm the cache in the background with a generous timeout; tools are ready by the next run.
         _schedule_revalidate(server)
         await _emit_warning(server.get("name", "mcp"), e)
-        return []
+        return [], FAILED, str(e) or type(e).__name__
 
 
-async def build_mcp_tools(servers: list[dict]) -> list:
+async def build_mcp_tools(servers: list[dict]) -> tuple:
     """Build confirm/blacklist-gated FunctionTools for this run from the schema
     cache (zero connection when warm). Connections are established lazily per
-    tool call (see _get_run_conn). Returns a flat list of FunctionTools."""
-    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in servers],
+    tool call (see _get_run_conn). Returns (flat FunctionTool list, per-server
+    ServerStatus list in the same order as *servers*) — the status side is the
+    defect-1 fix: load failures become visible to the model instead of only to
+    the UI event stream."""
+    probed = [s for s in servers if not s.get("config_error")]
+    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in probed],
                                      return_exceptions=True)
-    tools = []
+    results = iter(metas_per)
+    tools: list = []
+    statuses: list = []
     seen_names: set = set()
-    for s, metas in zip(servers, metas_per):
-        if isinstance(metas, Exception):
-            await _emit_warning(s.get("name", "mcp"), metas)
+    for s in servers:
+        name = s.get("name", "mcp")
+        if s.get("config_error"):
+            # Go flagged this server's stored credentials as undecryptable; do
+            # not connect with an unauthenticated config — a 401 at call time
+            # would mask the real cause.
+            statuses.append(ServerStatus(name=name, status=CONFIG_ERROR,
+                                         detail=str(s["config_error"])))
             continue
+        res = next(results)
+        if isinstance(res, Exception):
+            await _emit_warning(name, res)
+            statuses.append(ServerStatus(name=name, status=FAILED,
+                                         detail=str(res) or type(res).__name__))
+            continue
+        metas, status, detail = res
+        fq_names = []
         for meta in metas:
             tool = _wrap_tool(s, meta)
             if tool.name in seen_names:          # disambiguate cross-server collisions
@@ -800,7 +823,10 @@ async def build_mcp_tools(servers: list[dict]) -> list:
                 tool.name = f"{tool.name}_{suffix}"
             seen_names.add(tool.name)
             tools.append(tool)
-    return tools
+            fq_names.append(tool.name)
+        statuses.append(ServerStatus(name=name, status=status, detail=detail,
+                                     tool_names=fq_names))
+    return tools, statuses
 
 
 # The probe budget is PER PHASE, not one flat ceiling. The connect phase has to
