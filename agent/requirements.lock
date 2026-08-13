@@ -107,12 +107,17 @@ openai==2.53.0
 openai-agents==0.19.3
     # via -r requirements.txt
 openinference-instrumentation==0.1.56
-    # via openinference-instrumentation-openai-agents
+    # via
+    #   openinference-instrumentation-openai
+    #   openinference-instrumentation-openai-agents
+openinference-instrumentation-openai==0.1.54
+    # via -r requirements.txt
 openinference-instrumentation-openai-agents==1.6.1
     # via -r requirements.txt
 openinference-semantic-conventions==0.1.31
     # via
     #   openinference-instrumentation
+    #   openinference-instrumentation-openai
     #   openinference-instrumentation-openai-agents
 openpyxl==3.1.5
     # via -r requirements.txt
@@ -120,6 +125,7 @@ opentelemetry-api==1.43.0
     # via
     #   mcp
     #   openinference-instrumentation
+    #   openinference-instrumentation-openai
     #   openinference-instrumentation-openai-agents
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-instrumentation
@@ -130,7 +136,9 @@ opentelemetry-exporter-otlp-proto-common==1.43.0
 opentelemetry-exporter-otlp-proto-http==1.43.0
     # via -r requirements.txt
 opentelemetry-instrumentation==0.64b0
-    # via openinference-instrumentation-openai-agents
+    # via
+    #   openinference-instrumentation-openai
+    #   openinference-instrumentation-openai-agents
 opentelemetry-proto==1.43.0
     # via
     #   opentelemetry-exporter-otlp-proto-common
@@ -142,6 +150,7 @@ opentelemetry-sdk==1.43.0
     #   opentelemetry-exporter-otlp-proto-http
 opentelemetry-semantic-conventions==0.64b0
     # via
+    #   openinference-instrumentation-openai
     #   openinference-instrumentation-openai-agents
     #   opentelemetry-instrumentation
     #   opentelemetry-sdk
@@ -238,6 +247,7 @@ typing-extensions==4.16.0
     #   mcp-types
     #   openai
     #   openai-agents
+    #   openinference-instrumentation-openai
     #   openinference-instrumentation-openai-agents
     #   opentelemetry-api
     #   opentelemetry-exporter-otlp-proto-http
@@ -272,6 +282,7 @@ websockets==16.1.1
 wrapt==2.3.0
     # via
     #   openinference-instrumentation
+    #   openinference-instrumentation-openai
     #   openinference-instrumentation-openai-agents
     #   opentelemetry-instrumentation
 xlsxwriter==3.2.9
