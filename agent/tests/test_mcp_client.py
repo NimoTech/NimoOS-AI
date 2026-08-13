@@ -179,7 +179,7 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert "no longer recognizes" in out and "do NOT" in out
-    assert "next message" in out                # run 中途工具集不可变是 SDK 决定的,如实表述
+    assert "next message" in out                # the run's tool set is immutable (SDK decision) — the message states that honestly
     assert mc._cache_get(1) is None             # stale entry dropped
     assert scheduled == [1]                     # refresh scheduled for the next run
 
