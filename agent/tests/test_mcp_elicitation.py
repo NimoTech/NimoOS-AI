@@ -22,6 +22,7 @@ from mcp.client._memory import InMemoryTransport
 from mcp.server.lowlevel import Server
 
 import mcp_client.client as mc
+import mcp_client.elicitation as E
 from confirm import ConfirmManager
 from mcp_client.elicitation import make_elicitation_callback
 
@@ -530,3 +531,80 @@ async def test_production_connect_installs_the_callback():
     # 第二期仍然不声明这两个 —— 见 Global Constraints 第 9 条
     assert "sampling_callback" not in captured
     assert "list_roots_callback" not in captured
+
+
+# ── URL 卡的等待:带外授权发生在浏览器里,协议层等不起 ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_a_url_card_the_user_never_answers_sends_accept_anyway(monkeypatch):
+    """用户点开了授权页就再没回来。这时候发 accept 而不是 cancel:accept 按规范只断言
+    "用户同意进行这次交互"(*It does not mean that the interaction is complete*),
+    用户确实同意过,所以这句话是真的;而发出去能让长轮询/state-only 服务端有机会
+    返回终态。发 cancel 等于主动把一次可能已经成功的授权判死。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.05)
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://accounts.example.com/oauth")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    assert card["kind"] == "mcp_elicit_url"
+
+    result = await asyncio.wait_for(task, timeout=2)      # 没有人 resolve
+    assert result.action == "accept" and result.content is None
+
+
+@pytest.mark.asyncio
+async def test_the_url_card_wait_is_not_the_24h_form_wait(monkeypatch):
+    """URL 卡必须走自己的短超时。这条测试的价值在于:如果有人把 URL 分支合回共用的
+    wait_elicit 调用,它会挂在 ConfirmManager 的 timeout 上而不是 0.05 秒返回。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.05)
+    mgr, _ = _mgr()                    # ConfirmManager timeout=5
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://ok.example/oauth")))
+    await asyncio.wait_for(queue.get(), timeout=2)
+    # 1 秒远小于 ConfirmManager 的 5 秒,大于 URL_ELICIT_WAIT 的 0.05 秒
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result.action == "accept"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_cancel_on_a_url_card_is_still_cancel(monkeypatch):
+    """"超时算 accept" 绝不能把用户明确点的取消也吃掉。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 5)
+    mgr, _ = _mgr()
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestURLParams(
+        message="Authorize", url="https://ok.example/oauth")))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    mgr.resolve(card["confirm_id"], False, action="cancel")
+
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.action == "cancel"
+
+
+@pytest.mark.asyncio
+async def test_a_form_card_still_waits_on_the_managers_own_timeout(monkeypatch):
+    """反向保护:URL 分支的短超时不得泄漏到表单卡上。表单卡里没有任何会过期的
+    服务端状态,用户思考多久都不该被我们打断。"""
+    monkeypatch.setattr(E, "URL_ELICIT_WAIT", 0.01)
+    mgr, _ = _mgr()                    # ConfirmManager timeout=5
+    queue = asyncio.Queue()
+    cb = make_elicitation_callback(SERVER, **_ctx(mgr, queue))
+
+    task = asyncio.create_task(cb(None, T.ElicitRequestFormParams(
+        message="Who are you?", requestedSchema=FORM_SCHEMA)))
+    card = await asyncio.wait_for(queue.get(), timeout=2)
+    # 睡过 URL_ELICIT_WAIT 的 30 倍:表单卡如果误用了它,这时已经超时返回 cancel 了
+    await asyncio.sleep(0.3)
+    assert not task.done()
+
+    mgr.resolve(card["confirm_id"], True, action="accept", content={"name": "Nimo"})
+    result = await asyncio.wait_for(task, timeout=2)
+    assert result.action == "accept" and result.content == {"name": "Nimo"}
