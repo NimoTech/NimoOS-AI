@@ -17,7 +17,7 @@ def test_prompt_line_none_snapshot_is_empty():
 
 
 def test_prompt_line_no_servers_is_empty():
-    # 没有配置任何服务器时不注入（零成本）
+    # no servers configured: inject nothing (zero cost)
     assert st.render_prompt_line(_snap()) == ""
 
 
@@ -45,13 +45,13 @@ def test_prompt_line_config_unavailable():
 def test_prompt_line_detail_truncated():
     line = st.render_prompt_line(_snap(
         st.ServerStatus(name="x", status=st.FAILED, detail="e" * 500)))
-    assert len(line) < 220          # 状态行成本必须有界(约 20-40 token)
+    assert len(line) < 220          # status line's token cost must stay bounded (~20-40 tokens)
 
 
 # --- render_expand_section ---
 
 def test_expand_none_snapshot_falls_back():
-    # 2B 兜底:快照缺失时永不撒谎,也绝不回落到静态表
+    # 2B fallback: never lie when snapshot is missing, never fall back to static table
     lines = st.render_expand_section(None)
     assert lines == ["MCP runtime tools, if any, appear in your tool list on the next step."]
 
@@ -74,15 +74,15 @@ def test_expand_long_tool_list_truncated():
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="s", status=st.OK, tool_names=names))))
     assert "mcp__s__tool0" in joined and "mcp__s__tool14" in joined
-    assert "mcp__s__tool15" not in joined      # 截断列前 15 个
-    assert "(40 total)" in joined              # + 总数
+    assert "mcp__s__tool15" not in joined      # truncates to first 15
+    assert "(40 total)" in joined              # + total count
 
 
 def test_expand_failed_server_discloses_and_warns():
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="supabase", status=st.FAILED, detail="timeout"))))
     assert '"supabase"' in joined and "timeout" in joined
-    assert "Do not register replacement" in joined   # 防实录里的重复注册行为
+    assert "Do not register replacement" in joined   # guards against duplicate-registration behavior in field
 
 
 def test_expand_warming_server():
@@ -94,4 +94,4 @@ def test_expand_warming_server():
 def test_expand_config_unavailable():
     joined = "\n".join(st.render_expand_section(_snap(config_error="no ticket")))
     assert "could not be fetched" in joined and "no ticket" in joined
-    assert "registering" in joined      # 同样劝阻注册新服务器
+    assert "registering" in joined      # also discourages registering new servers
