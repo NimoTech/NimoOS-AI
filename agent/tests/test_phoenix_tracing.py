@@ -69,3 +69,29 @@ def test_run_config_disabled(monkeypatch):
     m = importlib.reload(pt)
     rc = m.build_trace_run_config(False, "s1", "u1", "deepseek-x", "chat")
     assert rc.tracing_disabled is True
+
+
+def test_setup_tracing_instruments_openai_client(monkeypatch):
+    # The OpenAI client instrumentor must be wired to the same provider so the
+    # enable/disable gate covers its spans too.
+    monkeypatch.delenv("NIMOOS_AGENT_TRACING", raising=False)
+    from openinference.instrumentation.openai import OpenAIInstrumentor
+    calls = []
+
+    def fake_instrument(self, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(OpenAIInstrumentor, "instrument", fake_instrument)
+    m = importlib.reload(pt)
+    assert m.setup_tracing() is True
+    assert len(calls) == 1
+    assert calls[0].get("tracer_provider") is not None
+
+
+def test_setup_tracing_survives_missing_openai_instrumentor(monkeypatch):
+    # Older bundles may lack the package; agents-level tracing must still install.
+    import sys
+    monkeypatch.delenv("NIMOOS_AGENT_TRACING", raising=False)
+    monkeypatch.setitem(sys.modules, "openinference.instrumentation.openai", None)
+    m = importlib.reload(pt)
+    assert m.setup_tracing() is True

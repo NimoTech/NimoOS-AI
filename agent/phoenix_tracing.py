@@ -79,6 +79,16 @@ def setup_tracing() -> bool:
                                   tracing_enabled_now)
         provider.add_span_processor(BatchSpanProcessor(gated))
         OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+        # Also instrument the OpenAI client itself: the Agents SDK generation
+        # span omits the request's tools list, so only client-level spans give
+        # Phoenix the llm.tools.* attributes. Optional — bundles without the
+        # package keep agents-only tracing.
+        try:
+            from openinference.instrumentation.openai import OpenAIInstrumentor
+            OpenAIInstrumentor().instrument(tracer_provider=provider)
+        except Exception:
+            _LOG.warning("OpenAI client instrumentation unavailable; "
+                         "LLM spans will not carry tool definitions", exc_info=True)
         # Suppress transient OTLP export errors (enabled but Phoenix briefly down).
         logging.getLogger("opentelemetry.exporter.otlp").setLevel(logging.CRITICAL)
         logging.getLogger("opentelemetry.sdk.trace.export").setLevel(logging.CRITICAL)
