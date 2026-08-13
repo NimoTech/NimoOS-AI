@@ -422,8 +422,11 @@ def _is_unsupported_capability(err) -> bool:
             and str(getattr(data, "message", "")).endswith("not supported"))
 
 
-_UNKNOWN_TOOL_RE = re.compile(r"unknown tool|tool\b.{0,80}?\b(not found|does not exist)",
-                              re.IGNORECASE)
+_UNKNOWN_TOOL_RE = re.compile(
+    r"unknown tool"
+    r"|no such tool"
+    r"|tool\s+[\"'`]?[\w./-]+[\"'`]?\s+(not found|does not exist)",
+    re.IGNORECASE)
 
 
 def _is_unknown_tool(err) -> bool:
@@ -433,7 +436,13 @@ def _is_unknown_tool(err) -> bool:
     invalidating on any MCPError would let plain argument errors punch through
     the warm path the cache exists to provide (defect-① review note). Two
     shapes are recognised: JSON-RPC METHOD_NOT_FOUND (-32601), and the common
-    "Unknown tool …" / "tool … not found" wordings servers put on generic codes.
+    "Unknown tool …" / "no such tool" / "tool <name> not found" wordings
+    servers put on generic codes. The tool-name form requires the name to sit
+    immediately next to "not found"/"does not exist" so that unrelated
+    resource errors merely mentioning a tool in passing (e.g. "Error
+    executing tool read_file: File not found") are not misclassified as a
+    missing tool — that would drop the schema cache and tell the model not to
+    retry, when a corrected argument is the right recovery.
     """
     data = getattr(err, "error", None)
     if data is None:

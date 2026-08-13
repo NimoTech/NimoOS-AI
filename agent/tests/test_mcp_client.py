@@ -150,6 +150,12 @@ def test_is_unknown_tool_signatures():
     assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="Tool 'search' not found")) is True
     assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="bad argument foo")) is False
     assert mc._is_unknown_tool(RuntimeError("Unknown tool")) is False   # not an MCPError shape
+    # resource errors that merely mention a tool name must NOT match — dropping
+    # the cache here would tell the model not to retry a recoverable error
+    assert mc._is_unknown_tool(MCPError(
+        code=INTERNAL_ERROR,
+        message="Error executing tool read_file: File not found")) is False
+    assert mc._is_unknown_tool(MCPError(code=INTERNAL_ERROR, message="No such tool: search")) is True
 
 
 def _approve_first(mgr, q):
