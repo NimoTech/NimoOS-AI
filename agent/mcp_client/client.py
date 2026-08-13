@@ -137,6 +137,11 @@ SCHEMA_TTL = 600
 # change notifications anyway, so that window is already accepted. Config changes
 # still invalidate instantly via the fingerprint, unaffected by this floor.
 SCHEMA_TTL_MIN = 60
+# Ceiling for a server-declared ttlMs. Without it a server declaring 24h really
+# gets cached for 24h, which multiplies the staleness window of removed tools
+# (defect ①) — the unknown-tool invalidation self-heals mid-TTL, but only after
+# the model has already tripped over the missing tool once.
+SCHEMA_TTL_MAX = 3600
 SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 
 # MRTR round cap = the SDK default (mcp/client/_input_required.py::
@@ -188,7 +193,7 @@ def _resolve_ttl(raw_ttl_ms) -> int:
     """
     if not isinstance(raw_ttl_ms, (int, float)) or raw_ttl_ms <= 0:
         return SCHEMA_TTL
-    return max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN)
+    return min(max(int(raw_ttl_ms) // 1000, SCHEMA_TTL_MIN), SCHEMA_TTL_MAX)
 
 
 class _CacheEntry:
