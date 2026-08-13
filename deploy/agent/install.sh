@@ -13,7 +13,15 @@ DATA_DIR="/var/lib/nimoos/ai/agent"
 HEALTH_URL="http://127.0.0.1:8282/healthz"
 HEALTH_TIMEOUT=60
 
-[[ -f "${IMAGE_TAR}" ]] || { echo "✗ Image package not found: ${IMAGE_TAR}" >&2; exit 1; }
+# Two ways the image can arrive: agent-image.tar next to this script (the full
+# offline bundle), or already present locally under IMAGE_REF (the GHCR path —
+# install-ai.sh pulls ghcr.io/nimotech/nimoos-agent:<tag> and tags it, then runs
+# this script from the small compose-only tarball). Neither → nothing to run.
+if [[ ! -f "${IMAGE_TAR}" ]] && ! docker image inspect "${IMAGE_REF}" >/dev/null 2>&1; then
+  echo "✗ Neither the image package (${IMAGE_TAR}) nor a preloaded ${IMAGE_REF} is present." >&2
+  echo "  Either extract the full bundle next to this script, or docker pull + docker tag the image first." >&2
+  exit 1
+fi
 
 # Readiness check: avoid binding an empty directory into the container when /DATA isn't
 # mounted (data would land in the wrong place). Accepts either "is a mountpoint" or
@@ -30,8 +38,12 @@ if ! data_ready /DATA; then
   exit 1
 fi
 
-echo "==> [1/4] Loading offline image ${IMAGE_REF} ..."
-docker load -i "${IMAGE_TAR}"
+if [[ -f "${IMAGE_TAR}" ]]; then
+  echo "==> [1/4] Loading offline image ${IMAGE_REF} ..."
+  docker load -i "${IMAGE_TAR}"
+else
+  echo "==> [1/4] ${IMAGE_REF} already present (pre-pulled); skipping docker load"
+fi
 
 echo "==> [2/4] Deploying compose to ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${DATA_DIR}"
