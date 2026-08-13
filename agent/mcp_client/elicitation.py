@@ -73,8 +73,9 @@ MAX_ANSWER_ATTEMPTS = 3
 # one sent in three minutes.
 #
 # Why not shorter: login + MFA + a consent screen on a slow phone is minutes, not
-# seconds. Three is comfortably past the realistic median and still inside the SDK's
-# 300s sse read timeout (see client.py::MCP_SSE_READ_TIMEOUT for why that matters).
+# seconds. Three is comfortably past the realistic median and still well inside our
+# own 900s sse idle read timeout (see client.py::MCP_SSE_READ_TIMEOUT for why that
+# matters — that value is our own explicit override, not the SDK's 300s default).
 #
 # What happens at the deadline is `on_timeout="accept"`, not "cancel" — see the
 # wait_elicit call below.
