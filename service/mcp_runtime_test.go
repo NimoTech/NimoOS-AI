@@ -85,3 +85,107 @@ func TestServerIDNeverReused(t *testing.T) {
 		t.Fatalf("new server inherited %d approvals from the deleted one", n)
 	}
 }
+
+func seedServer(t *testing.T, db *sql.DB) int64 {
+	t.Helper()
+	res, err := db.Exec(
+		`INSERT INTO mcp_servers (user_id,name,transport,url,command,args,env,headers,enabled,created_at,updated_at)
+		 VALUES ('u','gh','http','https://x/mcp','','[]','{}','',1,0,0)`)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
+func TestMarkProbingIsSingleFlight(t *testing.T) {
+	db := openTestDB(t)
+	rt := &mcpRuntimeService{db: db}
+	id := seedServer(t, db)
+
+	ok, err := rt.MarkProbing(id)
+	if err != nil || !ok {
+		t.Fatalf("first MarkProbing must win: ok=%v err=%v", ok, err)
+	}
+	ok, err = rt.MarkProbing(id)
+	if err != nil {
+		t.Fatalf("second MarkProbing err: %v", err)
+	}
+	if ok {
+		t.Fatal("second MarkProbing must lose — probe_state='probing' is the lock")
+	}
+}
+
+func TestSaveSuccessAdvancesListedAtAndHeartbeat(t *testing.T) {
+	db := openTestDB(t)
+	rt := &mcpRuntimeService{db: db}
+	id := seedServer(t, db)
+	db.Exec(`INSERT INTO mcp_tool_approvals (server_id,tool_name,identity_fp,schema_hash,approved_at,last_seen_at)
+	         VALUES (?,'create_issue','fp','sh',1,1)`, id)
+
+	tools := []ToolMeta{{Name: "create_issue", SchemaHash: "sh", DescHash: "d1"}}
+	r := &McpServerRuntime{ServerID: id, Handle: "github", Summary: "s", TTLSec: 600}
+	if err := rt.SaveSuccess(r, tools, `[{"name":"create_issue"}]`); err != nil {
+		t.Fatalf("SaveSuccess: %v", err)
+	}
+
+	got, _ := rt.Get(id)
+	if got.ListedAt == 0 {
+		t.Fatal("listed_at MUST advance on every successful probe — the memory cache keys off it")
+	}
+	if got.ProbeState != "ok" || got.FailStreak != 0 {
+		t.Fatalf("bad state after success: %+v", got)
+	}
+	var seen int64
+	db.QueryRow(`SELECT last_seen_at FROM mcp_tool_approvals WHERE server_id=? AND tool_name='create_issue'`, id).Scan(&seen)
+	if seen <= 1 {
+		t.Fatal("last_seen_at heartbeat must fire for tools present in a successful non-empty listing")
+	}
+}
+
+func TestSaveSuccessEmptyListingDoesNotClobber(t *testing.T) {
+	db := openTestDB(t)
+	rt := &mcpRuntimeService{db: db}
+	id := seedServer(t, db)
+	tools := []ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}
+	rt.SaveSuccess(&McpServerRuntime{ServerID: id, TTLSec: 600}, tools, `[{"name":"create_issue"}]`)
+
+	// First empty listing: could be jitter, must not clear the list.
+	rt.SaveSuccess(&McpServerRuntime{ServerID: id, TTLSec: 600}, []ToolMeta{}, `[]`)
+	got, _ := rt.Get(id)
+	if got.ToolsJSON == "[]" {
+		t.Fatal("a single empty listing must NOT clobber the tool list")
+	}
+	if got.EmptyStreak != 1 {
+		t.Fatalf("empty_streak = %d, want 1", got.EmptyStreak)
+	}
+
+	// Second consecutive empty listing: confirmed, now it may clear.
+	rt.SaveSuccess(&McpServerRuntime{ServerID: id, TTLSec: 600}, []ToolMeta{}, `[]`)
+	got, _ = rt.Get(id)
+	if got.ToolsJSON != "[]" {
+		t.Fatal("empty_streak >= 2 must clear the tool list")
+	}
+}
+
+func TestSaveFailureDoesNotTouchHeartbeat(t *testing.T) {
+	db := openTestDB(t)
+	rt := &mcpRuntimeService{db: db}
+	id := seedServer(t, db)
+	tools := []ToolMeta{{Name: "t", SchemaHash: "sh"}}
+	rt.SaveSuccess(&McpServerRuntime{ServerID: id, TTLSec: 600}, tools, `[]`)
+	db.Exec(`INSERT INTO mcp_tool_approvals (server_id,tool_name,identity_fp,schema_hash,approved_at,last_seen_at)
+	         VALUES (?,'t','fp','sh',1,999)`, id)
+
+	rt.SaveFailure(id, "connect_timeout", "boom")
+
+	var seen int64
+	db.QueryRow(`SELECT last_seen_at FROM mcp_tool_approvals WHERE server_id=? AND tool_name='t'`, id).Scan(&seen)
+	if seen != 999 {
+		t.Fatal("a failed probe must NOT move last_seen_at — otherwise a week-long outage re-asks everything")
+	}
+	got, _ := rt.Get(id)
+	if got.FailStreak != 1 || got.CooldownUntil == 0 || got.ProbeState != "failed" {
+		t.Fatalf("bad failure state: %+v", got)
+	}
+}

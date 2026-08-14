@@ -25,6 +25,7 @@ type Services interface {
 	Blacklist() *blacklistService
 	Skills() *skillsService
 	MCP() *mcpService
+	MCPRuntime() *mcpRuntimeService
 }
 
 type services struct {
@@ -41,6 +42,7 @@ type services struct {
 	blacklist       *blacklistService
 	skills          *skillsService
 	mcp             *mcpService
+	mcpRuntime      *mcpRuntimeService
 }
 
 func (s *services) DB() *sql.DB                       { return s.db }
@@ -56,6 +58,7 @@ func (s *services) Sessions() *sessionService         { return s.sessions }
 func (s *services) Blacklist() *blacklistService      { return s.blacklist }
 func (s *services) Skills() *skillsService            { return s.skills }
 func (s *services) MCP() *mcpService                  { return s.mcp }
+func (s *services) MCPRuntime() *mcpRuntimeService    { return s.mcpRuntime }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -84,6 +87,7 @@ func NewService(cfg *config.Config) Services {
 	store := &SkillsStore{Root: skillsRoot}
 	skillsSvc := &skillsService{db: db, store: store}
 	mcpSvc := &mcpService{db: db}
+	mcpRuntimeSvc := &mcpRuntimeService{db: db}
 
 	// Rebuild .runtime/<uid>/ for every user we know about. The skill_state
 	// table lists users; if a user has no row, the agent layer rebuilds on
@@ -129,6 +133,7 @@ func NewService(cfg *config.Config) Services {
 		blacklist:       blacklistSvc,
 		skills:          skillsSvc,
 		mcp:             mcpSvc,
+		mcpRuntime:      mcpRuntimeSvc,
 	}
 }
 
