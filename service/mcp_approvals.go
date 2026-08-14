@@ -44,57 +44,46 @@ func (s *mcpApprovalService) PutServerLevel(serverID int64, identityFP string) e
 	return s.put(serverID, "*", identityFP, "", "")
 }
 
-// Put records (or refreshes) one ordinary tool's approval. toolName must not
-// be "*" — use PutServerLevel for the server-level approval instead, and
-// this rejects the call otherwise.
+// Put records (or refreshes) one ordinary tool's approval, including the
+// desc_hash the user saw at approval time (design doc §5.2.1 — drives the
+// settings UI's "description changed" badge; participates in NO gate, see
+// EffectiveApprovals'/ListForServer's doc comments). toolName must not be
+// "*" — use PutServerLevel for the server-level approval instead, and this
+// rejects the call otherwise.
 //
-// This rejection exists because tool_name is otherwise a namespace
-// populated by names the MCP server itself declares, which this code must
-// treat as untrusted. Without it, a malicious server could publish one
-// ordinary, innocuous-looking tool literally named "*"; a future caller
+// This is the ONLY writer for ordinary tool approvals — both call sites
+// (ApprovalsInternal's confirm-card path in route/v2/mcp.go, and the public
+// PUT .../approvals/:tool endpoint in route/v2/mcp_approvals.go) look up
+// identity_fp/schema_hash/desc_hash from the server's current runtime row
+// and pass all three here; neither ever passes a value from a caller. A
+// single writer means there is no silent "" path for desc_hash: every
+// approval write stamps whatever the runtime row currently has for that
+// tool, so re-approving after a gate voids an approval never blanks a
+// previously recorded desc_hash back to "".
+//
+// The tool_name=="*" rejection exists because tool_name is otherwise a
+// namespace populated by names the MCP server itself declares, which this
+// code must treat as untrusted. Without it, a malicious server could publish
+// one ordinary, innocuous-looking tool literally named "*"; a future caller
 // that forwards a server-declared tool name into Put — believing it is
 // recording consent for that one tool — would silently write the
 // server-level sentinel row instead, converting a single-tool approval into
 // a blanket approval for every tool the server ever offers. Put refusing
 // tool_name=="*" outright closes that hole at the point where approvals are
 // written, regardless of where the name originated.
-func (s *mcpApprovalService) Put(serverID int64, toolName, identityFP, schemaHash string) error {
-	if toolName == "*" {
-		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
-	}
-	return s.put(serverID, toolName, identityFP, schemaHash, "")
-}
-
-// PutWithDescHash is Put plus desc_hash (design doc §5.2.1): the description
-// hash the user saw at approval time, for the settings UI's "description
-// changed" badge. It exists as a separate method — rather than adding a
-// parameter to Put — so the confirm-card write path (ApprovalsInternal,
-// route/v2/mcp.go), which predates desc_hash and has no ToolMeta.DescHash to
-// stamp from at that call site, is untouched by this task; its approvals
-// simply keep storing an empty desc_hash, which the badge logic below
-// already treats as "approved before we recorded it" rather than "changed".
-//
-// Used by the public PUT .../approvals/:tool endpoint (route/v2/mcp_approvals.go),
-// which has the full current ToolMeta on hand and can stamp all three
-// fingerprints (identity_fp, schema_hash, desc_hash) from the SAME runtime
-// observation in one write.
-//
-// desc_hash participates in NO gate — see EffectiveApprovals' and
-// ListForServer's doc comments; this method only stores the value, it never
-// reads it back for any pass/fail decision.
-func (s *mcpApprovalService) PutWithDescHash(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
+func (s *mcpApprovalService) Put(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
 	if toolName == "*" {
 		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
 	}
 	return s.put(serverID, toolName, identityFP, schemaHash, descHash)
 }
 
-// put is the shared writer behind Put, PutServerLevel and PutWithDescHash.
-// approved_at and last_seen_at are both set to now: approved_at marks when
-// the user consented, last_seen_at is reset here so a freshly (re-)approved
-// tool doesn't immediately fail the stale gate. descHash is stored verbatim
-// and never inspected here — see PutWithDescHash's doc comment for why it
-// must never enter a gate.
+// put is the shared writer behind Put and PutServerLevel. approved_at and
+// last_seen_at are both set to now: approved_at marks when the user
+// consented, last_seen_at is reset here so a freshly (re-)approved tool
+// doesn't immediately fail the stale gate. descHash is stored verbatim and
+// never inspected here — see Put's doc comment for why it must never enter
+// a gate.
 func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(`

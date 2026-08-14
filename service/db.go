@@ -274,7 +274,7 @@ func migrate(db *sql.DB) error {
 	_, _ = db.Exec(`ALTER TABLE mcp_servers ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
 	// desc_hash drives the settings UI's "description changed" badge (design
 	// doc §5.2.1) — it must NEVER be added to any invalidation gate. See
-	// mcp_approvals.go's PutWithDescHash doc comment for why.
+	// mcp_approvals.go's Put doc comment for why.
 	_, _ = db.Exec(`ALTER TABLE mcp_tool_approvals ADD COLUMN desc_hash TEXT NOT NULL DEFAULT ''`)
 
 	// Startup sweep: clear any MCP runtime row still showing probe_state='probing'.

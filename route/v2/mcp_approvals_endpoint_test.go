@@ -42,7 +42,7 @@ func TestToolsEndpointReturnsToolsWithApprovalStateAndLastSeenAt(t *testing.T) {
 		}, "[]"); err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}
-	if err := svc.MCPApprovals().PutWithDescHash(m.ID, "create_issue", "fp", "sh1", "dh1"); err != nil {
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "fp", "sh1", "dh1"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 
@@ -117,11 +117,11 @@ func TestToolsEndpointSetsDescChanged(t *testing.T) {
 	}
 	// "changed": approved when the description hash was "old-desc"; the probe
 	// above already moved tools_json's desc_hash to "new-desc".
-	if err := svc.MCPApprovals().PutWithDescHash(m.ID, "changed", "fp", "sh", "old-desc"); err != nil {
+	if err := svc.MCPApprovals().Put(m.ID, "changed", "fp", "sh", "old-desc"); err != nil {
 		t.Fatalf("approve changed: %v", err)
 	}
 	// "upgraded": approved before desc_hash existed — stored value is "".
-	if err := svc.MCPApprovals().Put(m.ID, "upgraded", "fp", "sh"); err != nil {
+	if err := svc.MCPApprovals().Put(m.ID, "upgraded", "fp", "sh", ""); err != nil {
 		t.Fatalf("approve upgraded: %v", err)
 	}
 
@@ -350,10 +350,10 @@ func TestDeleteApprovalsRemovesOnlyThatServer(t *testing.T) {
 	if err := svc.MCP().CreateMcpServer(m2); err != nil {
 		t.Fatalf("create m2: %v", err)
 	}
-	if err := svc.MCPApprovals().Put(m1.ID, "t", "fp", "sh"); err != nil {
+	if err := svc.MCPApprovals().Put(m1.ID, "t", "fp", "sh", ""); err != nil {
 		t.Fatalf("approve m1: %v", err)
 	}
-	if err := svc.MCPApprovals().Put(m2.ID, "t", "fp", "sh"); err != nil {
+	if err := svc.MCPApprovals().Put(m2.ID, "t", "fp", "sh", ""); err != nil {
 		t.Fatalf("approve m2: %v", err)
 	}
 
@@ -457,10 +457,10 @@ func TestListApprovalsReturnsOnlyCallersApprovalsWithServerHandle(t *testing.T) 
 		[]service.ToolMeta{{Name: "post_message", SchemaHash: "sh"}}, "[]"); err != nil {
 		t.Fatalf("seed theirs runtime: %v", err)
 	}
-	if err := svc.MCPApprovals().Put(mine.ID, "create_issue", "fp1", "sh"); err != nil {
+	if err := svc.MCPApprovals().Put(mine.ID, "create_issue", "fp1", "sh", ""); err != nil {
 		t.Fatalf("approve mine: %v", err)
 	}
-	if err := svc.MCPApprovals().Put(theirs.ID, "post_message", "fp2", "sh"); err != nil {
+	if err := svc.MCPApprovals().Put(theirs.ID, "post_message", "fp2", "sh", ""); err != nil {
 		t.Fatalf("approve theirs: %v", err)
 	}
 
@@ -492,5 +492,155 @@ func TestListApprovalsReturnsOnlyCallersApprovalsWithServerHandle(t *testing.T) 
 	}
 	if out.Items[0].ServerHandle != "github" {
 		t.Fatalf("expected server_handle %q, got %q", "github", out.Items[0].ServerHandle)
+	}
+}
+
+// TestToolsEndpointSurfacesStaleReasonForConfigVoidedApproval pins that a
+// currently-void approval is NOT reported as a plain, unqualified "approved"
+// toggle: the config gate (server identity changed — e.g. the user edited
+// the URL) is not derivable client-side, since the browser never sees
+// identity_fp. Without stale_reason surviving into the response, the tools
+// page would show every toggle still on, telling the user they will not be
+// re-prompted when in fact they will be.
+func TestToolsEndpointSurfacesStaleReasonForConfigVoidedApproval(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "old-fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "old-fp", "sh", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Simulate the user editing the server's URL: identity_fp moves, voiding
+	// the approval on the config gate.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "new-fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("update runtime: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+
+	var out struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			StaleReason string `json:"stale_reason"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(out.Tools) != 1 || out.Tools[0].StaleReason == "" {
+		t.Fatalf("expected a non-empty stale_reason for the config-voided approval, got %+v", out.Tools)
+	}
+}
+
+// TestApprovalEndpointsRejectMissingUserID pins the auth precondition shared
+// by all four public endpoints: without X-NimoOS-User-ID (set by the JWT
+// middleware after verifying the caller's bearer token), h.userID fails and
+// every one of these handlers must reject with 401 before touching anything
+// else.
+func TestApprovalEndpointsRejectMissingUserID(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		call func(c echo.Context) error
+	}{
+		{"Tools", h.Tools},
+		{"PutApproval", h.PutApproval},
+		{"DeleteApprovals", h.DeleteApprovals},
+		{"ListApprovals", h.ListApprovals},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", strings.NewReader(`{"approved":true}`))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			// Deliberately no X-NimoOS-User-ID header.
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+			setParams(c, []string{"id", "tool"}, []string{fmt.Sprint(m.ID), "create_issue"})
+			err := tc.call(c)
+			he, ok := err.(*echo.HTTPError)
+			if !ok || he.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: expected 401 for missing X-NimoOS-User-ID, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestPutApprovalPercentDecodesWildcard pins that a strictly-encoded "*"
+// (sent as "%2A", as a strict URL-encoding client would) still grants the
+// server-level approval, exercised through the REAL echo router (not
+// SetParamValues) so that Echo's actual param-extraction behavior is in
+// play: Echo's c.Param returns the raw percent-encoded segment (see
+// TestModelsHandler_Delete_PathParamPreservesEncoding's identical point for
+// :name), so without url.PathUnescape this would silently write a junk
+// approval literally named "%2A" instead of the wildcard.
+func TestPutApprovalPercentDecodesWildcard(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+	e.PUT("/mcp/servers/:id/approvals/:tool", h.PutApproval)
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "t", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/mcp/servers/%d/approvals/%%2A", m.ID), strings.NewReader(`{"approved":true}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := svc.MCPApprovals().ListForServer(m.ID)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	found, junk := false, false
+	for _, r := range rows {
+		if r.ToolName == "*" {
+			found = true
+		}
+		if r.ToolName == "%2A" {
+			junk = true
+		}
+	}
+	if junk {
+		t.Fatalf("expected '%%2A' to be decoded to the wildcard, not stored literally: %+v", rows)
+	}
+	if !found {
+		t.Fatalf("expected a server-level '*' approval, got %+v", rows)
 	}
 }

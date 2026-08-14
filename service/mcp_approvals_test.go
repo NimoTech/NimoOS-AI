@@ -17,7 +17,7 @@ func approve(t *testing.T, s *mcpApprovalService, id int64, tool, fp, sh string,
 	if tool == "*" {
 		err = s.PutServerLevel(id, fp)
 	} else {
-		err = s.Put(id, tool, fp, sh)
+		err = s.Put(id, tool, fp, sh, "")
 	}
 	if err != nil {
 		t.Fatalf("Put: %v", err)
@@ -160,10 +160,12 @@ func TestWildcardConfigGateVoidsOnIdentityChange(t *testing.T) {
 // TestPutRejectsWildcardToolName is the regression test for the '*'-namespace
 // hole: Put must never be able to write the server-level sentinel row, no
 // matter what name is passed to it — that is PutServerLevel's job alone.
+// Passes a non-empty descHash too, to pin that the rejection happens before
+// ANY of the fields (including desc_hash) could reach storage.
 func TestPutRejectsWildcardToolName(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
-	if err := ap.Put(seedServer(t, db), "*", "FP", "sh"); err == nil {
+	if err := ap.Put(seedServer(t, db), "*", "FP", "sh", "dh"); err == nil {
 		t.Fatal("Put must reject tool_name '*' — use PutServerLevel for the server-level approval")
 	}
 }
@@ -176,7 +178,7 @@ func TestNoRuntimeRowFailsClosedForOrdinaryTool(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
 	id := seedServer(t, db)
-	if err := ap.Put(id, "create_issue", "FP", "sh"); err != nil {
+	if err := ap.Put(id, "create_issue", "FP", "sh", ""); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	// Deliberately no SaveSuccess: no runtime row exists for this server.
@@ -216,7 +218,7 @@ func TestInterfaceGateFailsClosedWhenBothSchemaHashesEmpty(t *testing.T) {
 	ap := &mcpApprovalService{db: db}
 	rt := &mcpRuntimeService{db: db}
 	id := seedServer(t, db)
-	if err := ap.Put(id, "t", "FP", ""); err != nil {
+	if err := ap.Put(id, "t", "FP", "", ""); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
@@ -235,7 +237,7 @@ func TestHygieneKeepsNeverHeartbeatedRow(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
 	id := seedServer(t, db)
-	if err := ap.Put(id, "t", "FP", "sh"); err != nil {
+	if err := ap.Put(id, "t", "FP", "sh", ""); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if _, err := db.Exec(`UPDATE mcp_tool_approvals SET last_seen_at=0 WHERE server_id=? AND tool_name='t'`, id); err != nil {
@@ -279,14 +281,17 @@ func TestHygieneDeletesRowUnseenFor90Days(t *testing.T) {
 
 // --- Task 18b: desc_hash ---
 
-// TestPutWithDescHashStampsDescHash pins that PutWithDescHash writes the
-// desc_hash column verbatim, the same way Put already writes schema_hash.
-func TestPutWithDescHashStampsDescHash(t *testing.T) {
+// TestPutStampsDescHash pins that Put writes the desc_hash column verbatim,
+// the same way it already writes schema_hash. Put is now the ONLY writer for
+// ordinary tool approvals — both ApprovalsInternal's confirm-card path
+// (route/v2/mcp.go) and the public PUT .../approvals/:tool endpoint
+// (route/v2/mcp_approvals.go) go through it.
+func TestPutStampsDescHash(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
 	id := seedServer(t, db)
-	if err := ap.PutWithDescHash(id, "t", "FP", "sh", "dh1"); err != nil {
-		t.Fatalf("PutWithDescHash: %v", err)
+	if err := ap.Put(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("Put: %v", err)
 	}
 
 	var got string
@@ -298,39 +303,33 @@ func TestPutWithDescHashStampsDescHash(t *testing.T) {
 	}
 }
 
-// TestPutWithDescHashRejectsWildcardToolName mirrors TestPutRejectsWildcardToolName:
-// the '*' sentinel row must only ever be written by PutServerLevel.
-func TestPutWithDescHashRejectsWildcardToolName(t *testing.T) {
-	db := openTestDB(t)
-	ap := &mcpApprovalService{db: db}
-	if err := ap.PutWithDescHash(seedServer(t, db), "*", "FP", "sh", "dh"); err == nil {
-		t.Fatal("PutWithDescHash must reject tool_name '*' — use PutServerLevel for the server-level approval")
-	}
-}
-
-// TestPutStoresEmptyDescHash locks in that the plain Put/PutServerLevel paths
-// (used by the existing internal confirm-card writer, ApprovalsInternal)
-// still store an empty desc_hash, exactly as before this task — they were
-// not changed to accept one.
-func TestPutStoresEmptyDescHash(t *testing.T) {
+// TestReapprovingDoesNotBlankAnExistingDescHash is the regression test for
+// the data-loss bug this task fixes: when a gate voids an approval and the
+// confirmation card reappears, re-approving must NOT overwrite a previously
+// recorded desc_hash with "" just because the caller (at the time) had no
+// fresher value to stamp. Put's upsert writes desc_hash=excluded.desc_hash
+// unconditionally, so this pins that every CALLER of Put is responsible for
+// always looking up the CURRENT tools_json value (via lookupToolMeta) rather
+// than ever passing a blank one for a tool it already knows a hash for.
+func TestReapprovingDoesNotBlankAnExistingDescHash(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
 	id := seedServer(t, db)
-	if err := ap.Put(id, "t", "FP", "sh"); err != nil {
-		t.Fatalf("Put: %v", err)
+	if err := ap.Put(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("first Put: %v", err)
 	}
-	if err := ap.PutServerLevel(id, "FP"); err != nil {
-		t.Fatalf("PutServerLevel: %v", err)
+	// Re-approve with the SAME current desc_hash (as any correct caller must,
+	// by re-reading tools_json rather than caching an old/blank value).
+	if err := ap.Put(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("second Put: %v", err)
 	}
 
 	rows, err := ap.ListForServer(id)
 	if err != nil {
 		t.Fatalf("ListForServer: %v", err)
 	}
-	for _, r := range rows {
-		if r.DescHash != "" {
-			t.Fatalf("expected empty desc_hash from Put/PutServerLevel, got %q for tool %q", r.DescHash, r.ToolName)
-		}
+	if len(rows) != 1 || rows[0].DescHash != "dh1" {
+		t.Fatalf("expected desc_hash to remain %q across re-approval, got %+v", "dh1", rows)
 	}
 }
 
@@ -343,8 +342,8 @@ func TestListForServerExposesLastSeenAtAndDescHash(t *testing.T) {
 	db := openTestDB(t)
 	ap := &mcpApprovalService{db: db}
 	id := seedServer(t, db)
-	if err := ap.PutWithDescHash(id, "t", "FP", "sh", "dh1"); err != nil {
-		t.Fatalf("PutWithDescHash: %v", err)
+	if err := ap.Put(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("Put: %v", err)
 	}
 
 	rows, err := ap.ListForServer(id)

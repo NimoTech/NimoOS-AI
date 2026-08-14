@@ -643,30 +643,12 @@ func (h *MCPHandler) probeAndPersistAsync(m *service.McpServer, env, headers map
 // mcpApprovalsRequest is the body for POST /_internal/mcp/approvals. Only
 // server_id and tool_name are caller-supplied — Python derives both from the
 // confirm_id it minted when it showed the confirmation card, never from the
-// browser. identity_fp and schema_hash are deliberately NOT fields here: see
-// ApprovalsInternal for why they must never come from the request.
+// browser. identity_fp, schema_hash and desc_hash are deliberately NOT
+// fields here: see ApprovalsInternal for why they must never come from the
+// request.
 type mcpApprovalsRequest struct {
 	ServerID int64  `json:"server_id"`
 	ToolName string `json:"tool_name"`
-}
-
-// lookupSchemaHash returns the schema_hash currently recorded for toolName
-// in a McpServerRuntime's ToolsJSON (a JSON array of {name, schema_hash,
-// desc_hash}). It returns "" if the tool is not present in the listing —
-// this is the intended, safe outcome, not an error: Task 10's interface gate
-// treats an empty stored schema_hash as a failed gate, so the approval this
-// value feeds into simply will not take effect until the tool actually
-// appears in a listing. schema_hash itself is computed only in Python; this
-// function only looks up an already-computed value, never derives one.
-func lookupSchemaHash(toolsJSON, toolName string) string {
-	var tools []service.ToolMeta
-	_ = json.Unmarshal([]byte(toolsJSON), &tools)
-	for _, tl := range tools {
-		if tl.Name == toolName {
-			return tl.SchemaHash
-		}
-	}
-	return ""
 }
 
 // resolveWriteToken reads X-Agent-MCP-Write-Token and resolves it against
@@ -708,14 +690,20 @@ func (h *MCPHandler) resolveWriteToken(c echo.Context) (uid string, ok bool, han
 //     from "does not exist" — both cases are correctly rejected the same
 //     way, since a caller with neither ownership nor existence gets no
 //     information either way.
-//  3. identity_fp and schema_hash are ALWAYS read from the server's CURRENT
-//     mcp_server_runtime row, never from the request body (the request
-//     struct above has no fields for them at all). If a caller could supply
-//     these directly, it could mint an approval whose stored fingerprint
-//     always matches itself — the config/interface gates in
-//     EffectiveApprovals compare the stored value against the CURRENT
+//  3. identity_fp, schema_hash and desc_hash are ALWAYS read from the
+//     server's CURRENT mcp_server_runtime row (via lookupToolMeta, shared
+//     with the public PUT .../approvals/:tool endpoint in
+//     mcp_approvals.go), never from the request body (the request struct
+//     above has no fields for them at all). If a caller could supply
+//     identity_fp/schema_hash directly, it could mint an approval whose
+//     stored fingerprint always matches itself — the config/interface gates
+//     in EffectiveApprovals compare the stored value against the CURRENT
 //     runtime observation, so a self-consistent forged pair would never be
-//     invalidated, producing an approval that can never expire.
+//     invalidated, producing an approval that can never expire. desc_hash
+//     carries no such gate, but is stamped from the same lookup so this,
+//     the majority path by which users grant consent, also lights the
+//     settings UI's "description changed" badge (design doc §5.2.1) — not
+//     just approvals granted from the settings page.
 //  4. tool_name is trimmed exactly once (into the toolName local) and that
 //     same trimmed value is used for the emptiness check, the "*" routing
 //     decision, and the write itself. Validating against the trimmed value
@@ -746,10 +734,11 @@ func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
 	}
 
 	// rt is nil when this server has never had a successful probe (Task 4) —
-	// a normal state, not an error. identityFP/schemaHash then stay "",
-	// which is safe: EffectiveApprovals' config/interface gates both fail
-	// closed on an empty stored value, so the write below is accepted but
-	// inert until a real listing exists.
+	// a normal state, not an error. identityFP/schemaHash/descHash then stay
+	// "", which is safe: EffectiveApprovals' config/interface gates both
+	// fail closed on an empty stored value, and an empty stored desc_hash
+	// reports "description changed" as false rather than true — so the
+	// write below is accepted but inert until a real listing exists.
 	rt, err := h.svc.MCPRuntime().Get(req.ServerID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -764,11 +753,11 @@ func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
 		// row; Put itself rejects tool_name=="*" (Task 10).
 		err = h.svc.MCPApprovals().PutServerLevel(req.ServerID, identityFP)
 	} else {
-		var schemaHash string
+		var schemaHash, descHash string
 		if rt != nil {
-			schemaHash = lookupSchemaHash(rt.ToolsJSON, toolName)
+			schemaHash, descHash = lookupToolMeta(rt.ToolsJSON, toolName)
 		}
-		err = h.svc.MCPApprovals().Put(req.ServerID, toolName, identityFP, schemaHash)
+		err = h.svc.MCPApprovals().Put(req.ServerID, toolName, identityFP, schemaHash, descHash)
 	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

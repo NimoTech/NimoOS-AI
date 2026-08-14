@@ -148,6 +148,105 @@ func TestApprovalsEndpointStampsCurrentFingerprintAndHash(t *testing.T) {
 	}
 }
 
+// TestApprovalsEndpointStampsDescHash pins that the confirm-card path
+// (Python's ApprovalsInternal call) also stamps desc_hash from the current
+// runtime row — not just identity_fp/schema_hash. Before this fix,
+// ApprovalsInternal called Put with no desc_hash at all, so the settings
+// UI's "description changed" badge (design doc §5.2.1) never lit for the
+// majority of approvals, which are granted from the confirmation card, not
+// the settings page.
+func TestApprovalsEndpointStampsDescHash(t *testing.T) {
+	svc := mcpTestSvc(t)
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{
+		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh", DescHash: "dh1"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	tok := runTokens.Mint("u1", "sess1")
+	body := fmt.Sprintf(`{"server_id":%d,"tool_name":"create_issue"}`, m.ID)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Agent-MCP-Write-Token", tok)
+	rec := httptest.NewRecorder()
+	if err := h.ApprovalsInternal(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("approvals: %v", err)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := svc.MCPApprovals().ListForServer(m.ID)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	if len(rows) != 1 || rows[0].DescHash != "dh1" {
+		t.Fatalf("expected the confirm-card path to stamp desc_hash %q, got %+v", "dh1", rows)
+	}
+}
+
+// TestApprovalsEndpointReapprovalDoesNotBlankDescHash is the regression test
+// for the data-loss half of the same bug: a gate voiding an approval and the
+// card reappearing later must not silently erase a desc_hash the store
+// already had recorded, just because the write happens again through the
+// same call site.
+func TestApprovalsEndpointReapprovalDoesNotBlankDescHash(t *testing.T) {
+	svc := mcpTestSvc(t)
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{
+		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh", DescHash: "dh1"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	approveOnce := func() {
+		tok := runTokens.Mint("u1", "sess1")
+		body := fmt.Sprintf(`{"server_id":%d,"tool_name":"create_issue"}`, m.ID)
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set("X-Agent-MCP-Write-Token", tok)
+		rec := httptest.NewRecorder()
+		if err := h.ApprovalsInternal(e.NewContext(req, rec)); err != nil {
+			t.Fatalf("approvals: %v", err)
+		}
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	approveOnce() // e.g. a gate later voids this approval...
+	approveOnce() // ...and the card reappears, user re-ticks "always".
+
+	rows, err := svc.MCPApprovals().ListForServer(m.ID)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	if len(rows) != 1 || rows[0].DescHash != "dh1" {
+		t.Fatalf("re-approval must not blank a previously stamped desc_hash, got %+v", rows)
+	}
+}
+
 // TestSchemasEndpointReturnsListedAtForCacheKeying pins the response shape:
 // listed_at must ship alongside the schema bodies. Python's in-memory cache
 // is keyed on listed_at; without it a changed tool description can never

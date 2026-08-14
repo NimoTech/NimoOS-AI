@@ -3,6 +3,7 @@ package v2
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -27,11 +28,18 @@ import (
 // mcp_tool_approvals) — computing this response makes ZERO network calls,
 // which is the whole payoff of persisting the identity card (before this
 // design, showing the tool list required a live connection to the server).
+// StaleReason is populated ONLY for a currently-void approval (identical to
+// ListForServer's semantics) and is empty otherwise; the config gate in
+// particular (server identity changed) is not derivable client-side — the
+// browser never sees identity_fp — so without this field an edited server's
+// stale approvals would render as ordinary "approved" toggles, silently
+// telling the user they won't be re-prompted when they will be.
 type toolStateDTO struct {
 	Name        string `json:"name"`
 	Approved    bool   `json:"approved"`
 	LastSeenAt  int64  `json:"last_seen_at"`
 	DescChanged bool   `json:"desc_changed"`
+	StaleReason string `json:"stale_reason,omitempty"`
 }
 
 // approvalSummaryDTO is one element of GET /mcp/approvals' cross-server
@@ -55,12 +63,15 @@ type putApprovalRequest struct {
 // lookupToolMeta returns the schema_hash and desc_hash currently recorded
 // for toolName in a runtime row's ToolsJSON (a JSON array of {name,
 // schema_hash, desc_hash}). Both come back "" when the tool is not (or no
-// longer) present in the listing — the same safe-default convention as
-// mcp.go's lookupSchemaHash: the write this feeds is still accepted, it just
-// stays inert (fails the interface gate / reports no description change)
-// until the tool reappears in a real listing. Neither hash is computed
-// here — both are Python-only values (agent/mcp_client/hashing.py), only
-// looked up.
+// longer) present in the listing — this is the intended, safe outcome, not
+// an error: Task 10's interface gate treats an empty stored schema_hash as a
+// failed gate, and an empty stored desc_hash reports "description changed"
+// as false, so the approval this feeds into simply stays inert on the gate
+// (or quiet on the badge) until the tool reappears in a real listing.
+// Neither hash is computed here — both are Python-only values
+// (agent/mcp_client/hashing.py), only looked up. Shared by both writers of
+// ordinary tool approvals: ApprovalsInternal's confirm-card path (mcp.go)
+// and PutApproval below.
 func lookupToolMeta(toolsJSON, toolName string) (schemaHash, descHash string) {
 	var tools []service.ToolMeta
 	_ = json.Unmarshal([]byte(toolsJSON), &tools)
@@ -95,10 +106,11 @@ func (h *MCPHandler) ownerOrForbidden(c echo.Context) (uid string, id int64, err
 	return uid, id, nil
 }
 
-// Tools handles GET /v2/ai/mcp/servers/:id/tools (design doc §8.1). It reads
+// Tools handles GET /v1/ai/mcp/servers/:id/tools (design doc §8.1). It reads
 // the tool list straight out of mcp_server_runtime.tools_json and layers
-// each tool's approval state, last_seen_at and desc_changed badge on top,
-// using only mcp_tool_approvals — it never dials the MCP server itself.
+// each tool's approval state, last_seen_at, desc_changed badge and
+// stale_reason on top, using only mcp_tool_approvals — it never dials the
+// MCP server itself.
 func (h *MCPHandler) Tools(c echo.Context) error {
 	_, id, err := h.ownerOrForbidden(c)
 	if err != nil {
@@ -135,9 +147,11 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		switch row, ok := byName[m.Name]; {
 		case ok:
 			// An explicit per-tool approval is the more specific record;
-			// prefer it over a server-level one for last_seen_at/desc_changed.
+			// prefer it over a server-level one for
+			// last_seen_at/desc_changed/stale_reason.
 			dto.Approved = true
 			dto.LastSeenAt = row.LastSeenAt
+			dto.StaleReason = row.StaleReason
 			// desc_changed: stored desc_hash non-empty AND different from the
 			// current one. An empty stored value means "approved before we
 			// started recording it" — report false, not true, or every
@@ -149,13 +163,14 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 			// tool and has no description), so it never lights the badge.
 			dto.Approved = true
 			dto.LastSeenAt = wildcard.LastSeenAt
+			dto.StaleReason = wildcard.StaleReason
 		}
 		out = append(out, dto)
 	}
 	return c.JSON(http.StatusOK, map[string]any{"tools": out})
 }
 
-// PutApproval handles PUT /v2/ai/mcp/servers/:id/approvals/:tool. It is the
+// PutApproval handles PUT /v1/ai/mcp/servers/:id/approvals/:tool. It is the
 // browser-facing counterpart to ApprovalsInternal (mcp.go) and shares its
 // core security property:
 //
@@ -168,15 +183,24 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 //     EffectiveApprovals (which compare the stored value against the
 //     CURRENT runtime observation).
 //  3. tool_name=="*" routes to PutServerLevel (grant) / Delete(id,"*")
-//     (revoke); every other name goes to PutWithDescHash / Delete. Put/
-//     PutWithDescHash reject "*" outright (Task 10) — do not try to force it
-//     through them.
+//     (revoke); every other name goes to Put / Delete. Put rejects "*"
+//     outright (Task 10) — do not try to force it through.
+//
+// :tool is percent-decoded (url.PathUnescape) before use, matching this
+// codebase's convention for path segments that name an entity rather than
+// an opaque id (see models.go's DeleteModel): without it, a client that
+// strictly encodes the wildcard as "%2A" would silently write a junk
+// approval literally named "%2A" instead of granting server-level consent.
 func (h *MCPHandler) PutApproval(c echo.Context) error {
 	_, id, err := h.ownerOrForbidden(c)
 	if err != nil {
 		return err
 	}
-	toolName := strings.TrimSpace(c.Param("tool"))
+	toolName, err := url.PathUnescape(c.Param("tool"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid tool encoding")
+	}
+	toolName = strings.TrimSpace(toolName)
 	if toolName == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "tool name required")
 	}
@@ -217,10 +241,10 @@ func (h *MCPHandler) PutApproval(c echo.Context) error {
 
 	if toolName == "*" {
 		// PutServerLevel is the only path allowed to write the '*' sentinel
-		// row; Put/PutWithDescHash reject tool_name=="*" (Task 10).
+		// row; Put rejects tool_name=="*" (Task 10).
 		err = h.svc.MCPApprovals().PutServerLevel(id, identityFP)
 	} else {
-		err = h.svc.MCPApprovals().PutWithDescHash(id, toolName, identityFP, schemaHash, descHash)
+		err = h.svc.MCPApprovals().Put(id, toolName, identityFP, schemaHash, descHash)
 	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -228,7 +252,7 @@ func (h *MCPHandler) PutApproval(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// DeleteApprovals handles DELETE /v2/ai/mcp/servers/:id/approvals — revoke
+// DeleteApprovals handles DELETE /v1/ai/mcp/servers/:id/approvals — revoke
 // every approval (including the server-level '*' row) for one server, e.g.
 // the settings page's "revoke all" action or a delete-server confirmation
 // (design doc §8.2 point 6).
@@ -243,7 +267,7 @@ func (h *MCPHandler) DeleteApprovals(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// ListApprovals handles GET /v2/ai/mcp/approvals — a cross-server summary of
+// ListApprovals handles GET /v1/ai/mcp/approvals — a cross-server summary of
 // the caller's currently effective approvals (the same gated set
 // EffectiveApprovals hands the agent at run start), for the settings page's
 // "approved tools" overview (design doc §8.2 point 5). server_handle is
