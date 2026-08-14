@@ -27,6 +27,13 @@ class ServerStatus:
     detail: str = ""                                  # failure reason; empty when OK
     tool_names: list = field(default_factory=list)    # fq tool names (post-dedup)
     handle: str = ""                                  # self-reported identity (Task 7); "" = never probed
+    slug: str = ""                                    # this server's actual per-run deduped
+                                                        # expand_tools token from assign_slugs
+                                                        # (mcp_client.client); "" until Task 16
+                                                        # wires it through. The ONLY value
+                                                        # guaranteed correct after a handle
+                                                        # collision (e.g. "github_2") -- see
+                                                        # _slug_token.
     summary: str = ""                                 # server's one-line self-description (L1)
     instructions: str = ""                             # server's full instructions text (L2 only)
     stale: bool = False                                # tool_names/instructions are cached from
@@ -45,46 +52,73 @@ class McpStatusSnapshot:
 MCP_STATUS_VAR: ContextVar = ContextVar("mcp_status_snapshot", default=None)
 
 _DETAIL_MAX = 80
+_INSTRUCTIONS_MAX = 4000     # generous full-paragraph budget for L2's instructions —
+                             # bigger than _DETAIL_MAX's one-liner budget on purpose,
+                             # but still bounded against a runaway/hostile blob
 
 FALLBACK_LINE = "MCP runtime tools, if any, appear in your tool list on the next step."
 
 
-def _short(detail) -> str:
-    d = " ".join(str(detail or "").split())
-    return d if len(d) <= _DETAIL_MAX else d[:_DETAIL_MAX - 1] + "…"
+def _short(text, max_len: int = _DETAIL_MAX) -> str:
+    """Collapse all whitespace (including embedded newlines) to single spaces
+    and cap length. Applied to every piece of third-party server-reported
+    text (`detail`, `summary`, `instructions`) before it reaches the model:
+    without the whitespace collapse, an embedded newline in e.g. `summary`
+    can make one server's L1 entry visually split into what looks like a
+    second, independently parseable "MCP server ..." line — see the
+    trailing-";" boundary convention in render_expand_section, which this
+    normalization protects.
+    """
+    d = " ".join(str(text or "").split())
+    return d if len(d) <= max_len else d[:max_len - 1] + "…"
 
 
 def _label(s: ServerStatus) -> str:
     """The name the MODEL sees for this server.
 
-    Prefers the self-reported `handle` over the user-typed `name`: the model
-    routes by handle (assign_slugs prefers it too, and L1's "expand as:
-    mcp:<handle>" token is built from it), and it never sees the settings
-    page where the user typed a name like "测试1" ("test 1"). Falls back to
-    `name` only for a server that has never been successfully probed and so
-    has no self-reported handle yet.
+    Preference order:
+      1. `handle` -- the self-reported identity (Task 7). Best: it's what
+         the model uses elsewhere too.
+      2. `slug` -- the deduped assign_slugs identifier. Still model-facing
+         and collision-safe even before a server has ever been probed,
+         since assign_slugs derives it from the name when there's no handle
+         yet (`_slug(name)`).
+      3. `name` -- the raw user-typed name (e.g. "测试1" / "test 1"), which
+         the model should never see per the "reader is the model, not the
+         user" rule. This is a deliberate, documented exception: it only
+         fires when a status object has NEITHER a handle NOR a slug (e.g.
+         hand-built without ever going through assign_slugs), and at that
+         point there is no better model-facing identifier available --
+         showing nothing would be worse than showing the name.
     """
-    return s.handle or s.name
+    return s.handle or s.slug or s.name
 
 
 def _slug_token(s: ServerStatus) -> str:
-    """The exact `expand_tools(["mcp:<token>"])` token for this server.
+    """The exact `expand_tools(["mcp:<token>"])` token for this server, or
+    "" when no trustworthy slug is available (callers must then SUPPRESS the
+    "expand as:" hint entirely rather than guess).
 
-    Not re-derived from name/handle here — that would risk drifting from
-    assign_slugs's per-run collision dedup (mcp_client.client.assign_slugs),
-    which is the sole owner of that logic. Each fq tool name is already
-    stamped with the deduped slug (`mcp__<slug>__<tool>`, see
-    client._wrap_tool), so when at least one tool name exists we recover the
-    real slug straight from it — this is how a server whose handle collided
-    and got bumped to e.g. "github_2" still advertises the correct token.
-    Only a server with no tool names yet (never successfully probed) falls
-    back to the un-deduped label.
+    Preference order:
+      1. `s.slug` -- the actual per-run deduped slug from assign_slugs
+         (mcp_client.client.assign_slugs). The only value guaranteed to
+         reflect a collision bump (e.g. "github_2"); Task 16 populates it.
+      2. Recovered from an already-fq tool name (`mcp__<slug>__<tool>`, see
+         client._wrap_tool) when `s.slug` isn't set yet but tool names are.
+      3. "" -- deliberately NOT `_label(s)`. Falling back to the un-deduped
+         handle/name here was the bug: a server whose handle collided with
+         a sibling's (and so was actually assigned e.g. "github_2") would
+         advertise the sibling's bare "github" token, silently pointing
+         `expand_tools` at the WRONG server -- worse than advertising
+         nothing at all.
     """
+    if s.slug:
+        return s.slug
     if s.tool_names:
         parts = s.tool_names[0].split("__")
         if len(parts) >= 3 and parts[0] == "mcp":
             return parts[1]
-    return _label(s)
+    return ""
 
 
 def _summary(s: ServerStatus) -> str:
@@ -132,16 +166,21 @@ def render_expand_section(snapshot) -> list[str]:
             # list EVERY tool — an elided "… (40 total)" left the model unable
             # to see (and thus call) the hidden names, so it drifted to other tools
             listed = ", ".join(s.tool_names)
-            summary_part = f" — {s.summary}" if s.summary else ""
+            summary_part = f" — {_short(s.summary)}" if s.summary else ""
             # No schema and not the full instructions here — just enough to
             # route: which tools exist, and the exact token that opens L2
             # (mcp_gating.resolve_handle only accepts the deduped slug, which
-            # _slug_token recovers from the tool names themselves).
+            # _slug_token recovers from s.slug or the tool names themselves).
+            token = _slug_token(s)
+            # No trustworthy slug (see _slug_token) -> suppress the hint
+            # rather than guess: advertising no token beats advertising a
+            # wrong one that resolves to a different server.
+            expand_hint = f" expand as: mcp:{token} for full tool schemas;" if token else ""
             # trailing ";" terminates this server's tool list — without it,
             # weaker models read the unbulleted server lines as sub-items of
             # the preceding tool instead of parallel lists of callable tools
             lines.append(f'MCP server "{label}" ({len(s.tool_names)} tools){summary_part}: '
-                         f'{listed}; expand as: mcp:{_slug_token(s)} for full tool schemas;')
+                         f'{listed};{expand_hint}')
         elif s.status == WARMING:
             lines.append(f'MCP server "{label}": starting up in the background; '
                          "its tools should appear on a later message.")
@@ -158,8 +197,10 @@ def render_expand_section(snapshot) -> list[str]:
                 # come from the last successful probe, so they are marked
                 # stale rather than presented as currently callable.
                 stale_note = " (stale — from before the current failure)" if s.stale else ""
+                token = _slug_token(s)
+                expand_hint = f" expand as: mcp:{token} for details;" if token else ""
                 line += (f" — its last known tools{stale_note}: "
-                        f"{', '.join(s.tool_names)}; expand as: mcp:{_slug_token(s)}")
+                        f"{', '.join(s.tool_names)};{expand_hint}")
             else:
                 line += " — its tools are unavailable this run."
             lines.append(line)
@@ -180,7 +221,7 @@ def render_l2_preamble(s: ServerStatus) -> str:
     label = _label(s)
     parts = [f'MCP server "{label}"']
     if s.summary:
-        parts.append(s.summary)
+        parts.append(_short(s.summary))
     if s.stale:
         # Still surfaced, not hidden: the model asked to open this specific
         # server, so tell it plainly that what follows may be out of date
@@ -189,5 +230,8 @@ def render_l2_preamble(s: ServerStatus) -> str:
         parts.append(f"Note: this server is currently degraded{detail_part}; "
                      "the following instructions may be stale.")
     if s.instructions:
-        parts.append(s.instructions)
+        # Third-party text from the server itself: whitespace-normalized and
+        # length-capped the same way `detail`/`summary` are (see _short),
+        # just with a paragraph-sized budget instead of a one-liner's.
+        parts.append(_short(s.instructions, _INSTRUCTIONS_MAX))
     return "\n\n".join(parts)
