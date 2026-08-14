@@ -66,3 +66,30 @@ def test_connect_falls_back_to_auto_for_unrecognized_persisted_mode(monkeypatch,
                                  "url": "https://x", "protocol_mode": "2099-01-01"}))
     assert seen["mode"] == "auto"
     assert "2099-01-01" in caplog.text
+
+
+def test_probe_always_renegotiates_with_auto_even_with_a_persisted_mode(monkeypatch):
+    """The /test probe (test_server -> _test_server_inner) is the one call that
+    PRODUCES the persisted protocol_mode everything else reuses -- it must
+    never inherit a stale pin from a previous probe, or a wrong/outdated era
+    could never self-correct (Go is the sole writer of protocol_mode, and
+    nothing here re-probes on its own outside of /test). So even when the
+    server dict being (re-)tested already carries a protocol_mode from an
+    earlier probe, _connect must still be called with mode="auto"."""
+    seen = {}
+
+    class _FakeConn:
+        async def list_tools(self):
+            return [], mc.SCHEMA_TTL
+        async def aclose(self): pass
+
+    async def fake_connect(server, connect_timeout=None, mode=None):
+        seen["mode"] = mode
+        return _FakeConn()
+
+    monkeypatch.setattr(mc, "_connect", fake_connect)
+    out = asyncio.run(mc.test_server({"id": 1, "name": "s", "transport": "http",
+                                      "url": "https://x", "protocol_mode": "legacy"}))
+    assert out["ok"] is True
+    assert seen["mode"] == "auto", (
+        "the probe must re-negotiate from scratch, not inherit a stale persisted era")
