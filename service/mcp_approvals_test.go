@@ -276,3 +276,88 @@ func TestHygieneDeletesRowUnseenFor90Days(t *testing.T) {
 		t.Fatal("a row unseen for more than 90 days must be deleted outright by the hygiene gate")
 	}
 }
+
+// --- Task 18b: desc_hash ---
+
+// TestPutWithDescHashStampsDescHash pins that PutWithDescHash writes the
+// desc_hash column verbatim, the same way Put already writes schema_hash.
+func TestPutWithDescHashStampsDescHash(t *testing.T) {
+	db := openTestDB(t)
+	ap := &mcpApprovalService{db: db}
+	id := seedServer(t, db)
+	if err := ap.PutWithDescHash(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("PutWithDescHash: %v", err)
+	}
+
+	var got string
+	if err := db.QueryRow(`SELECT desc_hash FROM mcp_tool_approvals WHERE server_id=? AND tool_name='t'`, id).Scan(&got); err != nil {
+		t.Fatalf("select desc_hash: %v", err)
+	}
+	if got != "dh1" {
+		t.Fatalf("expected stored desc_hash %q, got %q", "dh1", got)
+	}
+}
+
+// TestPutWithDescHashRejectsWildcardToolName mirrors TestPutRejectsWildcardToolName:
+// the '*' sentinel row must only ever be written by PutServerLevel.
+func TestPutWithDescHashRejectsWildcardToolName(t *testing.T) {
+	db := openTestDB(t)
+	ap := &mcpApprovalService{db: db}
+	if err := ap.PutWithDescHash(seedServer(t, db), "*", "FP", "sh", "dh"); err == nil {
+		t.Fatal("PutWithDescHash must reject tool_name '*' — use PutServerLevel for the server-level approval")
+	}
+}
+
+// TestPutStoresEmptyDescHash locks in that the plain Put/PutServerLevel paths
+// (used by the existing internal confirm-card writer, ApprovalsInternal)
+// still store an empty desc_hash, exactly as before this task — they were
+// not changed to accept one.
+func TestPutStoresEmptyDescHash(t *testing.T) {
+	db := openTestDB(t)
+	ap := &mcpApprovalService{db: db}
+	id := seedServer(t, db)
+	if err := ap.Put(id, "t", "FP", "sh"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := ap.PutServerLevel(id, "FP"); err != nil {
+		t.Fatalf("PutServerLevel: %v", err)
+	}
+
+	rows, err := ap.ListForServer(id)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	for _, r := range rows {
+		if r.DescHash != "" {
+			t.Fatalf("expected empty desc_hash from Put/PutServerLevel, got %q for tool %q", r.DescHash, r.ToolName)
+		}
+	}
+}
+
+// TestListForServerExposesLastSeenAtAndDescHash pins the two fields the new
+// public /tools endpoint (route/v2/mcp_approvals.go) reads off ApprovalRow:
+// LastSeenAt and DescHash must round-trip through ListForServer unchanged.
+// This is a pure additional-data exposure — it must not touch any of
+// ListForServer's existing StaleReason gate logic.
+func TestListForServerExposesLastSeenAtAndDescHash(t *testing.T) {
+	db := openTestDB(t)
+	ap := &mcpApprovalService{db: db}
+	id := seedServer(t, db)
+	if err := ap.PutWithDescHash(id, "t", "FP", "sh", "dh1"); err != nil {
+		t.Fatalf("PutWithDescHash: %v", err)
+	}
+
+	rows, err := ap.ListForServer(id)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0].DescHash != "dh1" {
+		t.Fatalf("expected DescHash %q, got %q", "dh1", rows[0].DescHash)
+	}
+	if rows[0].LastSeenAt == 0 {
+		t.Fatal("expected a nonzero LastSeenAt for a freshly-approved row")
+	}
+}

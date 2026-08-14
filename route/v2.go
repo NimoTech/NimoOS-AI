@@ -125,6 +125,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.DELETE("/mcp/servers/:id", mcp.Delete)
 	g.POST("/mcp/servers/:id/test", mcp.Test)
 
+	// MCP tool approvals (design doc §8.1) — the settings UI's window into
+	// the approval store Task 10 built. Public/browser-facing, authenticated
+	// like the routes above; see route/v2/mcp_approvals.go.
+	g.GET("/mcp/servers/:id/tools", mcp.Tools)
+	g.PUT("/mcp/servers/:id/approvals/:tool", mcp.PutApproval)
+	g.DELETE("/mcp/servers/:id/approvals", mcp.DeleteApprovals)
+	g.GET("/mcp/approvals", mcp.ListApprovals)
+
 	// Privacy policy
 	g.GET("/policy", policy.Get)
 	g.PUT("/policy", policy.Update)

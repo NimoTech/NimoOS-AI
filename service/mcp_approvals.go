@@ -21,10 +21,16 @@ const hygieneWindowSec = 90 * 24 * 60 * 60
 // StaleReason is populated only by ListForServer, for the settings UI to
 // explain to the user why a listed approval is currently void; it is
 // display/diagnostic only and never feeds any pass/fail decision.
+// LastSeenAt and DescHash are likewise populated only by ListForServer, for
+// the public GET .../tools endpoint (route/v2/mcp_approvals.go) to compute
+// per-tool last_seen_at and the "description changed" badge. Like
+// StaleReason, neither ever feeds a gate decision.
 type ApprovalRow struct {
 	ServerID    int64
 	ToolName    string
 	StaleReason string
+	LastSeenAt  int64
+	DescHash    string
 }
 
 type mcpApprovalService struct{ db *sql.DB }
@@ -35,7 +41,7 @@ type mcpApprovalService struct{ db *sql.DB }
 // its doc comment for why). Since it never takes a schema_hash, this call
 // hardcodes it to "" — '*' is not a real tool and never has one.
 func (s *mcpApprovalService) PutServerLevel(serverID int64, identityFP string) error {
-	return s.put(serverID, "*", identityFP, "")
+	return s.put(serverID, "*", identityFP, "", "")
 }
 
 // Put records (or refreshes) one ordinary tool's approval. toolName must not
@@ -56,22 +62,48 @@ func (s *mcpApprovalService) Put(serverID int64, toolName, identityFP, schemaHas
 	if toolName == "*" {
 		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
 	}
-	return s.put(serverID, toolName, identityFP, schemaHash)
+	return s.put(serverID, toolName, identityFP, schemaHash, "")
 }
 
-// put is the shared writer behind Put and PutServerLevel. approved_at and
-// last_seen_at are both set to now: approved_at marks when the user
-// consented, last_seen_at is reset here so a freshly (re-)approved tool
-// doesn't immediately fail the stale gate.
-func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHash string) error {
+// PutWithDescHash is Put plus desc_hash (design doc §5.2.1): the description
+// hash the user saw at approval time, for the settings UI's "description
+// changed" badge. It exists as a separate method — rather than adding a
+// parameter to Put — so the confirm-card write path (ApprovalsInternal,
+// route/v2/mcp.go), which predates desc_hash and has no ToolMeta.DescHash to
+// stamp from at that call site, is untouched by this task; its approvals
+// simply keep storing an empty desc_hash, which the badge logic below
+// already treats as "approved before we recorded it" rather than "changed".
+//
+// Used by the public PUT .../approvals/:tool endpoint (route/v2/mcp_approvals.go),
+// which has the full current ToolMeta on hand and can stamp all three
+// fingerprints (identity_fp, schema_hash, desc_hash) from the SAME runtime
+// observation in one write.
+//
+// desc_hash participates in NO gate — see EffectiveApprovals' and
+// ListForServer's doc comments; this method only stores the value, it never
+// reads it back for any pass/fail decision.
+func (s *mcpApprovalService) PutWithDescHash(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
+	if toolName == "*" {
+		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
+	}
+	return s.put(serverID, toolName, identityFP, schemaHash, descHash)
+}
+
+// put is the shared writer behind Put, PutServerLevel and PutWithDescHash.
+// approved_at and last_seen_at are both set to now: approved_at marks when
+// the user consented, last_seen_at is reset here so a freshly (re-)approved
+// tool doesn't immediately fail the stale gate. descHash is stored verbatim
+// and never inspected here — see PutWithDescHash's doc comment for why it
+// must never enter a gate.
+func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(`
-		INSERT INTO mcp_tool_approvals (server_id, tool_name, identity_fp, schema_hash, approved_at, last_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO mcp_tool_approvals (server_id, tool_name, identity_fp, schema_hash, desc_hash, approved_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(server_id, tool_name) DO UPDATE SET
-			identity_fp=excluded.identity_fp, schema_hash=excluded.schema_hash,
+			identity_fp=excluded.identity_fp, schema_hash=excluded.schema_hash, desc_hash=excluded.desc_hash,
 			approved_at=excluded.approved_at, last_seen_at=excluded.last_seen_at`,
-		serverID, toolName, identityFP, schemaHash, now, now)
+		serverID, toolName, identityFP, schemaHash, descHash, now, now)
 	return err
 }
 
@@ -233,7 +265,7 @@ func (s *mcpApprovalService) EffectiveApprovals(userID string) ([]ApprovalRow, e
 // pass/fail decision — EffectiveApprovals owns that.
 func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error) {
 	rows, err := s.db.Query(`
-		SELECT a.tool_name, a.identity_fp, a.schema_hash, a.last_seen_at,
+		SELECT a.tool_name, a.identity_fp, a.schema_hash, a.desc_hash, a.last_seen_at,
 			r.identity_fp, r.tools_json
 		FROM mcp_tool_approvals a
 		LEFT JOIN mcp_server_runtime r ON r.server_id = a.server_id
@@ -249,11 +281,11 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 
 	var out []ApprovalRow
 	for rows.Next() {
-		var toolName, approvalFP, approvalSchema string
+		var toolName, approvalFP, approvalSchema, approvalDesc string
 		var lastSeenAt int64
 		var runtimeFP sql.NullString
 		var toolsJSON sql.NullString
-		if err := rows.Scan(&toolName, &approvalFP, &approvalSchema, &lastSeenAt,
+		if err := rows.Scan(&toolName, &approvalFP, &approvalSchema, &approvalDesc, &lastSeenAt,
 			&runtimeFP, &toolsJSON); err != nil {
 			return nil, err
 		}
@@ -288,7 +320,14 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 			}
 		}
 
-		out = append(out, ApprovalRow{ServerID: serverID, ToolName: toolName, StaleReason: reason})
+		// LastSeenAt and DescHash are exposed here purely for the settings UI
+		// (route/v2/mcp_approvals.go's GET .../tools) — they are read back
+		// as-is, same as StaleReason above, and play no part in the reason
+		// switch above them.
+		out = append(out, ApprovalRow{
+			ServerID: serverID, ToolName: toolName, StaleReason: reason,
+			LastSeenAt: lastSeenAt, DescHash: approvalDesc,
+		})
 	}
 	return out, rows.Err()
 }
