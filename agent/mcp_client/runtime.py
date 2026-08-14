@@ -100,37 +100,21 @@ def _read_ai_base() -> str | None:
         return None
 
 
-async def fetch_mcp_servers(ticket: str) -> list[dict] | ConfigUnavailable:
-    """Returns the enabled MCP servers (decrypted) for the run: a list on
-    success ([] really means "no servers configured"), or ConfigUnavailable
-    when the config could not be fetched. Never raises — MCP is additive."""
-    if not ticket:
-        return ConfigUnavailable("no MCP ticket on this request")
-    base = _read_ai_base()
-    if not base:
-        return ConfigUnavailable("ai.url is unreadable")
-    url = base.rstrip("/") + RUNTIME_PATH
-    try:
-        async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
-            resp = await client.get(url, headers={"X-Agent-MCP-Ticket": ticket})
-    except Exception as e:
-        return ConfigUnavailable(f"runtime config fetch failed: {e}")
-    if resp.status_code != 200:
-        return ConfigUnavailable(f"runtime config fetch returned HTTP {resp.status_code}")
-    servers = parse_servers(resp.text)
-    if servers is None:
-        return ConfigUnavailable("runtime config response was malformed")
-    return servers
-
-
 async def fetch_runtime(ticket: str) -> "RuntimePayload | ConfigUnavailable":
-    """Like fetch_mcp_servers, but parses the FULL Runtime response (the same
-    endpoint, extended by Task 8) via parse_runtime instead of parse_servers —
-    so the caller also gets Go's pre-filtered per-user approval set and the
-    run-scoped write token, not just the server list. This is the production
-    entry point agent.py's run() expects (a RuntimePayload); fetch_mcp_servers
-    is kept for callers (e.g. channel runs) that only need the plain server
-    list. Never raises — MCP is additive."""
+    """Fetch the Runtime endpoint and parse the FULL response (Task 8: the
+    server list plus Go's pre-filtered per-user approval set and a
+    run-scoped write token) via parse_runtime. This is the sole production
+    entry point for run start (main.py's /run endpoint); agent.py's
+    AgentRunner.run consumes the resulting RuntimePayload directly.
+
+    A near-identical predecessor, fetch_mcp_servers (which parsed only the
+    plain server list via parse_servers, discarding approvals/write_token),
+    was deleted once this replaced its one production call site — two copies
+    of the same fetch-and-degrade logic would only drift. parse_servers
+    itself stays: parse_runtime still uses it internally, and it has its own
+    direct tests (test_parse_servers_*).
+
+    Never raises — MCP is additive."""
     if not ticket:
         return ConfigUnavailable("no MCP ticket on this request")
     base = _read_ai_base()

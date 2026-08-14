@@ -153,6 +153,90 @@ async def test_runtime_payload_sets_approvals_write_token_and_releases_it(monkey
         "the write token must be released at run teardown, not left for the 24h backstop"
 
 
+def test_expand_tools_does_not_duplicate_a_repeated_slug(monkeypatch):
+    """Review fix: expand_tools(["mcp:github", "mcp:github"]) must not inject
+    the same server's tools twice. The SDK does not dedupe FunctionTool names
+    (agents/agent.py get_all_tools just concatenates), and OpenAI-compatible
+    providers commonly reject a duplicate function name with a 400 — which
+    would fail the WHOLE run, not just this expansion."""
+    from agents import Agent
+    from skills import tool_gating as tg, mcp_gating as mg
+
+    a = Agent(name="t", instructions="i", tools=[])
+    ag.RUN_AGENT_VAR.set(a)
+    mg.MCP_HANDLES_VAR.set({"github": 7})
+    tg.UNLOCKED_VAR.set(set())
+    mc._SCHEMA_CACHE.clear()
+
+    calls = {"n": 0}
+
+    async def fake_fetch(write_token, server_id):
+        calls["n"] += 1
+        return 102, [{"name": "create_issue", "description": "d", "input_schema": {"type": "object"}}]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+
+    tg.expand_categories(["mcp:github", "mcp:github"])
+    names = [getattr(t, "name", "") for t in a.tools]
+    assert names.count("mcp__github__create_issue") == 1, \
+        "a repeated slug in one expand_tools call must not duplicate its tools"
+    assert calls["n"] == 1, "the repeated slug must not trigger a second fetch either"
+
+
+def test_concurrent_expand_of_the_same_server_does_not_duplicate(monkeypatch):
+    """Review fix, the cross-thread half of the same finding: two
+    expand_tools(["mcp:github"]) calls for the SAME server in one step run on
+    two different worker threads (the SDK runs a step's tool calls in
+    parallel tasks; expand_categories delegates to asyncio.to_thread). Both
+    can pass the "already loaded" check against agent.tools before either
+    has spliced in, independently fetch and build IDENTICAL FunctionTools,
+    and then both try to add them — this pins that only one copy survives."""
+    import contextvars
+    import threading
+
+    from agents import Agent
+    from skills import tool_gating as tg, mcp_gating as mg
+
+    a = Agent(name="t", instructions="i", tools=[])
+    ag.RUN_AGENT_VAR.set(a)
+    mg.MCP_HANDLES_VAR.set({"github": 7})
+    tg.UNLOCKED_VAR.set(set())
+    mc._SCHEMA_CACHE.clear()
+
+    barrier = threading.Barrier(2)
+
+    async def fake_fetch(write_token, server_id):
+        # Force both threads to be mid-fetch (past the "already loaded"
+        # check) simultaneously, so the merge race is actually exercised
+        # instead of one call finishing before the other even starts.
+        barrier.wait(timeout=5)
+        return 103, [{"name": "create_issue", "description": "d", "input_schema": {"type": "object"}}]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+
+    # Each thread needs its OWN ContextVar snapshot (RUN_AGENT_VAR etc.) —
+    # this is what asyncio.to_thread does for a real concurrent expand_tools
+    # call. A single Context object cannot be .run() from two threads at
+    # once (CPython raises), so two independent copies are captured here,
+    # mirroring two separate to_thread dispatches from the SAME ambient
+    # context set above.
+    ctx1 = contextvars.copy_context()
+    ctx2 = contextvars.copy_context()
+    results = []
+
+    def worker(ctx):
+        results.append(ctx.run(tg._load_l2_tools, [("github", 7)]))
+
+    t1 = threading.Thread(target=worker, args=(ctx1,))
+    t2 = threading.Thread(target=worker, args=(ctx2,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    names = [getattr(t, "name", "") for t in a.tools]
+    assert names.count("mcp__github__create_issue") == 1, \
+        "two concurrent expansions of the same server must not duplicate its tools"
+
+
 def test_sdk_still_reresolves_tools_each_turn():
     """Pin down both halves of §0.3's foundation:
     1. get_all_tools reads self.tools, an ordinary list attribute, not a

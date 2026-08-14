@@ -119,6 +119,7 @@ def expand_categories(categories: list[str]) -> str:
     from skills import mcp_gating as _mcp   # local import: mcp_gating imports this module
 
     resolved: list[tuple[str, int]] = []   # (slug, server_id) for every valid mcp:<handle> token
+    seen_slugs: set[str] = set()           # dedup e.g. expand_tools(["mcp:github","mcp:github"])
     bad_handles: list[str] = []
     for token in handle_tokens:
         server_id = _mcp.resolve_handle(token)
@@ -126,6 +127,9 @@ def expand_categories(categories: list[str]) -> str:
             bad_handles.append(token)
         else:
             slug = token.split(":", 1)[1] if ":" in token else token
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
             resolved.append((slug, server_id))
     if bad_handles:
         valid_handles = sorted(_mcp.MCP_HANDLES_VAR.get({}).keys())
@@ -193,12 +197,13 @@ def expand_categories(categories: list[str]) -> str:
 # Serializes the read-modify-write of agent.tools across CONCURRENT
 # expand_tools calls. The SDK runs the model's tool calls for one step in
 # parallel tasks; since expand_categories now runs on a worker thread (see
-# expand_tools below), two expand_tools(["mcp:a"]) / expand_tools(["mcp:b"])
-# calls in the same step can race on `agent.tools = list(agent.tools) +
-# new_tools` from two different threads — without a lock, whichever thread's
-# assignment lands last would silently drop the other's tools. The lock only
-# guards this short, in-memory splice; the network fetch that precedes it is
-# NOT held under it, so concurrent servers still fetch in parallel.
+# expand_tools below), two expand_tools calls in the same step — for
+# different servers, or (a race, see _load_l2_tools_async) even the SAME
+# server — can otherwise race on splicing their built tools into
+# agent.tools from two different threads. The lock guards a fresh
+# read-check-append-assign each time a server's tools are ready to splice in
+# (not the whole function), and does NOT hold across the network fetch that
+# precedes it, so concurrent servers still fetch in parallel.
 _TOOLS_MERGE_LOCK = threading.Lock()
 
 
@@ -254,8 +259,14 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
 
     servers_by_id = _mc._RUN_SERVERS_VAR.get(None) or {}
     write_token = _mc.WRITE_TOKEN_VAR.get("")
-    new_tools = []
     for slug, server_id in pairs:
+        if slug in counts:
+            # Defense in depth against a duplicate (slug, server_id) pair
+            # WITHIN this same call — expand_categories already dedupes
+            # `resolved` before calling in, so this should be unreachable in
+            # practice, but a direct/future caller of this function with
+            # duplicate pairs must not fetch or build the same server twice.
+            continue
         prefix = f"mcp__{slug}__"
         # Re-derive "already loaded" from the LIVE agent's tool list, never
         # from the persisted unlock gate: the gate survives across runs/turns
@@ -281,23 +292,42 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
         else:
             fetched_at, schemas = await _mcp_runtime.fetch_schemas(write_token, server_id)
             _mc._cache_put(server_id, schemas, fetched_at)
-        n = 0
+        built = []
         for meta in schemas:
             if not isinstance(meta, dict) or not meta.get("name"):
                 continue
-            new_tools.append(_mc._wrap_tool(server, meta, slug=slug))
-            n += 1
-        counts[slug] = n
+            built.append(_mc._wrap_tool(server, meta, slug=slug))
 
-    if new_tools:
-        # New list, never mutate in place: get_all_tools walks self.tools
-        # every step; swapping the reference is free and side-steps any
-        # question of mutating a list while it is being iterated. Locked
-        # (see _TOOLS_MERGE_LOCK) because expand_categories now runs on a
-        # worker thread, so two concurrent expand_tools calls for different
-        # servers could otherwise race on this read-modify-write.
-        with _TOOLS_MERGE_LOCK:
-            agent.tools = list(agent.tools) + new_tools
+        if built:
+            # New list, never mutate in place: get_all_tools walks self.tools
+            # every step; swapping the reference is free and side-steps any
+            # question of mutating a list while it is being iterated.
+            #
+            # Locked AND re-checked against the CURRENT agent.tools right
+            # here, not just the "already loaded" check above: two
+            # concurrent expand_tools calls naming the SAME server (the SDK
+            # runs one step's tool calls in parallel tasks, and
+            # expand_categories runs each on its own worker thread) can both
+            # pass that check before either has spliced in, independently
+            # fetch and build IDENTICAL FunctionTools, and then both try to
+            # add them — the SDK does not dedupe by name, and most
+            # OpenAI-compatible providers reject a duplicate function name
+            # with a 400, failing the whole run. Filtering `built` against a
+            # FRESH read of agent.tools while holding the lock means whichever
+            # thread splices first wins and the second contributes nothing
+            # extra, instead of both adding the same names.
+            with _TOOLS_MERGE_LOCK:
+                existing_names = {getattr(t, "name", "") for t in agent.tools}
+                to_add = [t for t in built if getattr(t, "name", "") not in existing_names]
+                if to_add:
+                    agent.tools = list(agent.tools) + to_add
+        # Report the count of schemas this server actually returned, not
+        # len(to_add): if a concurrent call already spliced these exact
+        # tools in first, the true state is still "this server has len(built)
+        # tools available" — reporting 0 here would be misleading even
+        # though THIS call's splice contributed nothing.
+        counts[slug] = len(built)
+
     return counts
 
 
