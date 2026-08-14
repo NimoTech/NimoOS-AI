@@ -44,7 +44,7 @@ def _setup(conn=None):
 
 
 def test_wrap_tool_name_and_schema():
-    tool = mc._wrap_tool({"id": 1, "name": "My Git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "My Git"}, META, slug="my_git")
     assert tool.name == "mcp__my_git__search"
     assert tool.params_json_schema["properties"]["q"]["type"] == "string"
     assert tool.strict_json_schema is False
@@ -54,7 +54,7 @@ def test_wrap_tool_name_and_schema():
 async def test_invoke_confirm_then_call():
     fconn = FakeConn()
     mgr, q = _setup(conn=fconn)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve():
         for _ in range(50):
@@ -73,7 +73,7 @@ async def test_invoke_confirm_then_call():
 @pytest.mark.asyncio
 async def test_invoke_rejected_returns_text():
     mgr, q = _setup(conn=FakeConn())
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def reject():
         for _ in range(50):
@@ -91,7 +91,7 @@ async def test_invoke_rejected_returns_text():
 async def test_remember_skips_second_confirm():
     fconn = FakeConn()
     mgr, q = _setup(conn=fconn)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve_remember():
         for _ in range(50):
@@ -113,7 +113,8 @@ async def test_blacklist_blocks_path_arg():
     mc.USER_PATTERNS_VAR.set(["/etc/"])
     tool = mc._wrap_tool({"id": 1, "name": "fs"},
                          {"name": "read", "description": "",
-                          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}})
+                          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                         slug="fs")
     out = await tool.on_invoke_tool(None, '{"path":"/etc/shadow"}')
     assert out.startswith("[MCP error]")
     assert "blacklist" in out.lower()
@@ -124,7 +125,7 @@ async def test_connect_failure_message_distinct(monkeypatch):
     mgr, q = _setup()                       # no pre-seeded conn
     async def boom(s): raise RuntimeError("net down")
     monkeypatch.setattr(mc, "_connect", boom)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve():
         for _ in range(50):
@@ -180,7 +181,7 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
     mc._cache_put(1, [META], listed_at=1)
     scheduled = []
     monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
@@ -204,7 +205,7 @@ async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
     mc._cache_put(1, [META], listed_at=1)
     scheduled = []
     monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')

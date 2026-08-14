@@ -5,7 +5,6 @@ import asyncio
 import json
 import os
 import re
-import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from contextlib import AsyncExitStack
@@ -128,9 +127,12 @@ def _stdio_env(user_env: dict) -> dict:
     return env
 
 
-# Default entry lifetime when the server gives no hint (i.e. every legacy-protocol
-# server, and any 2026-07-28 server that leaves ttlMs at its default 0). Past this
-# an entry goes stale (still usable, triggers a background revalidate).
+# Default ttl_sec Python reports to Go when the server gives no ttlMs hint (i.e.
+# every legacy-protocol server, and any 2026-07-28 server that leaves ttlMs at its
+# default 0). Go persists this as mcp_server_runtime.ttl_sec and uses it to decide
+# when to re-probe (Task 8's TTL self-check, driven through test_server's response
+# — see McpConn.list_tools). It no longer governs anything on the Python side: this
+# process's own cache is keyed on listed_at alone (see _CacheEntry).
 SCHEMA_TTL = 600
 # Floor for a server-declared ttlMs. A server declaring something tiny would punch
 # through the zero-connection warm path that is the whole reason this cache exists.
@@ -140,9 +142,11 @@ SCHEMA_TTL = 600
 # authority — see _CacheEntry), unaffected by this floor.
 SCHEMA_TTL_MIN = 60
 # Ceiling for a server-declared ttlMs. Without it a server declaring 24h really
-# gets cached for 24h, which multiplies the staleness window of removed tools
-# (defect ①) — the unknown-tool invalidation self-heals mid-TTL, but only after
-# the model has already tripped over the missing tool once.
+# sets Go's re-probe window (mcp_server_runtime.ttl_sec) to 24h, which multiplies
+# how long a removed tool keeps being advertised (defect ①) — the unknown-tool
+# invalidation self-heals mid-window (client.py's own cache drops it immediately
+# on the call that discovers it, see _wrap_tool), but only after the model has
+# already tripped over the missing tool once.
 SCHEMA_TTL_MAX = 3600
 SCHEMA_CACHE_MAX = 256  # LRU capacity cap, bounds memory use
 
@@ -187,11 +191,14 @@ MCP_CLOSE_TIMEOUT = 5
 
 
 def _resolve_ttl(raw_ttl_ms) -> int:
-    """Server-declared ttlMs -> our cache entry lifetime, in seconds.
+    """Server-declared ttlMs -> the ttl_sec Python reports to Go, in seconds.
 
     "Absent" and "0" converge for free: legacy responses have no such field and the
-    SDK model defaults it to 0, so neither needs special-casing. Applied once, at
-    write time — see _cache_put.
+    SDK model defaults it to 0, so neither needs special-casing. Computed once per
+    list_tools() call and surfaced to Go via test_server's `ttl_sec` field (and the
+    legacy run-start cold path), which drives Go's own re-probe TTL self-check —
+    this process's schema cache no longer stores or recomputes a ttl at all; see
+    _CacheEntry.
     """
     if not isinstance(raw_ttl_ms, (int, float)) or raw_ttl_ms <= 0:
         return SCHEMA_TTL
@@ -247,7 +254,7 @@ def _cache_put(server_id: int, metas, listed_at: int) -> None:
     strict no-op when listed_at is 0: whatever was cached before (if
     anything) is left exactly as it was.
     """
-    if listed_at == 0:
+    if not listed_at:
         return
     _SCHEMA_CACHE[server_id] = _CacheEntry(metas, listed_at)
     _SCHEMA_CACHE.move_to_end(server_id)
@@ -467,15 +474,13 @@ def _is_unknown_tool(err) -> bool:
     return bool(_UNKNOWN_TOOL_RE.search(str(getattr(data, "message", ""))))
 
 
-def _wrap_tool(server: dict, meta: dict, slug: str = None) -> FunctionTool:
-    """slug is optional so every existing single-server call site (tests that
-    exercise one server in isolation) keeps working unchanged: it falls back to
-    slugging this server's own name, exactly what assign_slugs would produce
-    for a lone server anyway. build_mcp_tools is the one caller that MUST pass
-    the already-deduped slug — see assign_slugs — so that two servers sharing
-    a slug don't both claim the bare `mcp__<slug>__` prefix."""
-    if slug is None:
-        slug = _slug(server["name"])
+def _wrap_tool(server: dict, meta: dict, slug: str) -> FunctionTool:
+    """slug is required and MUST come from assign_slugs's per-run dedup pass —
+    never re-derived here. A local fallback (e.g. `server.get("handle") or
+    _slug(server["name"])`) would silently diverge from assign_slugs whenever
+    two servers actually collide (this function has no view of its siblings to
+    dedup against), reintroducing the exact "two servers, same tool prefix"
+    failure this task exists to close."""
     tool_name = meta["name"]
     fq_name = f"mcp__{slug}__{tool_name}"
     schema = sanitize_schema(meta.get("input_schema"))
@@ -553,8 +558,10 @@ class McpConn:
         return await self.client.call_tool(name, args)
 
     async def list_tools(self) -> tuple[list[dict], int]:
-        """Return (tool metas, cache ttl in seconds) — exactly what the schema
-        cache stores, so callers never touch the SDK result object.
+        """Return (tool metas, resolved ttl_sec) so callers never touch the SDK
+        result object directly. The ttl_sec is Go's re-probe TTL self-check input
+        (surfaced through test_server, see _resolve_ttl) — this process's own
+        schema cache does not store or act on it; see _CacheEntry.
 
         cacheScope is deliberately NOT read: it constrains shared intermediary
         proxies, and we are an end client — storing a field we never act on would
@@ -903,14 +910,25 @@ def assign_slugs(servers: list[dict]) -> dict[int, str]:
     the model was told to open would no longer correspond to any tool it can
     see. Falls back to `_slug(name)` only when there is no handle yet (e.g.
     the server has never been successfully probed).
+
+    Dedup tracks ASSIGNED slugs, not bases: a third server sharing a base with
+    two earlier ones must land on `_3`, not repeat `_2` (which happens if you
+    only ever bump a per-base counter without checking whether `<base>_2` was
+    itself already taken by something else's suffix). A base can collide with
+    another base's suffixed form too — e.g. a literal handle "github_2" next
+    to two servers named "github" — so the membership check is against the
+    flat set of names already handed out, not against `seen[base]`.
     """
     slugs: dict[int, str] = {}
-    seen: dict[str, int] = {}
+    used: set[str] = set()
     for s in servers:
         base = s.get("handle") or _slug(s.get("name", ""))
-        count = seen.get(base, 0) + 1
-        seen[base] = count
-        slugs[s["id"]] = base if count == 1 else f"{base}_{count}"
+        name, n = base, 1
+        while name in used:
+            n += 1
+            name = f"{base}_{n}"
+        used.add(name)
+        slugs[s["id"]] = name
     return slugs
 
 

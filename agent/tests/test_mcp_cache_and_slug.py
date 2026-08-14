@@ -42,3 +42,29 @@ def test_dedup_happens_at_slug_level():
     gate a user opens (mcp:github_2) and the tools that gate exposes."""
     slugs = mc.assign_slugs([{"id": 1, "name": "GitHub"}, {"id": 2, "name": "github"}])
     assert slugs == {1: "github", 2: "github_2"}
+
+    # A base can collide with another server's own literal handle: two
+    # servers handled "github" plus a third literally handled "github_2"
+    # must not let the second and third both land on "github_2" — that
+    # silently hands two different servers the same tool-name prefix, exactly
+    # the failure this function exists to prevent. A per-base counter (bump
+    # seen["github"] and stringify it) gets this wrong: it never checks
+    # whether "github_2" was independently claimed, so dedup must track
+    # already-ASSIGNED names instead.
+    slugs = mc.assign_slugs([
+        {"id": 1, "handle": "github"},
+        {"id": 2, "handle": "github"},
+        {"id": 3, "handle": "github_2"},
+    ])
+    assert len(set(slugs.values())) == 3, \
+        f"every assigned slug must be unique, got {slugs}"
+
+
+def test_assign_slugs_prefers_handle_over_name():
+    """The handle-over-name preference (see assign_slugs' docstring) is load
+    bearing in production, where Go always sends a handle: without this test,
+    dropping the preference (e.g. reverting to `_slug(s["name"])` outright)
+    would not fail anything else in this file, since the other test's dicts
+    are name-only."""
+    slugs = mc.assign_slugs([{"id": 1, "handle": "github", "name": "测试1"}])
+    assert slugs == {1: "github"}

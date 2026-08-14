@@ -131,6 +131,25 @@ async def test_config_error_server_never_probed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_two_servers_colliding_on_name_get_distinct_slugs(monkeypatch):
+    """End-to-end: two servers that both slug to "github" must come out of
+    build_mcp_tools as mcp__github__* and mcp__github_2__* — never
+    mcp__github__search / mcp__github__search_2 (the old, deleted tool-name
+    dedup), which would leave the model unable to tell the two servers apart."""
+    async def fake_metas(s):
+        return ([{"name": "search", "description": "",
+                  "input_schema": {"type": "object", "properties": {}}}], mc.OK, "")
+    monkeypatch.setattr(mc, "_metas_for_server", fake_metas)
+    tools, statuses = await mc.build_mcp_tools([
+        {"id": 1, "name": "GitHub"},
+        {"id": 2, "name": "github"},
+    ])
+    assert [t.name for t in tools] == ["mcp__github__search", "mcp__github_2__search"]
+    assert statuses[0].tool_names == ["mcp__github__search"]
+    assert statuses[1].tool_names == ["mcp__github_2__search"]
+
+
+@pytest.mark.asyncio
 async def test_mixed_servers_keep_order(monkeypatch):
     # statuses must stay aligned with the input order even when a config_error
     # server sits between two probed ones (the gather list skips it).

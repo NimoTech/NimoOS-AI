@@ -164,7 +164,7 @@ class _RaisingConn:
 @pytest.mark.asyncio
 async def test_rounds_exceeded_tells_the_model_to_wait_for_authorization():
     _setup_run(_RaisingConn(InputRequiredRoundsExceededError(10)))
-    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META, slug="notion")
     out = await tool.on_invoke_tool(None, json.dumps({}))
 
     assert "do NOT retry with different arguments" in out
@@ -184,7 +184,7 @@ async def test_rounds_exceeded_tells_the_model_to_wait_for_authorization():
 async def test_undeclared_capability_still_points_at_server_configuration(exc):
     """第二期仍然不声明 sampling / roots —— 这条路径必须原样活着。"""
     _setup_run(_RaisingConn(exc))
-    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META, slug="notion")
     out = await tool.on_invoke_tool(None, json.dumps({}))
 
     assert "needs interactive input" in out
@@ -195,7 +195,7 @@ async def test_undeclared_capability_still_points_at_server_configuration(exc):
 @pytest.mark.asyncio
 async def test_ordinary_failure_still_uses_the_generic_message():
     _setup_run(_RaisingConn(RuntimeError("upstream 502")))
-    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META, slug="notion")
     out = await tool.on_invoke_tool(None, json.dumps({}))
 
     assert "MCP tool search failed" in out
@@ -242,7 +242,7 @@ async def test_legacy_url_elicitation_gets_its_own_message():
 
     _setup_run(_RaisingConn(UrlElicitationRequiredError([
         ElicitRequestURLParams(message="Authorize", url="https://example.com/oauth")])))
-    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "notion"}, META, slug="notion")
     out = await tool.on_invoke_tool(None, json.dumps({}))
 
     assert "notion" in out
