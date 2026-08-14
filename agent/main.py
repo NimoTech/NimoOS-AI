@@ -2071,7 +2071,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                context_album=None,
                auth_header: str = "",
                user_lang: str = "",
-               mcp_servers: "list | ConfigUnavailable | None" = None,
+               mcp_servers: "list | ConfigUnavailable | RuntimePayload | None" = None,
                channel_send_file=None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
@@ -2310,8 +2310,8 @@ async def run_session(
         )
         _conn.commit()
 
-    from mcp_client.runtime import fetch_mcp_servers
-    mcp_servers = await fetch_mcp_servers(request.headers.get("X-Agent-MCP-Ticket", ""))
+    from mcp_client.runtime import fetch_runtime
+    mcp_servers = await fetch_runtime(request.headers.get("X-Agent-MCP-Ticket", ""))
 
     sink = _start_run(
         session_id, x_user_id, req.message,

@@ -14,14 +14,16 @@ opening it dumped N servers x M tools of full JSON schema into the prompt at
 once (roughly 20k tokens for a single 87-tool server). Now "mcp" alone never
 loads any server's schema; only naming a specific server via "mcp:<handle>"
 does. This module owns the gate-key/handle bookkeeping for that split; the
-actual FunctionTool loading is done elsewhere (see Task 16).
+actual FunctionTool loading is done in skills/tool_gating.py's
+_load_l2_tools_async (Task 16), which appends the loaded tools directly onto
+the live run's agent.tools rather than gating them with an is_enabled
+callback keyed on gate_key() — by the time a tool exists in agent.tools at
+all, its server's gate is already open (that IS the gate), so no separate
+per-tool enable check is needed.
 """
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Any, Callable
-
-from skills.tool_gating import current_unlocked
 
 # Injected at the start of a run: slug -> server_id, the inverse of
 # mcp_client.client.assign_slugs(servers) (id -> slug). Defaults to an empty
@@ -44,16 +46,3 @@ def resolve_handle(token: str) -> int | None:
     """Resolve an "mcp:<handle>" token to a server id, or None if unknown."""
     slug = token.split(":", 1)[1] if ":" in token else token
     return MCP_HANDLES_VAR.get({}).get(slug)
-
-
-def make_mcp_is_enabled(server_id: int) -> Callable[[Any, Any], bool]:
-    """Build an SDK is_enabled callback for one MCP server's tools.
-
-    Same shape as tool_gating.make_is_enabled, keyed by gate_key(server_id)
-    instead of a static category name.
-    """
-    key = gate_key(server_id)
-
-    def _is_enabled(_ctx: Any, _agent: Any) -> bool:
-        return key in current_unlocked()
-    return _is_enabled

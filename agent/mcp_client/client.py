@@ -993,18 +993,26 @@ async def build_mcp_tools(servers: list[dict]) -> tuple:
     statuses: list = []
     for s in servers:
         name = s.get("name", "mcp")
+        handle = s.get("handle", "") or ""
+        slug = slugs.get(s.get("id"), "")
+        summary = s.get("summary", "") or ""
+        instructions = s.get("instructions", "") or ""
         if s.get("config_error"):
             # Go flagged this server's stored credentials as undecryptable; do
             # not connect with an unauthenticated config — a 401 at call time
             # would mask the real cause.
             statuses.append(ServerStatus(name=name, status=CONFIG_ERROR,
-                                         detail=str(s["config_error"])))
+                                         detail=str(s["config_error"]),
+                                         handle=handle, slug=slug,
+                                         summary=summary, instructions=instructions))
             continue
         res = next(results)
         if isinstance(res, Exception):
             await _emit_warning(name, res)
             statuses.append(ServerStatus(name=name, status=FAILED,
-                                         detail=str(res) or type(res).__name__))
+                                         detail=str(res) or type(res).__name__,
+                                         handle=handle, slug=slug,
+                                         summary=summary, instructions=instructions))
             continue
         metas, status, detail = res
         fq_names = []
@@ -1013,7 +1021,8 @@ async def build_mcp_tools(servers: list[dict]) -> tuple:
             tools.append(tool)
             fq_names.append(tool.name)
         statuses.append(ServerStatus(name=name, status=status, detail=detail,
-                                     tool_names=fq_names))
+                                     tool_names=fq_names, handle=handle, slug=slug,
+                                     summary=summary, instructions=instructions))
     return tools, statuses
 
 

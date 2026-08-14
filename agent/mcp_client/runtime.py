@@ -123,6 +123,33 @@ async def fetch_mcp_servers(ticket: str) -> list[dict] | ConfigUnavailable:
     return servers
 
 
+async def fetch_runtime(ticket: str) -> "RuntimePayload | ConfigUnavailable":
+    """Like fetch_mcp_servers, but parses the FULL Runtime response (the same
+    endpoint, extended by Task 8) via parse_runtime instead of parse_servers —
+    so the caller also gets Go's pre-filtered per-user approval set and the
+    run-scoped write token, not just the server list. This is the production
+    entry point agent.py's run() expects (a RuntimePayload); fetch_mcp_servers
+    is kept for callers (e.g. channel runs) that only need the plain server
+    list. Never raises — MCP is additive."""
+    if not ticket:
+        return ConfigUnavailable("no MCP ticket on this request")
+    base = _read_ai_base()
+    if not base:
+        return ConfigUnavailable("ai.url is unreadable")
+    url = base.rstrip("/") + RUNTIME_PATH
+    try:
+        async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
+            resp = await client.get(url, headers={"X-Agent-MCP-Ticket": ticket})
+    except Exception as e:
+        return ConfigUnavailable(f"runtime config fetch failed: {e}")
+    if resp.status_code != 200:
+        return ConfigUnavailable(f"runtime config fetch returned HTTP {resp.status_code}")
+    payload = parse_runtime(resp.text)
+    if payload is None:
+        return ConfigUnavailable("runtime config response was malformed")
+    return payload
+
+
 def _parse_schemas_body(payload: str) -> tuple[int, list[dict]] | None:
     """Parse the schemas endpoint body into (listed_at, schemas), or None when
     the body is malformed. Kept separate from fetch_schemas so the parsing

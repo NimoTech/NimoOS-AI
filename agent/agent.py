@@ -43,7 +43,7 @@ import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
 from mcp_client import status as mcp_status
-from mcp_client.runtime import ConfigUnavailable
+from mcp_client.runtime import ConfigUnavailable, RuntimePayload
 import skills.mcp_gating as mcp_gating
 from profiles import get_profile
 from wiki_client import WikiClient
@@ -397,14 +397,6 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
     return tools
 
 
-def gate_runtime_tools(tools, category: str):
-    """Wrap runtime tools (e.g. MCP) with a gated is_enabled copy for a category."""
-    import dataclasses
-    from skills import tool_gating as _gat
-    return [dataclasses.replace(t, is_enabled=_gat.make_is_enabled(category))
-            for t in tools]
-
-
 def attachment_system_block(attachment_ids, *, session_id: str) -> str:
     """System-prompt suffix listing non-image attachments. Empty string when
     there are no non-image attachments."""
@@ -644,7 +636,7 @@ class AgentRunner:
         context_album=None,
         auth_header: str = "",
         user_lang: str = "",
-        mcp_servers: "list | ConfigUnavailable | None" = None,
+        mcp_servers: "list | ConfigUnavailable | RuntimePayload | None" = None,
         channel_send_file=None,
     ) -> None:
         lock = _get_lock(session_id)
@@ -667,26 +659,38 @@ class AgentRunner:
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
-            # CONTRACT (see client.py's _CONFIRMED_TOOLS_VAR comment): this is
-            # meant to be Go's pre-filtered "passed all four gates" approval
-            # set for the CURRENT user, handed down alongside the server
-            # list. main.py does not yet fetch that richer runtime payload
-            # (it still calls the older fetch_mcp_servers/parse_servers
-            # path, not parse_runtime) — until that wiring lands this stays
-            # an empty set every run, same behavior as before this change.
-            mcp_client._CONFIRMED_TOOLS_VAR.set(set())
             mcp_client._RUN_CONNS_VAR.set({})
             mcp_client._RUN_CONN_LOCKS_VAR.set({})
+            # main.py's /run endpoint fetches the FULL Runtime payload
+            # (mcp_client.runtime.fetch_runtime -> parse_runtime), which
+            # carries Go's pre-filtered per-user approval set and a
+            # run-scoped write token alongside the server list. Channel runs
+            # (and any older caller) still pass a plain server list/
+            # ConfigUnavailable/None, so both shapes are accepted here —
+            # unwrap a RuntimePayload's fields once, up front; every later
+            # use of `mcp_servers` in this method (the _build_mcp_for_run
+            # call below) then sees the plain server-list shape it always
+            # expected.
+            if isinstance(mcp_servers, RuntimePayload):
+                _mcp_payload = mcp_servers
+                mcp_servers = mcp_servers.servers
+            else:
+                _mcp_payload = None
+            _mcp_write_token = _mcp_payload.write_token if _mcp_payload else ""
+            # CONTRACT (see client.py's _CONFIRMED_TOOLS_VAR comment): Go's
+            # pre-filtered "passed all four gates" approval set for the
+            # CURRENT user. Empty when the caller didn't supply a
+            # RuntimePayload (channel runs, or an older Go build whose
+            # response parse_runtime already tolerates missing approvals for)
+            # — degrading to "ask every time" rather than failing the run.
+            mcp_client._CONFIRMED_TOOLS_VAR.set(_mcp_payload.approvals if _mcp_payload else set())
             _mcp_server_list = mcp_servers if isinstance(mcp_servers, list) else []
             _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_server_list)
             mcp_client._RUN_SERVERS_VAR.set(
                 {s["id"]: s for s in _mcp_server_list if isinstance(s, dict) and "id" in s})
-            # Run-scoped write token (Task 9): same main.py gap as
-            # _CONFIRMED_TOOLS_VAR above — no real token flows in yet, so this
-            # defaults to "", the documented degraded path (put_approval gives
-            # up and the approval isn't remembered; fetch_schemas degrades to
-            # (0, []); the call/fetch that triggered it still proceeds).
-            mcp_client.WRITE_TOKEN_VAR.set("")
+            # Run-scoped write token (Task 9): "" (same degraded path as
+            # above) when no RuntimePayload was supplied.
+            mcp_client.WRITE_TOKEN_VAR.set(_mcp_write_token)
             # slug -> server_id, the inverse of assign_slugs's id -> slug —
             # skills/mcp_gating.py resolves "mcp:<slug>" tokens through this.
             mcp_gating.MCP_HANDLES_VAR.set(
@@ -909,11 +913,17 @@ class AgentRunner:
             _mcp_allowed = profile is None or profile.tools is None
             mcp_tools, mcp_snapshot = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
             full_prompt = _apply_mcp_status(full_prompt, mcp_snapshot)
-            run_tools = (select_tools_for_run(attachment_ids,
-                                              session_id=session_id, profile=profile)
-                         + (gate_runtime_tools(mcp_tools, "mcp")
-                            if (profile is None or profile.tools is None)
-                            else mcp_tools))
+            # mcp_tools is always [] here (Task 16: run start opens zero
+            # connections and builds zero tools) — L2 (skills/tool_gating.py)
+            # injects a server's real FunctionTools straight into the live
+            # Agent object mid-run instead, once the model asks for that
+            # specific server (see RUN_AGENT_VAR). `+ mcp_tools` is kept
+            # (rather than dropped) purely so this stays correct if that
+            # contract is ever revisited; there is no per-category gating to
+            # apply here anymore (the old gate_runtime_tools wrapper was
+            # deleted as dead code — nothing ever reached it non-empty).
+            run_tools = select_tools_for_run(
+                attachment_ids, session_id=session_id, profile=profile) + mcp_tools
             try:
                 _overhead = (context_compaction.estimate_tokens(full_prompt)
                              + context_compaction.estimate_tools_tokens(run_tools))
@@ -1123,6 +1133,13 @@ class AgentRunner:
                 # egress routing table.
                 self._active_sinks.pop(session_id, None)
                 await mcp_client.close_run_conns()
+                if _mcp_write_token:
+                    # Shrink the token's replay window back down to this run's
+                    # actual duration instead of leaving it valid for Go's 24h
+                    # backstop (RunTokenStore). Best-effort/never-raises — see
+                    # release_token's own docstring.
+                    from mcp_client import runtime as _mcp_runtime_mod
+                    await _mcp_runtime_mod.release_token(_mcp_write_token)
                 await sink.put({"type": "done"})
 
 

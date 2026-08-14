@@ -9,8 +9,12 @@ they're visible to the model.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from contextvars import ContextVar
 from typing import Any, Callable
+
+_LOG = logging.getLogger("nimoos-agent")
 
 # Injected by agent.py at the start of a run; defaults to an empty set as a
 # fallback (tests/error paths).
@@ -134,10 +138,6 @@ def expand_categories(categories: list[str]) -> str:
         UNLOCKED_VAR.set(cur)
     resolved_gate_keys = [_mcp.gate_key(sid) for _, sid in resolved]
     newly = [c for c in static_categories if c not in cur] + [k for k in resolved_gate_keys if k not in cur]
-    # Only fetch/inject for a server whose gate THIS call is the one flipping —
-    # a repeat expand_tools(["mcp:github"]) for an already-unlocked server must
-    # not re-fetch or duplicate its tools in agent.tools.
-    newly_resolved = [(slug, sid) for slug, sid in resolved if _mcp.gate_key(sid) not in cur]
     cur.update(static_categories)
     cur.update(resolved_gate_keys)
     _persist(sorted(cur))
@@ -156,14 +156,20 @@ def expand_categories(categories: list[str]) -> str:
         if c == "mcp":
             lines.extend(_mcp_runtime_lines())
 
-    # L2: fetch schemas and inject FunctionTools for every newly-opened server
-    # gate, straight into the live run's agent.tools (see _load_l2_tools).
-    # `loaded` maps slug -> count of tools actually added, for every slug this
-    # call attempted; a slug that was already unlocked before this call (and
-    # so wasn't attempted again) simply is not a key in it.
-    loaded = _load_l2_tools(newly_resolved)
+    # L2: fetch schemas and inject FunctionTools for every requested server —
+    # for ALL of `resolved`, not just the ones whose GATE this call happens to
+    # be flipping. The persisted unlock gate (`cur`, written above) survives
+    # across runs and turns (agent.py reloads it from the DB at every run
+    # start via db.get_unlocked_categories), but agent.tools starts EMPTY on
+    # every run (see _build_mcp_for_run) — so gate membership can never tell
+    # us whether THIS run's live agent actually has the tools yet. Whether to
+    # skip re-fetching is decided inside _load_l2_tools_async instead, from
+    # the live agent.tools contents. `loaded` maps slug -> either None (tools
+    # were already present in the live agent, nothing fetched) or an int
+    # count of tools actually added by this call (0 = fetched but empty).
+    loaded = _load_l2_tools(resolved)
     for slug, _sid in resolved:
-        if slug not in loaded:
+        if loaded.get(slug) is None:
             lines.append(f"- mcp:{slug}: already unlocked; its tools are already in your tool list")
         elif loaded[slug]:
             n = loaded[slug]
@@ -184,25 +190,53 @@ def expand_categories(categories: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _load_l2_tools(pairs: list[tuple[str, int]]) -> dict[str, int]:
+# Serializes the read-modify-write of agent.tools across CONCURRENT
+# expand_tools calls. The SDK runs the model's tool calls for one step in
+# parallel tasks; since expand_categories now runs on a worker thread (see
+# expand_tools below), two expand_tools(["mcp:a"]) / expand_tools(["mcp:b"])
+# calls in the same step can race on `agent.tools = list(agent.tools) +
+# new_tools` from two different threads — without a lock, whichever thread's
+# assignment lands last would silently drop the other's tools. The lock only
+# guards this short, in-memory splice; the network fetch that precedes it is
+# NOT held under it, so concurrent servers still fetch in parallel.
+_TOOLS_MERGE_LOCK = threading.Lock()
+
+
+def _load_l2_tools(pairs: list[tuple[str, int]]) -> dict[str, "int | None"]:
     """Synchronous entry point for L2 loading. See expand_categories's
-    docstring for why asyncio.run() is safe to use here. Returns {slug:
-    tools_added_count} for every (slug, server_id) pair in *pairs* — 0 means
-    the fetch degraded to nothing, never that the pair was skipped."""
+    docstring for why asyncio.run() is safe to use here — that safety
+    argument covers ONLY the "no running loop in this thread" precondition
+    asyncio.run() itself requires, so it is checked explicitly up front
+    rather than papered over with a broad try/except: a RuntimeError raised
+    from INSIDE _load_l2_tools_async (a real bug) must propagate and be
+    visible, not be silently reported as "0 tools loaded".
+
+    Returns {slug: tools_added_count | None} for every (slug, server_id) pair
+    in *pairs* — None means the tools were already present in the live
+    agent.tools (nothing fetched); 0 means a fetch was attempted and
+    degraded to nothing; neither means the pair was silently skipped.
+    """
     if not pairs:
         return {}
     try:
-        return asyncio.run(_load_l2_tools_async(pairs))
+        asyncio.get_running_loop()
     except RuntimeError:
-        # Defensive only: see expand_categories's docstring for why this
-        # should be unreachable under the SDK's current threading model. If a
-        # future change ever does call this from a thread that already owns a
-        # running loop, degrade to "gate opened, nothing loaded yet" instead
-        # of crashing the tool call.
+        pass    # expected: see expand_categories's docstring — no loop here
+    else:
+        # Defensive only: should be unreachable under the SDK's current
+        # threading model (expand_tools always hands this to a worker
+        # thread). Log loudly rather than crash the tool call outright if a
+        # future change ever does call this from a thread that already owns
+        # a running loop.
+        _LOG.warning(
+            "_load_l2_tools called from a thread with an already-running "
+            "event loop; skipping L2 injection this call instead of "
+            "crashing on asyncio.run() (pairs=%r)", pairs)
         return {slug: 0 for slug, _ in pairs}
+    return asyncio.run(_load_l2_tools_async(pairs))
 
 
-async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, int]:
+async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int | None"]:
     """Fetch each server's full tool schemas and inject its FunctionTools into
     the live run's agent. Reads RUN_AGENT_VAR from mcp_client.client (imported
     here, not at module load time, to avoid a circular import: agent.py
@@ -213,7 +247,7 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, int]:
     import mcp_client.client as _mc
     from mcp_client import runtime as _mcp_runtime
 
-    counts: dict[str, int] = {}
+    counts: dict[str, "int | None"] = {}
     agent = _mc.RUN_AGENT_VAR.get(None)
     if agent is None:          # no run in progress (e.g. called outside a run)
         return {slug: 0 for slug, _ in pairs}
@@ -222,6 +256,17 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, int]:
     write_token = _mc.WRITE_TOKEN_VAR.get("")
     new_tools = []
     for slug, server_id in pairs:
+        prefix = f"mcp__{slug}__"
+        # Re-derive "already loaded" from the LIVE agent's tool list, never
+        # from the persisted unlock gate: the gate survives across runs/turns
+        # (agent.py reloads it from the DB at every run start) while
+        # agent.tools starts empty on every run, so gate membership alone
+        # cannot tell us whether THIS run's agent has the tools yet. Skipping
+        # here also makes a retry after a degraded (0, []) fetch actually
+        # retry, instead of forever reporting stale "already unlocked" text.
+        if any(getattr(t, "name", "").startswith(prefix) for t in agent.tools):
+            counts[slug] = None
+            continue
         # Fall back to a minimal stand-in when this run's server snapshot
         # doesn't have the id MCP_HANDLES_VAR resolved to (should not happen
         # in practice — both are derived from the same server list — but
@@ -247,8 +292,12 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, int]:
     if new_tools:
         # New list, never mutate in place: get_all_tools walks self.tools
         # every step; swapping the reference is free and side-steps any
-        # question of mutating a list while it is being iterated.
-        agent.tools = list(agent.tools) + new_tools
+        # question of mutating a list while it is being iterated. Locked
+        # (see _TOOLS_MERGE_LOCK) because expand_categories now runs on a
+        # worker thread, so two concurrent expand_tools calls for different
+        # servers could otherwise race on this read-modify-write.
+        with _TOOLS_MERGE_LOCK:
+            agent.tools = list(agent.tools) + new_tools
     return counts
 
 

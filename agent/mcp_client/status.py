@@ -29,11 +29,11 @@ class ServerStatus:
     handle: str = ""                                  # self-reported identity (Task 7); "" = never probed
     slug: str = ""                                    # this server's actual per-run deduped
                                                         # expand_tools token from assign_slugs
-                                                        # (mcp_client.client); "" until Task 16
-                                                        # wires it through. The ONLY value
-                                                        # guaranteed correct after a handle
-                                                        # collision (e.g. "github_2") -- see
-                                                        # _slug_token.
+                                                        # (mcp_client.client); populated at every
+                                                        # construction site since Task 16. The
+                                                        # ONLY value guaranteed correct after a
+                                                        # handle collision (e.g. "github_2") --
+                                                        # see _slug_token.
     summary: str = ""                                 # server's one-line self-description (L1)
     instructions: str = ""                             # server's full instructions text (L2 only)
     stale: bool = False                                # tool_names/instructions are cached from
