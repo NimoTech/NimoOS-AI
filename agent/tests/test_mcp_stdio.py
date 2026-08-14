@@ -150,7 +150,7 @@ async def test_metas_for_server_never_connects_stdio_or_http(monkeypatch, _clear
     itself, for ANY transport (stdio included) — Go is the sole party that
     connects to produce a schema list. A cache miss goes through
     mcp_client.runtime.fetch_schemas over loopback instead."""
-    async def boom(s, connect_timeout=None): raise AssertionError("must NOT connect to build a tool list")
+    async def boom(s, connect_timeout=None, mode=None): raise AssertionError("must NOT connect to build a tool list")
     monkeypatch.setattr(mc, "_connect", boom)
     calls = []
     async def fake_fetch(token, server_id):
@@ -203,7 +203,7 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
             import asyncio
             await asyncio.sleep(10)
         async def aclose(self): pass
-    async def fake_connect(s, connect_timeout=None): return SlowSrv()
+    async def fake_connect(s, connect_timeout=None, mode=None): return SlowSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "PROBE_LIST_TIMEOUT", 0.05)   # only the list phase is squeezed
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
@@ -224,7 +224,7 @@ async def test_stdio_conn_cleanup_called_on_close(monkeypatch):
     class FakeStdioSrv:
         async def aclose(self): cleaned["n"] += 1   # stack unwind happens here
 
-    async def fake_connect(server, connect_timeout=None):
+    async def fake_connect(server, connect_timeout=None, mode=None):
         return FakeStdioSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 

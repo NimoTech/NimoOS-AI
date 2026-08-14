@@ -52,7 +52,7 @@ class _FakeConn:
 
 
 def test_test_server_returns_identity_card(monkeypatch):
-    async def fake_connect(server, connect_timeout=None):
+    async def fake_connect(server, connect_timeout=None, mode=None):
         return _FakeConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "_read_instructions", lambda conn: "Tools for GitHub.")

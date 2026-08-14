@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from collections import OrderedDict
@@ -17,12 +18,15 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST, METHOD_NOT_FOUND
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
 from mcp_client.status import OK, FAILED, CONFIG_ERROR, ServerStatus
 from mcp_client.hashing import schema_hash, desc_hash
 from mcp_client import runtime as mcp_runtime
+
+logger = logging.getLogger(__name__)
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -786,7 +790,33 @@ async def _build_transport(server: dict, stack: AsyncExitStack,
 # That is exactly how it worked before this upgrade; changing it is out of scope.
 
 
-async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
+def _resolve_protocol_mode(server: dict) -> str:
+    """Validate a persisted `protocol_mode` before handing it to the SDK.
+
+    The SDK's `Client.__post_init__` raises ValueError at construction time for
+    any mode other than "legacy", "auto", or a version string it recognizes as
+    modern (mcp/client/client.py:378-385). Go is the sole writer of
+    `protocol_mode` — it derives and persists whatever era/version it
+    negotiated during the probe (Task 7/8) — but a value written by an older
+    Go build can outlive an SDK upgrade that drops it from
+    `MODERN_PROTOCOL_VERSIONS`. Passing such a stale value straight through
+    would make Client(...) raise on every single connection attempt, with no
+    self-healing path (nothing here re-probes on its own). So fall back to
+    "auto" for anything the current SDK does not recognize, and log it so a
+    stale pin is diagnosable rather than silently swallowed.
+    """
+    mode = server.get("protocol_mode") or "auto"
+    if mode in ("legacy", "auto") or mode in MODERN_PROTOCOL_VERSIONS:
+        return mode
+    logger.warning(
+        "server %r has an unrecognized persisted protocol_mode %r "
+        "(not 'legacy'/'auto' and not in the SDK's MODERN_PROTOCOL_VERSIONS); "
+        "falling back to 'auto' for this connection",
+        server.get("id"), mode)
+    return "auto"
+
+
+async def _connect(server: dict, connect_timeout: int = None, mode: str = None) -> "McpConn":
     """Build a transport, wrap it in an SDK Client, and hand back a McpConn whose
     aclose() unwinds the whole stack (Client → transport → socket/subprocess).
 
@@ -801,19 +831,31 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     now the sole party that dials the MCP server to produce a schema list;
     this function is only reached for an actual per-tool-call connect
     (_get_run_conn) and for the /test probe (_test_server_inner).
+
+    `mode` lets a caller pin the SDK handshake mode explicitly; when omitted it
+    resolves from the persisted negotiation result (`server["protocol_mode"]`,
+    validated by _resolve_protocol_mode), falling back to "auto" when absent
+    or unrecognized.
     """
     connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
     session_to = _session_timeout(server)
+    mode = mode if mode is not None else _resolve_protocol_mode(server)
 
     stack = AsyncExitStack()
     try:
         transport = await _build_transport(server, stack, connect_to, session_to)
         client = await stack.enter_async_context(Client(
             transport,
-            # mode="auto" IS the dual-protocol support: probe server/discover, fall
-            # back to the legacy initialize handshake on old servers. We write no
-            # protocol-version logic of our own.
-            mode="auto",
+            # mode's source: the persisted negotiation result
+            # (mcp_server_runtime.protocol_mode), or "auto" when there isn't one
+            # yet (probes server/discover, falling back to the legacy handshake
+            # on failure). A persisted era lets every later connection skip that
+            # probe entirely instead of waiting out DISCOVER_TIMEOUT_SECONDS on a
+            # legacy server that silently discards server/discover. The SDK
+            # accepts "legacy" / "auto" / a modern version string
+            # (mcp/client/client.py:378-385); we write no protocol-version logic
+            # of our own beyond validating a stored value (_resolve_protocol_mode).
+            mode=mode,
             read_timeout_seconds=session_to,
             input_required_max_rounds=MCP_INPUT_REQUIRED_ROUNDS,
             # SDK-side response caching is off: this project's own manifest cache is
@@ -1064,7 +1106,12 @@ async def _test_server_inner(server: dict) -> dict:
         # Both layers are needed: connect_timeout= is the only bound actually enforced
         # on the stdio branch (see _connect's docstring), while the surrounding wait_for
         # is the real ceiling for http/sse. Dropping either leaves an unbounded path.
-        conn = await asyncio.wait_for(_connect(server, connect_timeout=connect_to),
+        #
+        # mode="auto" is pinned explicitly here (rather than left to _connect's
+        # default of the persisted protocol_mode): this probe IS the one call that
+        # re-negotiates the era from scratch, and its result is what every other
+        # call site's persisted protocol_mode gets reused from.
+        conn = await asyncio.wait_for(_connect(server, connect_timeout=connect_to, mode="auto"),
                                       timeout=connect_to)
     except asyncio.TimeoutError:
         # MUST precede `except Exception`: in 3.11 asyncio.TimeoutError is the builtin
