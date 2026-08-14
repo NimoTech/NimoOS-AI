@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -137,7 +136,8 @@ SCHEMA_TTL = 600
 # through the zero-connection warm path that is the whole reason this cache exists.
 # Worst case is a manifest up to a minute stale — we explicitly do not subscribe to
 # change notifications anyway, so that window is already accepted. Config changes
-# still invalidate instantly via the fingerprint, unaffected by this floor.
+# invalidate through Go re-probing and advancing listed_at (the sole freshness
+# authority — see _CacheEntry), unaffected by this floor.
 SCHEMA_TTL_MIN = 60
 # Ceiling for a server-declared ttlMs. Without it a server declaring 24h really
 # gets cached for 24h, which multiplies the staleness window of removed tools
@@ -199,13 +199,21 @@ def _resolve_ttl(raw_ttl_ms) -> int:
 
 
 class _CacheEntry:
-    __slots__ = ("metas", "fetched_at", "fingerprint", "ttl")
+    """In-process side-cache of one server's schema bodies.
 
-    def __init__(self, metas, fetched_at, fingerprint, ttl):
-        self.metas = metas              # list[dict]: {"name","description","input_schema"}
-        self.fetched_at = fetched_at    # time.monotonic()
-        self.fingerprint = fingerprint
-        self.ttl = ttl                  # seconds; resolved at WRITE time (see _resolve_ttl)
+    Deliberately does NOT carry ttl / fingerprint / fetched_at anymore: the
+    single authority on freshness is the DB (mcp_server_runtime.listed_at /
+    ttl_sec). Keeping a second set of freshness books here would let the two
+    diverge — a process restart empties this cache while the DB is still
+    inside its TTL, or the reverse. This is exactly the reasoning already
+    written down where the SDK's own response caching was disabled (see the
+    `cache=None` comment in _connect: "two caches would fight").
+    """
+    __slots__ = ("metas", "listed_at")
+
+    def __init__(self, metas, listed_at):
+        self.metas = metas          # list[dict]: {"name","description","input_schema"}
+        self.listed_at = listed_at  # the DB's mcp_server_runtime.listed_at this body was fetched under
 
 
 _SCHEMA_CACHE: "OrderedDict[int, _CacheEntry]" = OrderedDict()  # key = server["id"], LRU
@@ -227,30 +235,36 @@ def _extract_meta(mcp_tool) -> dict:
             "input_schema": getattr(mcp_tool, "input_schema", None)}
 
 
-def _cache_put(server_id: int, metas, fingerprint, ttl) -> None:
-    _SCHEMA_CACHE[server_id] = _CacheEntry(metas, time.monotonic(), fingerprint, ttl)
+def _cache_put(server_id: int, metas, listed_at: int) -> None:
+    """Write metas into the side cache, keyed by the listed_at they were
+    fetched under.
+
+    listed_at == 0 means the caller could not establish trust in this body
+    (see mcp_client.runtime.fetch_schemas, which degrades to (0, []) on any
+    network/parse failure) and MUST be treated as "nothing to cache", never
+    as a new cache state — writing it would let one failed fetch silently
+    blank out a perfectly good previously-cached manifest. So this is a
+    strict no-op when listed_at is 0: whatever was cached before (if
+    anything) is left exactly as it was.
+    """
+    if listed_at == 0:
+        return
+    _SCHEMA_CACHE[server_id] = _CacheEntry(metas, listed_at)
     _SCHEMA_CACHE.move_to_end(server_id)
     while len(_SCHEMA_CACHE) > SCHEMA_CACHE_MAX:
         _SCHEMA_CACHE.popitem(last=False)   # evict least-recently-used
 
 
-def _cache_get(server_id: int):
+def _cache_get(server_id: int, listed_at: int):
+    """Return the cached entry iff it was cached under exactly this
+    listed_at; otherwise None. A mismatch (older, newer, or simply no entry)
+    is always a miss — the DB is the sole authority on which listed_at is
+    current, so this cache never guesses about freshness on its own."""
     entry = _SCHEMA_CACHE.get(server_id)
-    if entry is not None:
-        _SCHEMA_CACHE.move_to_end(server_id)
+    if entry is None or entry.listed_at != listed_at:
+        return None
+    _SCHEMA_CACHE.move_to_end(server_id)
     return entry
-
-
-def _fingerprint(server: dict) -> str:
-    basis = json.dumps({
-        "transport": server.get("transport", "http"),
-        "url": server.get("url", ""),
-        "headers": server.get("headers", {}),
-        "command": server.get("command", ""),
-        "args": server.get("args", []),
-        "env": server.get("env", {}),
-    }, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(basis.encode()).hexdigest()
 
 
 # Set per-run by agent.py (mirrors how skills/* receive context).
@@ -453,8 +467,15 @@ def _is_unknown_tool(err) -> bool:
     return bool(_UNKNOWN_TOOL_RE.search(str(getattr(data, "message", ""))))
 
 
-def _wrap_tool(server: dict, meta: dict) -> FunctionTool:
-    slug = _slug(server["name"])
+def _wrap_tool(server: dict, meta: dict, slug: str = None) -> FunctionTool:
+    """slug is optional so every existing single-server call site (tests that
+    exercise one server in isolation) keeps working unchanged: it falls back to
+    slugging this server's own name, exactly what assign_slugs would produce
+    for a lone server anyway. build_mcp_tools is the one caller that MUST pass
+    the already-deduped slug — see assign_slugs — so that two servers sharing
+    a slug don't both claim the bare `mcp__<slug>__` prefix."""
+    if slug is None:
+        slug = _slug(server["name"])
     tool_name = meta["name"]
     fq_name = f"mcp__{slug}__{tool_name}"
     schema = sanitize_schema(meta.get("input_schema"))
@@ -710,9 +731,9 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
             mode="auto",
             read_timeout_seconds=session_to,
             input_required_max_rounds=MCP_INPUT_REQUIRED_ROUNDS,
-            # SDK-side response caching is off: this project's own manifest cache has
-            # two semantics the SDK's lacks (config-fingerprint invalidation and
-            # stale-while-revalidate), and two caches would fight.
+            # SDK-side response caching is off: this project's own manifest cache is
+            # keyed on Go's DB-authoritative listed_at (see _CacheEntry), a freshness
+            # semantic the SDK's own cache doesn't have, and two caches would fight.
             cache=None,
             # This single argument declares BOTH elicitation sub-capabilities.
             # mcp/client/session.py::_build_capabilities builds
@@ -799,9 +820,13 @@ async def _revalidate(server: dict) -> None:
         # run-start cap would reject). This is what self-heals a slow server.
         conn = await _connect(server, connect_timeout=_session_timeout(server))
         try:
-            metas, ttl = await asyncio.wait_for(conn.list_tools(),
-                                                timeout=_session_timeout(server))
-            _cache_put(server["id"], metas, _fingerprint(server), ttl)
+            metas, _ttl = await asyncio.wait_for(conn.list_tools(),
+                                                 timeout=_session_timeout(server))
+            # listed_at, not the server's own ttlMs, is what this write is keyed
+            # under — see _CacheEntry. server["listed_at"] is whatever Go handed
+            # this run at start; if this server was never probed by Go (0), the
+            # _cache_put guard below is a no-op rather than caching under "0".
+            _cache_put(server["id"], metas, server.get("listed_at", 0))
         finally:
             await conn.aclose()
     except Exception:
@@ -819,26 +844,31 @@ async def _cold_fetch(server: dict):
         # the outer deadline (started before _connect) always fires first, so the inner
         # wait_for would never actually timeout. Per-request read timeouts are separately
         # bounded by Client(read_timeout_seconds=...) in _connect.
-        metas, ttl = await conn.list_tools()
+        metas, _ttl = await conn.list_tools()
     finally:
         await conn.aclose()
-    _cache_put(server["id"], metas, _fingerprint(server), ttl)
+    _cache_put(server["id"], metas, server.get("listed_at", 0))
     return metas
 
 
 async def _metas_for_server(server: dict):
     """Return (tool metas, status, detail) for a server, preferring cache.
-    Cold/changed -> fetch inline; stale -> serve cached + background revalidate.
-    On failure returns ([], FAILED/WARMING, reason) and still emits the UI
-    warning event — the status return is the model-facing channel (defect 1),
-    the event is the UI-facing one; both render the same fact."""
-    fp = _fingerprint(server)
-    entry = _cache_get(server["id"])
-    if entry is not None and entry.fingerprint == fp:
-        if time.monotonic() - entry.fetched_at > entry.ttl:
-            _schedule_revalidate(server)        # stale-while-revalidate
+    Cold / listed_at advanced -> fetch inline. On failure returns
+    ([], FAILED/WARMING, reason) and still emits the UI warning event — the
+    status return is the model-facing channel (defect 1), the event is the
+    UI-facing one; both render the same fact.
+
+    Freshness is a single exact match against server["listed_at"] — the value
+    Go handed this run at start (see _CacheEntry). There is no separate
+    stale-while-revalidate window here anymore: once Go's listed_at moves on
+    (new probe, config change, anything), the old body is just a miss, not a
+    "stale but good enough" body to keep serving.
+    """
+    listed_at = server.get("listed_at", 0)
+    entry = _cache_get(server["id"], listed_at)
+    if entry is not None:
         return entry.metas, OK, ""
-    # cold / fingerprint changed:
+    # cold / listed_at advanced since our last fetch:
     if server.get("transport") == "stdio":
         _schedule_revalidate(server)            # background single-flight self-healing warmup (connect+list+cache), does not block run startup
         await _emit_warning(server.get("name", "mcp"),
@@ -858,6 +888,32 @@ async def _metas_for_server(server: dict):
         return [], FAILED, str(e) or type(e).__name__
 
 
+def assign_slugs(servers: list[dict]) -> dict[int, str]:
+    """Resolve each server's stable slug for tool-name prefixing, deduping
+    collisions in *servers* order: the first server to claim a slug keeps the
+    bare form, later ones get `_2`, `_3`, ...
+
+    Prefers the server's self-reported `handle` (Task 7, Go derives it from
+    serverInfo.name / package name / URL host / typed name / command, in that
+    order) over slugifying the user-typed `name`. This matters: Go and the
+    model both speak in terms of `handle` (L1 tells the model "expand as:
+    mcp:<handle>" — see Task 14/15). If this function slugged from `name`
+    instead, a server whose typed name differs from its self-reported
+    identity would get tools prefixed `mcp__<something-else>__`, and the gate
+    the model was told to open would no longer correspond to any tool it can
+    see. Falls back to `_slug(name)` only when there is no handle yet (e.g.
+    the server has never been successfully probed).
+    """
+    slugs: dict[int, str] = {}
+    seen: dict[str, int] = {}
+    for s in servers:
+        base = s.get("handle") or _slug(s.get("name", ""))
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        slugs[s["id"]] = base if count == 1 else f"{base}_{count}"
+    return slugs
+
+
 async def build_mcp_tools(servers: list[dict]) -> tuple:
     """Build confirm/blacklist-gated FunctionTools for this run from the schema
     cache (zero connection when warm). Connections are established lazily per
@@ -869,9 +925,16 @@ async def build_mcp_tools(servers: list[dict]) -> tuple:
     metas_per = await asyncio.gather(*[_metas_for_server(s) for s in probed],
                                      return_exceptions=True)
     results = iter(metas_per)
+    # Dedup happens once, at the slug level, BEFORE any tool name is built —
+    # not by patching individual tool names afterwards. Two servers that both
+    # slug to "github" must become mcp__github__* and mcp__github_2__*, never
+    # mcp__github__create_issue / mcp__github__create_issue_2: the latter
+    # leaves the model unable to tell which server it's calling, and breaks
+    # the correspondence between the gate a user opens (mcp:github_2) and the
+    # tools that gate exposes.
+    slugs = assign_slugs(servers)
     tools: list = []
     statuses: list = []
-    seen_names: set = set()
     for s in servers:
         name = s.get("name", "mcp")
         if s.get("config_error"):
@@ -890,13 +953,7 @@ async def build_mcp_tools(servers: list[dict]) -> tuple:
         metas, status, detail = res
         fq_names = []
         for meta in metas:
-            tool = _wrap_tool(s, meta)
-            if tool.name in seen_names:          # disambiguate cross-server collisions
-                suffix = 2
-                while f"{tool.name}_{suffix}" in seen_names:
-                    suffix += 1
-                tool.name = f"{tool.name}_{suffix}"
-            seen_names.add(tool.name)
+            tool = _wrap_tool(s, meta, slug=slugs[s["id"]])
             tools.append(tool)
             fq_names.append(tool.name)
         statuses.append(ServerStatus(name=name, status=status, detail=detail,

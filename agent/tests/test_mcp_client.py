@@ -177,7 +177,7 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
 
     mgr, q = _setup(conn=UnknownToolConn())
     mc._SCHEMA_CACHE.clear()
-    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
+    mc._cache_put(1, [META], listed_at=1)
     scheduled = []
     monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
     tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
@@ -186,7 +186,7 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert "no longer recognizes" in out and "do NOT" in out
     assert "next message" in out                # the run's tool set is immutable (SDK decision) — the message states that honestly
-    assert mc._cache_get(1) is None             # stale entry dropped
+    assert 1 not in mc._SCHEMA_CACHE            # stale entry dropped
     assert scheduled == [1]                     # refresh scheduled for the next run
 
 
@@ -201,7 +201,7 @@ async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
 
     mgr, q = _setup(conn=ArgErrorConn())
     mc._SCHEMA_CACHE.clear()
-    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
+    mc._cache_put(1, [META], listed_at=1)
     scheduled = []
     monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
     tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
@@ -209,5 +209,5 @@ async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert out.startswith("[MCP error] MCP tool search failed")
-    assert mc._cache_get(1) is not None        # cache untouched
+    assert 1 in mc._SCHEMA_CACHE                # cache untouched
     assert scheduled == []

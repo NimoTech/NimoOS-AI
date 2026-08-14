@@ -34,43 +34,6 @@ def test_resolve_ttl_uses_named_constants():
     assert mc.SCHEMA_TTL_MAX == 3600
 
 
-def test_ttl_is_stored_at_write_time_not_recomputed_on_read():
-    """The read path runs at every run start for every enabled server, so it must
-    be a single subtraction — the policy is applied once, when the entry is written."""
-    mc._SCHEMA_CACHE.clear()
-    mc._cache_put(1, [{"name": "a"}], "fp", 90)
-    assert mc._cache_get(1).ttl == 90
-
-
-@pytest.mark.asyncio
-async def test_short_ttl_entry_is_stale_and_triggers_single_revalidate(monkeypatch):
-    """Short server-declared TTLs make background refresh much more frequent, so the
-    single-flight lock goes from 'debounce' to 'stop us hammering the server'."""
-    import time
-
-    mc._SCHEMA_CACHE.clear()
-    mc._REVALIDATING.clear()
-    mc.EVENT_QUEUE_VAR.set(None)
-
-    server = {"id": 1, "name": "x", "transport": "http", "url": "https://x"}
-    fp = mc._fingerprint(server)
-    mc._cache_put(1, [{"name": "a"}], fp, 60)
-    mc._SCHEMA_CACHE[1].fetched_at = time.monotonic() - 61
-
-    started = []
-
-    async def fake_revalidate(s):
-        started.append(s["id"])
-        await asyncio.sleep(0.05)
-
-    monkeypatch.setattr(mc, "_revalidate", fake_revalidate)
-
-    results = await asyncio.gather(*[mc._metas_for_server(server) for _ in range(5)])
-    assert all(r == ([{"name": "a"}], mc.OK, "") for r in results)   # stale served, never blocked
-    await asyncio.sleep(0.1)
-    assert started == [1], f"single-flight broken: {len(started)} concurrent refreshes"
-
-
 @pytest.mark.asyncio
 async def test_cold_path_has_a_single_total_budget(monkeypatch):
     """Raising the connect leg to 8s must not double the run-start worst case.

@@ -26,7 +26,7 @@ async def test_test_server_ok_and_does_not_warm_the_schema_cache(monkeypatch):
     monkeypatch.setattr(mc, "_connect", fake_connect)
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["ok"] is True and out["tool_count"] == 1 and out["tools"] == ["search"]
-    assert mc._cache_get(1) is None            # not warmed
+    assert 1 not in mc._SCHEMA_CACHE           # not warmed
 
 
 @pytest.mark.asyncio
@@ -353,4 +353,4 @@ async def test_test_server_result_carries_no_cache_entry_shape(monkeypatch):
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["protocol_era"] == "modern"
     assert out["tool_metas"][0]["name"] == "t"
-    assert mc._cache_get(1) is None
+    assert 1 not in mc._SCHEMA_CACHE
