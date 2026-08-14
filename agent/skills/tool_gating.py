@@ -73,24 +73,54 @@ def _mcp_runtime_lines() -> list[str]:
         return ["MCP runtime tools, if any, appear in your tool list on the next step."]
 
 
+# expand_tools takes two different forms of input token:
+#   "apps" / "mcp" / ...  -- a static category (a CATEGORY_TOOLS key)
+#   "mcp:github"          -- a single MCP server's handle
+#
+# Why two levels: every MCP server used to share the single "mcp" gate, so
+# opening it dumped N servers x M tools of full JSON schema into the prompt
+# at once (roughly 20k tokens for a single 87-tool server).
+# Now "mcp" only unlocks the management tools and returns a catalogue (tool
+# names, no schema); only "mcp:github" loads that one server's FunctionTools
+# into the live tool set.
 def expand_categories(categories: list[str]) -> str:
     """Pure logic: unlock the given categories, return the text shown to the model. Wrapped by expand_tools."""
     if not categories:
         return categories_overview()
     valid = set(_reg.CATEGORY_TOOLS.keys())
-    unknown = [c for c in categories if c not in valid]
+    handle_tokens = [c for c in categories if c not in valid and c.startswith("mcp:")]
+    static_categories = [c for c in categories if c not in handle_tokens]
+
+    unknown = [c for c in static_categories if c not in valid]
     if unknown:
         return (f"Unknown categories {unknown}. Valid categories: " + ", ".join(sorted(valid)) +
                 ". Retry with these category names.")
+
+    from skills import mcp_gating as _mcp   # local import: mcp_gating imports this module
+
+    resolved_gate_keys: list[str] = []
+    bad_handles: list[str] = []
+    for token in handle_tokens:
+        server_id = _mcp.resolve_handle(token)
+        if server_id is None:
+            bad_handles.append(token)
+        else:
+            resolved_gate_keys.append(_mcp.gate_key(server_id))
+    if bad_handles:
+        valid_handles = sorted(_mcp.MCP_HANDLES_VAR.get({}).keys())
+        return (f"Unknown MCP handles {bad_handles}. Valid handles: " + ", ".join(valid_handles) +
+                ". Retry with mcp:<handle>.")
+
     cur = current_unlocked()
     if not isinstance(cur, set):     # fallback: ensure it can be mutated in place
         cur = set(cur)
         UNLOCKED_VAR.set(cur)
-    newly = [c for c in categories if c not in cur]
-    cur.update(categories)
+    newly = [c for c in static_categories if c not in cur] + [k for k in resolved_gate_keys if k not in cur]
+    cur.update(static_categories)
+    cur.update(resolved_gate_keys)
     _persist(sorted(cur))
     lines = [f"Unlocked: {', '.join(categories)}. The following tools are now available:"]
-    for c in categories:
+    for c in static_categories:
         for t in _reg.CATEGORY_TOOLS[c]:
             if c == "mcp":
                 # label the admin tool and terminate with ";" so it reads as
@@ -102,6 +132,9 @@ def expand_categories(categories: list[str]) -> str:
                 lines.append(f"- {_name(t)}")
         if c == "mcp":
             lines.extend(_mcp_runtime_lines())
+    for token in handle_tokens:
+        # Task 16 injects this server's FunctionTools; here we only flip the gate.
+        lines.append(f"- {token}: its tools will appear in your tool list on the next step")
     if not newly:
         lines.append("(these categories were already unlocked — every tool named "
                       "above, with its full description, is ALREADY in your tool "
