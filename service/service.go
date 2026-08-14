@@ -26,6 +26,7 @@ type Services interface {
 	Skills() *skillsService
 	MCP() *mcpService
 	MCPRuntime() *mcpRuntimeService
+	MCPApprovals() *mcpApprovalService
 }
 
 type services struct {
@@ -43,6 +44,7 @@ type services struct {
 	skills          *skillsService
 	mcp             *mcpService
 	mcpRuntime      *mcpRuntimeService
+	mcpApprovals    *mcpApprovalService
 }
 
 func (s *services) DB() *sql.DB                       { return s.db }
@@ -59,6 +61,7 @@ func (s *services) Blacklist() *blacklistService      { return s.blacklist }
 func (s *services) Skills() *skillsService            { return s.skills }
 func (s *services) MCP() *mcpService                  { return s.mcp }
 func (s *services) MCPRuntime() *mcpRuntimeService    { return s.mcpRuntime }
+func (s *services) MCPApprovals() *mcpApprovalService { return s.mcpApprovals }
 
 // NewService wires all service dependencies. Panics on initialization failure.
 func NewService(cfg *config.Config) Services {
@@ -88,6 +91,7 @@ func NewService(cfg *config.Config) Services {
 	skillsSvc := &skillsService{db: db, store: store}
 	mcpSvc := &mcpService{db: db}
 	mcpRuntimeSvc := &mcpRuntimeService{db: db}
+	mcpApprovalsSvc := &mcpApprovalService{db: db}
 
 	// Rebuild .runtime/<uid>/ for every user we know about. The skill_state
 	// table lists users; if a user has no row, the agent layer rebuilds on
@@ -134,6 +138,7 @@ func NewService(cfg *config.Config) Services {
 		skills:          skillsSvc,
 		mcp:             mcpSvc,
 		mcpRuntime:      mcpRuntimeSvc,
+		mcpApprovals:    mcpApprovalsSvc,
 	}
 }
 
@@ -148,10 +153,11 @@ func NewServiceFromParts(db *sql.DB, store *SkillsStore) Services {
 // NewServicesForTest wires only the pieces handler tests need.
 func NewServicesForTest(db *sql.DB, mk *crypto.MasterKey) Services {
 	return &services{
-		db:         db,
-		masterKey:  mk,
-		providers:  &providerService{db: db},
-		mcp:        &mcpService{db: db},
-		mcpRuntime: &mcpRuntimeService{db: db},
+		db:           db,
+		masterKey:    mk,
+		providers:    &providerService{db: db},
+		mcp:          &mcpService{db: db},
+		mcpRuntime:   &mcpRuntimeService{db: db},
+		mcpApprovals: &mcpApprovalService{db: db},
 	}
 }
