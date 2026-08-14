@@ -3,7 +3,8 @@ import json
 import pytest
 
 import mcp_client.runtime as rt
-from mcp_client.runtime import fetch_schemas, parse_runtime, put_approval, release_token
+from mcp_client.runtime import (_parse_schemas_body, fetch_schemas, parse_runtime,
+                                 put_approval, release_token)
 
 
 def test_parse_runtime_extracts_servers_approvals_and_token():
@@ -154,6 +155,53 @@ async def test_fetch_schemas_malformed_body_returns_zero_and_empty(monkeypatch):
     monkeypatch.setattr(rt.httpx, "AsyncClient", FakeAsyncClient)
 
     assert await fetch_schemas("tok123", 42) == (0, [])
+
+
+def test_parse_schemas_body_missing_listed_at_discards_schemas():
+    # listed_at is what Task 13's cache keys on; if it's untrustworthy, the
+    # accompanying schemas must be discarded too, or the cache can never
+    # invalidate a stale listing.
+    out = _parse_schemas_body(json.dumps({"schemas": [{"name": "t"}]}))
+    assert out is None, (
+        "schemas must be discarded when listed_at is missing, "
+        "or the cache can never invalidate"
+    )
+
+
+def test_parse_schemas_body_wrong_typed_listed_at_discards_schemas():
+    out = _parse_schemas_body(json.dumps({"listed_at": "x", "schemas": [{"name": "t"}]}))
+    assert out is None, (
+        "schemas must be discarded when listed_at is wrong-typed, "
+        "or the cache can never invalidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_schemas_missing_listed_at_returns_zero_and_empty(monkeypatch):
+    monkeypatch.setattr(rt, "_read_ai_base", lambda: "http://127.0.0.1:1")
+    body = json.dumps({"schemas": [{"name": "t"}]})
+    FakeAsyncClient, _ = _make_fake_client(response=_FakeResponse(status_code=200, text=body))
+    monkeypatch.setattr(rt.httpx, "AsyncClient", FakeAsyncClient)
+
+    out = await fetch_schemas("tok123", 42)
+    assert out == (0, []), (
+        "schemas must be discarded when listed_at is missing, "
+        "or the cache can never invalidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_schemas_wrong_typed_listed_at_returns_zero_and_empty(monkeypatch):
+    monkeypatch.setattr(rt, "_read_ai_base", lambda: "http://127.0.0.1:1")
+    body = json.dumps({"listed_at": "x", "schemas": [{"name": "t"}]})
+    FakeAsyncClient, _ = _make_fake_client(response=_FakeResponse(status_code=200, text=body))
+    monkeypatch.setattr(rt.httpx, "AsyncClient", FakeAsyncClient)
+
+    out = await fetch_schemas("tok123", 42)
+    assert out == (0, []), (
+        "schemas must be discarded when listed_at is wrong-typed, "
+        "or the cache can never invalidate"
+    )
 
 
 @pytest.mark.asyncio
