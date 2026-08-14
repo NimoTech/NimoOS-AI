@@ -23,6 +23,7 @@ from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATIO
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
 from mcp_client.status import OK, FAILED, WARMING, CONFIG_ERROR, ServerStatus
+from mcp_client.hashing import schema_hash, desc_hash
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -593,6 +594,38 @@ def _protocol_fields(conn) -> dict:
                 "supported_versions": []}
 
 
+def _read_instructions(conn) -> str:
+    """Server self-description. Both protocol eras carry this field
+    (DiscoverResult.instructions / InitializeResult.instructions); the spec
+    explicitly suggests folding it into the system prompt."""
+    try:
+        session = conn.client.session
+        for src in (session.discover_result, session.initialize_result):
+            if src is not None and getattr(src, "instructions", None):
+                return str(src.instructions)
+    except Exception:
+        pass
+    return ""
+
+
+def _read_server_info(conn) -> dict:
+    """serverInfo. On the modern path it comes from the discover result's _meta
+    stamp; on legacy it comes from the initialize result. The SDK's
+    session.server_info already unifies both paths (mcp/client/session.py:777-788)."""
+    try:
+        info = conn.client.session.server_info
+        if info is None:
+            return {}
+        return {
+            "name": getattr(info, "name", "") or "",
+            "title": getattr(info, "title", "") or "",
+            "version": getattr(info, "version", "") or "",
+            "description": getattr(info, "description", "") or "",
+        }
+    except Exception:
+        return {}
+
+
 async def _emit_warning(server_name: str, err) -> None:
     queue = EVENT_QUEUE_VAR.get()
     if queue is None:
@@ -942,8 +975,16 @@ async def _test_server_inner(server: dict) -> dict:
             return {"ok": False, "error": f"Listing tools failed: {e}", "error_key": "list_failed",
                     "detail": str(e)}
         proto = _protocol_fields(conn)
+        instructions = _read_instructions(conn)
+        server_info = _read_server_info(conn)
     finally:
         await conn.aclose()
-    if "id" in server:
-        _cache_put(server["id"], metas, _fingerprint(server), ttl)
-    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas], **proto}
+    metas_out = [{"name": m["name"],
+                  "schema_hash": schema_hash(m.get("input_schema")),
+                  "desc_hash": desc_hash(m.get("description"))} for m in metas]
+    schemas_out = [{"name": m["name"],
+                    "description": m.get("description", "") or "",
+                    "input_schema": m.get("input_schema")} for m in metas]
+    return {"ok": True, "tool_count": len(metas), "tools": [m["name"] for m in metas],
+            "instructions": instructions, "server_info": server_info,
+            "ttl_sec": ttl, "tool_metas": metas_out, "schemas": schemas_out, **proto}
