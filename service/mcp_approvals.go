@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -28,11 +29,41 @@ type ApprovalRow struct {
 
 type mcpApprovalService struct{ db *sql.DB }
 
-// Put records (or refreshes) one tool approval. approved_at and last_seen_at
-// are both set to now: approved_at marks when the user consented,
-// last_seen_at is reset here so a freshly (re-)approved tool doesn't
-// immediately fail the stale gate.
+// PutServerLevel records (or refreshes) the server-level '*' approval — the
+// user's blanket "always allow every tool on this server" consent. It is
+// the ONLY way to write the '*' row; Put itself rejects tool_name=="*" (see
+// its doc comment for why). Since it never takes a schema_hash, this call
+// hardcodes it to "" — '*' is not a real tool and never has one.
+func (s *mcpApprovalService) PutServerLevel(serverID int64, identityFP string) error {
+	return s.put(serverID, "*", identityFP, "")
+}
+
+// Put records (or refreshes) one ordinary tool's approval. toolName must not
+// be "*" — use PutServerLevel for the server-level approval instead, and
+// this rejects the call otherwise.
+//
+// This rejection exists because tool_name is otherwise a namespace
+// populated by names the MCP server itself declares, which this code must
+// treat as untrusted. Without it, a malicious server could publish one
+// ordinary, innocuous-looking tool literally named "*"; a future caller
+// that forwards a server-declared tool name into Put — believing it is
+// recording consent for that one tool — would silently write the
+// server-level sentinel row instead, converting a single-tool approval into
+// a blanket approval for every tool the server ever offers. Put refusing
+// tool_name=="*" outright closes that hole at the point where approvals are
+// written, regardless of where the name originated.
 func (s *mcpApprovalService) Put(serverID int64, toolName, identityFP, schemaHash string) error {
+	if toolName == "*" {
+		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
+	}
+	return s.put(serverID, toolName, identityFP, schemaHash)
+}
+
+// put is the shared writer behind Put and PutServerLevel. approved_at and
+// last_seen_at are both set to now: approved_at marks when the user
+// consented, last_seen_at is reset here so a freshly (re-)approved tool
+// doesn't immediately fail the stale gate.
+func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHash string) error {
 	now := time.Now().Unix()
 	_, err := s.db.Exec(`
 		INSERT INTO mcp_tool_approvals (server_id, tool_name, identity_fp, schema_hash, approved_at, last_seen_at)
@@ -86,11 +117,10 @@ func (s *mcpApprovalService) DeleteAll(serverID int64) error {
 // its own presence in a listing — so it skips the interface and stale gates.
 //
 // A server with no runtime row at all (never successfully probed) has no
-// entry in the runtime map below, so every non-wildcard approval for it
-// fails the config gate (identity_fp compares "" from the DB default against
-// whatever was approved) and is excluded. This is the safe default: without
-// a probe there is nothing to compare against, so the tool is treated as
-// unconfirmed rather than silently trusted.
+// entry in the runtime map below, so its runtime identity_fp reads back as
+// "". The config gate requires both sides to be a non-empty match, so every
+// approval for such a server — wildcard included — fails closed rather than
+// being treated as trusted just because "" happens to equal "".
 func (s *mcpApprovalService) EffectiveApprovals(userID string) ([]ApprovalRow, error) {
 	// Gate 4 (hygiene) runs first and unconditionally: delete rows that
 	// haven't been seen in 90 days. last_seen_at > 0 excludes rows that have
@@ -132,10 +162,21 @@ func (s *mcpApprovalService) EffectiveApprovals(userID string) ([]ApprovalRow, e
 		}
 
 		// Config gate: identity_fp must still match the current runtime
-		// observation. A server with no runtime row at all yields runtimeFP
-		// as NULL/"" here, which never equals a real approved fingerprint,
-		// so it correctly fails closed rather than being treated as trusted.
-		if approvalFP != runtimeFP.String {
+		// observation, AND neither side may be empty. A server with no
+		// runtime row at all (or a runtime row that exists but was never
+		// populated with a real fingerprint — MarkProbing's bare INSERT and
+		// SaveSuccess's empty-listing branch both leave identity_fp at its
+		// column default of '') yields runtimeFP as NULL/"" here. Comparing
+		// that directly against approvalFP would treat "no fingerprint on
+		// either side" as a match — a fail-open hole: a caller that writes
+		// an approval with an empty identity_fp before the server has ever
+		// probed successfully would pass this gate forever. Requiring both
+		// sides to be non-empty (in addition to equal) closes it.
+		//
+		// This check MUST run before the tool_name=="*" branch below: the
+		// wildcard only skips the interface and stale gates, never this one
+		// (see TestWildcardConfigGateVoidsOnIdentityChange).
+		if approvalFP == "" || !runtimeFP.Valid || runtimeFP.String == "" || approvalFP != runtimeFP.String {
 			continue
 		}
 
@@ -163,8 +204,15 @@ func (s *mcpApprovalService) EffectiveApprovals(userID string) ([]ApprovalRow, e
 			}
 			toolSetCache[serverID] = tools
 		}
+		// Both approvalSchema and meta.SchemaHash default to "" (an approval
+		// row with no recorded hash, or a tools_json entry with no
+		// schema_hash key). Comparing only for equality would let those two
+		// empty defaults match each other — the tool's arguments could then
+		// change freely without ever voiding the approval. Require both
+		// sides non-empty as well. This still only compares stored hashes;
+		// it never computes or normalizes one (schema_hash is Python-only).
 		meta, present := tools[toolName]
-		if !present || meta.SchemaHash != approvalSchema {
+		if !present || approvalSchema == "" || meta.SchemaHash == "" || meta.SchemaHash != approvalSchema {
 			continue
 		}
 
@@ -212,7 +260,7 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 
 		reason := ""
 		switch {
-		case approvalFP != runtimeFP.String:
+		case approvalFP == "" || !runtimeFP.Valid || runtimeFP.String == "" || approvalFP != runtimeFP.String:
 			reason = "config changed: server identity no longer matches the approved one"
 		case toolName == "*":
 			// Server-level approval: no interface/stale reasons apply.
@@ -233,7 +281,7 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 			switch {
 			case !present:
 				reason = "tool no longer offered by the server"
-			case meta.SchemaHash != approvalSchema:
+			case approvalSchema == "" || meta.SchemaHash == "" || meta.SchemaHash != approvalSchema:
 				reason = "interface changed: tool's schema no longer matches the approved one"
 			case now-lastSeenAt > staleWindowSec:
 				reason = "stale: tool not seen in the last 7 days"
