@@ -630,3 +630,168 @@ func (h *MCPHandler) probeAndPersistAsync(m *service.McpServer, env, headers map
 		log.Printf("mcp runtime self-check: background probe for server %d failed: %v", m.ID, err)
 	}
 }
+
+// --- internal loopback write-back endpoints ---
+//
+// These three endpoints are the ONLY way the Python agent writes anything
+// back into Go for MCP. Everything else the agent does with MCP data is
+// read-only (Runtime, the schemas fetch below). ApprovalsInternal in
+// particular is a privilege boundary, not plumbing: it records that a user
+// consented to a tool, which suppresses future confirmation prompts for
+// that (server, tool) pair.
+
+// mcpApprovalsRequest is the body for POST /_internal/mcp/approvals. Only
+// server_id and tool_name are caller-supplied — Python derives both from the
+// confirm_id it minted when it showed the confirmation card, never from the
+// browser. identity_fp and schema_hash are deliberately NOT fields here: see
+// ApprovalsInternal for why they must never come from the request.
+type mcpApprovalsRequest struct {
+	ServerID int64  `json:"server_id"`
+	ToolName string `json:"tool_name"`
+}
+
+// lookupSchemaHash returns the schema_hash currently recorded for toolName
+// in a McpServerRuntime's ToolsJSON (a JSON array of {name, schema_hash,
+// desc_hash}). It returns "" if the tool is not present in the listing —
+// this is the intended, safe outcome, not an error: Task 10's interface gate
+// treats an empty stored schema_hash as a failed gate, so the approval this
+// value feeds into simply will not take effect until the tool actually
+// appears in a listing. schema_hash itself is computed only in Python; this
+// function only looks up an already-computed value, never derives one.
+func lookupSchemaHash(toolsJSON, toolName string) string {
+	var tools []service.ToolMeta
+	_ = json.Unmarshal([]byte(toolsJSON), &tools)
+	for _, tl := range tools {
+		if tl.Name == toolName {
+			return tl.SchemaHash
+		}
+	}
+	return ""
+}
+
+// ApprovalsInternal handles POST /v1/ai/_internal/mcp/approvals — Python's
+// only write path into Go for MCP (design doc §5.4). It records that the
+// user consented ("don't ask again") to server_id+tool_name, which later
+// suppresses confirmation prompts for that pair via
+// MCPApprovals().EffectiveApprovals.
+//
+// Security-sensitive, read carefully before changing:
+//
+//  1. Auth is the run-scoped write token (X-Agent-MCP-Write-Token), minted
+//     once per run by Runtime(). No token, an unknown token, or an expired
+//     one is a 401 — written directly via c.JSON (not echo.NewHTTPError) so
+//     that a caller inspecting rec.Code directly (as this handler's own
+//     tests do, and as Runtime's ticket check above already establishes the
+//     convention for) sees the right status even without Echo's error
+//     handler in the loop. The authorization subject must never be
+//     inferable from an unauthenticated call.
+//  2. The token resolves to a user_id. The target server has an owner;
+//     if they differ this is a 403 — otherwise any run could grant
+//     approvals on a server it does not own. GetMcpServer filters by
+//     (id, user_id) together, so a server_id that exists but belongs to
+//     someone else comes back as sql.ErrNoRows here, indistinguishable
+//     from "does not exist" — both cases are correctly rejected the same
+//     way, since a caller with neither ownership nor existence gets no
+//     information either way.
+//  3. identity_fp and schema_hash are ALWAYS read from the server's CURRENT
+//     mcp_server_runtime row, never from the request body (the request
+//     struct above has no fields for them at all). If a caller could supply
+//     these directly, it could mint an approval whose stored fingerprint
+//     always matches itself — the config/interface gates in
+//     EffectiveApprovals compare the stored value against the CURRENT
+//     runtime observation, so a self-consistent forged pair would never be
+//     invalidated, producing an approval that can never expire.
+func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
+	tok := c.Request().Header.Get("X-Agent-MCP-Write-Token")
+	uid, ok := h.runTokens.Resolve(tok)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "invalid or missing mcp write token"})
+	}
+
+	var req mcpApprovalsRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if req.ServerID == 0 || strings.TrimSpace(req.ToolName) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "server_id and tool_name required")
+	}
+
+	if _, err := h.svc.MCP().GetMcpServer(req.ServerID, uid); err != nil {
+		return echo.NewHTTPError(http.StatusForbidden, "server does not belong to the authenticated user")
+	}
+
+	// rt is nil when this server has never had a successful probe (Task 4) —
+	// a normal state, not an error. identityFP/schemaHash then stay "",
+	// which is safe: EffectiveApprovals' config/interface gates both fail
+	// closed on an empty stored value, so the write below is accepted but
+	// inert until a real listing exists.
+	rt, err := h.svc.MCPRuntime().Get(req.ServerID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	var identityFP string
+	if rt != nil {
+		identityFP = rt.IdentityFP
+	}
+
+	if req.ToolName == "*" {
+		// PutServerLevel is the only path allowed to write the '*' sentinel
+		// row; Put itself rejects tool_name=="*" (Task 10).
+		err = h.svc.MCPApprovals().PutServerLevel(req.ServerID, identityFP)
+	} else {
+		var schemaHash string
+		if rt != nil {
+			schemaHash = lookupSchemaHash(rt.ToolsJSON, req.ToolName)
+		}
+		err = h.svc.MCPApprovals().Put(req.ServerID, req.ToolName, identityFP, schemaHash)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+// SchemasInternal handles GET /v1/ai/_internal/mcp/servers/:id/schemas — the
+// L2 loopback fetch (design doc §1.2.1/§2.2.1): a millisecond, no-third-
+// party-network read that expands one server's full tool schemas the first
+// time a run needs them. listed_at MUST ship alongside the schema bodies:
+// Python's in-memory cache is keyed on it, and without it a changed tool
+// description could never invalidate that cache and reach the model.
+//
+// This endpoint is read-only — it never writes runtime rows or schemas; Go
+// is the sole writer of that state, populated by the probe path (Task 7),
+// not by anything reachable from here.
+func (h *MCPHandler) SchemasInternal(c echo.Context) error {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid id")
+	}
+	listedAt, schemasJSON, err := h.svc.MCPRuntime().GetSchemas(id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	var schemas []any
+	_ = json.Unmarshal([]byte(schemasJSON), &schemas)
+	if schemas == nil {
+		schemas = []any{}
+	}
+	return c.JSON(http.StatusOK, map[string]any{
+		"listed_at": listedAt,
+		"schemas":   schemas,
+	})
+}
+
+// ReleaseTokenInternal handles POST /v1/ai/_internal/mcp/token/release. The
+// agent calls this at run teardown to shrink its write token's replay window
+// back down to the run's actual duration, instead of leaving it valid for
+// the full 24h backstop (see RunTokenStore's doc comment for why 24h exists
+// at all). The token itself is the sole key Release needs; a missing or
+// already-invalid token is a harmless no-op, since releasing is idempotent
+// cleanup that a caller should never have to fail-check.
+func (h *MCPHandler) ReleaseTokenInternal(c echo.Context) error {
+	tok := c.Request().Header.Get("X-Agent-MCP-Write-Token")
+	if tok != "" {
+		h.runTokens.Release(tok)
+	}
+	return c.NoContent(http.StatusNoContent)
+}
