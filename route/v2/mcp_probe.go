@@ -3,7 +3,9 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -51,6 +53,14 @@ func stripNoise(s string) string {
 // user-typed name is only the last-resort fallback, once every automatic
 // signal is unavailable, and otherwise only serves as a disambiguating suffix
 // in the UI layer.
+//
+// BuildHandle stays pure and MAY still return "": a stdio server can have no
+// args, no url, and a userName that is itself purely non-ASCII/punctuation
+// (slugify collapses it to ""). Command is the last automatic signal in that
+// case; if even that is empty or noise-only, the caller (probeAndPersist) is
+// responsible for substituting a synthetic, per-server handle before
+// persisting — never store an empty handle, since the model needs some token
+// to name the server by and two empty handles would collide.
 func BuildHandle(serverInfo map[string]string, transport, rawURL, command string, args []string, userName string) string {
 	if serverInfo != nil {
 		if n := serverInfo["name"]; n != "" {
@@ -85,7 +95,14 @@ func BuildHandle(serverInfo map[string]string, transport, rawURL, command string
 			return stripNoise(host)
 		}
 	}
-	return slugify(userName)
+	if h := slugify(userName); h != "" {
+		return h
+	}
+	// The user-typed name itself collapsed to "" and there was no args/url
+	// signal either. The command binary name (e.g. "python3", "uvx") is the
+	// last automatic signal available before falling through to the empty
+	// string, which the caller must replace with a synthetic handle.
+	return stripNoise(path.Base(command))
 }
 
 func isTLD(s string) bool {
@@ -266,8 +283,14 @@ func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[stri
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Post(h.agentURL+"/agent/mcp/test", "application/json", bytes.NewReader(payload))
 	if err != nil {
+		// The probe never reached Python. This IS the failure outcome (not a
+		// persistence side-effect of one), so any error saving it just gets
+		// logged: turning it into a 500 here would still discard the 502
+		// body below that the browser needs, and leaving it unlogged would
+		// hide that probe_state may be stuck at 'probing' (see the "wedge"
+		// comment on the SaveSuccess branch below for why that matters).
 		if serr := h.svc.MCPRuntime().SaveFailure(m.ID, "agent_unreachable", "agent unreachable"); serr != nil {
-			return probeResult{}, serr
+			log.Printf("mcp probe %d: failed to persist agent_unreachable result: %v", m.ID, serr)
 		}
 		body, _ := json.Marshal(map[string]any{"ok": false, "error": "agent unreachable"})
 		return probeResult{StatusCode: http.StatusBadGateway, Body: body}, nil
@@ -278,7 +301,7 @@ func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[stri
 	var res probeResponse
 	if jsonErr := json.Unmarshal(body, &res); jsonErr != nil {
 		if serr := h.svc.MCPRuntime().SaveFailure(m.ID, "bad_probe_response", jsonErr.Error()); serr != nil {
-			return probeResult{}, serr
+			log.Printf("mcp probe %d: failed to persist bad_probe_response result: %v", m.ID, serr)
 		}
 		return probeResult{StatusCode: http.StatusOK, Body: body}, nil
 	}
@@ -289,12 +312,19 @@ func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[stri
 			errKey = "unknown"
 		}
 		if serr := h.svc.MCPRuntime().SaveFailure(m.ID, errKey, res.Error); serr != nil {
-			return probeResult{}, serr
+			log.Printf("mcp probe %d: failed to persist probe failure %q: %v", m.ID, errKey, serr)
 		}
 		return probeResult{StatusCode: http.StatusOK, Body: body}, nil
 	}
 
 	handle := BuildHandle(res.ServerInfo, m.Transport, m.URL, m.Command, args, m.Name)
+	if handle == "" {
+		// Every automatic signal AND the user-typed name were unusable (see
+		// BuildHandle's doc comment). BuildHandle stays pure, so the
+		// synthetic fallback -- guaranteed unique and non-empty -- lives
+		// here, at the one call site that knows the server's id.
+		handle = fmt.Sprintf("server_%d", m.ID)
+	}
 	summary := BuildSummary(res.Instructions, res.ServerInfo, m.Transport, m.URL, m.Command, args, res.Schemas)
 	schemasJSON, _ := json.Marshal(res.Schemas)
 
@@ -313,7 +343,21 @@ func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[stri
 		ProtocolEra:   res.ProtocolEra,
 	}
 	if serr := h.svc.MCPRuntime().SaveSuccess(runtime, res.ToolMetas, string(schemasJSON)); serr != nil {
-		return probeResult{}, serr
+		// The probe itself succeeded, so the plan requires the browser to
+		// still see that outcome synchronously -- this must NOT become a
+		// 500 that throws away a 125-second probe result over an unrelated
+		// DB error. Persisting a best-effort SaveFailure clears the
+		// single-flight lock that MarkProbing claimed above and that
+		// SaveSuccess's own failure would otherwise leave wedged at
+		// 'probing' until process restart (service/mcp_runtime.go:144-147
+		// documents this exact class of stuck-lock bug). If that best-effort
+		// call ALSO fails, log it but keep the original SaveSuccess error as
+		// the one that actually explains what went wrong.
+		if ferr := h.svc.MCPRuntime().SaveFailure(m.ID, "persist_failed", serr.Error()); ferr != nil {
+			log.Printf("mcp probe %d: SaveSuccess failed (%v) AND the best-effort SaveFailure to release the lock also failed: %v", m.ID, serr, ferr)
+		} else {
+			log.Printf("mcp probe %d: probe succeeded but persisting the result failed: %v", m.ID, serr)
+		}
 	}
 	return probeResult{StatusCode: http.StatusOK, Body: body}, nil
 }
