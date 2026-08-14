@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"time"
@@ -133,15 +134,49 @@ func (s *mcpRuntimeService) MarkProbing(serverID int64) (bool, error) {
 //     time".
 func (s *mcpRuntimeService) SaveSuccess(r *McpServerRuntime, tools []ToolMeta, schemasJSON string) error {
 	now := time.Now().Unix()
-	tx, err := s.db.Begin()
+
+	// The database is opened with _journal_mode=WAL (see NewDB). A plain
+	// db.Begin() is DEFERRED: its first statement below is the SELECT of
+	// empty_streak, which only takes a read snapshot. If any other
+	// connection commits a write before this transaction's own first write
+	// statement runs, SQLite refuses to upgrade that read snapshot and
+	// returns SQLITE_BUSY_SNAPSHOT — an error the busy-timeout handler does
+	// NOT retry, so the whole probe result would be silently discarded
+	// (and, combined with the single-flight lock, that server's probe_state
+	// would stay stuck at 'probing' since neither SaveSuccess nor its
+	// caller would ever reach the code that clears it).
+	//
+	// The single-flight lock in MarkProbing does not protect against this:
+	// it only serializes probes of the *same* server, but concurrent
+	// probes of *different* servers still write the same ai.db file.
+	//
+	// Fix: check out a single dedicated connection and issue a literal
+	// BEGIN IMMEDIATE on it, so the write lock is acquired up front. Any
+	// contention then surfaces as ordinary SQLITE_BUSY, which go-sqlite3's
+	// busy handler does retry. We deliberately do NOT add _txlock=immediate
+	// to the shared DSN in NewDB — that would change transaction semantics
+	// for every other caller of this *sql.DB (sessions, provider_models,
+	// ...), not just this one read-then-write transaction.
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer conn.Close()
+
+	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
 
 	empty := len(tools) == 0
 	var prevEmpty int
-	tx.QueryRow(`SELECT empty_streak FROM mcp_server_runtime WHERE server_id=?`, r.ServerID).Scan(&prevEmpty)
+	conn.QueryRowContext(ctx, `SELECT empty_streak FROM mcp_server_runtime WHERE server_id=?`, r.ServerID).Scan(&prevEmpty)
 
 	writeList := !empty || prevEmpty+1 >= 2 // only clear on two consecutive empty listings
 	newEmptyStreak := 0
@@ -157,7 +192,7 @@ func (s *mcpRuntimeService) SaveSuccess(r *McpServerRuntime, tools []ToolMeta, s
 	// Many columns: UPSERT writes them out one by one to avoid any
 	// dependency on SELECT * column order.
 	if writeList {
-		if _, err = tx.Exec(`
+		if _, err = conn.ExecContext(ctx, `
 			INSERT INTO mcp_server_runtime
 			 (server_id,server_name,server_title,server_version,handle,instructions,summary,
 			  tools_json,listed_at,ttl_sec,config_fp,identity_fp,protocol_mode,protocol_era,
@@ -178,19 +213,28 @@ func (s *mcpRuntimeService) SaveSuccess(r *McpServerRuntime, tools []ToolMeta, s
 			r.ProtocolMode, r.ProtocolEra, now, newEmptyStreak); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`
+		if _, err = conn.ExecContext(ctx, `
 			INSERT INTO mcp_server_schemas (server_id, listed_at, schemas_json) VALUES (?,?,?)
 			ON CONFLICT(server_id) DO UPDATE SET listed_at=excluded.listed_at,
 			 schemas_json=excluded.schemas_json`, r.ServerID, now, schemasJSON); err != nil {
 			return err
 		}
 	} else {
-		// Empty listing, but the first one: only record success and
-		// empty_streak — don't touch the tool list, schemas, or listed_at.
-		if _, err = tx.Exec(`
-			UPDATE mcp_server_runtime SET probe_state='ok', last_ok_at=?, last_error='',
-			 last_error_key='', fail_streak=0, cooldown_until=0, empty_streak=?
-			WHERE server_id=?`, now, newEmptyStreak, r.ServerID); err != nil {
+		// Empty listing, but the first one (or the server has no runtime
+		// row at all yet — e.g. its very first probe happens to see zero
+		// tools): only record success and empty_streak, and leave the
+		// tool list, schemas and listed_at untouched. INSERT-or-UPDATE so
+		// this converges correctly whether or not a row already exists —
+		// a bare UPDATE would silently affect zero rows and record
+		// nothing when there is no pre-existing row (e.g. if MarkProbing
+		// was skipped or its row was never created).
+		if _, err = conn.ExecContext(ctx, `
+			INSERT INTO mcp_server_runtime (server_id, probe_state, last_ok_at, empty_streak)
+			VALUES (?, 'ok', ?, ?)
+			ON CONFLICT(server_id) DO UPDATE SET probe_state='ok', last_ok_at=excluded.last_ok_at,
+			 last_error='', last_error_key='', fail_streak=0, cooldown_until=0,
+			 empty_streak=excluded.empty_streak`,
+			r.ServerID, now, newEmptyStreak); err != nil {
 			return err
 		}
 	}
@@ -198,19 +242,23 @@ func (s *mcpRuntimeService) SaveSuccess(r *McpServerRuntime, tools []ToolMeta, s
 	// Heartbeat: only advance for tools that appeared in this listing. An
 	// empty listing triggers nothing (the loop body never runs).
 	for _, tl := range tools {
-		if _, err = tx.Exec(`UPDATE mcp_tool_approvals SET last_seen_at=?
+		if _, err = conn.ExecContext(ctx, `UPDATE mcp_tool_approvals SET last_seen_at=?
 			WHERE server_id=? AND tool_name=?`, now, r.ServerID, tl.Name); err != nil {
 			return err
 		}
 	}
 	// The service-level '*' row follows any successful, non-empty probe.
 	if !empty {
-		if _, err = tx.Exec(`UPDATE mcp_tool_approvals SET last_seen_at=?
+		if _, err = conn.ExecContext(ctx, `UPDATE mcp_tool_approvals SET last_seen_at=?
 			WHERE server_id=? AND tool_name='*'`, now, r.ServerID); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if _, err = conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // SaveFailure never touches last_seen_at: otherwise a server down for a

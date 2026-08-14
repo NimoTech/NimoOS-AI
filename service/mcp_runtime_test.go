@@ -141,6 +141,24 @@ func TestSaveSuccessAdvancesListedAtAndHeartbeat(t *testing.T) {
 	if seen <= 1 {
 		t.Fatal("last_seen_at heartbeat must fire for tools present in a successful non-empty listing")
 	}
+
+	// A single SaveSuccess call also satisfies "listed_at != 0" via the plain
+	// INSERT path, which would pass even if the UPDATE branch never advanced
+	// listed_at. Pin listed_at to a known small value and probe again to
+	// prove the *second* successful probe still advances it — this is the
+	// actual invariant: every success advances listed_at, not just the first.
+	if _, err := db.Exec(`UPDATE mcp_server_runtime SET listed_at=1 WHERE server_id=?`, id); err != nil {
+		t.Fatalf("pin listed_at: %v", err)
+	}
+	if err := rt.SaveSuccess(r, tools, `[{"name":"create_issue"}]`); err != nil {
+		t.Fatalf("second SaveSuccess: %v", err)
+	}
+	got, _ = rt.Get(id)
+	if got.ListedAt <= 1 {
+		t.Fatalf("listed_at must advance on a SECOND successful probe too (got %d) — "+
+			"otherwise Python's schema cache pins to the first probe forever and a "+
+			"changed tool description never reaches the model", got.ListedAt)
+	}
 }
 
 func TestSaveSuccessEmptyListingDoesNotClobber(t *testing.T) {
@@ -187,5 +205,67 @@ func TestSaveFailureDoesNotTouchHeartbeat(t *testing.T) {
 	got, _ := rt.Get(id)
 	if got.FailStreak != 1 || got.CooldownUntil == 0 || got.ProbeState != "failed" {
 		t.Fatalf("bad failure state: %+v", got)
+	}
+}
+
+// TestStaleProbingClearedOnStartup covers finding 1: nimoos-ai is the only
+// process that ever probes MCP servers, so a runtime row still showing
+// probe_state='probing' when the database is (re-)opened can only be a
+// leftover from a process that died mid-probe (systemctl restart, panic,
+// crash) — never an actual concurrent probe. The startup migration must
+// clear it so MarkProbing's single-flight lock does not wedge that server
+// forever.
+func TestStaleProbingClearedOnStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	id := seedServer(t, db)
+	if _, err := db.Exec(
+		`INSERT INTO mcp_server_runtime (server_id, probe_state) VALUES (?, 'probing')`, id); err != nil {
+		t.Fatalf("seed stale probing row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Re-open through the normal init path — this simulates a nimoos-ai restart.
+	db2, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("re-open NewDB: %v", err)
+	}
+	t.Cleanup(func() { db2.Close() })
+
+	rt := &mcpRuntimeService{db: db2}
+	ok, err := rt.MarkProbing(id)
+	if err != nil || !ok {
+		t.Fatalf("stale 'probing' state must be cleared on startup so MarkProbing can "+
+			"succeed again: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestSaveSuccessEmptyListingCreatesRowWhenMissing covers finding 4: a
+// server's very first probe can legitimately see zero tools. That must
+// still converge to a runtime row with probe_state='ok', not be silently
+// dropped because there was nothing to UPDATE yet.
+func TestSaveSuccessEmptyListingCreatesRowWhenMissing(t *testing.T) {
+	db := openTestDB(t)
+	rt := &mcpRuntimeService{db: db}
+	id := seedServer(t, db)
+
+	if err := rt.SaveSuccess(&McpServerRuntime{ServerID: id, TTLSec: 600}, []ToolMeta{}, `[]`); err != nil {
+		t.Fatalf("SaveSuccess: %v", err)
+	}
+
+	got, err := rt.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got == nil {
+		t.Fatal("a successful probe (even an empty one) must create a runtime row, not record nothing")
+	}
+	if got.ProbeState != "ok" || got.EmptyStreak != 1 {
+		t.Fatalf("bad state for first-ever empty listing: %+v", got)
 	}
 }

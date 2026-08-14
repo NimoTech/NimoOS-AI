@@ -273,6 +273,18 @@ func migrate(db *sql.DB) error {
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE mcp_servers ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
 
+	// Startup sweep: clear any MCP runtime row still showing probe_state='probing'.
+	// nimoos-ai is the only process that ever probes MCP servers (Go is the sole
+	// writer of MCP runtime state), so a 'probing' row observed at process startup
+	// can only be left over from a previous process that died mid-probe (a routine
+	// `systemctl restart nimoos-ai`, a panic, or a crash) — it can never be a
+	// concurrent probe actually in flight, because this migration runs before
+	// anything in this process starts probing. Without this sweep, MarkProbing's
+	// single-flight lock (probe_state='probing') would wedge that server forever:
+	// every later probe attempt would see the lock as held and refuse to run, and
+	// recovering would mean hand-editing ai.db.
+	_, _ = db.Exec(`UPDATE mcp_server_runtime SET probe_state='' WHERE probe_state='probing'`)
+
 	// One-time backfill: classify rows whose provider_type is still empty.
 	rows, err = db.Query(`SELECT id, base_url, protocol FROM providers WHERE provider_type=''`)
 	if err == nil {
