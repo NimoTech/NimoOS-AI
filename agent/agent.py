@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextvars import ContextVar
 from typing import AsyncIterator
 
 from agents import Agent, Runner
@@ -43,11 +44,28 @@ from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
 from mcp_client import status as mcp_status
 from mcp_client.runtime import ConfigUnavailable
+import skills.mcp_gating as mcp_gating
 from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
 _LOG = logging.getLogger("nimoos-agent")
+
+# Set at run start (see AgentRunner.run, right after Agent construction) to
+# this run's live Agent object. skills/tool_gating.py's L2 loading replaces
+# .tools on this object mid-run (see expand_categories / _load_l2_tools). The
+# SDK re-reads agent.tools on every step (pinned by
+# tests/test_mcp_zero_network_start.py::test_sdk_still_reresolves_tools_each_turn),
+# so swapping this Agent's tools list takes effect starting the model's next
+# step — that property is the entire foundation L2 rests on. Default None
+# means "no run in progress" (tests/error paths).
+#
+# Re-exported from mcp_client.client (NOT constructed here): some test
+# helpers reload "agent" out of sys.modules (see mcp_client.client's comment
+# on this same ContextVar for why that matters), so the single stable object
+# lives in a module nobody reloads that way, and this name is just an alias
+# to it for readability and for tests that do `agent.RUN_AGENT_VAR`.
+RUN_AGENT_VAR = mcp_client.RUN_AGENT_VAR
 
 # Each run persists the FULL history as a new snapshot row; keep a bounded
 # undo window per session instead of letting the table grow O(turns^2).
@@ -425,11 +443,37 @@ def format_context_lines(context_photo=None, context_album=None) -> str:
     return out
 
 
+# Go's probe_state (route/v2/mcp.go's Runtime response, Task 8) mapped onto
+# this process's own ServerStatus vocabulary. "probing" and any unrecognized/
+# empty value (a server Go has never successfully probed) both fall back to
+# WARMING: neither means "known broken", just "no confirmed-good tool list to
+# show yet".
+_MCP_PROBE_STATE_TO_STATUS = {
+    "ok": mcp_status.OK,
+    "failed": mcp_status.FAILED,
+}
+
+
 async def _build_mcp_for_run(mcp_servers):
-    """Build cache-backed, confirm-gated MCP tools for this run. Never raises —
-    MCP is additive. Returns (FunctionTool list, McpStatusSnapshot | None);
-    a None snapshot means MCP is not in play (or the pipeline errored), which
-    renders as no prompt line + the fallback expand_tools wording."""
+    """Build the per-run MCP status snapshot PURELY from the server dicts Go
+    already probed and handed down at run start. Opens ZERO third-party
+    connections and always returns an EMPTY tool list — run start must never
+    pay a connect/list round trip, no matter how many MCP servers exist or
+    how sick they are (a legacy-protocol server that silently swallows
+    server/discover used to cost a 10s wait before the first token).
+
+    This is the L0/L1 half of progressive disclosure: the system-prompt line
+    (render_prompt_line) and expand_tools(["mcp"])'s catalogue
+    (render_expand_section) are rendered entirely from this snapshot. L2 — a
+    single server's real FunctionTools — is loaded later, mid-run, by
+    skills.tool_gating.expand_tools(["mcp:<handle>"]) once the model asks for
+    that specific server (see that module for the fetch + injection).
+
+    Never raises — MCP is additive. Returns (empty tool list,
+    McpStatusSnapshot | None); a None snapshot means MCP is not in play (or
+    this construction step itself errored), which renders as no prompt line
+    plus the fallback expand_tools wording.
+    """
     if isinstance(mcp_servers, ConfigUnavailable):
         return [], mcp_status.McpStatusSnapshot(config_error=mcp_servers.reason)
     if mcp_servers is None:
@@ -437,8 +481,35 @@ async def _build_mcp_for_run(mcp_servers):
     if not mcp_servers:
         return [], mcp_status.McpStatusSnapshot()
     try:
-        tools, statuses = await mcp_client.build_mcp_tools(mcp_servers)
-        return tools, mcp_status.McpStatusSnapshot(servers=statuses)
+        slugs = mcp_client.assign_slugs(mcp_servers)
+        statuses = []
+        for s in mcp_servers:
+            name = s.get("name", "mcp")
+            if s.get("config_error"):
+                # Go flagged this server's stored credentials as
+                # undecryptable; never advertise it as connectable.
+                statuses.append(mcp_status.ServerStatus(
+                    name=name, status=mcp_status.CONFIG_ERROR,
+                    detail=str(s["config_error"]),
+                    handle=s.get("handle", "") or "",
+                    slug=slugs.get(s.get("id"), "")))
+                continue
+            slug = slugs.get(s["id"], "")
+            tool_names = [f"mcp__{slug}__{t['name']}" for t in (s.get("tools") or [])
+                          if isinstance(t, dict) and t.get("name")]
+            status = _MCP_PROBE_STATE_TO_STATUS.get(s.get("probe_state", ""), mcp_status.WARMING)
+            statuses.append(mcp_status.ServerStatus(
+                name=name, status=status,
+                detail=(s.get("last_error", "") or "") if status != mcp_status.OK else "",
+                tool_names=tool_names,
+                handle=s.get("handle", "") or "", slug=slug,
+                summary=s.get("summary", "") or "",
+                instructions=s.get("instructions", "") or "",
+                # A non-OK status with tool names on hand means those names
+                # came from a probe before the current failure/warmup, not a
+                # live connection right now — see status.py's stale rules.
+                stale=(status != mcp_status.OK and bool(tool_names))))
+        return [], mcp_status.McpStatusSnapshot(servers=statuses)
     except Exception:
         return [], None
 
@@ -596,9 +667,30 @@ class AgentRunner:
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
+            # CONTRACT (see client.py's _CONFIRMED_TOOLS_VAR comment): this is
+            # meant to be Go's pre-filtered "passed all four gates" approval
+            # set for the CURRENT user, handed down alongside the server
+            # list. main.py does not yet fetch that richer runtime payload
+            # (it still calls the older fetch_mcp_servers/parse_servers
+            # path, not parse_runtime) — until that wiring lands this stays
+            # an empty set every run, same behavior as before this change.
             mcp_client._CONFIRMED_TOOLS_VAR.set(set())
             mcp_client._RUN_CONNS_VAR.set({})
             mcp_client._RUN_CONN_LOCKS_VAR.set({})
+            _mcp_server_list = mcp_servers if isinstance(mcp_servers, list) else []
+            _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_server_list)
+            mcp_client._RUN_SERVERS_VAR.set(
+                {s["id"]: s for s in _mcp_server_list if isinstance(s, dict) and "id" in s})
+            # Run-scoped write token (Task 9): same main.py gap as
+            # _CONFIRMED_TOOLS_VAR above — no real token flows in yet, so this
+            # defaults to "", the documented degraded path (put_approval gives
+            # up and the approval isn't remembered; fetch_schemas degrades to
+            # (0, []); the call/fetch that triggered it still proceeds).
+            mcp_client.WRITE_TOKEN_VAR.set("")
+            # slug -> server_id, the inverse of assign_slugs's id -> slug —
+            # skills/mcp_gating.py resolves "mcp:<slug>" tokens through this.
+            mcp_gating.MCP_HANDLES_VAR.set(
+                {slug: sid for sid, slug in _mcp_slugs_by_id.items()})
             mb_skills.SESSION_ID_VAR.set(session_id)
             mb_skills.EVENT_QUEUE_VAR.set(sink)
             mb_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
@@ -874,6 +966,10 @@ class AgentRunner:
                 model=model,
                 model_settings=model_settings,
             )
+            # L2's injection target: skills/tool_gating.py's expand_categories
+            # replaces .tools on THIS object mid-run once the model opens a
+            # specific MCP server (see RUN_AGENT_VAR's module-level comment).
+            RUN_AGENT_VAR.set(agent)
 
             if continue_run:
                 input_messages = send_history

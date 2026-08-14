@@ -6,13 +6,22 @@ from mcp_client.runtime import ConfigUnavailable
 
 
 @pytest.mark.asyncio
-async def test_build_returns_tools_and_snapshot(monkeypatch):
-    async def fake_build(servers):
-        return ["DUMMY_TOOL"], [st.ServerStatus(name="x", status=st.OK, tool_names=["t"])]
-    monkeypatch.setattr(mc, "build_mcp_tools", fake_build)
-    tools, snap = await agent_mod._build_mcp_for_run([{"id": 1, "name": "x"}])
-    assert tools == ["DUMMY_TOOL"]
+async def test_build_returns_snapshot_without_connecting(monkeypatch):
+    """Task 16: _build_mcp_for_run is pure construction from the server dicts
+    Go already handed down at run start — it must NEVER call build_mcp_tools
+    (which would connect to each server). Run start's tool list is always
+    empty; L2 (skills/tool_gating.py) loads a server's real tools later."""
+    async def boom(servers):
+        raise AssertionError("_build_mcp_for_run must not call build_mcp_tools")
+    monkeypatch.setattr(mc, "build_mcp_tools", boom)
+    tools, snap = await agent_mod._build_mcp_for_run(
+        [{"id": 1, "name": "x", "handle": "x", "probe_state": "ok",
+          "tools": [{"name": "t"}]}])
+    assert tools == []
     assert snap.servers[0].name == "x" and snap.config_error == ""
+    assert snap.servers[0].status == st.OK
+    assert snap.servers[0].handle == "x"
+    assert snap.servers[0].tool_names == ["mcp__x__t"]
 
 
 @pytest.mark.asyncio
@@ -38,8 +47,8 @@ async def test_build_config_unavailable_snapshot():
 
 @pytest.mark.asyncio
 async def test_build_never_raises(monkeypatch):
-    async def boom(servers): raise RuntimeError("x")
-    monkeypatch.setattr(mc, "build_mcp_tools", boom)
+    def boom(servers): raise RuntimeError("x")
+    monkeypatch.setattr(mc, "assign_slugs", boom)
     assert await agent_mod._build_mcp_for_run([{"id": 1}]) == ([], None)
 
 

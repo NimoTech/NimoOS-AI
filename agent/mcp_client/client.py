@@ -279,14 +279,52 @@ SESSION_ID_VAR: ContextVar = ContextVar("mcp_session_id", default="")
 EVENT_QUEUE_VAR: ContextVar = ContextVar("mcp_event_queue", default=None)
 CONFIRM_MGR_VAR: ContextVar = ContextVar("mcp_confirm_mgr", default=None)
 USER_PATTERNS_VAR: ContextVar = ContextVar("mcp_user_patterns", default=[])
-# session-scoped set of "serverid::toolname" the user chose to remember.
-# CONTRACT: agent.py MUST call _CONFIRMED_TOOLS_VAR.set(set()) at the start of
-# each run (see Task 13) to prevent cross-run/session bleed of approvals.
+# session-scoped set of "serverid::toolname" (or "serverid::*" for a
+# server-level approval) that are already approved for this run's user.
+# CONTRACT: agent.py MUST call _CONFIRMED_TOOLS_VAR.set(...) at the start of
+# EVERY run (originally Task 13) to prevent cross-run/cross-user bleed of
+# approvals. It now sets this to Go's pre-filtered set of approvals that have
+# already passed all four gates for the CURRENT user (design doc §5.2) —
+# no longer always an empty set. This still satisfies the original intent:
+# Go recomputes that set fresh for the current user on every run, so a stale
+# or another user's approval can never leak in through this ContextVar.
 _CONFIRMED_TOOLS_VAR: ContextVar = ContextVar("mcp_confirmed_tools", default=set())
 
 # Per-run lazy MCP connections. agent.py MUST set both to fresh {} at run start.
 _RUN_CONNS_VAR: ContextVar = ContextVar("mcp_run_conns", default=None)
 _RUN_CONN_LOCKS_VAR: ContextVar = ContextVar("mcp_run_conn_locks", default=None)
+
+# Per-run mapping of server_id -> the full server dict Go handed this run at
+# start (transport/url/headers/command/args/env — everything _wrap_tool and
+# _get_run_conn need to actually call a tool later). agent.py sets this
+# alongside _RUN_CONNS_VAR. skills/tool_gating.py's L2 loading has no other
+# way to go from a resolved server_id back to that server's connection
+# details, since run start (Task 16) no longer builds any tools up front.
+# None means "not set" (defensive default for tests/error paths).
+_RUN_SERVERS_VAR: ContextVar = ContextVar("mcp_run_servers", default=None)
+
+# Set at run start (agent.py) to this run's live Agent object; agent.py
+# re-exports this SAME object as `agent.RUN_AGENT_VAR` for readability and so
+# tests can do `import agent; agent.RUN_AGENT_VAR`. Defined HERE rather than
+# in agent.py because several test files (test_egress_confirm_route.py,
+# test_main*.py — see `_reload_main`/module-reload helpers) delete "agent"
+# from sys.modules and reimport it for their own DB-isolation purposes; a
+# ContextVar constructed at agent.py's module level would silently become a
+# SECOND, independent object after such a reload, desyncing any code that
+# captured the old module's attribute beforehand. mcp_client.client is never
+# among the modules those helpers reload, so this stays the single stable
+# source of truth regardless of what happens to sys.modules["agent"].
+# skills/tool_gating.py's L2 loading reads it from here directly for the same
+# reason. Default None means "no run in progress" (tests/error paths).
+RUN_AGENT_VAR: ContextVar = ContextVar("nimoos_run_agent", default=None)
+
+# Run-scoped write token (Task 9). Consumed by _ensure_confirmed (Task 17) to
+# persist "don't ask again" approvals, and by skills/tool_gating.py's L2
+# loading to fetch a server's full tool schemas (the schemas endpoint 401s
+# without it). Defaults to "": the documented degraded path is to proceed
+# with the current call/fetch anyway and simply not persist/authenticate
+# that one request, never to block on a missing token.
+WRITE_TOKEN_VAR: ContextVar[str] = ContextVar("mcp_write_token", default="")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PATH_KEY_RE = re.compile(r"(path|file|dir|directory)", re.IGNORECASE)
