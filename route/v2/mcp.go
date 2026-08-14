@@ -1,15 +1,12 @@
 package v2
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/NimoTech/NimoOS-AI/pkg/mcpparse"
 	"github.com/NimoTech/NimoOS-AI/service"
@@ -327,7 +324,12 @@ func (h *MCPHandler) decryptMap(enc string) map[string]string {
 
 // Test handles POST /v1/ai/mcp/servers/:id/test — connectivity probe. Go can't
 // speak MCP, so it decrypts the saved config and forwards to the Python agent's
-// /agent/mcp/test, returning the agent's {ok,tool_count,tools,protocol_era,protocol_version,supported_versions,error} verbatim.
+// /agent/mcp/test via probeAndPersist, which persists the resulting identity
+// card (handle, summary, tool list, protocol era/mode, fingerprints) BEFORE
+// this returns the agent's
+// {ok,tool_count,tools,protocol_era,protocol_version,supported_versions,error}
+// verbatim to the browser — the settings page still shows the outcome
+// synchronously, it just now also lands in mcp_server_runtime.
 func (h *MCPHandler) Test(c echo.Context) error {
 	uid, err := h.userID(c)
 	if err != nil {
@@ -344,31 +346,11 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	var args []string
-	_ = json.Unmarshal([]byte(m.Args), &args)
-	payload, _ := json.Marshal(map[string]any{
-		"id": m.ID, "name": m.Name, "transport": m.Transport, "url": m.URL,
-		"command": m.Command, "args": args,
-		"env":     h.decryptMap(m.Env),
-		"headers": h.decryptMap(m.Headers),
-	})
-	// Must exceed Python's outer backstop (client.py: TEST_TIMEOUT=41 /
-	// STDIO_TEST_TIMEOUT=120) so Python cancels first and releases the subprocess and
-	// socket, rather than Go abandoning a request that keeps running. Those Python
-	// values are themselves connect phase + list phase + close phase + slack -- see
-	// the constant block in client.py.
-	timeout := 43 * time.Second
-	if m.Transport == "stdio" {
-		timeout = 125 * time.Second
-	}
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Post(h.agentURL+"/agent/mcp/test", "application/json", bytes.NewReader(payload))
+	pr, err := h.probeAndPersist(m, h.decryptMap(m.Env), h.decryptMap(m.Headers))
 	if err != nil {
-		return c.JSON(http.StatusBadGateway, map[string]any{"ok": false, "error": "agent unreachable"})
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return c.JSONBlob(http.StatusOK, body)
+	return c.JSONBlob(pr.StatusCode, pr.Body)
 }
 
 // --- internal loopback CRUD-lite (no JWT; localhost-only via _internal group) ---
