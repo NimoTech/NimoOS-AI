@@ -14,13 +14,14 @@ import (
 )
 
 type MCPHandler struct {
-	svc      service.Services
-	tickets  *TicketStore
-	agentURL string
+	svc       service.Services
+	tickets   *TicketStore
+	runTokens *RunTokenStore
+	agentURL  string
 }
 
-func NewMCPHandler(svc service.Services, tickets *TicketStore, agentURL string) *MCPHandler {
-	return &MCPHandler{svc: svc, tickets: tickets, agentURL: agentURL}
+func NewMCPHandler(svc service.Services, tickets *TicketStore, runTokens *RunTokenStore, agentURL string) *MCPHandler {
+	return &MCPHandler{svc: svc, tickets: tickets, runTokens: runTokens, agentURL: agentURL}
 }
 
 type mcpRequest struct {

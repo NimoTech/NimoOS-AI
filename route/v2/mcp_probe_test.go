@@ -148,7 +148,7 @@ func TestTest_SuccessPersistsRuntimeRow(t *testing.T) {
 	}`)
 	defer agent.Close()
 
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), agent.URL)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), agent.URL)
 	c, rec := testEcho(http.MethodPost, fmt.Sprintf("%d", m.ID), "u1")
 	if err := h.Test(c); err != nil {
 		t.Fatalf("Test: %v", err)
@@ -216,7 +216,7 @@ func TestTest_FailurePersistsAndClearsLock(t *testing.T) {
 	agent := probeAgentStub(t, `{"ok": false, "error": "Connection failed: boom", "error_key": "connect_failed"}`)
 	defer agent.Close()
 
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), agent.URL)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), agent.URL)
 	c, rec := testEcho(http.MethodPost, fmt.Sprintf("%d", m.ID), "u1")
 	if err := h.Test(c); err != nil {
 		t.Fatalf("Test: %v", err)
@@ -270,7 +270,7 @@ func TestTest_SyntheticHandleWhenEverySignalIsUnusable(t *testing.T) {
 	}`)
 	defer agent.Close()
 
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), agent.URL)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), agent.URL)
 	c, rec := testEcho(http.MethodPost, fmt.Sprintf("%d", m.ID), "u1")
 	if err := h.Test(c); err != nil {
 		t.Fatalf("Test: %v", err)
