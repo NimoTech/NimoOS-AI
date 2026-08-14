@@ -176,7 +176,9 @@ async def test_schema_fetch_failure_reports_failed_and_warns(monkeypatch, _clear
     metas, status, detail = await mc._metas_for_server(
         {"id": 7, "name": "h", "transport": "http", "url": "https://x"})
     assert metas == [] and status == mc.FAILED
-    assert detail
+    # Pin the exact fixed string (client.py's _metas_for_server), not just
+    # truthiness.
+    assert detail == "could not fetch tool schemas from nimoos-ai"
     assert warns                        # user warned
 
 

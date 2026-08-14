@@ -1,4 +1,7 @@
+import asyncio
 import json
+import time
+
 import pytest
 
 import mcp_client.runtime as rt
@@ -139,3 +142,29 @@ async def test_fetch_runtime_success_carries_approvals_and_token(monkeypatch):
     assert out.servers[0]["handle"] == "github"
     assert out.approvals == {"1::create_issue"}
     assert out.write_token == "tok123"
+
+
+# --- fetch_schemas's run-start budget (Task 17 review finding 3) ---
+#
+# Task 17 deleted _metas_for_server's own connect+list budget
+# (MCP_COLD_TOTAL_TIMEOUT, enforced with an explicit asyncio.wait_for around
+# a direct connect) because _metas_for_server no longer connects to a
+# third-party server at all — it asks Go for schemas over loopback via
+# fetch_schemas instead. That moved the ONLY bound left between a hung/slow
+# probe and a run start that never returns into fetch_schemas's own
+# httpx.AsyncClient(timeout=FETCH_TIMEOUT). Nothing was pinning that bound;
+# this test exercises it against a REAL hanging endpoint (a socket that
+# accepts the connection and then never writes a byte), not a mock, so a
+# regression that drops the `timeout=` kwarg would actually be caught.
+@pytest.mark.asyncio
+async def test_fetch_schemas_gives_up_promptly_on_a_hanging_server(monkeypatch):
+    server = await asyncio.start_server(lambda r, w: None, host="127.0.0.1", port=0)
+    host, port = server.sockets[0].getsockname()[:2]
+    monkeypatch.setattr(rt, "_read_ai_base", lambda: f"http://{host}:{port}")
+    monkeypatch.setattr(rt, "FETCH_TIMEOUT", 0.2)
+    async with server:
+        started = time.monotonic()
+        listed_at, schemas = await rt.fetch_schemas("tok", 1)
+        elapsed = time.monotonic() - started
+    assert (listed_at, schemas) == (0, [])   # documented degrade shape, never raises
+    assert elapsed < 2.0, f"fetch_schemas was not bounded by FETCH_TIMEOUT ({elapsed:.2f}s)"

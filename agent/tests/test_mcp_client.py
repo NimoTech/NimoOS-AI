@@ -88,7 +88,19 @@ async def test_invoke_rejected_returns_text():
 
 
 @pytest.mark.asyncio
-async def test_remember_skips_second_confirm():
+async def test_remember_skips_second_confirm(monkeypatch):
+    # remember=True below reaches _ensure_confirmed's persist branch, which
+    # calls mcp_client.runtime.put_approval. Must be patched: unpatched, this
+    # would open a real loopback socket to nimoos-ai whenever
+    # /var/run/nimoos/ai.url happens to exist on the machine running the
+    # suite — making the code under test take a different branch depending
+    # on machine state, exactly the class of test this task was careful to
+    # avoid elsewhere. The outcome is irrelevant to this test either way (a
+    # write failure must not block the call — see
+    # test_mcp_persistent_approval.py), so a no-op stub is enough.
+    async def noop_put_approval(*a, **kw): return True
+    monkeypatch.setattr("mcp_client.runtime.put_approval", noop_put_approval)
+
     fconn = FakeConn()
     mgr, q = _setup(conn=fconn)
     tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")

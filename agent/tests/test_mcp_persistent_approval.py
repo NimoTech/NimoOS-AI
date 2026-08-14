@@ -54,6 +54,29 @@ def test_persist_failure_does_not_block_the_call(monkeypatch):
     assert asyncio.run(mc._ensure_confirmed({"id": 1, "name": "s"}, "search", {})) is True
 
 
+def test_persist_raising_does_not_block_the_call(monkeypatch):
+    """Same degradation rule, but for a put_approval that RAISES rather than
+    returning False (e.g. Go is down, not just unreachable in a way that
+    degrades cleanly). In production runtime.put_approval's own try/except
+    already turns every such failure into a plain False, but that guarantee
+    must not rest on that single internal implementation detail going
+    untested — a future edit to put_approval's exception handling must not
+    be able to silently turn an approved call into a hard failure."""
+    _setup(monkeypatch, remember=True)
+    async def boom(*a, **kw): raise RuntimeError("go is down")
+    monkeypatch.setattr("mcp_client.runtime.put_approval", boom)
+    assert asyncio.run(mc._ensure_confirmed({"id": 1, "name": "s"}, "search", {})) is True
+
+
+def test_a_tool_literally_named_star_is_never_persisted(monkeypatch):
+    """A tool named "*" would otherwise write the exact "{sid}::*" key Go's
+    own server-level grant uses, laundering "approved this one tool" into
+    "approved every tool on this server"."""
+    _, written = _setup(monkeypatch, remember=True)
+    asyncio.run(mc._ensure_confirmed({"id": 1, "name": "s"}, "*", {}))
+    assert written == []
+
+
 def test_no_background_refresh_symbols_remain():
     """Go is the sole writer; Python must not have any background refresh task."""
     for gone in ("_schedule_revalidate", "_revalidate", "_REVALIDATING",

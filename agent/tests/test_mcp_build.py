@@ -5,16 +5,6 @@ META = {"name": "search", "description": "d",
         "input_schema": {"type": "object", "properties": {}}}
 
 
-class GoodConn:
-    """Matches the new McpConn contract: call_tool / list_tools / aclose."""
-    def __init__(self): self.closed = False
-    async def call_tool(self, name, args): ...
-    async def list_tools(self):
-        return [{"name": "search", "description": "d",
-                 "input_schema": {"type": "object", "properties": {}}}], mc.SCHEMA_TTL
-    async def aclose(self): self.closed = True
-
-
 @pytest.fixture(autouse=True)
 def _clear_cache():
     mc._SCHEMA_CACHE.clear()
@@ -64,7 +54,10 @@ async def test_schema_fetch_failure_skips(monkeypatch):
     tools, statuses = await mc.build_mcp_tools([{"id": 9, "name": "bad"}])
     assert tools == [] and events == ["bad"]
     assert statuses[0].name == "bad" and statuses[0].status == mc.FAILED
-    assert statuses[0].detail        # the reason reaches the model now
+    # Pin the exact fixed string (client.py's _metas_for_server), not just
+    # truthiness — an empty-but-truthy placeholder would slip past `assert
+    # statuses[0].detail` unnoticed.
+    assert statuses[0].detail == "could not fetch tool schemas from nimoos-ai"
 
 
 @pytest.mark.asyncio

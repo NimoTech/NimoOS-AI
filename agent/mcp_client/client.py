@@ -379,16 +379,34 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
         # the payload object (phase-3 review defect ②).
         confirmed_tools.add(key)
         _CONFIRMED_TOOLS_VAR.set(confirmed_tools)
-        # Persist the choice with Go so it also survives across runs/
-        # sessions and a server being disabled and re-enabled. Degradation
-        # rule (design doc §5.4, non-negotiable — see
-        # mcp_client.runtime.put_approval's own docstring): a write failure
-        # here is IGNORED and this call still proceeds. Losing the
-        # persisted preference only costs "the user gets asked again next
-        # time" (annoying); refusing a call the user just explicitly
-        # approved, purely because a write-back to Go failed, would be a
-        # broken product.
-        await mcp_runtime.put_approval(WRITE_TOKEN_VAR.get(""), sid, tool_name)
+        # A tool literally named "*" would otherwise launder a single
+        # tool-level approval into the exact "{sid}::*" key Go's own
+        # server-level grant uses (see the wildcard check above) — silently
+        # turning "the user approved this one tool" into "the user approved
+        # every tool on this server". Reachability is thin today (tool
+        # names come from the server's own schema list, never the model,
+        # and the resulting mcp__<slug>__* function name would fail the
+        # API's function-name regex anyway) but nothing structurally
+        # prevents it, so never persist that ambiguity.
+        if tool_name != "*":
+            try:
+                # Persist the choice with Go so it also survives across
+                # runs/sessions and a server being disabled and re-enabled.
+                # Degradation rule (design doc §5.4, non-negotiable — see
+                # mcp_client.runtime.put_approval's own docstring): a write
+                # failure here is IGNORED and this call still proceeds.
+                # Losing the persisted preference only costs "the user gets
+                # asked again next time" (annoying); refusing a call the
+                # user just explicitly approved, purely because a
+                # write-back to Go failed, would be a broken product. The
+                # try/except here is deliberate belt-and-braces: the rule
+                # must hold even if put_approval's OWN internal guard
+                # (runtime.py's try/except around the httpx call) is ever
+                # weakened or bypassed — this call must never be blocked by
+                # a failure, of any kind, to persist it.
+                await mcp_runtime.put_approval(WRITE_TOKEN_VAR.get(""), sid, tool_name)
+            except Exception:
+                pass
     return confirmed
 
 
