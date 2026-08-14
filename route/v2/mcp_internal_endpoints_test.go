@@ -154,7 +154,8 @@ func TestApprovalsEndpointStampsCurrentFingerprintAndHash(t *testing.T) {
 // invalidate the cache and reach the model.
 func TestSchemasEndpointReturnsListedAtForCacheKeying(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
 	e := echo.New()
 
 	m := &service.McpServer{
@@ -178,7 +179,9 @@ func TestSchemasEndpointReturnsListedAtForCacheKeying(t *testing.T) {
 		t.Fatalf("test setup did not produce a nonzero listed_at")
 	}
 
+	tok := runTokens.Mint("u1", "sess1")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Agent-MCP-Write-Token", tok)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 	c.SetParamNames("id")
@@ -202,5 +205,177 @@ func TestSchemasEndpointReturnsListedAtForCacheKeying(t *testing.T) {
 	}
 	if len(out.Schemas) != 1 || out.Schemas[0]["name"] != "create_issue" {
 		t.Fatalf("expected the schema body to pass through, got %+v", out.Schemas)
+	}
+}
+
+// TestApprovalsEndpointRejectsInvalidOrExpiredToken extends the
+// missing-token coverage to the two other ways a token can fail to resolve:
+// a token string that was never minted at all, and one that WAS minted but
+// has since expired. Both must 401, exactly like a missing token.
+func TestApprovalsEndpointRejectsInvalidOrExpiredToken(t *testing.T) {
+	svc := mcpTestSvc(t)
+	body := `{"server_id":1,"tool_name":"create_issue"}`
+
+	t.Run("unknown token", func(t *testing.T) {
+		h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+		e := echo.New()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set("X-Agent-MCP-Write-Token", "not-a-real-token")
+		rec := httptest.NewRecorder()
+		if err := h.ApprovalsInternal(e.NewContext(req, rec)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unknown token, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("expired token", func(t *testing.T) {
+		// A negative TTL makes Mint hand back a token whose expiry is
+		// already in the past, without needing to sleep in the test.
+		expiredTokens := NewRunTokenStore(-time.Minute)
+		h := NewMCPHandler(svc, NewTicketStore(time.Minute), expiredTokens, "http://127.0.0.1:1")
+		e := echo.New()
+		tok := expiredTokens.Mint("u1", "sess1")
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set("X-Agent-MCP-Write-Token", tok)
+		rec := httptest.NewRecorder()
+		if err := h.ApprovalsInternal(e.NewContext(req, rec)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for expired token, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestApprovalsEndpointRoutesWildcardToServerLevel pins the "*" →
+// PutServerLevel routing decision directly: if this ever regressed into
+// calling Put("*", ...) instead, Task 10's Put rejects tool_name=="*" and
+// this request would 500 instead of succeeding.
+func TestApprovalsEndpointRoutesWildcardToServerLevel(t *testing.T) {
+	svc := mcpTestSvc(t)
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{
+		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "t", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	tok := runTokens.Mint("u1", "sess1")
+	body := fmt.Sprintf(`{"server_id":%d,"tool_name":"*"}`, m.ID)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Agent-MCP-Write-Token", tok)
+	rec := httptest.NewRecorder()
+	if err := h.ApprovalsInternal(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("wildcard approval must route to PutServerLevel and succeed, got error: %v", err)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := svc.MCPApprovals().ListForServer(m.ID)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.ToolName == "*" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a server-level '*' approval row, got %+v", rows)
+	}
+}
+
+// TestApprovalsEndpointRejectsNonexistentServerLikeForeignServer pins the
+// no-enumeration-oracle property: a server_id that doesn't exist at all must
+// produce the exact same 403 as a server_id that exists but belongs to
+// someone else, never a distinct 404 that would let a caller tell the two
+// apart.
+func TestApprovalsEndpointRejectsNonexistentServerLikeForeignServer(t *testing.T) {
+	svc := mcpTestSvc(t)
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	e := echo.New()
+
+	tok := runTokens.Mint("u1", "sess1")
+	body := `{"server_id":999999,"tool_name":"create_issue"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Agent-MCP-Write-Token", tok)
+	rec := httptest.NewRecorder()
+	err := h.ApprovalsInternal(e.NewContext(req, rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a nonexistent server_id (same as a foreign one, no enumeration oracle), got %v", err)
+	}
+}
+
+// TestSchemasEndpointRejectsMissingToken pins that SchemasInternal is NOT
+// bare LocalhostOnly plumbing: it returns user-scoped tool schemas keyed by
+// a sequential integer id, so it needs the same positive credential as
+// ApprovalsInternal, not just the internal group's network gate.
+func TestSchemasEndpointRejectsMissingToken(t *testing.T) {
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("1")
+	if err := h.SchemasInternal(c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing write token, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSchemasEndpointRejectsForeignServer pins the ownership check on the
+// read path: a valid write token for one user must not be usable to read
+// another user's server schemas — without this, any run's write token would
+// double as a cross-user read credential over every server's tool argument
+// schemas and descriptions.
+func TestSchemasEndpointRejectsForeignServer(t *testing.T) {
+	svc := mcpTestSvc(t)
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{
+		UserID: "owner", Name: "github", Transport: "http", URL: "https://x",
+		Args: "[]", Env: "{}", Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	tok := runTokens.Mint("attacker", "sess1")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Agent-MCP-Write-Token", tok)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues(fmt.Sprint(m.ID))
+	err := h.SchemasInternal(c)
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a token whose user does not own the server, got %v", err)
 	}
 }

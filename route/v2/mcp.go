@@ -669,6 +669,25 @@ func lookupSchemaHash(toolsJSON, toolName string) string {
 	return ""
 }
 
+// resolveWriteToken reads X-Agent-MCP-Write-Token and resolves it against
+// h.runTokens. On failure (missing, unknown, or expired token) it writes the
+// 401 directly via c.JSON (not echo.NewHTTPError) so that a caller
+// inspecting rec.Code directly — as this handler's own tests do, and as
+// Runtime's ticket check elsewhere in this file already establishes the
+// convention for — sees the right status even without Echo's error handler
+// in the loop, and returns ok=false with that response already written as
+// handlerErr so the caller can just `return handlerErr` immediately. Shared
+// by every endpoint gated on this run-scoped credential (ApprovalsInternal,
+// SchemasInternal) so the 401 path is defined in exactly one place.
+func (h *MCPHandler) resolveWriteToken(c echo.Context) (uid string, ok bool, handlerErr error) {
+	tok := c.Request().Header.Get("X-Agent-MCP-Write-Token")
+	uid, ok = h.runTokens.Resolve(tok)
+	if !ok {
+		return "", false, c.JSON(http.StatusUnauthorized, map[string]string{"message": "invalid or missing mcp write token"})
+	}
+	return uid, true, nil
+}
+
 // ApprovalsInternal handles POST /v1/ai/_internal/mcp/approvals — Python's
 // only write path into Go for MCP (design doc §5.4). It records that the
 // user consented ("don't ask again") to server_id+tool_name, which later
@@ -678,13 +697,9 @@ func lookupSchemaHash(toolsJSON, toolName string) string {
 // Security-sensitive, read carefully before changing:
 //
 //  1. Auth is the run-scoped write token (X-Agent-MCP-Write-Token), minted
-//     once per run by Runtime(). No token, an unknown token, or an expired
-//     one is a 401 — written directly via c.JSON (not echo.NewHTTPError) so
-//     that a caller inspecting rec.Code directly (as this handler's own
-//     tests do, and as Runtime's ticket check above already establishes the
-//     convention for) sees the right status even without Echo's error
-//     handler in the loop. The authorization subject must never be
-//     inferable from an unauthenticated call.
+//     once per run by Runtime() and resolved via resolveWriteToken. No
+//     token, an unknown token, or an expired one is a 401. The authorization
+//     subject must never be inferable from an unauthenticated call.
 //  2. The token resolves to a user_id. The target server has an owner;
 //     if they differ this is a 403 — otherwise any run could grant
 //     approvals on a server it does not own. GetMcpServer filters by
@@ -701,18 +716,28 @@ func lookupSchemaHash(toolsJSON, toolName string) string {
 //     EffectiveApprovals compare the stored value against the CURRENT
 //     runtime observation, so a self-consistent forged pair would never be
 //     invalidated, producing an approval that can never expire.
+//  4. tool_name is trimmed exactly once (into the toolName local) and that
+//     same trimmed value is used for the emptiness check, the "*" routing
+//     decision, and the write itself. Validating against the trimmed value
+//     while writing the untrimmed one would let " create_issue " pass
+//     validation but land in storage as literally " create_issue " — a
+//     value no gate could ever match, silently producing an approval that
+//     re-asks forever with no error surfaced anywhere. (A padded wildcard
+//     like " * " already fails safe under this scheme too: it is not equal
+//     to "*", so it falls through to Put as an ordinary, never-matching tool
+//     name instead of ever reaching PutServerLevel.)
 func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
-	tok := c.Request().Header.Get("X-Agent-MCP-Write-Token")
-	uid, ok := h.runTokens.Resolve(tok)
+	uid, ok, err := h.resolveWriteToken(c)
 	if !ok {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"message": "invalid or missing mcp write token"})
+		return err
 	}
 
 	var req mcpApprovalsRequest
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	if req.ServerID == 0 || strings.TrimSpace(req.ToolName) == "" {
+	toolName := strings.TrimSpace(req.ToolName)
+	if req.ServerID == 0 || toolName == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "server_id and tool_name required")
 	}
 
@@ -734,16 +759,16 @@ func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
 		identityFP = rt.IdentityFP
 	}
 
-	if req.ToolName == "*" {
+	if toolName == "*" {
 		// PutServerLevel is the only path allowed to write the '*' sentinel
 		// row; Put itself rejects tool_name=="*" (Task 10).
 		err = h.svc.MCPApprovals().PutServerLevel(req.ServerID, identityFP)
 	} else {
 		var schemaHash string
 		if rt != nil {
-			schemaHash = lookupSchemaHash(rt.ToolsJSON, req.ToolName)
+			schemaHash = lookupSchemaHash(rt.ToolsJSON, toolName)
 		}
-		err = h.svc.MCPApprovals().Put(req.ServerID, req.ToolName, identityFP, schemaHash)
+		err = h.svc.MCPApprovals().Put(req.ServerID, toolName, identityFP, schemaHash)
 	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -761,10 +786,28 @@ func (h *MCPHandler) ApprovalsInternal(c echo.Context) error {
 // This endpoint is read-only — it never writes runtime rows or schemas; Go
 // is the sole writer of that state, populated by the probe path (Task 7),
 // not by anything reachable from here.
+//
+// Auth: this requires the same run-scoped write token as ApprovalsInternal,
+// plus an ownership check against the resolved user_id. LocalhostOnly alone
+// is NOT sufficient here — :id is a bare, sequential primary key, so without
+// a positive credential and ownership check, any local process could walk
+// id=1,2,3... and read every user's MCP tool names, argument schemas and
+// third-party prose (and even derive a probed/exists oracle from
+// listed_at != 0). Every other user-scoped internal endpoint in this service
+// carries a positive credential on top of LocalhostOnly (Runtime requires
+// the MCP ticket; ProviderCredentials requires a constant-time token
+// compare) — this endpoint follows the same doctrine.
 func (h *MCPHandler) SchemasInternal(c echo.Context) error {
+	uid, ok, err := h.resolveWriteToken(c)
+	if !ok {
+		return err
+	}
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid id")
+	}
+	if _, err := h.svc.MCP().GetMcpServer(id, uid); err != nil {
+		return echo.NewHTTPError(http.StatusForbidden, "server does not belong to the authenticated user")
 	}
 	listedAt, schemasJSON, err := h.svc.MCPRuntime().GetSchemas(id)
 	if err != nil {
