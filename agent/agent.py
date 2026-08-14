@@ -683,7 +683,15 @@ class AgentRunner:
             # RuntimePayload (channel runs, or an older Go build whose
             # response parse_runtime already tolerates missing approvals for)
             # — degrading to "ask every time" rather than failing the run.
-            mcp_client._CONFIRMED_TOOLS_VAR.set(_mcp_payload.approvals if _mcp_payload else set())
+            # A COPY, never the payload's own set: _ensure_confirmed (Task 17)
+            # mutates this ContextVar's set in place when the user picks
+            # "don't ask again" this run, to avoid re-asking later in the
+            # SAME run. Handing it the payload's own `approvals` set directly
+            # would let that in-place mutation write through to
+            # RuntimePayload.approvals itself, making the payload object
+            # non-reusable (phase-3 review defect ②).
+            mcp_client._CONFIRMED_TOOLS_VAR.set(
+                set(_mcp_payload.approvals) if _mcp_payload else set())
             _mcp_server_list = mcp_servers if isinstance(mcp_servers, list) else []
             _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_server_list)
             mcp_client._RUN_SERVERS_VAR.set(

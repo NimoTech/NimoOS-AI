@@ -6,8 +6,6 @@ gives up (returns []) rather than block startup, so a miss means the model simpl
 cannot see those tools this turn. The server's ttlMs is therefore an INPUT to our
 policy, never a replacement for it.
 """
-import asyncio
-
 import pytest
 
 import mcp_client.client as mc
@@ -32,33 +30,3 @@ def test_resolve_ttl_uses_named_constants():
     assert mc.SCHEMA_TTL == 600
     assert mc.SCHEMA_TTL_MIN == 60
     assert mc.SCHEMA_TTL_MAX == 3600
-
-
-@pytest.mark.asyncio
-async def test_cold_path_has_a_single_total_budget(monkeypatch):
-    """Raising the connect leg to 8s must not double the run-start worst case.
-    connect + list share ONE budget, so the cold path still gives up around 10s."""
-    import time
-
-    mc._SCHEMA_CACHE.clear()
-    mc._REVALIDATING.clear()
-    mc.EVENT_QUEUE_VAR.set(None)
-    monkeypatch.setattr(mc, "MCP_COLD_TOTAL_TIMEOUT", 0.1)
-
-    async def never_connects(server, connect_timeout=None):
-        await asyncio.sleep(30)
-
-    async def noop_revalidate(s):
-        return None
-
-    monkeypatch.setattr(mc, "_connect", never_connects)
-    monkeypatch.setattr(mc, "_revalidate", noop_revalidate)
-
-    started = time.monotonic()
-    metas, status, detail = await mc._metas_for_server(
-        {"id": 1, "name": "x", "transport": "http", "url": "https://x"})
-    elapsed = time.monotonic() - started
-
-    assert metas == []                    # give up rather than block run start
-    assert status == mc.FAILED and detail # the failure is now visible to the model
-    assert elapsed < 1.0, f"cold path was not capped by the total budget ({elapsed:.2f}s)"

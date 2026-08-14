@@ -170,7 +170,11 @@ def _approve_first(mgr, q):
 
 
 @pytest.mark.asyncio
-async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
+async def test_unknown_tool_keeps_stale_cache_no_refresh(monkeypatch):
+    """As of Task 17, Go is the sole writer of MCP runtime state: an
+    unknown-tool error no longer drops the schema cache or schedules any
+    Python-side refresh (both mechanisms are deleted). The stale entry is
+    left exactly as it was; only the model-facing message changes."""
     class UnknownToolConn:
         async def call_tool(self, name, args):
             raise MCPError(code=METHOD_NOT_FOUND, message="Unknown tool: search")
@@ -179,16 +183,12 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
     mgr, q = _setup(conn=UnknownToolConn())
     mc._SCHEMA_CACHE.clear()
     mc._cache_put(1, [META], listed_at=1)
-    scheduled = []
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
     tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert "no longer recognizes" in out and "do NOT" in out
-    assert "next message" in out                # the run's tool set is immutable (SDK decision) — the message states that honestly
-    assert 1 not in mc._SCHEMA_CACHE            # stale entry dropped
-    assert scheduled == [1]                     # refresh scheduled for the next run
+    assert 1 in mc._SCHEMA_CACHE                # stale entry is left in place — no Python-side drop
 
 
 @pytest.mark.asyncio
@@ -203,12 +203,9 @@ async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
     mgr, q = _setup(conn=ArgErrorConn())
     mc._SCHEMA_CACHE.clear()
     mc._cache_put(1, [META], listed_at=1)
-    scheduled = []
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
     tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert out.startswith("[MCP error] MCP tool search failed")
     assert 1 in mc._SCHEMA_CACHE                # cache untouched
-    assert scheduled == []

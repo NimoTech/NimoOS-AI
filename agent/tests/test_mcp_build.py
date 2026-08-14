@@ -18,9 +18,8 @@ class GoodConn:
 @pytest.fixture(autouse=True)
 def _clear_cache():
     mc._SCHEMA_CACHE.clear()
-    mc._REVALIDATING.clear()
-    mc._BACKGROUND_TASKS.clear()
     mc.EVENT_QUEUE_VAR.set(None)
+    mc.WRITE_TOKEN_VAR.set("")
     yield
     mc._SCHEMA_CACHE.clear()
 
@@ -28,8 +27,8 @@ def _clear_cache():
 @pytest.mark.asyncio
 async def test_cache_hit_does_not_connect(monkeypatch):
     mc._cache_put(1, [META], listed_at=5)
-    async def boom(s): raise AssertionError("must not connect on cache hit")
-    monkeypatch.setattr(mc, "_connect", boom)
+    async def boom(token, sid): raise AssertionError("must not fetch on cache hit")
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", boom)
     tools, statuses = await mc.build_mcp_tools([{"id": 1, "name": "x", "listed_at": 5}])
     assert [t.name for t in tools] == ["mcp__x__search"]
     assert [s.status for s in statuses] == [mc.OK]
@@ -37,30 +36,35 @@ async def test_cache_hit_does_not_connect(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cold_fetch_connects_and_caches(monkeypatch):
-    connects = {"n": 0}
-    async def fake_connect(s):
-        connects["n"] += 1
-        return GoodConn()
-    monkeypatch.setattr(mc, "_connect", fake_connect)
+async def test_cache_miss_fetches_schemas_over_loopback(monkeypatch):
+    """As of Task 17, a cache miss no longer connects to the MCP server
+    itself — it asks Go for the schemas it already has, over loopback,
+    using this run's write token."""
+    calls = []
+    async def fake_fetch(token, server_id):
+        calls.append((token, server_id))
+        return 5, [META]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+    mc.WRITE_TOKEN_VAR.set("tok")
     tools, statuses = await mc.build_mcp_tools([{"id": 1, "name": "x", "listed_at": 5}])
     assert [t.name for t in tools] == ["mcp__x__search"]
-    assert connects["n"] == 1
+    assert calls == [("tok", 1)]
     assert mc._cache_get(1, 5) is not None
     assert statuses[0].status == mc.OK
 
 
 @pytest.mark.asyncio
-async def test_cold_fetch_failure_skips(monkeypatch):
+async def test_schema_fetch_failure_skips(monkeypatch):
     events = []
     async def fake_emit(name, err): events.append(name)
     monkeypatch.setattr(mc, "_emit_warning", fake_emit)
-    async def boom(s): raise RuntimeError("down")
-    monkeypatch.setattr(mc, "_connect", boom)
+    async def fake_fetch(token, server_id):
+        return 0, []   # mcp_client.runtime.fetch_schemas's documented degrade shape
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
     tools, statuses = await mc.build_mcp_tools([{"id": 9, "name": "bad"}])
     assert tools == [] and events == ["bad"]
     assert statuses[0].name == "bad" and statuses[0].status == mc.FAILED
-    assert "down" in statuses[0].detail        # the reason reaches the model now
+    assert statuses[0].detail        # the reason reaches the model now
 
 
 @pytest.mark.asyncio
@@ -70,13 +74,13 @@ async def test_listed_at_mismatch_forces_cold_refetch(monkeypatch):
     body is a plain miss — never served stale — even though it is still sitting
     right there in _SCHEMA_CACHE."""
     mc._cache_put(1, [META], listed_at=1)
-    connects = {"n": 0}
-    async def fake_connect(s):
-        connects["n"] += 1
-        return GoodConn()
-    monkeypatch.setattr(mc, "_connect", fake_connect)
+    calls = {"n": 0}
+    async def fake_fetch(token, server_id):
+        calls["n"] += 1
+        return 2, [META]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
     tools, statuses = await mc.build_mcp_tools([{"id": 1, "name": "x", "listed_at": 2}])
-    assert connects["n"] == 1
+    assert calls["n"] == 1
     assert [t.name for t in tools] == ["mcp__x__search"]
     assert statuses[0].status == mc.OK
     assert mc._cache_get(1, 2) is not None     # refetched body now cached under the new listed_at
@@ -87,33 +91,15 @@ async def test_listed_at_zero_never_trusts_the_cache(monkeypatch):
     """A server Go has never successfully probed reports listed_at == 0.
     _cache_get must never report a hit for that — 0 can't be a real cached
     state (see _cache_put's write guard) — so this must always fall through
-    to a fresh connect rather than serving whatever happens to be cached."""
+    to a fresh fetch rather than serving whatever happens to be cached."""
     mc._cache_put(1, [META], listed_at=1)      # some unrelated prior good entry
-    connects = {"n": 0}
-    async def fake_connect(s):
-        connects["n"] += 1
-        return GoodConn()
-    monkeypatch.setattr(mc, "_connect", fake_connect)
-    await mc.build_mcp_tools([{"id": 1, "name": "x", "listed_at": 0}])
-    assert connects["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_schedule_revalidate_single_flight(monkeypatch):
     calls = {"n": 0}
-    async def fake_revalidate(s):
+    async def fake_fetch(token, server_id):
         calls["n"] += 1
-        import asyncio
-        await asyncio.sleep(0.02)
-    monkeypatch.setattr(mc, "_revalidate", fake_revalidate)
-    mc._REVALIDATING.clear()
-    for _ in range(5):
-        mc._schedule_revalidate({"id": 1, "name": "x"})
-    import asyncio
-    await asyncio.sleep(0.05)
+        return 0, []
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+    await mc.build_mcp_tools([{"id": 1, "name": "x", "listed_at": 0}])
     assert calls["n"] == 1
-    assert 1 not in mc._REVALIDATING
-    assert len(mc._BACKGROUND_TASKS) == 0
 
 
 @pytest.mark.asyncio

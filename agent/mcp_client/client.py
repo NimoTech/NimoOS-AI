@@ -20,8 +20,9 @@ from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATIO
 
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
-from mcp_client.status import OK, FAILED, WARMING, CONFIG_ERROR, ServerStatus
+from mcp_client.status import OK, FAILED, CONFIG_ERROR, ServerStatus
 from mcp_client.hashing import schema_hash, desc_hash
+from mcp_client import runtime as mcp_runtime
 
 # Nominal connect budget; raised 5→8 for mcp 2.0 (mode="auto" first probes
 # server/discover and falls back to the legacy initialize handshake on old
@@ -33,18 +34,15 @@ from mcp_client.hashing import schema_hash, desc_hash
 # connect_to)) — the http branch builds its httpx2.AsyncClient with
 # `timeout=session_to`, and the sse branch passes `timeout=session_to` to
 # sse_client, neither touches connect_to. So today the 5→8 change has zero
-# runtime effect; the actual upper bounds are: http/sse's run-start cold path
-# is capped at the _metas_for_server layer by MCP_COLD_TOTAL_TIMEOUT, and
-# stdio is capped by STDIO_CONNECT_TIMEOUT (via _connect_timeout()), not this
-# constant. Not deleted — tests/test_mcp_stdio.py pins _connect_timeout()'s
-# lookup table against it, and it is still the value _cold_fetch's default
-# `connect_timeout=None` resolves to.
+# runtime effect; stdio is capped by STDIO_CONNECT_TIMEOUT (via
+# _connect_timeout()), not this constant. Since Task 17, building a run's
+# live tool list no longer dials a third-party server at all — Go is the
+# sole party that connects to build a schema list (_metas_for_server asks
+# Go for schemas over loopback instead, see its own docstring) — so this
+# constant now only matters for an actual per-tool-call connect
+# (_get_run_conn) and for the /test probe (_test_server_inner). Not deleted
+# — tests/test_mcp_stdio.py pins _connect_timeout()'s lookup table against it.
 MCP_CONNECT_TIMEOUT = 8
-
-# Single hard cap on the WHOLE run-start cold path (connect + list). Without it,
-# raising the connect leg to 8s would push the worst case from 5+5 to 8+8 and make
-# run start noticeably slower; this keeps it exactly where it was.
-MCP_COLD_TOTAL_TIMEOUT = 10
 
 # ClientSession read timeout — bounds each JSON-RPC request (list_tools AND call_tool),
 # NOT just the connect. Must be generous: remote tool calls (e.g. MS Learn semantic
@@ -224,8 +222,6 @@ class _CacheEntry:
 
 
 _SCHEMA_CACHE: "OrderedDict[int, _CacheEntry]" = OrderedDict()  # key = server["id"], LRU
-_REVALIDATING: set = set()             # re-entrancy guard: only one background refresh per server at a time
-_BACKGROUND_TASKS: set = set()         # strong refs so asyncio.create_task tasks aren’t GC’d
 
 
 def _extract_meta(mcp_tool) -> dict:
@@ -351,8 +347,15 @@ def _gate_args(args: dict, patterns: list[str]) -> None:
 
 
 async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
-    key = f"{server['id']}::{tool_name}"
-    if key in _CONFIRMED_TOOLS_VAR.get(set()):
+    sid = server["id"]
+    key = f"{sid}::{tool_name}"
+    confirmed_tools = _CONFIRMED_TOOLS_VAR.get(set())
+    # A server-level approval (the "{id}::*" form documented above — see
+    # Go's PutServerLevel/EffectiveApprovals) covers every tool on that
+    # server, so it must be checked ALONGSIDE the exact-tool key, not
+    # instead of it. Checking only the exact key silently ignored a
+    # wildcard grant (phase-3 review defect ①).
+    if f"{sid}::*" in confirmed_tools or key in confirmed_tools:
         return True
     mgr = CONFIRM_MGR_VAR.get()
     queue = EVENT_QUEUE_VAR.get()
@@ -368,9 +371,24 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     })
     confirmed = await mgr.wait(confirm_id)
     if confirmed and mgr.consume_remember(confirm_id):
-        s = _CONFIRMED_TOOLS_VAR.get(set())
-        s.add(key)
-        _CONFIRMED_TOOLS_VAR.set(s)
+        # Keep this run from asking again for the rest of THIS run. This
+        # mutates the ContextVar's set object in place — safe only because
+        # agent.py seeds _CONFIRMED_TOOLS_VAR with a COPY of
+        # RuntimePayload.approvals at run start (see its own comment there),
+        # never the payload's own set, so this can never write through to
+        # the payload object (phase-3 review defect ②).
+        confirmed_tools.add(key)
+        _CONFIRMED_TOOLS_VAR.set(confirmed_tools)
+        # Persist the choice with Go so it also survives across runs/
+        # sessions and a server being disabled and re-enabled. Degradation
+        # rule (design doc §5.4, non-negotiable — see
+        # mcp_client.runtime.put_approval's own docstring): a write failure
+        # here is IGNORED and this call still proceeds. Losing the
+        # persisted preference only costs "the user gets asked again next
+        # time" (annoying); refusing a call the user just explicitly
+        # approved, purely because a write-back to Go failed, would be a
+        # broken product.
+        await mcp_runtime.put_approval(WRITE_TOKEN_VAR.get(""), sid, tool_name)
     return confirmed
 
 
@@ -550,16 +568,18 @@ def _wrap_tool(server: dict, meta: dict, slug: str) -> FunctionTool:
             if _is_unsupported_capability(e):
                 return _unsupported_capability_msg(server["name"])
             if _is_unknown_tool(e):
-                # Defect ①: within the TTL the manifest keeps advertising a tool
-                # the server has removed, and nothing ever corrected it. Drop the
-                # entry and refresh in the background. The run's tool set is
-                # immutable (an SDK decision), so the refresh helps the NEXT run
-                # — the message states that honestly.
-                _SCHEMA_CACHE.pop(server["id"], None)
-                _schedule_revalidate(server)
+                # The manifest still lists this tool, but the server says it
+                # doesn't exist — the listing is stale. We do NOT refresh it
+                # here: Go is the sole writer of MCP runtime state (design
+                # doc §2.1), and requirement ② (a Python-side self-heal) has
+                # been dropped. The stale listing self-corrects once
+                # listed_at + ttl_sec expires and the next Runtime GET
+                # triggers Go's own background probe to fix it — an accepted
+                # upper bound of ttl_sec (<= 1h). This delay is a
+                # deliberately accepted cost; see design doc §2.5.
                 return (f'[MCP error] MCP server "{server["name"]}" no longer recognizes '
                         f"tool {tool_name} — it may have been removed on the server side. "
-                        "The tool list will be refreshed for your next message; do NOT "
+                        "The tool list will refresh automatically over time; do NOT "
                         "retry this call with different arguments.")
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
@@ -611,8 +631,8 @@ class McpConn:
 
     async def aclose(self):
         try:
-            # Shielded: _cold_fetch's finally and test_server both call this from
-            # inside an outer asyncio.wait_for. A bare await would be re-cancelled
+            # Shielded: test_server calls this from inside an outer
+            # asyncio.wait_for. A bare await would be re-cancelled
             # on the spot, leaving the Client context unexited (leaked httpx client
             # / unix socket). move_on_after keeps the shield from waiting forever.
             with anyio.CancelScope(shield=True):
@@ -753,14 +773,16 @@ async def _connect(server: dict, connect_timeout: int = None) -> "McpConn":
     aclose() unwinds the whole stack (Client → transport → socket/subprocess).
 
     connect_timeout is only actually ENFORCED for the stdio branch (passed straight
-    through to netns start_mcp_stdio). For http/sse, the connect is bounded
-    differently in different callers: _get_run_conn and _revalidate do NOT wrap
+    through to netns start_mcp_stdio). For http/sse, _get_run_conn does NOT wrap
     _connect() in asyncio.wait_for, so the handshake is bounded only by the generous
-    httpx2 AsyncClient(timeout=session_to) built in _build_transport. For the
-    run-start cold path, _metas_for_server wraps _cold_fetch (which calls _connect)
-    in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the entire connect+list
-    sequence together. test_server also wraps its connect+list probe in an outer
-    asyncio.wait_for.
+    httpx2 AsyncClient(timeout=session_to) built in _build_transport. test_server
+    wraps its own connect+list probe in an outer asyncio.wait_for instead.
+
+    Building a run's live tool list (_metas_for_server) no longer calls
+    _connect() at all as of Task 17 — see that function's own docstring: Go is
+    now the sole party that dials the MCP server to produce a schema list;
+    this function is only reached for an actual per-tool-call connect
+    (_get_run_conn) and for the /test probe (_test_server_inner).
     """
     connect_to = connect_timeout if connect_timeout is not None else _connect_timeout(server)
     session_to = _session_timeout(server)
@@ -845,92 +867,43 @@ async def close_run_conns() -> None:
     conns.clear()
 
 
-def _schedule_revalidate(server: dict) -> None:
-    sid = server["id"]
-    if sid in _REVALIDATING:           # single-flight per server
-        return
-    _REVALIDATING.add(sid)
-    task = asyncio.create_task(_revalidate(server))
-    _BACKGROUND_TASKS.add(task)        # strong ref so the task isn't GC'd mid-await
-    def _done(t):
-        _BACKGROUND_TASKS.discard(t)
-        _REVALIDATING.discard(sid)
-    task.add_done_callback(_done)
-
-
-async def _revalidate(server: dict) -> None:
-    try:
-        # background: not blocking any run, so use the generous session budget for
-        # both connect and list (tolerates a cold remote connect that the 8s
-        # run-start cap would reject). This is what self-heals a slow server.
-        conn = await _connect(server, connect_timeout=_session_timeout(server))
-        try:
-            metas, _ttl = await asyncio.wait_for(conn.list_tools(),
-                                                 timeout=_session_timeout(server))
-            # listed_at, not the server's own ttlMs, is what this write is keyed
-            # under — see _CacheEntry. server["listed_at"] is whatever Go handed
-            # this run at start; if this server was never probed by Go (0), the
-            # _cache_put guard below is a no-op rather than caching under "0".
-            _cache_put(server["id"], metas, server.get("listed_at", 0))
-        finally:
-            await conn.aclose()
-    except Exception:
-        pass   # keep stale cache; background task must never raise
-
-
-async def _cold_fetch(server: dict):
-    """Connect once just to read schemas; cache + return metas. Connection is
-    closed immediately (real calls use the per-run lazy connection)."""
-    conn = await _connect(server)
-    try:
-        # No wait_for here — the caller (_metas_for_server) wraps the whole _cold_fetch
-        # in asyncio.wait_for with MCP_COLD_TOTAL_TIMEOUT, capping the complete cold path
-        # (connect + list). Wrapping again here with the same constant would create dead code:
-        # the outer deadline (started before _connect) always fires first, so the inner
-        # wait_for would never actually timeout. Per-request read timeouts are separately
-        # bounded by Client(read_timeout_seconds=...) in _connect.
-        metas, _ttl = await conn.list_tools()
-    finally:
-        await conn.aclose()
-    _cache_put(server["id"], metas, server.get("listed_at", 0))
-    return metas
-
-
 async def _metas_for_server(server: dict):
     """Return (tool metas, status, detail) for a server, preferring cache.
-    Cold / listed_at advanced -> fetch inline. On failure returns
-    ([], FAILED/WARMING, reason) and still emits the UI warning event — the
-    status return is the model-facing channel (defect 1), the event is the
-    UI-facing one; both render the same fact.
+    On failure returns ([], FAILED, reason) and still emits the UI warning
+    event — the status return is the model-facing channel (defect 1), the
+    event is the UI-facing one; both render the same fact.
 
     Freshness is a single exact match against server["listed_at"] — the value
     Go handed this run at start (see _CacheEntry). There is no separate
-    stale-while-revalidate window here anymore: once Go's listed_at moves on
-    (new probe, config change, anything), the old body is just a miss, not a
+    stale-while-revalidate window here: once Go's listed_at moves on (new
+    probe, config change, anything), the old body is just a miss, not a
     "stale but good enough" body to keep serving.
+
+    As of Task 17, this function never connects to the MCP server itself.
+    Go is the sole party that dials third-party servers to produce a schema
+    list now (design doc's architecture inversion) — on a cache miss this
+    asks Go for the schemas it already has, over loopback, via
+    mcp_client.runtime.fetch_schemas, using this run's write token. The only
+    remaining place Python itself connects to an MCP server is a genuine
+    per-tool-call invocation (_get_run_conn, reached from _wrap_tool), never
+    while merely building the run's tool list.
     """
     listed_at = server.get("listed_at", 0)
     entry = _cache_get(server["id"], listed_at)
     if entry is not None:
         return entry.metas, OK, ""
-    # cold / listed_at advanced since our last fetch:
-    if server.get("transport") == "stdio":
-        _schedule_revalidate(server)            # background single-flight self-healing warmup (connect+list+cache), does not block run startup
-        await _emit_warning(server.get("name", "mcp"),
-                            "stdio tools are initializing in the background for first use; retry shortly")
-        return [], WARMING, "stdio server is initializing in the background"
-    try:
-        # ONE budget for the whole cold path (connect + list). The connect leg alone
-        # is now 8s for mode="auto"'s extra server/discover round trip; without this
-        # cap the run-start worst case would grow from 5+5 to 8+8.
-        metas = await asyncio.wait_for(_cold_fetch(server), timeout=MCP_COLD_TOTAL_TIMEOUT)
-        return metas, OK, ""
-    except Exception as e:
-        # A cold-fetch timeout is usually a cold connection on a slow link.
-        # Warm the cache in the background with a generous timeout; tools are ready by the next run.
-        _schedule_revalidate(server)
-        await _emit_warning(server.get("name", "mcp"), e)
-        return [], FAILED, str(e) or type(e).__name__
+    write_token = WRITE_TOKEN_VAR.get("")
+    fetched_at, schemas = await mcp_runtime.fetch_schemas(write_token, server["id"])
+    if fetched_at:
+        _cache_put(server["id"], schemas, fetched_at)
+        return schemas, OK, ""
+    # fetch_schemas degrades to (0, []) on any network error, non-200 status,
+    # or malformed body (see its own docstring) — never raises. That is
+    # indistinguishable here from "nothing to show yet", so it is reported
+    # the same way build_mcp_tools already reports any other load failure.
+    detail = "could not fetch tool schemas from nimoos-ai"
+    await _emit_warning(server.get("name", "mcp"), detail)
+    return [], FAILED, detail
 
 
 def assign_slugs(servers: list[dict]) -> dict[int, str]:
