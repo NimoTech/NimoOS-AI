@@ -303,6 +303,11 @@ type runtimeServer struct {
 	// must not connect with an unauthenticated config — a 401 at call time
 	// would mask the real cause (the stored credentials are broken).
 	ConfigError string `json:"config_error,omitempty"`
+	// UpdatedAt is mcp_servers.updated_at (the config row itself, not the
+	// probe observation below) — when the user last edited this server's
+	// settings. Nothing consumes it yet; it ships because the brief's
+	// Interfaces block lists it alongside the identity card fields.
+	UpdatedAt int64 `json:"updated_at"`
 
 	// Everything below is the identity card + health observation persisted by
 	// probeAndPersist (Task 7) into mcp_server_runtime. This is the whole
@@ -515,7 +520,8 @@ func (h *MCPHandler) Runtime(c echo.Context) error {
 			ID: m.ID, Name: m.Name, Transport: m.Transport, URL: m.URL,
 			Command: m.Command, Args: args,
 			Env: env, Headers: headers,
-			Tools: []service.ToolMeta{},
+			UpdatedAt: m.UpdatedAt,
+			Tools:     []service.ToolMeta{},
 		}
 		if envErr != nil || hdrErr != nil {
 			rs.Env, rs.Headers = map[string]string{}, map[string]string{}

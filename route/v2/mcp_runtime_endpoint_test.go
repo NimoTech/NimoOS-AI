@@ -197,6 +197,21 @@ func TestRuntimeSkipsRefreshWhenInCooldown(t *testing.T) {
 	if probeHit.Load() {
 		t.Fatal("a server in cooldown was probed — the circuit breaker is decorative")
 	}
+	// The 150ms window above is a soft guard: if the gate ever regressed, a
+	// wrongly-spawned goroutine would still need to win a race against the
+	// sleep to be caught. Assert the persisted state deterministically too:
+	// probe_state was seeded as "ok" by SaveSuccess and MarkProbing is the
+	// only thing that flips it to "probing" — any probe attempt, wrongly
+	// fired or not, changes this column immediately, before it ever reaches
+	// the network. If this ever regresses to "probing" (or "failed", had the
+	// fake agent's response reached SaveFailure), the breaker did not hold.
+	rt, err := svc.MCPRuntime().Get(serverID)
+	if err != nil {
+		t.Fatalf("get runtime: %v", err)
+	}
+	if rt == nil || rt.ProbeState != "ok" {
+		t.Fatalf("expected probe_state to stay 'ok' with no probe attempted, got %+v", rt)
+	}
 }
 
 // TestRuntimeIncludesWriteTokenAndApprovals asserts the response carries the
@@ -204,7 +219,7 @@ func TestRuntimeSkipsRefreshWhenInCooldown(t *testing.T) {
 // in the SAME response as the server list — zero extra round-trips is part
 // of requirement ①.
 func TestRuntimeIncludesWriteTokenAndApprovals(t *testing.T) {
-	svc, _ := mcpRuntimeTestSvc(t)
+	svc, db := mcpRuntimeTestSvc(t)
 	ts := NewTicketStore(time.Minute)
 	runTokens := NewRunTokenStore(time.Minute)
 	h := NewMCPHandler(svc, ts, runTokens, "http://127.0.0.1:1")
@@ -223,8 +238,22 @@ func TestRuntimeIncludesWriteTokenAndApprovals(t *testing.T) {
 	// fires and the (deliberately unreachable) agentURL above is never hit.
 	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{
 		ServerID: serverID, TTLSec: 3600, IdentityFP: identityFP,
+		Handle: "github", Summary: "GitHub issues and PRs",
+		Instructions: "Use create_issue to file bugs.", ProtocolMode: "2026-07-28",
 	}, []service.ToolMeta{{Name: "create_issue", SchemaHash: "h1", DescHash: "d1"}}, "[]"); err != nil {
 		t.Fatalf("seed runtime: %v", err)
+	}
+	// SaveSuccess unconditionally zeroes last_error/last_error_key/
+	// cooldown_until (a successful probe clears any prior failure state), so
+	// stamp non-zero/non-empty values directly to prove they round-trip
+	// through the response under their exact JSON keys. This does not
+	// re-trigger the TTL self-check: listed_at (just set to now by
+	// SaveSuccess) plus the 3600s TTL above is nowhere near expired, so the
+	// probe pre-filter's TTL condition alone keeps this server untouched
+	// regardless of cooldown_until's value.
+	if _, err := db.Exec(`UPDATE mcp_server_runtime SET last_error=?, last_error_key=?, cooldown_until=? WHERE server_id=?`,
+		"agent unreachable", "agent_unreachable", time.Now().Unix()+60, serverID); err != nil {
+		t.Fatalf("stamp error fields: %v", err)
 	}
 	// A server-level '*' approval whose identity_fp matches the current
 	// runtime row passes all four EffectiveApprovals gates.
@@ -242,6 +271,25 @@ func TestRuntimeIncludesWriteTokenAndApprovals(t *testing.T) {
 	}
 
 	var out struct {
+		Servers []struct {
+			ID           int64  `json:"id"`
+			UpdatedAt    int64  `json:"updated_at"`
+			Handle       string `json:"handle"`
+			Summary      string `json:"summary"`
+			Instructions string `json:"instructions"`
+			Tools        []struct {
+				Name       string `json:"name"`
+				SchemaHash string `json:"schema_hash"`
+				DescHash   string `json:"desc_hash"`
+			} `json:"tools"`
+			ListedAt      int64  `json:"listed_at"`
+			TTLSec        int64  `json:"ttl_sec"`
+			ProtocolMode  string `json:"protocol_mode"`
+			ProbeState    string `json:"probe_state"`
+			LastError     string `json:"last_error"`
+			LastErrorKey  string `json:"last_error_key"`
+			CooldownUntil int64  `json:"cooldown_until"`
+		} `json:"servers"`
 		Approvals []struct {
 			ServerID int64  `json:"server_id"`
 			ToolName string `json:"tool_name"`
@@ -257,6 +305,52 @@ func TestRuntimeIncludesWriteTokenAndApprovals(t *testing.T) {
 	}
 	if len(out.Approvals) != 1 || out.Approvals[0].ServerID != serverID || out.Approvals[0].ToolName != "*" {
 		t.Fatalf("expected the one effective approval to ship in the same response, got %+v", out.Approvals)
+	}
+
+	// Every identity-card / health-observation key by name: a silent rename
+	// here would land unnoticed on Task 12 (the Python parser reads these
+	// keys by name, and is written to tolerate MISSING fields, not renamed
+	// ones).
+	if len(out.Servers) != 1 {
+		t.Fatalf("expected exactly one server, got %+v", out.Servers)
+	}
+	s := out.Servers[0]
+	if s.Handle != "github" {
+		t.Fatalf("handle: got %q", s.Handle)
+	}
+	if s.Summary != "GitHub issues and PRs" {
+		t.Fatalf("summary: got %q", s.Summary)
+	}
+	if s.Instructions != "Use create_issue to file bugs." {
+		t.Fatalf("instructions: got %q", s.Instructions)
+	}
+	if len(s.Tools) != 1 || s.Tools[0].Name != "create_issue" ||
+		s.Tools[0].SchemaHash != "h1" || s.Tools[0].DescHash != "d1" {
+		t.Fatalf("tools: got %+v", s.Tools)
+	}
+	if s.ListedAt == 0 {
+		t.Fatalf("listed_at: expected a non-zero timestamp, got %d", s.ListedAt)
+	}
+	if s.TTLSec != 3600 {
+		t.Fatalf("ttl_sec: got %d", s.TTLSec)
+	}
+	if s.ProtocolMode != "2026-07-28" {
+		t.Fatalf("protocol_mode: got %q", s.ProtocolMode)
+	}
+	if s.ProbeState != "ok" {
+		t.Fatalf("probe_state: got %q", s.ProbeState)
+	}
+	if s.LastError != "agent unreachable" {
+		t.Fatalf("last_error: got %q", s.LastError)
+	}
+	if s.LastErrorKey != "agent_unreachable" {
+		t.Fatalf("last_error_key: got %q", s.LastErrorKey)
+	}
+	if s.CooldownUntil == 0 {
+		t.Fatalf("cooldown_until: expected the stamped non-zero value, got %d", s.CooldownUntil)
+	}
+	if s.UpdatedAt == 0 {
+		t.Fatalf("updated_at: expected mcp_servers.updated_at to be non-zero, got %d", s.UpdatedAt)
 	}
 
 	// The token must actually resolve to this run's user — proving it was

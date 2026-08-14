@@ -67,10 +67,22 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	e := echo.New()
 
 	enc, _ := svc.MasterKey().Encrypt(`{"Authorization":"Bearer SECRET"}`)
-	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+	m := &service.McpServer{
 		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
 		Args: "[]", Env: "{}", Headers: enc, Enabled: true,
-	})
+	}
+	_ = svc.MCP().CreateMcpServer(m)
+	// Task 8's TTL self-check treats a server with no runtime row as
+	// trivially expired and fires a background probe against agentURL
+	// ("http://127.0.0.1:1" above, deliberately unreachable). Seed a fresh,
+	// long-TTL runtime row so that pre-filter skips this server: this test
+	// is about decryption, not the self-check, and an unwanted goroutine
+	// would otherwise call SaveFailure after t.Cleanup has closed the DB —
+	// harmless in production but noisy/racy here.
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{ServerID: m.ID, TTLSec: 3600},
+		[]service.ToolMeta{{Name: "noop", SchemaHash: "h", DescHash: "d"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
 
 	tok := ts.Mint("u1")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -112,10 +124,21 @@ func TestMcpHandler_RuntimeMarksUndecryptableConfig(t *testing.T) {
 
 	// Headers is non-empty but NOT ciphertext produced by this master key, so
 	// decryption fails — the defect-1 silent point 3 scenario.
-	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+	m := &service.McpServer{
 		UserID: "u1", Name: "broken", Transport: "http", URL: "https://x",
 		Args: "[]", Env: "{}", Headers: "garbage-not-ciphertext", Enabled: true,
-	})
+	}
+	_ = svc.MCP().CreateMcpServer(m)
+	// A decrypt failure already makes Task 8's TTL self-check skip this
+	// server (probing with known-broken credentials would just fail
+	// predictably), but seed a fresh, long-TTL runtime row anyway so this
+	// test's cleanliness does not depend on that guard remaining in place —
+	// see TestMcpHandler_RuntimeReturnsDecryptedForTicket's identical comment
+	// for what goes wrong otherwise.
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{ServerID: m.ID, TTLSec: 3600},
+		[]service.ToolMeta{{Name: "noop", SchemaHash: "h", DescHash: "d"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
 
 	tok := ts.Mint("u1")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
