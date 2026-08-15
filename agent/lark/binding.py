@@ -104,7 +104,7 @@ _IDENTITY_KEYS = frozenset({
 
 
 class _State:
-    __slots__ = ("phase", "verify_url", "identity", "error", "log", "task")
+    __slots__ = ("phase", "verify_url", "identity", "error", "log", "task", "sync_task")
 
     def __init__(self) -> None:
         self.phase: str = "unbound"
@@ -113,6 +113,11 @@ class _State:
         self.error: str = ""
         self.log: str = ""
         self.task: asyncio.Task | None = None
+        # Fire-and-forget lark skills registration kicked off once `_flow`
+        # reaches `bound` (see `_sync_skills_after_bind`). Never awaited by
+        # production code -- binding success must not depend on it -- but
+        # tests hold onto it to make the otherwise-async hook deterministic.
+        self.sync_task: asyncio.Task | None = None
 
     def snapshot(self) -> dict:
         return {
@@ -147,6 +152,8 @@ def reset_all() -> None:
     for st in _STATES.values():
         if st.task and not st.task.done():
             st.task.cancel()
+        if st.sync_task and not st.sync_task.done():
+            st.sync_task.cancel()
     _STATES.clear()
     _LOCK = asyncio.Lock()
 
@@ -476,6 +483,34 @@ def _project_identity(doc: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# lark skills sync hook (Task 9)
+# ---------------------------------------------------------------------------
+
+
+async def _sync_skills_after_bind(uid: str) -> dict | None:
+    """Fire-and-forget: register the embedded lark skills once binding
+    succeeds.
+
+    Scheduled via `asyncio.create_task` right after `_flow` sets
+    `phase = "bound"` -- never awaited there, so a slow or failing sync can
+    never turn a successful bind into a `failed` one. Any exception (import,
+    subprocess, HTTP) is caught and only logged; `lark.skills_sync` is
+    imported lazily to avoid a module-load-time circular import (it imports
+    `binding` itself for subprocess plumbing).
+    """
+    try:
+        from lark import skills_sync
+
+        result = await skills_sync.sync(uid)
+        if result.get("failed"):
+            _LOG.warning("lark skills sync had failures for %s: %s", uid, result["failed"])
+        return result
+    except Exception:  # pragma: no cover - defensive, must never surface
+        _LOG.warning("lark skills sync failed after bind for %s", uid, exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # state machine
 # ---------------------------------------------------------------------------
 
@@ -553,6 +588,9 @@ async def _flow(uid: str, st: _State) -> None:
         st.phase = "bound"
         st.verify_url = ""
         st.error = ""
+        # Fire-and-forget: schedule after `phase` is already "bound", so this
+        # can never delay or fail the binding response itself.
+        st.sync_task = asyncio.create_task(_sync_skills_after_bind(uid))
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pragma: no cover - defensive
@@ -639,6 +677,13 @@ async def unbind(uid: str) -> None:
             await _run(uid, ["auth", "logout"], LOGOUT_TIMEOUT)
         except Exception:  # pragma: no cover - logout is best-effort
             _LOG.warning("lark auth logout failed for %s", uid, exc_info=True)
+
+        try:
+            from lark import skills_sync
+
+            await skills_sync.remove_all(uid)
+        except Exception:  # pragma: no cover - removal is best-effort
+            _LOG.warning("lark skills remove_all failed during unbind for %s", uid, exc_info=True)
 
         try:
             shutil.rmtree(user_home(uid) / ".lark-cli", ignore_errors=True)

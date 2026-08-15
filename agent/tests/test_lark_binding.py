@@ -751,3 +751,103 @@ def test_m7_is_configured_is_tristate(lark_env, monkeypatch):
         assert await binding._is_configured(UID) == binding.RC_NO_CLI
 
     run_async(scenario())
+
+
+# ==========================================================================
+# Task 9: lark skills sync hook
+# ==========================================================================
+
+
+def test_bound_schedules_fire_and_forget_skills_sync(lark_env, monkeypatch):
+    """Reaching `bound` must kick off `skills_sync.sync(uid)` without
+    awaiting it inline -- a slow/failing sync must never delay or fail the
+    binding response itself."""
+    from lark import skills_sync
+
+    calls = []
+
+    async def fake_sync(uid):
+        calls.append(uid)
+        return {"installed": ["lark-base"], "failed": []}
+
+    monkeypatch.setattr(skills_sync, "sync", fake_sync)
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        st = await _await_phase("bound")
+        assert st["phase"] == "bound"
+        # bound was already reported before the hook is awaited here --
+        # proving the hook does not gate the phase transition.
+        task = binding._STATES[UID].sync_task
+        assert task is not None
+        await task
+
+    run_async(scenario())
+    assert calls == [UID]
+
+
+def test_bound_hook_exception_is_logged_not_raised(lark_env, monkeypatch):
+    from lark import skills_sync
+
+    async def boom_sync(uid):
+        raise RuntimeError("sync exploded")
+
+    monkeypatch.setattr(skills_sync, "sync", boom_sync)
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        st = await _await_phase("bound")
+        assert st["phase"] == "bound"
+        task = binding._STATES[UID].sync_task
+        result = await task  # must not raise despite the sync exploding
+        assert result is None
+
+    run_async(scenario())
+
+
+def test_unbind_calls_skills_remove_all(lark_env, monkeypatch):
+    from lark import skills_sync
+
+    calls = []
+
+    async def fake_remove_all(uid):
+        calls.append(uid)
+
+    monkeypatch.setattr(skills_sync, "remove_all", fake_remove_all)
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        await _await_phase("bound")
+        await binding.unbind(UID)
+
+    run_async(scenario())
+    assert calls == [UID]
+
+
+def test_unbind_tolerates_skills_remove_all_failure(lark_env, monkeypatch):
+    """remove_all raising must not stop the rest of unbind's teardown
+    (auth logout, rmtree, state reset)."""
+    from lark import skills_sync
+
+    async def boom_remove_all(uid):
+        raise RuntimeError("remove_all exploded")
+
+    monkeypatch.setattr(skills_sync, "remove_all", boom_remove_all)
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        await _await_phase("bound")
+        home = lark_env["homes"] / UID
+        assert (home / ".lark-cli").is_dir()
+
+        await binding.unbind(UID)  # must not raise
+
+        assert not (home / ".lark-cli").exists()
+        st = await binding.status(UID)
+        assert st["phase"] == "unbound"
+
+    run_async(scenario())
