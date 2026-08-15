@@ -94,6 +94,82 @@ func TestToolsEndpointReturnsToolsWithApprovalStateAndLastSeenAt(t *testing.T) {
 	}
 }
 
+// TestToolsEndpointTotalStoredApprovalsCountsRemovedToolApprovals pins the
+// mcp-progressive-disclosure Task 21 fix round: total_stored_approvals must
+// count EVERY row ListForServer returns for this server, including an
+// approval whose tool has since disappeared from the live tools_json
+// snapshot -- that approval gets no toolStateDTO row at all (the Tools loop
+// only ranges over metas), so len(tools) alone would silently undercount
+// exactly what CASCADE will delete if the server is removed.
+func TestToolsEndpointTotalStoredApprovalsCountsRemovedToolApprovals(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	// First handshake still lists "removed_tool" -- approve it while it's
+	// live, exactly like a real user would.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{
+			{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh1"},
+			{Name: "removed_tool", SchemaHash: "sh2", DescHash: "dh2"},
+		}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "fp", "sh1", "dh1"); err != nil {
+		t.Fatalf("approve create_issue: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "removed_tool", "fp", "sh2", "dh2"); err != nil {
+		t.Fatalf("approve removed_tool: %v", err)
+	}
+	// A later re-probe no longer lists "removed_tool" -- its approval row is
+	// untouched in mcp_tool_approvals (nothing here deletes it), but the
+	// Tools loop below only ranges over the CURRENT tools_json, so it will
+	// never produce a toolStateDTO for it.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{
+			{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh1"},
+		}, "[]"); err != nil {
+		t.Fatalf("re-probe runtime: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var out struct {
+		Tools                []struct{ Name string } `json:"tools"`
+		TotalStoredApprovals int                      `json:"total_stored_approvals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("expected 1 tool row (removed_tool dropped from the live snapshot), got %+v", out.Tools)
+	}
+	if out.TotalStoredApprovals != 2 {
+		t.Fatalf("expected total_stored_approvals=2 (both stored rows, including the removed tool's), got %d; body=%s",
+			out.TotalStoredApprovals, rec.Body.String())
+	}
+	if out.TotalStoredApprovals <= len(out.Tools) {
+		t.Fatalf("total_stored_approvals (%d) must exceed the returned tool row count (%d) in this scenario -- "+
+			"otherwise the removed tool's approval is silently uncounted", out.TotalStoredApprovals, len(out.Tools))
+	}
+}
+
 // TestToolsEndpointSetsDescChanged pins Step 3 assertion 2: desc_changed is
 // true when the stored desc_hash differs from the current one, and false
 // when the stored value is empty (the pre-upgrade case) — never true just

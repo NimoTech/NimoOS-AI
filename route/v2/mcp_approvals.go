@@ -57,11 +57,25 @@ type toolStateDTO struct {
 // has no way to know a wildcard grant exists at all (byName["*"] is server-
 // side only), so its server-level toggle always initialized off even when a
 // live grant was in force.
+//
+// TotalStoredApprovals (mcp-progressive-disclosure Task 21 fix round) is the
+// raw count of EVERY row ListForServer returned for this server — i.e.
+// len(approvals) below, before the Tools loop filters it down to whatever
+// currently appears in metas. This is the number a caller needs for "how many
+// approvals will CASCADE delete along with this server", and it can exceed
+// the count implied by the Tools/ServerLevelApproved fields above: a tool
+// that has since been removed from the server's live tools_json snapshot
+// never gets a toolStateDTO row at all (the loop below only ranges over
+// metas), so its still-stored approval would otherwise be invisible to any
+// caller trying to derive a count from Tools/ServerLevelApproved alone. No
+// new query — approvals is already fetched below for the per-tool lookup;
+// this just reports its length instead of discarding it.
 type toolsResponseDTO struct {
 	Tools                     []toolStateDTO `json:"tools"`
 	ServerLevelApproved       bool           `json:"server_level_approved"`
 	ServerLevelStaleReason    string         `json:"server_level_stale_reason,omitempty"`
 	ServerLevelStaleReasonKey string         `json:"server_level_stale_reason_key,omitempty"`
+	TotalStoredApprovals      int            `json:"total_stored_approvals"`
 }
 
 // approvalSummaryDTO is one element of GET /mcp/approvals' cross-server
@@ -192,7 +206,7 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		out = append(out, dto)
 	}
 
-	resp := toolsResponseDTO{Tools: out}
+	resp := toolsResponseDTO{Tools: out, TotalStoredApprovals: len(approvals)}
 	if hasWildcard {
 		// True even if void (see toolsResponseDTO's doc comment) — mirrors
 		// each toolStateDTO row's own Approved semantics above.
