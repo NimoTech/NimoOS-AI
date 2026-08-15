@@ -82,7 +82,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 CLONE_NEWNET = 0x40000000
 
-MEM_BYTES = 512 * 1024 * 1024
+# prlimit --as (RLIMIT_AS / virtual address space) cap for sandboxed shell
+# commands — defense in depth on top of the container's `mem_limit: 2g` cgroup,
+# which is the real backstop on physical memory. 512 MiB was too tight: Go
+# 1.21+'s runtime reserves a large virtual-address region up front in
+# runtime.mallocinit() (before any user code runs), and that reservation
+# itself fails outright under a restrictive RLIMIT_AS — crashing every
+# Go-compiled toolbox binary (e.g. `gh`) with "failed to reserve page summary
+# memory", regardless of how little memory the program actually uses.
+# Empirically (2026-08-15, gh 2.62.0 amd64 on 118): 1G/2G/4G --as all let `gh
+# --version` run; 512M does not. Default picked as min(smallest-working-tier
+# x2, 4G) = min(1G*2, 4G) = 2G, overridable via NIMOOS_SANDBOX_AS_BYTES for
+# boxes that need to go higher for some other Go-runtime toolbox component.
+MEM_BYTES = int(os.environ.get("NIMOOS_SANDBOX_AS_BYTES", 2 * 1024 * 1024 * 1024))
 MAX_TIMEOUT_SEC = 300
 DEFAULT_TIMEOUT_SEC = 30
 MAX_OUTPUT_BYTES = 16 * 1024
