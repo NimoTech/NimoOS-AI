@@ -65,6 +65,7 @@ import json
 import logging
 import os
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -409,6 +410,33 @@ def _execute_mcp_stdio(req: dict) -> dict:
 # Command execution
 # ---------------------------------------------------------------------------
 
+def _shell_argv(cmd: str) -> list[str]:
+    """Build the prlimit-wrapped bash argv for a shell *cmd*.
+
+    The command runs as ``/bin/bash -lc``, i.e. a *login* shell — that's
+    required so things like `.bashrc`/`.profile`-driven tool setups (uv, nvm,
+    etc.) still work. But a login shell also sources `/etc/profile`, which on
+    Debian unconditionally re-exports PATH (root: "/usr/local/sbin:...",
+    non-root: "/usr/local/bin:..."), silently stomping the sandbox PATH
+    (including TOOLBOX_BIN) that _execute's base_env just set. Prepending an
+    explicit `export PATH=...;` to the command string itself re-asserts the
+    sandbox PATH *after* /etc/profile has already run, since it executes as
+    part of the command bash was told to run, not as an env var bash can
+    discard on login. base_env's "PATH" is left in place too as defense in
+    depth (e.g. for the exec() call itself before bash sources anything).
+    """
+    path_export = f"export PATH={shlex.quote(_sandbox_path())}; "
+    return [
+        PRLIMIT_BIN,
+        f"--as={MEM_BYTES}",
+        f"--cpu={MAX_TIMEOUT_SEC}",
+        f"--nofile={NOFILE_LIMIT}",
+        f"--nproc={NPROC}",
+        "--",
+        "/bin/bash", "-lc", path_export + cmd,
+    ]
+
+
 def _execute(req: dict) -> dict:
     """Dispatch *req* to the appropriate handler and return a response dict."""
     req_id = req.get("id", "")
@@ -445,15 +473,7 @@ def _execute(req: dict) -> dict:
     base_env["no_proxy"] = ""
 
     # Build prlimit-wrapped command
-    argv = [
-        PRLIMIT_BIN,
-        f"--as={MEM_BYTES}",
-        f"--cpu={MAX_TIMEOUT_SEC}",
-        f"--nofile={NOFILE_LIMIT}",
-        f"--nproc={NPROC}",
-        "--",
-        "/bin/bash", "-lc", cmd,
-    ]
+    argv = _shell_argv(cmd)
 
     try:
         proc = subprocess.Popen(
