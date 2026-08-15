@@ -420,13 +420,18 @@ func (h *MCPHandler) migrateBackfillIdentityCards() error {
 	if err != nil {
 		return err
 	}
+	// One defer covers every return path below (scan error, rows.Err, and the
+	// ordinary fallthrough) uniformly -- sql.Rows.Close is idempotent, so this
+	// is safe even though earlier revisions of this loop also closed
+	// explicitly on the error path only, which left the rows.Err() path
+	// leaking the connection back to the (small) SQLite pool.
+	defer rows.Close()
 	var pending []*service.McpServer
 	for rows.Next() {
 		m := &service.McpServer{}
 		var enabled int
 		if scanErr := rows.Scan(&m.ID, &m.UserID, &m.Name, &m.Transport, &m.URL, &m.Command,
 			&m.Args, &m.Env, &m.Headers, &enabled, &m.CreatedAt, &m.UpdatedAt); scanErr != nil {
-			rows.Close()
 			return scanErr
 		}
 		m.Enabled = enabled == 1
@@ -435,7 +440,6 @@ func (h *MCPHandler) migrateBackfillIdentityCards() error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	rows.Close()
 
 	// One at a time, on purpose — see the doc comment above.
 	for _, m := range pending {

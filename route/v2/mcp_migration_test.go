@@ -340,3 +340,122 @@ func TestUpdateDoesNotInvalidateRuntimeOnRenameOrToggle(t *testing.T) {
 		t.Fatalf("listed_at/ttl_sec changed after a rename+toggle (name/enabled must never invalidate): before=%+v after=%+v", before, after)
 	}
 }
+
+// The rename-only test above cannot actually disprove a ciphertext-comparing
+// implementation: it sends no env/headers at all, so applyReq never
+// re-encrypts those columns and the ciphertext is byte-identical before and
+// after by construction — a broken implementation would pass it unchanged.
+//
+// This is the variant that actually exercises the subtlety: AES-GCM draws a
+// fresh random nonce on every Encrypt call (pkg/crypto/masterkey.go), so
+// resending the exact same header plaintext on a rename still produces
+// different ciphertext bytes. A ciphertext-comparing implementation would
+// see "the column changed" and wrongly wipe the identity card; comparing
+// decrypted plaintext (what configFPOf actually does) must not.
+func TestUpdateDoesNotInvalidateRuntimeOnRenameWhenResendingIdenticalHeaders(t *testing.T) {
+	svc := mcpTestSvc(t)
+	hdrEnc, err := svc.MasterKey().Encrypt(`{"Authorization":"Bearer secret-value"}`)
+	if err != nil {
+		t.Fatalf("encrypt headers: %v", err)
+	}
+	m := &service.McpServer{
+		UserID: "u1", Name: "github", Transport: "http", URL: "https://x.example.com/mcp",
+		Args: "[]", Env: "{}", Headers: hdrEnc, Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{
+		ServerID: m.ID, Handle: "github", Summary: "unchanged", TTLSec: 300,
+	}, []service.ToolMeta{{Name: "noop"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime row: %v", err)
+	}
+	before, err := svc.MCPRuntime().Get(m.ID)
+	if err != nil || before == nil || before.ListedAt == 0 {
+		t.Fatalf("test setup: expected a seeded runtime row with a non-zero listed_at, got %+v, err=%v", before, err)
+	}
+	beforeHeaders := m.Headers
+
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	// Rename AND resend the exact same header content (not a no-op: applyReq
+	// re-encrypts whenever req.Headers is non-nil, regardless of whether the
+	// plaintext actually differs from what was stored).
+	rec := doUpdate(t, h, m.ID, "u1",
+		`{"name":"github (renamed)","headers":{"Authorization":"Bearer secret-value"}}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("update code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	reloaded, err := svc.MCP().GetMcpServer(m.ID, "u1")
+	if err != nil {
+		t.Fatalf("GetMcpServer: %v", err)
+	}
+	if reloaded.Headers == beforeHeaders {
+		t.Fatal("test setup invalid: headers ciphertext did not change across the update, so this test cannot distinguish plaintext-compare from ciphertext-compare")
+	}
+
+	after, err := svc.MCPRuntime().Get(m.ID)
+	if err != nil {
+		t.Fatalf("MCPRuntime().Get: %v", err)
+	}
+	if after == nil {
+		t.Fatal("expected the runtime row to still exist")
+	}
+	if after.ListedAt != before.ListedAt || after.TTLSec != before.TTLSec {
+		t.Fatalf("listed_at/ttl_sec changed after a rename that resent identical header plaintext (must compare decrypted content, not ciphertext): before=%+v after=%+v", before, after)
+	}
+}
+
+// Same subtlety as above, but for env on a stdio server (env is always
+// cleared to "{}" for http/sse in validateAndClean, so the env column only
+// carries meaningful content on the stdio path).
+func TestUpdateDoesNotInvalidateRuntimeOnRenameWhenResendingIdenticalEnv(t *testing.T) {
+	svc := mcpTestSvc(t)
+	envEnc, err := svc.MasterKey().Encrypt(`{"TOKEN":"secret-value"}`)
+	if err != nil {
+		t.Fatalf("encrypt env: %v", err)
+	}
+	m := &service.McpServer{
+		UserID: "u1", Name: "local-tool", Transport: "stdio", Command: "npx",
+		Args: `["-y","some-server"]`, Env: envEnc, Enabled: true,
+	}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{
+		ServerID: m.ID, Handle: "local-tool", Summary: "unchanged", TTLSec: 300,
+	}, []service.ToolMeta{{Name: "noop"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime row: %v", err)
+	}
+	before, err := svc.MCPRuntime().Get(m.ID)
+	if err != nil || before == nil || before.ListedAt == 0 {
+		t.Fatalf("test setup: expected a seeded runtime row with a non-zero listed_at, got %+v, err=%v", before, err)
+	}
+	beforeEnv := m.Env
+
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	rec := doUpdate(t, h, m.ID, "u1",
+		`{"name":"local-tool (renamed)","env":{"TOKEN":"secret-value"}}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("update code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	reloaded, err := svc.MCP().GetMcpServer(m.ID, "u1")
+	if err != nil {
+		t.Fatalf("GetMcpServer: %v", err)
+	}
+	if reloaded.Env == beforeEnv {
+		t.Fatal("test setup invalid: env ciphertext did not change across the update, so this test cannot distinguish plaintext-compare from ciphertext-compare")
+	}
+
+	after, err := svc.MCPRuntime().Get(m.ID)
+	if err != nil {
+		t.Fatalf("MCPRuntime().Get: %v", err)
+	}
+	if after == nil {
+		t.Fatal("expected the runtime row to still exist")
+	}
+	if after.ListedAt != before.ListedAt || after.TTLSec != before.TTLSec {
+		t.Fatalf("listed_at/ttl_sec changed after a rename that resent identical env plaintext (must compare decrypted content, not ciphertext): before=%+v after=%+v", before, after)
+	}
+}
