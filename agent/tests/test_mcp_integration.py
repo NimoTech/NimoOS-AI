@@ -8,12 +8,14 @@ from mcp_client.runtime import ConfigUnavailable
 @pytest.mark.asyncio
 async def test_build_returns_snapshot_without_connecting(monkeypatch):
     """Task 16: _build_mcp_for_run is pure construction from the server dicts
-    Go already handed down at run start — it must NEVER call build_mcp_tools
-    (which would connect to each server). Run start's tool list is always
-    empty; L2 (skills/tool_gating.py) loads a server's real tools later."""
-    async def boom(servers):
-        raise AssertionError("_build_mcp_for_run must not call build_mcp_tools")
-    monkeypatch.setattr(mc, "build_mcp_tools", boom)
+    Go already handed down at run start — it must NEVER connect to any
+    server (build_mcp_tools, which used to do that, was deleted once L2
+    stopped calling it — see skills/tool_gating.py's _load_l2_tools_async,
+    which now routes through _metas_for_server directly). Run start's tool
+    list is always empty; L2 loads a server's real tools later."""
+    async def boom(*a, **kw):
+        raise AssertionError("_build_mcp_for_run must not connect to any MCP server")
+    monkeypatch.setattr(mc, "_connect", boom)
     tools, snap = await agent_mod._build_mcp_for_run(
         [{"id": 1, "name": "x", "handle": "x", "probe_state": "ok",
           "tools": [{"name": "t"}]}])

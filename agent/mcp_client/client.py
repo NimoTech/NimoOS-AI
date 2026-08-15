@@ -960,7 +960,10 @@ async def _metas_for_server(server: dict):
     # fetch_schemas degrades to (0, []) on any network error, non-200 status,
     # or malformed body (see its own docstring) — never raises. That is
     # indistinguishable here from "nothing to show yet", so it is reported
-    # the same way build_mcp_tools already reports any other load failure.
+    # the same way any other load failure is (both callers of this function —
+    # skills/tool_gating.py's L2 loader and, historically, the now-deleted
+    # build_mcp_tools — rely on this branch to never silently hand back stale
+    # or trusted-looking schemas for a failed fetch).
     detail = "could not fetch tool schemas from nimoos-ai"
     await _emit_warning(server.get("name", "mcp"), detail)
     return [], FAILED, detail
@@ -1001,62 +1004,6 @@ def assign_slugs(servers: list[dict]) -> dict[int, str]:
         used.add(name)
         slugs[s["id"]] = name
     return slugs
-
-
-async def build_mcp_tools(servers: list[dict]) -> tuple:
-    """Build confirm/blacklist-gated FunctionTools for this run from the schema
-    cache (zero connection when warm). Connections are established lazily per
-    tool call (see _get_run_conn). Returns (flat FunctionTool list, per-server
-    ServerStatus list in the same order as *servers*) — the status side is the
-    defect-1 fix: load failures become visible to the model instead of only to
-    the UI event stream."""
-    probed = [s for s in servers if not s.get("config_error")]
-    metas_per = await asyncio.gather(*[_metas_for_server(s) for s in probed],
-                                     return_exceptions=True)
-    results = iter(metas_per)
-    # Dedup happens once, at the slug level, BEFORE any tool name is built —
-    # not by patching individual tool names afterwards. Two servers that both
-    # slug to "github" must become mcp__github__* and mcp__github_2__*, never
-    # mcp__github__create_issue / mcp__github__create_issue_2: the latter
-    # leaves the model unable to tell which server it's calling, and breaks
-    # the correspondence between the gate a user opens (mcp:github_2) and the
-    # tools that gate exposes.
-    slugs = assign_slugs(servers)
-    tools: list = []
-    statuses: list = []
-    for s in servers:
-        name = s.get("name", "mcp")
-        handle = s.get("handle", "") or ""
-        slug = slugs.get(s.get("id"), "")
-        summary = s.get("summary", "") or ""
-        instructions = s.get("instructions", "") or ""
-        if s.get("config_error"):
-            # Go flagged this server's stored credentials as undecryptable; do
-            # not connect with an unauthenticated config — a 401 at call time
-            # would mask the real cause.
-            statuses.append(ServerStatus(name=name, status=CONFIG_ERROR,
-                                         detail=str(s["config_error"]),
-                                         handle=handle, slug=slug,
-                                         summary=summary, instructions=instructions))
-            continue
-        res = next(results)
-        if isinstance(res, Exception):
-            await _emit_warning(name, res)
-            statuses.append(ServerStatus(name=name, status=FAILED,
-                                         detail=str(res) or type(res).__name__,
-                                         handle=handle, slug=slug,
-                                         summary=summary, instructions=instructions))
-            continue
-        metas, status, detail = res
-        fq_names = []
-        for meta in metas:
-            tool = _wrap_tool(s, meta, slug=slugs[s["id"]])
-            tools.append(tool)
-            fq_names.append(tool.name)
-        statuses.append(ServerStatus(name=name, status=status, detail=detail,
-                                     tool_names=fq_names, handle=handle, slug=slug,
-                                     summary=summary, instructions=instructions))
-    return tools, statuses
 
 
 # The probe budget is PER PHASE, not one flat ceiling. The connect phase has to

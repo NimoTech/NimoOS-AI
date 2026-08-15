@@ -61,6 +61,44 @@ def test_l2_appends_tools_to_the_live_agent(monkeypatch):
         "L2 must inject this server's FunctionTools into the live agent.tools"
 
 
+def test_l2_untrusted_zero_sentinel_injects_no_tools(monkeypatch):
+    """Fix-2 regression pin: fetch_schemas degrading to (0, [...]) — a
+    non-empty schemas array alongside the fetched_at==0 "never trust this"
+    sentinel — must inject ZERO tools into the live agent and must tell the
+    model something truthful, not silently splice in what would look like a
+    working server's tools.
+
+    Before this fix, _load_l2_tools_async cache-checked correctly (via
+    _cache_put's own write guard) but then built FunctionTools from
+    `schemas` unconditionally, ignoring the sentinel on the fetch path. This
+    was latent only because Go never emitted listed_at == 0 alongside a
+    non-empty tools array — a transport-relevant server Update now deletes
+    the runtime AND schemas rows together (see route/v2/mcp.go's Update
+    handler), making exactly this response shape reachable from a real,
+    in-flight fetch immediately after such an edit.
+    """
+    from agents import Agent
+    from skills import tool_gating as tg, mcp_gating as mg
+
+    a = Agent(name="t", instructions="i", tools=[])
+    ag.RUN_AGENT_VAR.set(a)
+    mg.MCP_HANDLES_VAR.set({"github": 7})
+    tg.UNLOCKED_VAR.set(set())
+    mc._SCHEMA_CACHE.clear()
+
+    async def fake_fetch(write_token, server_id):
+        return 0, [{"name": "create_issue", "description": "d", "input_schema": {"type": "object"}}]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+
+    out = tg.expand_categories(["mcp:github"])
+    names = [getattr(t, "name", "") for t in a.tools]
+    assert not any(n.startswith("mcp__github__") for n in names), \
+        "an untrusted (0, [...]) fetch must never inject tools into the live agent"
+    # Truthful reporting: neither silent success nor a fabricated tool count.
+    assert "mcp:github: gate opened, but no tool schemas could be loaded" in out
+    assert "1 tool loaded" not in out
+
+
 def test_l2_reloads_when_the_persisted_gate_is_already_open(monkeypatch):
     """Review fix, C1: the unlock gate (UNLOCKED_VAR) is persisted per session
     and reloaded at the start of EVERY run/turn (agent.py's

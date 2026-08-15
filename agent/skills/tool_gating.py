@@ -250,7 +250,6 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
     some tests reload "agent" out of sys.modules, which would otherwise risk
     reading a stale, disconnected copy; see that ContextVar's comment."""
     import mcp_client.client as _mc
-    from mcp_client import runtime as _mcp_runtime
 
     counts: dict[str, "int | None"] = {}
     agent = _mc.RUN_AGENT_VAR.get(None)
@@ -258,7 +257,6 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
         return {slug: 0 for slug, _ in pairs}
 
     servers_by_id = _mc._RUN_SERVERS_VAR.get(None) or {}
-    write_token = _mc.WRITE_TOKEN_VAR.get("")
     for slug, server_id in pairs:
         if slug in counts:
             # Defense in depth against a duplicate (slug, server_id) pair
@@ -285,13 +283,21 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
         # against it would fail with the normal "[MCP error] cannot connect"
         # message rather than the gate silently doing nothing).
         server = servers_by_id.get(server_id) or {"id": server_id, "name": slug}
-        listed_at = server.get("listed_at", 0)
-        entry = _mc._cache_get(server_id, listed_at)
-        if entry is not None:
-            schemas = entry.metas
-        else:
-            fetched_at, schemas = await _mcp_runtime.fetch_schemas(write_token, server_id)
-            _mc._cache_put(server_id, schemas, fetched_at)
+        # Delegate cache-check + fetch + the fetched_at==0 trust sentinel to
+        # _metas_for_server (the same helper build_mcp_tools used) instead of
+        # re-implementing it here. The earlier inline version cache-checked
+        # correctly but then built tools from `schemas` unconditionally even
+        # when fetch_schemas degraded to (0, []) -- harmless only because Go
+        # never emitted that exact combination (listed_at == 0 alongside a
+        # non-empty schemas array) at the time this was written. A
+        # transport-relevant Update now deletes the runtime AND schemas rows
+        # together (see route/v2/mcp.go's Update handler), so that state is
+        # reachable, and this call must never silently inject the pre-edit
+        # server's tools as though they were live and trusted.
+        # _metas_for_server also emits the UI warning event on failure, which
+        # this call site relied on _cache_put's write-guard alone to avoid
+        # doing before.
+        schemas, _status, _detail = await _mc._metas_for_server(server)
         built = []
         for meta in schemas:
             if not isinstance(meta, dict) or not meta.get("name"):

@@ -203,11 +203,23 @@ func (h *MCPHandler) Update(c echo.Context) error {
 	// changed; nothing replaced it, so a stale listing could serve for up to
 	// SCHEMA_TTL_MAX (3600s) after an edit. Fix: whenever a transport-
 	// relevant field actually changed (transport/url/command/args/env/
-	// headers — exactly what ConfigFP hashes), zero this server's
-	// listed_at/ttl_sec. Python's schema cache is keyed on listed_at and
-	// already treats 0 as "never trust this", so zeroing it invalidates both
-	// Go's identity card and Python's cache at once, and the next Runtime GET
-	// re-probes via the existing TTL self-check — this is invalidation only,
+	// headers — exactly what ConfigFP hashes), delete both this server's
+	// runtime row (mcp_server_runtime) and its cached schema bodies
+	// (mcp_server_schemas) outright, rather than merely zeroing listed_at/
+	// ttl_sec on the runtime row. A partial column reset left three other
+	// observations from the OLD config in place: identity_fp (so the config
+	// gate in service/mcp_approvals.go kept treating "don't ask again"
+	// grants for the old server as still effective — indefinitely, if the
+	// new endpoint never has a successful probe to overwrite it), the
+	// separate mcp_server_schemas row (its own listed_at, never touched by a
+	// column reset, so SchemasInternal kept serving the pre-edit schema
+	// bodies under a fresh-looking timestamp), and protocol_mode (a modern
+	// pin from the old server surviving onto a legacy new one, failing every
+	// connect until a re-probe). Deleting both rows makes the server read as
+	// never-probed everywhere at once: the config gate voids (no runtime row
+	// -> empty identity_fp -> gate fails open-safe), L1 shows "not yet
+	// probed", protocol falls back to auto, and the existing TTL self-check
+	// re-probes on the very next Runtime GET — this is invalidation only,
 	// never a synchronous probe from inside this handler.
 	//
 	// name/note/enabled deliberately do NOT reach this branch: ConfigFP
@@ -218,9 +230,14 @@ func (h *MCPHandler) Update(c echo.Context) error {
 	afterFP, afterOK := h.configFPOf(existing)
 	if !beforeOK || !afterOK || beforeFP != afterFP {
 		if _, execErr := h.svc.DB().Exec(
-			`UPDATE mcp_server_runtime SET listed_at=0, ttl_sec=0 WHERE server_id=?`, existing.ID,
+			`DELETE FROM mcp_server_runtime WHERE server_id=?`, existing.ID,
 		); execErr != nil {
 			log.Printf("mcp update %d: failed to invalidate cached runtime config: %v", existing.ID, execErr)
+		}
+		if _, execErr := h.svc.DB().Exec(
+			`DELETE FROM mcp_server_schemas WHERE server_id=?`, existing.ID,
+		); execErr != nil {
+			log.Printf("mcp update %d: failed to invalidate cached schemas: %v", existing.ID, execErr)
 		}
 	}
 

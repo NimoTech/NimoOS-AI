@@ -35,6 +35,17 @@ def test_prompt_line_mixed_statuses():
     assert "old: configuration error (decrypt failed)" in line
 
 
+def test_prompt_line_ok_server_with_zero_tools_is_not_misrepresented_as_ready():
+    # A server that probes ok but publishes zero tools (e.g. a real remote
+    # server that requires auth this repo does not try to detect) must not
+    # read as "0 tools ready" -- that phrasing implies a working, expandable
+    # server, which this one is not.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="needsauth", status=st.OK, tool_names=[])))
+    assert "0 tools ready" not in line
+    assert "needsauth: connected, published no tools" in line
+
+
 def test_prompt_line_config_unavailable():
     line = st.render_prompt_line(_snap(config_error="HTTP 500"))
     assert "configuration could not be fetched" in line
@@ -82,6 +93,23 @@ def test_expand_long_tool_list_not_truncated():
         assert n in joined
     assert "…" not in joined
     assert "(40 tools)" in joined and joined.rstrip().endswith(";")
+
+
+def test_expand_ok_server_with_zero_tools_has_no_dangling_punctuation_or_expand_hint():
+    # Before this fix, an OK status with tool_names == [] fell into the
+    # generic OK branch and produced a malformed 'MCP server "x" (0 tools): ;'
+    # line PLUS an "expand as:" hint -- inviting the model to open a gate
+    # with nothing behind it. Opening it used to report "no tool schemas
+    # could be loaded right now -- try again shortly", which is untrue: there
+    # is nothing to load, and retrying will not help. Both real enabled
+    # servers on the live machine are in exactly this state.
+    joined = "\n".join(st.render_expand_section(_snap(
+        st.ServerStatus(name="needsauth", status=st.OK, tool_names=[],
+                        summary="a remote server"))))
+    assert ": ;" not in joined
+    assert "expand as:" not in joined
+    assert '"needsauth": connected, but published no tools' in joined
+    assert "a remote server" in joined
 
 
 def test_expand_failed_server_discloses_and_warns():

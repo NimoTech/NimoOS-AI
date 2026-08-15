@@ -39,7 +39,13 @@ func NewRunTokenStore(ttl time.Duration) *RunTokenStore {
 
 func (s *RunTokenStore) Mint(userID, sessionID string) string {
 	b := make([]byte, 24)
-	_, _ = rand.Read(b)
+	// This token authorizes approval writes (see the doc comment above), so a
+	// silently-ignored rand.Read failure that hands back an all-zero token —
+	// practically impossible, but guessable by any local process if it ever
+	// happened — must never pass as a real mint. Panic rather than degrade.
+	if _, err := rand.Read(b); err != nil {
+		panic("RunTokenStore.Mint: crypto/rand.Read failed: " + err.Error())
+	}
 	tok := hex.EncodeToString(b)
 	s.mu.Lock()
 	defer s.mu.Unlock()

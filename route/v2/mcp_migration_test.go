@@ -258,7 +258,14 @@ func doUpdate(t *testing.T, h *MCPHandler, id int64, uid, body string) *httptest
 // replaced it — Update wrote only mcp_servers, never touching
 // mcp_server_runtime, so a stale listing kept serving for up to
 // SCHEMA_TTL_MAX after an edit. A transport-relevant change (here: url) must
-// zero listed_at/ttl_sec so the next Runtime GET re-probes.
+// delete BOTH the runtime row and the schemas row outright — a column-only
+// reset (listed_at=0, ttl_sec=0) would leave identity_fp, tools_json,
+// protocol_mode and the separate mcp_server_schemas row all pointing at the
+// OLD server, which is exactly what let a stale "don't ask again" approval
+// keep working after a config change (the config gate compares against
+// identity_fp, which only a column reset would leave untouched). Deleting
+// both rows makes the server read as never-probed everywhere at once, and
+// void any approval that was effective under the old identity.
 func TestUpdateInvalidatesRuntimeConfigOnURLChange(t *testing.T) {
 	svc := mcpTestSvc(t)
 	m := &service.McpServer{
@@ -269,15 +276,41 @@ func TestUpdateInvalidatesRuntimeConfigOnURLChange(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{
-		ServerID: m.ID, Handle: "github", Summary: "old", TTLSec: 300,
-	}, []service.ToolMeta{{Name: "noop"}}, "[]"); err != nil {
+		ServerID: m.ID, Handle: "github", Summary: "old", IdentityFP: "old-identity-fp", TTLSec: 300,
+	}, []service.ToolMeta{{Name: "noop", SchemaHash: "sh1"}}, "[]"); err != nil {
 		t.Fatalf("seed runtime row: %v", err)
 	}
 	if r, _ := svc.MCPRuntime().Get(m.ID); r == nil || r.ListedAt == 0 {
 		t.Fatalf("test setup: expected a seeded runtime row with a non-zero listed_at, got %+v", r)
 	}
+	if listedAt, _, _ := svc.MCPRuntime().GetSchemas(m.ID); listedAt == 0 {
+		t.Fatalf("test setup: expected a seeded schemas row with a non-zero listed_at")
+	}
 
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	// Grant a "don't ask again" approval under the OLD identity, through the
+	// same internal endpoint Python uses mid-run, so this test proves the
+	// gate-level consequence (EffectiveApprovals), not just raw column state.
+	runTokens := NewRunTokenStore(time.Minute)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), runTokens, "http://127.0.0.1:1")
+	tok := runTokens.Mint("u1", "sess1")
+	e := echo.New()
+	approvalBody := fmt.Sprintf(`{"server_id":%d,"tool_name":"noop"}`, m.ID)
+	approvalReq := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(approvalBody))
+	approvalReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	approvalReq.Header.Set("X-Agent-MCP-Write-Token", tok)
+	approvalRec := httptest.NewRecorder()
+	if err := h.ApprovalsInternal(e.NewContext(approvalReq, approvalRec)); err != nil {
+		t.Fatalf("ApprovalsInternal: %v", err)
+	}
+	if approvalRec.Code != http.StatusNoContent {
+		t.Fatalf("approvals code = %d, body = %s", approvalRec.Code, approvalRec.Body.String())
+	}
+	if approvals, err := svc.MCPApprovals().EffectiveApprovals("u1"); err != nil {
+		t.Fatalf("EffectiveApprovals (pre-update): %v", err)
+	} else if len(approvals) != 1 {
+		t.Fatalf("test setup: expected the approval to be effective before the update, got %+v", approvals)
+	}
+
 	rec := doUpdate(t, h, m.ID, "u1", `{"url":"https://new.example.com/mcp"}`)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("update code = %d, body = %s", rec.Code, rec.Body.String())
@@ -287,11 +320,21 @@ func TestUpdateInvalidatesRuntimeConfigOnURLChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MCPRuntime().Get: %v", err)
 	}
-	if r == nil {
-		t.Fatal("expected the runtime row to still exist")
+	if r != nil {
+		t.Fatalf("expected the runtime row to be deleted after a transport-relevant change, got %+v", r)
 	}
-	if r.ListedAt != 0 || r.TTLSec != 0 {
-		t.Fatalf("listed_at=%d ttl_sec=%d, want both zeroed after a URL (transport-relevant) change", r.ListedAt, r.TTLSec)
+	if listedAt, schemasJSON, err := svc.MCPRuntime().GetSchemas(m.ID); err != nil {
+		t.Fatalf("GetSchemas: %v", err)
+	} else if listedAt != 0 || schemasJSON != "[]" {
+		t.Fatalf("expected the schemas row to be deleted too, got listed_at=%d schemas_json=%s", listedAt, schemasJSON)
+	}
+
+	approvals, err := svc.MCPApprovals().EffectiveApprovals("u1")
+	if err != nil {
+		t.Fatalf("EffectiveApprovals (post-update): %v", err)
+	}
+	if len(approvals) != 0 {
+		t.Fatalf("approval granted under the old identity must no longer be effective after a transport-relevant change, got %+v", approvals)
 	}
 }
 

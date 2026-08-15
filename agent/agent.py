@@ -693,9 +693,14 @@ class AgentRunner:
             mcp_client._CONFIRMED_TOOLS_VAR.set(
                 set(_mcp_payload.approvals) if _mcp_payload else set())
             _mcp_server_list = mcp_servers if isinstance(mcp_servers, list) else []
-            _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_server_list)
-            mcp_client._RUN_SERVERS_VAR.set(
-                {s["id"]: s for s in _mcp_server_list if isinstance(s, dict) and "id" in s})
+            # Guard against a malformed server dict (missing "id"): assign_slugs
+            # indexes by s["id"] internally and would raise KeyError, killing the
+            # whole run over an add-on capability that must never prevent one
+            # from starting. Reuses the exact same guard the next line already
+            # applied to _RUN_SERVERS_VAR, so both are built from one filtered list.
+            _mcp_valid_servers = [s for s in _mcp_server_list if isinstance(s, dict) and "id" in s]
+            _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_valid_servers)
+            mcp_client._RUN_SERVERS_VAR.set({s["id"]: s for s in _mcp_valid_servers})
             # Run-scoped write token (Task 9): "" (same degraded path as
             # above) when no RuntimePayload was supplied.
             mcp_client.WRITE_TOKEN_VAR.set(_mcp_write_token)

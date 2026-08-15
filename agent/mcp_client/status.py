@@ -125,6 +125,13 @@ def _summary(s: ServerStatus) -> str:
     label = _label(s)
     if s.status == OK:
         n = len(s.tool_names)
+        if n == 0:
+            # Plainly distinct from a real "N tools ready" line: the server
+            # connected fine, it simply has nothing to offer right now (the
+            # common real-world case is auth the server needs but this repo
+            # deliberately does not try to detect — see render_expand_section).
+            # "0 tools ready" would read as a working, expandable server.
+            return f"{label}: connected, published no tools"
         return f"{label}: {n} tool{'s' if n != 1 else ''} ready"
     if s.status == WARMING:
         return f"{label}: starting up, tools available shortly"
@@ -162,7 +169,23 @@ def render_expand_section(snapshot) -> list[str]:
     degraded = False
     for s in snapshot.servers:
         label = _label(s)
-        if s.status == OK:
+        if s.status == OK and not s.tool_names:
+            # A server that connected fine but published zero tools is NOT
+            # the same state as one with tools ready to expand. Left to fall
+            # into the branch below, `listed` would be "" -- producing a
+            # malformed "... : ;" line -- and the expand hint would invite the
+            # model to open a gate with nothing behind it; following that
+            # advice used to get told "no tool schemas could be loaded right
+            # now -- try again shortly", which is false (there is nothing to
+            # load, and no amount of retrying will change that). This is not
+            # hypothetical -- an authenticated remote server that probes ok
+            # but requires a login it doesn't have publishes exactly this.
+            # Deliberately not attempting to detect auth here (accepted
+            # limitation) -- just state the observed fact and stop there, with
+            # no "expand as:" hint.
+            summary_part = f" — {_short(s.summary)}" if s.summary else ""
+            lines.append(f'MCP server "{label}": connected, but published no tools{summary_part}.')
+        elif s.status == OK:
             # list EVERY tool — an elided "… (40 total)" left the model unable
             # to see (and thus call) the hidden names, so it drifted to other tools
             listed = ", ".join(s.tool_names)
