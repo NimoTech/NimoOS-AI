@@ -851,3 +851,53 @@ def test_unbind_tolerates_skills_remove_all_failure(lark_env, monkeypatch):
         assert st["phase"] == "unbound"
 
     run_async(scenario())
+
+
+def test_unbind_cancels_in_flight_skills_sync_before_remove_all(lark_env, monkeypatch):
+    """Medium fix-round-1 regression: a bind->unbind race must not let a
+    still-running skills_sync.sync() re-install a skill after remove_all just
+    deleted it. unbind() must cancel the in-flight sync_task *before* calling
+    remove_all, not just cancel the binding flow's own `task`."""
+    from lark import skills_sync
+
+    post_install_calls: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_sync(uid):
+        started.set()
+        await release.wait()  # simulates a sync still mid-flight
+        # If cancellation didn't actually stop this task, execution would
+        # resume here once `release` is set below and "install" something.
+        post_install_calls.append(uid)
+        return {"installed": [], "failed": []}
+
+    remove_calls: list[str] = []
+
+    async def fake_remove_all(uid):
+        remove_calls.append(uid)
+
+    monkeypatch.setattr(skills_sync, "sync", slow_sync)
+    monkeypatch.setattr(skills_sync, "remove_all", fake_remove_all)
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        await _await_phase("bound")
+
+        sync_task = binding._STATES[UID].sync_task
+        await started.wait()  # sync is now genuinely in flight
+
+        await binding.unbind(UID)
+
+        assert sync_task.cancelled(), "in-flight sync_task must be cancelled by unbind"
+        assert remove_calls == [UID], "remove_all must still run"
+        assert post_install_calls == [], "cancelled sync must never resume past its await"
+
+        # Even if something (a bug) still held a reference to `release` and set
+        # it later, the cancelled task must not come back to life and append.
+        release.set()
+        await asyncio.sleep(0.05)
+        assert post_install_calls == []
+
+    run_async(scenario())

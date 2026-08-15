@@ -673,6 +673,22 @@ async def unbind(uid: str) -> None:
             except Exception:  # pragma: no cover - flow already logs its own
                 _LOG.warning("lark flow errored during unbind for %s", uid, exc_info=True)
 
+        sync_task = st.sync_task
+        st.sync_task = None
+
+        if sync_task and not sync_task.done():
+            # Must be cancelled *before* remove_all runs below: otherwise a
+            # still-running sync() can `_post_install` a skill back in right
+            # after remove_all just deleted it -- reinstating a registration
+            # for a user who is in the middle of being unbound.
+            sync_task.cancel()
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover - sync already logs its own
+                _LOG.warning("lark skills sync errored during unbind for %s", uid, exc_info=True)
+
         try:
             await _run(uid, ["auth", "logout"], LOGOUT_TIMEOUT)
         except Exception:  # pragma: no cover - logout is best-effort
