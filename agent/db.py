@@ -300,6 +300,16 @@ CREATE TABLE IF NOT EXISTS shell_allowlist (
     created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS toolbox_components (
+    id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'installed'
+        CHECK(status IN ('installing','installed','failed')),
+    error TEXT NOT NULL DEFAULT '',
+    installed_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 -- Knowledge notes (M1). Files under <notes_root>/<user_id>/ are the CONTENT
 -- authority; these rows are the METADATA authority, joined by the immutable
 -- frontmatter UUID (= notes.id). Soft-delete only: hard deletes would orphan

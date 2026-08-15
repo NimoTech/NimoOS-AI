@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "id": "lark-cli",
+      "name": "Feishu CLI (lark-cli)",
+      "description": "Official Feishu/Lark command-line agent toolkit: Bitable, Docs, IM, Drive and more.",
+      "version": "1.0.85",
+      "method": "npm",
+      "npm_package": "@larksuite/cli",
+      "bins": ["lark-cli"],
+      "check": ["lark-cli", "--version"]
+    },
+    {
+      "id": "gh",
+      "name": "GitHub CLI",
+      "description": "GitHub official CLI: repos, PRs, issues, API.",
+      "version": "2.62.0",
+      "method": "binary",
+      "artifacts": {
+        "amd64": { "url": "https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_amd64.tar.gz", "sha256": "41c8b0698ad3003cb5c44bde672a1ffd5f818595abd80162fbf8cc999418446a", "bin_path": "gh_2.62.0_linux_amd64/bin/gh" },
+        "arm64": { "url": "https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_arm64.tar.gz", "sha256": "a165413209aab98bfb1db9629b97bc9c59778d38bb7378a33a0363cf822e7965", "bin_path": "gh_2.62.0_linux_arm64/bin/gh" }
+      },
+      "bins": ["gh"],
+      "check": ["gh", "--version"]
+    }
+  ]
+}
