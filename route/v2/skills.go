@@ -3,6 +3,7 @@ package v2
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
@@ -136,6 +137,113 @@ func (h *SkillsHandler) Delete(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "missing user")
 	}
 	if err := h.svc.Skills().Delete(uid, c.Param("id")); err != nil {
+		if errors.Is(err, service.ErrSkillNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, err.Error())
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+// --- internal loopback (no JWT; localhost-only via _internal group) ---
+// user_id comes from the request body (caller is a local, trusted process —
+// the Python agent registering a skill bundled with a Go component such as
+// the Lark integration), NOT from X-NimoOS-User-ID. Mirrors the
+// ParseInternal/RegisterInternal shape in route/v2/mcp.go.
+//
+// The agent container's skills tree is mounted read-only, so Python can't
+// write manifest.json/SKILL.md itself; it calls back into Go instead.
+
+type internalSkillInstallBody struct {
+	UserID string          `json:"user_id"`
+	Skill  skillCreateBody `json:"skill"`
+}
+
+// sanitizeSkillDescription cleans an upstream-supplied skill description for
+// safe injection into the agent's system prompt, mirroring the rules
+// validateSkillDescription (skills_store.go) enforces on the public
+// endpoint. Descriptions arriving here come from official Go component
+// content we don't control, so instead of rejecting bad input with 400 we
+// sanitize it: newlines are folded to spaces, control characters are
+// dropped, angle brackets are replaced (not stripped, so meaning survives),
+// and the result is capped at 256 runes.
+func sanitizeSkillDescription(d string) string {
+	var b strings.Builder
+	for _, r := range d {
+		switch {
+		case r == '\n' || r == '\r':
+			b.WriteRune(' ')
+		case r == '<':
+			b.WriteRune('(')
+		case r == '>':
+			b.WriteRune(')')
+		case r < 0x20 || r == 0x7f:
+			// drop control characters
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if runes := []rune(out); len(runes) > 256 {
+		out = string(runes[:256])
+	}
+	return out
+}
+
+// InstallInternal handles POST /v1/ai/_internal/skills/install — registers
+// (or, on repeat calls with the same name, overwrites) a skill bundle owned
+// by a Go component into the given user's skill store. Used by Task 9's
+// Python-side component registration on agent startup.
+func (h *SkillsHandler) InstallInternal(c echo.Context) error {
+	var b internalSkillInstallBody
+	if err := c.Bind(&b); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if strings.TrimSpace(b.UserID) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	sk := b.Skill
+	sk.Description = sanitizeSkillDescription(sk.Description)
+	files := make([]service.SkillFileUpload, 0, len(sk.Scripts))
+	for _, f := range sk.Scripts {
+		files = append(files, service.SkillFileUpload{Path: f.Path, Content: []byte(f.Content)})
+	}
+	out, err := h.svc.Skills().InstallOrReplace(b.UserID, service.CreateSkillReq{
+		Name: sk.Name, Title: sk.Title, Description: sk.Description,
+		Trigger: sk.Trigger, Color: sk.Color, Icon: sk.Icon,
+		MD: sk.MD, Examples: sk.Examples, Scripts: files,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrBadSkillID),
+			errors.Is(err, service.ErrBadDescription),
+			errors.Is(err, service.ErrBadPath),
+			errors.Is(err, service.ErrBundleTooLarge):
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"id": out.ID})
+}
+
+// RemoveInternal handles POST /v1/ai/_internal/skills/remove — same as the
+// public DELETE /skills/:id, but user_id comes from the body instead of
+// X-NimoOS-User-ID (see InstallInternal).
+func (h *SkillsHandler) RemoveInternal(c echo.Context) error {
+	var b struct {
+		UserID string `json:"user_id"`
+		ID     string `json:"id"`
+	}
+	if err := c.Bind(&b); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if strings.TrimSpace(b.UserID) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	if strings.TrimSpace(b.ID) == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "id required")
+	}
+	if err := h.svc.Skills().Delete(b.UserID, b.ID); err != nil {
 		if errors.Is(err, service.ErrSkillNotFound) {
 			return echo.NewHTTPError(http.StatusNotFound, err.Error())
 		}

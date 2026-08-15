@@ -296,6 +296,27 @@ func (s *skillsService) CreateUser(userID string, r CreateSkillReq) (*Skill, err
 	return &sk, nil
 }
 
+// InstallOrReplace creates a user skill bundle, overwriting any existing
+// bundle with the same id instead of failing with ErrDuplicateSkill.
+//
+// Used by the internal component-install endpoint (Task 7): Go components
+// (e.g. the Lark integration) reinstall their bundled skill(s) on every
+// startup, and re-registering the same skill twice should be idempotent
+// rather than 409. CreateFromForm itself has no overwrite mode, so this
+// deletes the existing bundle first when one is present.
+func (s *skillsService) InstallOrReplace(userID string, r CreateSkillReq) (*Skill, error) {
+	id := slugify(r.Name)
+	if err := ValidateSkillID(id); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(s.store.UserPath(userID, id)); err == nil {
+		if err := s.Delete(userID, id); err != nil {
+			return nil, err
+		}
+	}
+	return s.CreateUser(userID, r)
+}
+
 // SetEnabled updates the enabled state. Works for both built-in and user skills.
 func (s *skillsService) SetEnabled(userID, id string, enabled bool) error {
 	defer s.rebuildAfter(userID)

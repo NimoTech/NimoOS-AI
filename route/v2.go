@@ -31,6 +31,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
 	searchClient := service.NewSearchClient(runtimePath + "/search.url")
 	services := v2.NewServicesStatusHandler(agent, ollamaURL, openvinoURL, parserClient, searchClient)
+	skills := v2.NewSkillsHandlerFull(svc, agentURL)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -99,6 +100,8 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.GET("/mcp/list", mcp.ListInternal)
 	internal.POST("/mcp/remove", mcp.RemoveInternal)
 	internal.GET("/agent/provider-credentials", v2.ProviderCredentials(svc, runtimePath))
+	internal.POST("/skills/install", skills.InstallInternal)
+	internal.POST("/skills/remove", skills.RemoveInternal)
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -204,7 +207,6 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.DELETE("/blacklist/:id", blacklist.Delete)
 
 	// Skill management
-	skills := v2.NewSkillsHandlerFull(svc, agentURL)
 	g.GET("/skills", skills.List)
 	g.POST("/skills", skills.Create)
 	g.GET("/skills/:id", skills.Get)
