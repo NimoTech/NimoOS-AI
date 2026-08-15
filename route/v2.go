@@ -27,6 +27,12 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	mcpTickets := v2.NewTicketStore(30 * time.Second)
 	runTokens := v2.NewRunTokenStore(24 * time.Hour)
 	mcp := v2.NewMCPHandler(svc, mcpTickets, runTokens, agentURL)
+	// Task 22: backfill identity cards for MCP servers that existed before
+	// this progressive-disclosure feature shipped. Belt-and-braces on top of
+	// the TTL self-check in mcp.go's Runtime handler (see
+	// StartMigrationBackfill's doc comment) — runs once, in the background,
+	// and never blocks startup.
+	mcp.StartMigrationBackfill()
 	agent := v2.NewAgentHandler(svc, agentURL, 60, mcpTickets)
 	agent.StartHealthMonitor()
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")

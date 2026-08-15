@@ -362,6 +362,90 @@ func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[stri
 	return probeResult{StatusCode: http.StatusOK, Body: body}, nil
 }
 
+// --- migration: backfill identity cards for pre-existing servers ---
+
+// StartMigrationBackfill launches, in its own background goroutine, the
+// one-time sweep that gives every pre-existing MCP server (one that predates
+// this progressive-disclosure feature and therefore has no mcp_server_runtime
+// row at all) its first identity card. The caller (route/v2.go, at process
+// startup, mirroring how AgentHandler.StartHealthMonitor is wired) must never
+// wait on this: a single stdio server's probe can take up to ~120s (see
+// probeAndPersist's timeout comment above), and there may be many such
+// servers, so running the sweep on the startup path could hang service
+// start for many minutes.
+func (h *MCPHandler) StartMigrationBackfill() {
+	go func() {
+		if err := h.migrateBackfillIdentityCards(); err != nil {
+			log.Printf("mcp migration sweep: %v", err)
+		}
+	}()
+}
+
+// migrateBackfillIdentityCards is the sweep itself, run synchronously on the
+// goroutine StartMigrationBackfill spawns (tests call it directly so they can
+// observe its effects deterministically instead of racing a detached
+// goroutine). Servers get here after an upgrade: they existed before Task 7's
+// "probe on add" mechanism shipped, so the model's L1 catalogue would show
+// them as "not yet probed" forever without this. The fix is simply to run the
+// exact same probeAndPersist flow a newly-added server gets — no new
+// mechanism.
+//
+// Only servers with NO runtime row at all are candidates (the LEFT JOIN
+// below). This is deliberately narrower than "needs a fresh probe": Task 8's
+// TTL self-check (route/v2/mcp.go's Runtime handler) already re-probes a
+// server whose listing has merely expired, and also already treats a
+// missing runtime row as trivially expired, so it independently backfills
+// never-probed servers the first time anyone calls Runtime for them. This
+// sweep is therefore belt-and-braces, not the only backfill path — and the
+// two can safely run concurrently: probeAndPersist's first step,
+// MarkProbing, is an atomic UPSERT that claims the single-flight lock by
+// INSERTing the row with probe_state='probing', so exactly one of the two
+// wins the claim for any given server and the loser costs one Get query and
+// exits nil. No second locking mechanism is layered on top of it here.
+//
+// Serial by design: a stdio server's probe shells out to an npx/uvx child
+// process and can take up to ~120s. Firing off every candidate concurrently
+// would spawn that many child processes at once and could saturate a NAS's
+// disk and network; probing them one at a time, inside this single
+// goroutine, keeps the blast radius to one child process no matter how many
+// servers need backfilling.
+func (h *MCPHandler) migrateBackfillIdentityCards() error {
+	rows, err := h.svc.DB().Query(`
+		SELECT s.id, s.user_id, s.name, s.transport, s.url, s.command, s.args,
+		       s.env, s.headers, s.enabled, s.created_at, s.updated_at
+		FROM mcp_servers s
+		LEFT JOIN mcp_server_runtime r ON r.server_id = s.id
+		WHERE r.server_id IS NULL AND s.enabled = 1
+		ORDER BY s.id`)
+	if err != nil {
+		return err
+	}
+	var pending []*service.McpServer
+	for rows.Next() {
+		m := &service.McpServer{}
+		var enabled int
+		if scanErr := rows.Scan(&m.ID, &m.UserID, &m.Name, &m.Transport, &m.URL, &m.Command,
+			&m.Args, &m.Env, &m.Headers, &enabled, &m.CreatedAt, &m.UpdatedAt); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		m.Enabled = enabled == 1
+		pending = append(pending, m)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+
+	// One at a time, on purpose — see the doc comment above.
+	for _, m := range pending {
+		if _, err := h.probeAndPersist(m, h.decryptMap(m.Env), h.decryptMap(m.Headers)); err != nil {
+			log.Printf("mcp migration sweep: probe for server %d failed: %v", m.ID, err)
+		}
+	}
+	return nil
+}
+
 // probingInProgressResult builds the response returned when MarkProbing finds
 // a probe already in flight for this server: the caller must not block
 // forever waiting on someone else's probe, so it gets back the last

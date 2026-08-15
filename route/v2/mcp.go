@@ -137,6 +137,30 @@ func (h *MCPHandler) Parse(c echo.Context) error {
 	return c.JSON(http.StatusOK, p)
 }
 
+// configFPOf computes service.ConfigFP for m's CURRENT in-memory state
+// (transport/url/command/args plus the DECRYPTED env/headers plaintext — the
+// ciphertext columns themselves must never be compared directly, since
+// AES-GCM re-encrypts the same plaintext to different bytes on every save,
+// which would report a change on every single update regardless of whether
+// anything transport-relevant actually moved). ConfigFP already excludes
+// name/note/enabled (see mcp_fingerprint.go), which is exactly the "must not
+// invalidate" set Update needs to leave alone, so it is reused as-is rather
+// than re-implemented here.
+//
+// The bool return is false when env or headers fail to decrypt; Update
+// treats that as "can't prove nothing changed" and invalidates defensively
+// rather than failing the save outright.
+func (h *MCPHandler) configFPOf(m *service.McpServer) (string, bool) {
+	var args []string
+	_ = json.Unmarshal([]byte(m.Args), &args)
+	env, envErr := h.decryptMapErr(m.Env)
+	headers, hdrErr := h.decryptMapErr(m.Headers)
+	if envErr != nil || hdrErr != nil {
+		return "", false
+	}
+	return service.ConfigFP(m.Transport, m.URL, m.Command, args, env, headers), true
+}
+
 func (h *MCPHandler) Update(c echo.Context) error {
 	uid, err := h.userID(c)
 	if err != nil {
@@ -153,6 +177,10 @@ func (h *MCPHandler) Update(c echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	// Captured BEFORE applyReq mutates existing in place, so this reflects
+	// the config as it stood before the request.
+	beforeFP, beforeOK := h.configFPOf(existing)
+
 	var req mcpRequest
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
@@ -169,6 +197,33 @@ func (h *MCPHandler) Update(c echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+
+	// Task 13 deleted Python's _fingerprint, which used to invalidate the
+	// cached tool listing the instant a server's url/headers/command
+	// changed; nothing replaced it, so a stale listing could serve for up to
+	// SCHEMA_TTL_MAX (3600s) after an edit. Fix: whenever a transport-
+	// relevant field actually changed (transport/url/command/args/env/
+	// headers — exactly what ConfigFP hashes), zero this server's
+	// listed_at/ttl_sec. Python's schema cache is keyed on listed_at and
+	// already treats 0 as "never trust this", so zeroing it invalidates both
+	// Go's identity card and Python's cache at once, and the next Runtime GET
+	// re-probes via the existing TTL self-check — this is invalidation only,
+	// never a synchronous probe from inside this handler.
+	//
+	// name/note/enabled deliberately do NOT reach this branch: ConfigFP
+	// excludes them on purpose (see mcp_fingerprint.go), so a rename or an
+	// enable/disable toggle never invalidates a cached listing or forces a
+	// re-probe — a load-bearing property throughout this plan (the approval
+	// gates key on identity_fp, not updated_at, for the same reason).
+	afterFP, afterOK := h.configFPOf(existing)
+	if !beforeOK || !afterOK || beforeFP != afterFP {
+		if _, execErr := h.svc.DB().Exec(
+			`UPDATE mcp_server_runtime SET listed_at=0, ttl_sec=0 WHERE server_id=?`, existing.ID,
+		); execErr != nil {
+			log.Printf("mcp update %d: failed to invalidate cached runtime config: %v", existing.ID, execErr)
+		}
+	}
+
 	return c.NoContent(http.StatusNoContent)
 }
 
