@@ -20,7 +20,7 @@ _MAX_SKILL_MD_BYTES = 50 * 1024
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import agent_md
@@ -2540,6 +2540,26 @@ async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias
     except installer.InstallError:
         raise HTTPException(404, "unknown_component")
     return {"status": "ok"}
+
+
+@app.post("/agent/lark/binding")
+async def lark_binding_start(x_user_id: str = Header(..., alias="X-User-Id")):
+    from lark import binding as _lark
+    return JSONResponse(await _lark.start(x_user_id), status_code=202)
+
+
+@app.get("/agent/lark/binding")
+async def lark_binding_status(x_user_id: str = Header(..., alias="X-User-Id")):
+    # Never 404s: a user who has never bound simply reports phase=unbound.
+    from lark import binding as _lark
+    return await _lark.status(x_user_id)
+
+
+@app.delete("/agent/lark/binding", status_code=204)
+async def lark_binding_delete(x_user_id: str = Header(..., alias="X-User-Id")):
+    from lark import binding as _lark
+    await _lark.unbind(x_user_id)
+    return Response(status_code=204)
 
 
 @app.post("/agent/sandbox-run")
