@@ -2489,6 +2489,59 @@ async def shell_allowlist_delete(
     return {"ok": _al.delete(_db.get_connection(), entry_id)}
 
 
+_TOOLBOX_JOBS: dict[str, "asyncio.Task"] = {}
+
+
+@app.get("/agent/toolbox")
+async def toolbox_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    return {"components": installer.list_components(_db.get_connection())}
+
+
+@app.post("/agent/toolbox/install")
+async def toolbox_install(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    try:
+        body = await request.json()
+        cid = str(body["id"])
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    try:
+        installer._catalog_by_id(cid)
+    except installer.InstallError:
+        raise HTTPException(404, "unknown_component")
+    job = _TOOLBOX_JOBS.get(cid)
+    if job and not job.done():
+        raise HTTPException(409, "already_installing")
+
+    async def _job():
+        try:
+            await installer.install(_db.get_connection(), cid)
+        except Exception:
+            _LOG.exception("toolbox install failed: %s", cid)
+
+    _TOOLBOX_JOBS[cid] = asyncio.create_task(_job())
+    return JSONResponse({"status": "installing"}, status_code=202)
+
+
+@app.post("/agent/toolbox/uninstall")
+async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    try:
+        body = await request.json()
+        cid = str(body["id"])
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    try:
+        installer.uninstall(_db.get_connection(), cid)
+    except installer.InstallError:
+        raise HTTPException(404, "unknown_component")
+    return {"status": "ok"}
+
+
 @app.post("/agent/sandbox-run")
 async def sandbox_run_endpoint(
     req: SandboxRunRequest,
