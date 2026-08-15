@@ -550,6 +550,139 @@ func TestToolsEndpointSurfacesStaleReasonForConfigVoidedApproval(t *testing.T) {
 	}
 }
 
+// TestToolsEndpointSurfacesStaleReasonKeyAlongsideProse pins that
+// stale_reason_key (the machine-readable counterpart added so the UI can map
+// through its own i18n table instead of rendering English prose directly)
+// rides alongside stale_reason rather than replacing it, using the same
+// config-voided setup as the test above.
+func TestToolsEndpointSurfacesStaleReasonKeyAlongsideProse(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "old-fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "old-fp", "sh", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "new-fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("update runtime: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+
+	var out struct {
+		Tools []struct {
+			Name           string `json:"name"`
+			StaleReason    string `json:"stale_reason"`
+			StaleReasonKey string `json:"stale_reason_key"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %+v", out.Tools)
+	}
+	if out.Tools[0].StaleReason == "" {
+		t.Fatalf("expected the prose stale_reason to still be present, got %+v", out.Tools[0])
+	}
+	if out.Tools[0].StaleReasonKey != service.StaleReasonConfigChanged {
+		t.Fatalf("expected stale_reason_key %q, got %+v", service.StaleReasonConfigChanged, out.Tools[0])
+	}
+}
+
+// TestToolsEndpointReportsServerLevelApproved pins that GET .../tools reports
+// whether a server-level ('*') grant exists, since listMCPTools's per-tool
+// rows alone give the UI no way to know: without this field the settings
+// page's server-level toggle always initialized off even when a live grant
+// was in force.
+func TestToolsEndpointReportsServerLevelApproved(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	decode := func() struct {
+		ServerLevelApproved       bool   `json:"server_level_approved"`
+		ServerLevelStaleReason    string `json:"server_level_stale_reason"`
+		ServerLevelStaleReasonKey string `json:"server_level_stale_reason_key"`
+	} {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("X-NimoOS-User-ID", "u1")
+		rec := httptest.NewRecorder()
+		c := e.NewContext(req, rec)
+		setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+		if err := h.Tools(c); err != nil {
+			t.Fatalf("Tools: %v", err)
+		}
+		var out struct {
+			ServerLevelApproved       bool   `json:"server_level_approved"`
+			ServerLevelStaleReason    string `json:"server_level_stale_reason"`
+			ServerLevelStaleReasonKey string `json:"server_level_stale_reason_key"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		return out
+	}
+
+	if out := decode(); out.ServerLevelApproved {
+		t.Fatalf("expected server_level_approved=false with no wildcard grant, got %+v", out)
+	}
+
+	if err := svc.MCPApprovals().PutServerLevel(m.ID, "fp"); err != nil {
+		t.Fatalf("grant wildcard: %v", err)
+	}
+	if out := decode(); !out.ServerLevelApproved || out.ServerLevelStaleReasonKey != "" {
+		t.Fatalf("expected server_level_approved=true with no stale reason for a live grant, got %+v", out)
+	}
+
+	// Void it: edit the server's identity (config gate), same as the
+	// per-tool config-voided test above.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "new-fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh"}}, "[]"); err != nil {
+		t.Fatalf("update runtime: %v", err)
+	}
+	out := decode()
+	if !out.ServerLevelApproved {
+		t.Fatalf("expected server_level_approved to stay true even when void (mirrors per-tool rows), got %+v", out)
+	}
+	if out.ServerLevelStaleReasonKey != service.StaleReasonConfigChanged {
+		t.Fatalf("expected server_level_stale_reason_key %q, got %+v", service.StaleReasonConfigChanged, out)
+	}
+	if out.ServerLevelStaleReason == "" {
+		t.Fatalf("expected the prose server_level_stale_reason to also be populated, got %+v", out)
+	}
+}
+
 // TestApprovalEndpointsRejectMissingUserID pins the auth precondition shared
 // by all four public endpoints: without X-NimoOS-User-ID (set by the JWT
 // middleware after verifying the caller's bearer token), h.userID fails and

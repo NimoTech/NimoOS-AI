@@ -34,12 +34,34 @@ import (
 // browser never sees identity_fp — so without this field an edited server's
 // stale approvals would render as ordinary "approved" toggles, silently
 // telling the user they won't be re-prompted when they will be.
+// StaleReasonKey is StaleReason's machine-readable counterpart (one of
+// service.StaleReasonXxx) — added so the UI can map it through its own
+// error_key-style i18n table (mcpErrorKey.ts's existing pattern for
+// testMCPServer) instead of rendering the English prose straight to screen.
+// StaleReason is kept as-is alongside it: nothing that reads it today breaks.
 type toolStateDTO struct {
-	Name        string `json:"name"`
-	Approved    bool   `json:"approved"`
-	LastSeenAt  int64  `json:"last_seen_at"`
-	DescChanged bool   `json:"desc_changed"`
-	StaleReason string `json:"stale_reason,omitempty"`
+	Name           string `json:"name"`
+	Approved       bool   `json:"approved"`
+	LastSeenAt     int64  `json:"last_seen_at"`
+	DescChanged    bool   `json:"desc_changed"`
+	StaleReason    string `json:"stale_reason,omitempty"`
+	StaleReasonKey string `json:"stale_reason_key,omitempty"`
+}
+
+// toolsResponseDTO is the full body of GET .../tools. ServerLevelApproved
+// reports whether a server-level ('*') approval row exists for this server —
+// true even if it is currently void, mirroring each toolStateDTO row's own
+// Approved semantics (see its doc comment above): the settings UI shows the
+// switch on with an explanation rather than silently off, so a void grant
+// still tells the user what they once approved. Without this field the UI
+// has no way to know a wildcard grant exists at all (byName["*"] is server-
+// side only), so its server-level toggle always initialized off even when a
+// live grant was in force.
+type toolsResponseDTO struct {
+	Tools                     []toolStateDTO `json:"tools"`
+	ServerLevelApproved       bool           `json:"server_level_approved"`
+	ServerLevelStaleReason    string         `json:"server_level_stale_reason,omitempty"`
+	ServerLevelStaleReasonKey string         `json:"server_level_stale_reason_key,omitempty"`
 }
 
 // approvalSummaryDTO is one element of GET /mcp/approvals' cross-server
@@ -125,7 +147,7 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	if rt == nil {
-		return c.JSON(http.StatusOK, map[string]any{"tools": []toolStateDTO{}})
+		return c.JSON(http.StatusOK, toolsResponseDTO{Tools: []toolStateDTO{}})
 	}
 
 	var metas []service.ToolMeta
@@ -148,10 +170,11 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		case ok:
 			// An explicit per-tool approval is the more specific record;
 			// prefer it over a server-level one for
-			// last_seen_at/desc_changed/stale_reason.
+			// last_seen_at/desc_changed/stale_reason(_key).
 			dto.Approved = true
 			dto.LastSeenAt = row.LastSeenAt
 			dto.StaleReason = row.StaleReason
+			dto.StaleReasonKey = row.StaleReasonKey
 			// desc_changed: stored desc_hash non-empty AND different from the
 			// current one. An empty stored value means "approved before we
 			// started recording it" — report false, not true, or every
@@ -164,10 +187,20 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 			dto.Approved = true
 			dto.LastSeenAt = wildcard.LastSeenAt
 			dto.StaleReason = wildcard.StaleReason
+			dto.StaleReasonKey = wildcard.StaleReasonKey
 		}
 		out = append(out, dto)
 	}
-	return c.JSON(http.StatusOK, map[string]any{"tools": out})
+
+	resp := toolsResponseDTO{Tools: out}
+	if hasWildcard {
+		// True even if void (see toolsResponseDTO's doc comment) — mirrors
+		// each toolStateDTO row's own Approved semantics above.
+		resp.ServerLevelApproved = true
+		resp.ServerLevelStaleReason = wildcard.StaleReason
+		resp.ServerLevelStaleReasonKey = wildcard.StaleReasonKey
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 // PutApproval handles PUT /v1/ai/mcp/servers/:id/approvals/:tool. It is the

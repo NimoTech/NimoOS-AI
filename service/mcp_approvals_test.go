@@ -360,3 +360,114 @@ func TestListForServerExposesLastSeenAtAndDescHash(t *testing.T) {
 		t.Fatal("expected a nonzero LastSeenAt for a freshly-approved row")
 	}
 }
+
+// TestListForServerStaleReasonKeyMatchesEachArm pins that StaleReasonKey (the
+// machine-readable counterpart added so the settings UI can map through its
+// own i18n table instead of rendering StaleReason's English prose directly)
+// matches the current arm exactly, for all four existing prose arms plus the
+// "in force" (no reason at all) case. The prose StaleReason field is also
+// checked where relevant, to pin that adding the key did not replace it.
+func TestListForServerStaleReasonKeyMatchesEachArm(t *testing.T) {
+	t.Run("config_changed", func(t *testing.T) {
+		db := openTestDB(t)
+		ap := &mcpApprovalService{db: db}
+		rt := &mcpRuntimeService{db: db}
+		id := seedServer(t, db)
+		approve(t, ap, id, "t", "OLD_FP", "sh", 0)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "NEW_FP", TTLSec: 600},
+			[]ToolMeta{{Name: "t", SchemaHash: "sh"}}, `[]`)
+
+		rows, err := ap.ListForServer(id)
+		if err != nil {
+			t.Fatalf("ListForServer: %v", err)
+		}
+		if len(rows) != 1 || rows[0].StaleReasonKey != StaleReasonConfigChanged {
+			t.Fatalf("expected StaleReasonKey %q, got %+v", StaleReasonConfigChanged, rows)
+		}
+		if rows[0].StaleReason == "" {
+			t.Fatal("expected the prose StaleReason to still be populated alongside the key")
+		}
+	})
+
+	t.Run("tool_removed", func(t *testing.T) {
+		db := openTestDB(t)
+		ap := &mcpApprovalService{db: db}
+		rt := &mcpRuntimeService{db: db}
+		id := seedServer(t, db)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{{Name: "t", SchemaHash: "sh"}}, `[]`)
+		approve(t, ap, id, "t", "FP", "sh", 0)
+		// Server dropped the tool: same identity, empty tools_json. SaveSuccess
+		// has a flap guard (mcp_runtime.go's empty_streak) that ignores a
+		// single empty listing as a possible cold-path hiccup and only commits
+		// the empty tools_json on the SECOND consecutive one -- so this must
+		// call it twice, not once, or tools_json still holds the old listing
+		// and the tool never actually goes missing.
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{}, `[]`)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{}, `[]`)
+
+		rows, err := ap.ListForServer(id)
+		if err != nil {
+			t.Fatalf("ListForServer: %v", err)
+		}
+		if len(rows) != 1 || rows[0].StaleReasonKey != StaleReasonToolRemoved {
+			t.Fatalf("expected StaleReasonKey %q, got %+v", StaleReasonToolRemoved, rows)
+		}
+	})
+
+	t.Run("schema_changed", func(t *testing.T) {
+		db := openTestDB(t)
+		ap := &mcpApprovalService{db: db}
+		rt := &mcpRuntimeService{db: db}
+		id := seedServer(t, db)
+		approve(t, ap, id, "t", "FP", "OLD_SCHEMA", 0)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{{Name: "t", SchemaHash: "NEW_SCHEMA"}}, `[]`)
+
+		rows, err := ap.ListForServer(id)
+		if err != nil {
+			t.Fatalf("ListForServer: %v", err)
+		}
+		if len(rows) != 1 || rows[0].StaleReasonKey != StaleReasonSchemaChanged {
+			t.Fatalf("expected StaleReasonKey %q, got %+v", StaleReasonSchemaChanged, rows)
+		}
+	})
+
+	t.Run("stale", func(t *testing.T) {
+		db := openTestDB(t)
+		ap := &mcpApprovalService{db: db}
+		rt := &mcpRuntimeService{db: db}
+		id := seedServer(t, db)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{{Name: "t", SchemaHash: "sh"}}, `[]`)
+		approve(t, ap, id, "t", "FP", "sh", 8*day) // not seen for 8 days
+
+		rows, err := ap.ListForServer(id)
+		if err != nil {
+			t.Fatalf("ListForServer: %v", err)
+		}
+		if len(rows) != 1 || rows[0].StaleReasonKey != StaleReasonStale {
+			t.Fatalf("expected StaleReasonKey %q, got %+v", StaleReasonStale, rows)
+		}
+	})
+
+	t.Run("in force -- empty prose and key, not a fifth code", func(t *testing.T) {
+		db := openTestDB(t)
+		ap := &mcpApprovalService{db: db}
+		rt := &mcpRuntimeService{db: db}
+		id := seedServer(t, db)
+		rt.SaveSuccess(&McpServerRuntime{ServerID: id, IdentityFP: "FP", TTLSec: 600},
+			[]ToolMeta{{Name: "t", SchemaHash: "sh"}}, `[]`)
+		approve(t, ap, id, "t", "FP", "sh", 0)
+
+		rows, err := ap.ListForServer(id)
+		if err != nil {
+			t.Fatalf("ListForServer: %v", err)
+		}
+		if len(rows) != 1 || rows[0].StaleReasonKey != "" || rows[0].StaleReason != "" {
+			t.Fatalf("expected an in-force approval to carry no reason/key, got %+v", rows)
+		}
+	})
+}

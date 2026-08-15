@@ -21,17 +21,36 @@ const hygieneWindowSec = 90 * 24 * 60 * 60
 // StaleReason is populated only by ListForServer, for the settings UI to
 // explain to the user why a listed approval is currently void; it is
 // display/diagnostic only and never feeds any pass/fail decision.
+// StaleReasonKey is the machine-readable counterpart of StaleReason, one of
+// the StaleReasonXxx constants below, set alongside it in the exact same
+// switch arms in ListForServer -- added so the settings UI can map it to a
+// localized string (mcpErrorKey.ts's existing error_key pattern) instead of
+// rendering StaleReason's English prose directly. StaleReason itself is kept
+// unchanged: nothing that reads it today should break.
 // LastSeenAt and DescHash are likewise populated only by ListForServer, for
 // the public GET .../tools endpoint (route/v2/mcp_approvals.go) to compute
 // per-tool last_seen_at and the "description changed" badge. Like
 // StaleReason, neither ever feeds a gate decision.
 type ApprovalRow struct {
-	ServerID    int64
-	ToolName    string
-	StaleReason string
-	LastSeenAt  int64
-	DescHash    string
+	ServerID       int64
+	ToolName       string
+	StaleReason    string
+	StaleReasonKey string
+	LastSeenAt     int64
+	DescHash       string
 }
+
+// StaleReasonXxx are the machine-readable codes for ListForServer's reason
+// switch, one per existing arm (config gate / tool-removed / interface gate
+// / stale gate). Adding a code here must be paired with adding an arm to
+// that switch -- see TestListForServerStaleReasonKeyMatchesEachArm, which
+// pins all four.
+const (
+	StaleReasonConfigChanged = "config_changed"
+	StaleReasonToolRemoved   = "tool_removed"
+	StaleReasonSchemaChanged = "schema_changed"
+	StaleReasonStale         = "stale"
+)
 
 type mcpApprovalService struct{ db *sql.DB }
 
@@ -280,9 +299,11 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 		}
 
 		reason := ""
+		reasonKey := ""
 		switch {
 		case approvalFP == "" || !runtimeFP.Valid || runtimeFP.String == "" || approvalFP != runtimeFP.String:
 			reason = "config changed: server identity no longer matches the approved one"
+			reasonKey = StaleReasonConfigChanged
 		case toolName == "*":
 			// Server-level approval: no interface/stale reasons apply.
 		default:
@@ -302,19 +323,22 @@ func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error
 			switch {
 			case !present:
 				reason = "tool no longer offered by the server"
+				reasonKey = StaleReasonToolRemoved
 			case approvalSchema == "" || meta.SchemaHash == "" || meta.SchemaHash != approvalSchema:
 				reason = "interface changed: tool's schema no longer matches the approved one"
+				reasonKey = StaleReasonSchemaChanged
 			case now-lastSeenAt > staleWindowSec:
 				reason = "stale: tool not seen in the last 7 days"
+				reasonKey = StaleReasonStale
 			}
 		}
 
 		// LastSeenAt and DescHash are exposed here purely for the settings UI
 		// (route/v2/mcp_approvals.go's GET .../tools) — they are read back
-		// as-is, same as StaleReason above, and play no part in the reason
-		// switch above them.
+		// as-is, same as StaleReason/StaleReasonKey above, and play no part
+		// in the reason switch above them.
 		out = append(out, ApprovalRow{
-			ServerID: serverID, ToolName: toolName, StaleReason: reason,
+			ServerID: serverID, ToolName: toolName, StaleReason: reason, StaleReasonKey: reasonKey,
 			LastSeenAt: lastSeenAt, DescHash: approvalDesc,
 		})
 	}
