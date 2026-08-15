@@ -102,3 +102,36 @@ def test_mem_bytes_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("NIMOOS_SANDBOX_AS_BYTES", raising=False)
         importlib.reload(executor)  # restore module state for later tests
+
+
+def test_mem_bytes_falls_back_on_non_numeric_env(monkeypatch, caplog):
+    """A bad deployment value for NIMOOS_SANDBOX_AS_BYTES (typo, empty string,
+    non-numeric) must never raise at module-import time — it should log a
+    warning and fall back to the 2GiB default instead of taking the whole
+    executor daemon down.
+    """
+    monkeypatch.setenv("NIMOOS_SANDBOX_AS_BYTES", "not-a-number")
+    from netns import executor
+    with caplog.at_level("WARNING", logger="netns.executor"):
+        importlib.reload(executor)
+    try:
+        assert executor.MEM_BYTES == 2 * 1024 * 1024 * 1024
+        assert "NIMOOS_SANDBOX_AS_BYTES" in caplog.text
+    finally:
+        monkeypatch.delenv("NIMOOS_SANDBOX_AS_BYTES", raising=False)
+        importlib.reload(executor)  # restore module state for later tests
+
+
+def test_mem_bytes_falls_back_on_non_positive_env(monkeypatch, caplog):
+    """Same fallback for a syntactically-valid but semantically-nonsensical
+    value (zero or negative bytes)."""
+    monkeypatch.setenv("NIMOOS_SANDBOX_AS_BYTES", "-1")
+    from netns import executor
+    with caplog.at_level("WARNING", logger="netns.executor"):
+        importlib.reload(executor)
+    try:
+        assert executor.MEM_BYTES == 2 * 1024 * 1024 * 1024
+        assert "NIMOOS_SANDBOX_AS_BYTES" in caplog.text
+    finally:
+        monkeypatch.delenv("NIMOOS_SANDBOX_AS_BYTES", raising=False)
+        importlib.reload(executor)  # restore module state for later tests

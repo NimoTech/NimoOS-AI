@@ -48,15 +48,20 @@ Response schema:
   }
 
 Constants:
-  MEM_BYTES         = 512 MiB address-space limit passed to prlimit
+  MEM_BYTES         = 2 GiB address-space limit passed to prlimit (default;
+                      overridable via NIMOOS_SANDBOX_AS_BYTES — see below)
   MAX_TIMEOUT_SEC   = 300 s
   DEFAULT_TIMEOUT_SEC = 30 s
   MAX_OUTPUT_BYTES  = 16 KiB
   NPROC             = 1024
 
 Environment overrides (for testing / deployment):
-  NIMOOS_EXEC_SOCK      — Unix socket path (default /var/run/nimoos/agent-exec.sock)
-  NIMOOS_EXEC_PID_FILE  — PID file path   (default /var/run/nimoos/agent-exec.pid)
+  NIMOOS_EXEC_SOCK        — Unix socket path (default /var/run/nimoos/agent-exec.sock)
+  NIMOOS_EXEC_PID_FILE    — PID file path   (default /var/run/nimoos/agent-exec.pid)
+  NIMOOS_SANDBOX_AS_BYTES — prlimit --as (RLIMIT_AS) cap for sandboxed shell
+                            commands, in bytes (default 2 GiB). Invalid values
+                            (non-numeric or <= 0) log a warning and fall back
+                            to the default rather than raising at import time.
 """
 from __future__ import annotations
 
@@ -94,7 +99,35 @@ CLONE_NEWNET = 0x40000000
 # --version` run; 512M does not. Default picked as min(smallest-working-tier
 # x2, 4G) = min(1G*2, 4G) = 2G, overridable via NIMOOS_SANDBOX_AS_BYTES for
 # boxes that need to go higher for some other Go-runtime toolbox component.
-MEM_BYTES = int(os.environ.get("NIMOOS_SANDBOX_AS_BYTES", 2 * 1024 * 1024 * 1024))
+_DEFAULT_MEM_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _parse_mem_bytes(raw: str | None) -> int:
+    """Parse NIMOOS_SANDBOX_AS_BYTES into a positive int, falling back to
+    _DEFAULT_MEM_BYTES (with a warning) on any invalid value — missing,
+    non-numeric, or <= 0 — so a bad deployment env var can never raise at
+    module-import time and take the whole executor daemon down with it.
+    """
+    if raw is None:
+        return _DEFAULT_MEM_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid NIMOOS_SANDBOX_AS_BYTES=%r (not an integer); "
+            "falling back to default %d bytes", raw, _DEFAULT_MEM_BYTES,
+        )
+        return _DEFAULT_MEM_BYTES
+    if value <= 0:
+        logger.warning(
+            "invalid NIMOOS_SANDBOX_AS_BYTES=%r (must be > 0); "
+            "falling back to default %d bytes", raw, _DEFAULT_MEM_BYTES,
+        )
+        return _DEFAULT_MEM_BYTES
+    return value
+
+
+MEM_BYTES = _parse_mem_bytes(os.environ.get("NIMOOS_SANDBOX_AS_BYTES"))
 MAX_TIMEOUT_SEC = 300
 DEFAULT_TIMEOUT_SEC = 30
 MAX_OUTPUT_BYTES = 16 * 1024
