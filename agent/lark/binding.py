@@ -63,7 +63,40 @@ INTERACTIVE_TIMEOUT = 15 * 60
 
 PHASES = ("unbound", "starting", "await_verify", "polling", "bound", "failed")
 
+# Synthetic exit codes. Kept out of the CLI's own range (it uses 2/3/4/5) so a
+# probe failure is never mistaken for a real answer — notably "not configured",
+# which would otherwise send us off to create a brand-new Feishu app.
+RC_TIMEOUT = 124
+RC_NO_CLI = 127
+
 _URL_RE = re.compile(r"https://\S+")
+
+# Anything whose *key* matches gets its value replaced before it can reach the
+# log tail or the identity projection. Applied recursively.
+_SECRET_KEY_RE = re.compile(r"token|secret|credential|cookie|password|passwd|api[_-]?key", re.I)
+# Keys that match the regex but carry no secret — `token_status` is literally
+# the logged-in/logged-out flag the UI wants to show.
+_SAFE_KEYS = frozenset({"token_status", "tokenstatus", "token_expires_at"})
+_REDACTED = "[redacted]"
+
+# Plain-text fallback for streams that are not JSON: `access_token: xxx`,
+# `"refresh_token" = xxx`. Group 1 is the key, group 2 the separator.
+_SECRET_LINE_RE = re.compile(
+    r'("?[\w.-]*(?:token|secret|credential|cookie|password|passwd|api[_-]?key)[\w.-]*"?)'
+    r'(\s*[:=]\s*)\S+',
+    re.I,
+)
+
+# Identity is echoed to the UI, so it is a whitelist projection: unknown keys
+# are dropped rather than passed through. Anything not listed here simply does
+# not reach the browser.
+_IDENTITY_KEYS = frozenset({
+    "name", "user_name", "en_name", "nick_name", "display_name",
+    "user_id", "open_id", "union_id", "employee_id",
+    "tenant_key", "tenant_name", "app_id", "app_name",
+    "identity", "identity_type", "profile", "brand", "domain",
+    "status", "token_status", "expires_at", "avatar_url", "email",
+})
 
 # ---------------------------------------------------------------------------
 # state
@@ -103,11 +136,19 @@ def _state(uid: str) -> _State:
 
 
 def reset_all() -> None:
-    """Drop all in-memory state (test hook)."""
+    """Drop all in-memory state (test hook).
+
+    Also rebinds `_LOCK`. An asyncio.Lock only binds itself to a loop on its
+    first *contended* acquire, and then raises if awaited from a different one
+    — which is exactly what happens across successive `asyncio.run()` calls in
+    the test suite. Production has a single loop and never hits this.
+    """
+    global _LOCK
     for st in _STATES.values():
         if st.task and not st.task.done():
             st.task.cancel()
     _STATES.clear()
+    _LOCK = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +171,58 @@ def user_home(uid: str) -> Path:
     home = Path(shell.HOMES_ROOT) / uid
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+_UID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def valid_uid(uid: str) -> bool:
+    """Reject anything that could escape HOMES_ROOT (`../`, `/`, empty, NUL).
+
+    Same shape of hole as Task 7's: `uid` lands in a filesystem path, so it is
+    validated as an opaque token rather than sanitised.
+    """
+    return bool(uid) and _UID_RE.fullmatch(uid) is not None
+
+
+def _redact(value, _depth: int = 0):
+    """Recursively blank out secret-looking values by key name.
+
+    lark-cli's success envelopes are not fully known (see module docstring), so
+    anything we surface to the UI — the log tail and the identity blob — goes
+    through here first: an envelope that happens to carry `access_token` must
+    not reach a browser just because we did not anticipate the field.
+    """
+    if _depth > 12:
+        return value
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k)
+            if key.lower() not in _SAFE_KEYS and _SECRET_KEY_RE.search(key):
+                out[key] = _REDACTED
+            else:
+                out[key] = _redact(v, _depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_redact(v, _depth + 1) for v in value]
+    return value
+
+
+def _redact_text(text: str) -> str:
+    """Redact a raw CLI stream before it becomes the UI-visible log tail.
+
+    Re-serialises the JSON envelope when there is one; otherwise falls back to
+    a line-oriented `key: value` / `key=value` scrub so a plain-text leak (or a
+    half-written stream we could not decode) is still covered.
+    """
+    doc = _parse_json(text)
+    if doc is not None:
+        try:
+            return json.dumps(_redact(doc), ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    return _SECRET_LINE_RE.sub(r"\1\2" + _REDACTED, text or "")
 
 
 def _clip(text: str) -> str:
@@ -214,36 +307,58 @@ def _scrape_url(text: str) -> str | None:
 
 
 def _err_summary(rc: int, stderr: str, step: str) -> str:
+    """One-line, UI-visible failure summary. Scrubbed like the log tail is."""
     doc = _parse_json(stderr)
     if isinstance(doc, dict):
         err = doc.get("error")
         if isinstance(err, dict):
             msg = err.get("message") or err.get("subtype") or err.get("type")
             if msg:
-                return f"{step}: {msg}"
+                return _SECRET_LINE_RE.sub(r"\1\2" + _REDACTED, f"{step}: {msg}")
     tail = (stderr or "").strip().splitlines()
     if tail:
-        return f"{step}: {tail[-1][:400]}"
+        return _SECRET_LINE_RE.sub(r"\1\2" + _REDACTED, f"{step}: {tail[-1][:400]}")
     return f"{step}: exit {rc}"
+
+
+async def _spawn(uid: str, args: list[str]):
+    """create_subprocess_exec with the minimal env, or None if the CLI is absent."""
+    try:
+        return await asyncio.create_subprocess_exec(
+            lark_bin(),
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_env(uid),
+            cwd=str(user_home(uid)),
+        )
+    except OSError:
+        # The toolbox component simply isn't installed yet — which is the
+        # *default* state of a fresh box, and the first thing the settings page
+        # asks about. Must degrade to "unbound", never a 500.
+        return None
 
 
 async def _run(uid: str, args: list[str], timeout: float) -> tuple[int, str, str]:
     """Run the CLI, capturing both streams. Returns (rc, stdout, stderr)."""
-    proc = await asyncio.create_subprocess_exec(
-        lark_bin(),
-        *args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_env(uid),
-        cwd=str(user_home(uid)),
-    )
+    proc = await _spawn(uid, args)
+    if proc is None:
+        return RC_NO_CLI, "", f"lark-cli not found at {lark_bin()}"
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, "", f"timed out after {timeout}s"
+        return RC_TIMEOUT, "", f"timed out after {timeout}s"
+    except asyncio.CancelledError:
+        # unbind() cancels the flow task mid-step. Without this the child
+        # survives the cancellation: a still-polling `auth login --device-code`
+        # would go on to write a fresh token into ~/.lark-cli *after* unbind's
+        # rmtree, silently resurrecting the binding we were told to destroy.
+        proc.kill()
+        await proc.wait()
+        raise
     return (
         proc.returncode or 0,
         out.decode("utf-8", "replace"),
@@ -258,15 +373,9 @@ async def _run_streaming_url(uid: str, args: list[str], st: _State, timeout: flo
     browser, so the URL must be pulled from the stream *while the process is
     still running* — waiting for exit would never surface it.
     """
-    proc = await asyncio.create_subprocess_exec(
-        lark_bin(),
-        *args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_env(uid),
-        cwd=str(user_home(uid)),
-    )
+    proc = await _spawn(uid, args)
+    if proc is None:
+        return RC_NO_CLI, f"lark-cli not found at {lark_bin()}"
     buf: list[str] = []
 
     async def _pump(stream, scrape: bool):
@@ -276,7 +385,7 @@ async def _run_streaming_url(uid: str, args: list[str], st: _State, timeout: flo
                 break
             text = line.decode("utf-8", "replace")
             buf.append(text)
-            st.log = _clip("".join(buf))
+            st.log = _clip(_redact_text("".join(buf)))
             if scrape and not st.verify_url:
                 url = _scrape_url(text)
                 if url:
@@ -295,9 +404,10 @@ async def _run_streaming_url(uid: str, args: list[str], st: _State, timeout: flo
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, "".join(buf) + f"\ntimed out after {timeout}s"
+        return RC_TIMEOUT, "".join(buf) + f"\ntimed out after {timeout}s"
     except asyncio.CancelledError:
         proc.kill()
+        await proc.wait()  # reap, so unbind's rmtree cannot race a live child
         raise
     return rc, "".join(buf)
 
@@ -307,9 +417,18 @@ async def _run_streaming_url(uid: str, args: list[str], st: _State, timeout: flo
 # ---------------------------------------------------------------------------
 
 
-async def _is_configured(uid: str) -> bool:
+async def _is_configured(uid: str) -> int:
+    """0 = configured, 1 = not configured, RC_TIMEOUT/RC_NO_CLI = unusable.
+
+    Deliberately tri-state. Collapsing a probe failure into "not configured"
+    would send the flow into `config init --new`, which really does create a
+    brand-new Feishu app — an irreversible side effect triggered by a 5s
+    timeout blip.
+    """
     rc, _out, _err = await _run(uid, ["config", "show"], PROBE_TIMEOUT)
-    return rc == 0
+    if rc in (RC_TIMEOUT, RC_NO_CLI):
+        return rc
+    return 0 if rc == 0 else 1
 
 
 async def _whoami(uid: str) -> dict | None:
@@ -331,7 +450,29 @@ async def _whoami(uid: str) -> dict | None:
     status = _find_key(doc, ("token_status", "tokenStatus"))
     if isinstance(status, str) and status.lower() in ("loggedout", "logged_out", "none", ""):
         return None
-    return doc
+    # Decide on the raw doc above, project for display below: the identity blob
+    # is echoed straight to the browser.
+    return _project_identity(doc)
+
+
+def _project_identity(doc: dict) -> dict:
+    """Whitelist-project a whoami envelope down to displayable identity fields.
+
+    Unknown keys are dropped, not passed through — the bound-state envelope is
+    unrecorded (Task 11), so an allow-list is the only way to be sure a token
+    field we never anticipated does not reach the UI. Nested dicts are walked
+    so `{"user": {"name": ...}}` survives.
+    """
+    out: dict = {}
+    for k, v in doc.items():
+        key = str(k)
+        if isinstance(v, dict):
+            nested = _project_identity(v)
+            if nested:
+                out[key] = nested
+        elif key in _IDENTITY_KEYS:
+            out[key] = _redact({key: v})[key]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -342,13 +483,22 @@ async def _whoami(uid: str) -> dict | None:
 async def _flow(uid: str, st: _State) -> None:
     try:
         # Step 1 — is the app config present?
-        if not await _is_configured(uid):
+        configured = await _is_configured(uid)
+        if configured == RC_NO_CLI:
+            st.phase = "failed"
+            st.error = f"lark-cli is not installed at {lark_bin()}"
+            return
+        if configured == RC_TIMEOUT:
+            st.phase = "failed"
+            st.error = "config show: probe timeout"
+            return
+        if configured != 0:
             # Step 2 — create an app. Blocks on the browser; URL comes off the
             # live stderr stream.
             rc, log = await _run_streaming_url(
                 uid, ["config", "init", "--new"], st, INTERACTIVE_TIMEOUT
             )
-            st.log = _clip(log)
+            st.log = _clip(_redact_text(log))
             if rc != 0:
                 st.phase = "failed"
                 st.error = _err_summary(rc, log, "config init")
@@ -367,7 +517,7 @@ async def _flow(uid: str, st: _State) -> None:
             ],
             LOGIN_INIT_TIMEOUT,
         )
-        st.log = _clip(err or out)
+        st.log = _clip(_redact_text(err or out))
         if rc != 0:
             st.phase = "failed"
             st.error = _err_summary(rc, err or out, "auth login")
@@ -393,7 +543,7 @@ async def _flow(uid: str, st: _State) -> None:
             ["auth", "login", "--device-code", str(code), "--json"],
             INTERACTIVE_TIMEOUT,
         )
-        st.log = _clip(err or out)
+        st.log = _clip(_redact_text(err or out))
         if rc != 0:
             st.phase = "failed"
             st.error = _err_summary(rc, err or out, "auth login --device-code")
@@ -434,43 +584,65 @@ async def status(uid: str) -> dict:
     if st is not None and st.task and not st.task.done():
         return st.snapshot()
 
-    if st is None or st.phase in ("unbound", "bound"):
-        identity = await _whoami(uid)
-        st = _state(uid)
-        if identity is not None:
-            st.phase = "bound"
-            st.identity = identity
-            st.verify_url = ""
-            st.error = ""
-        else:
-            st.phase = "unbound"
-            st.identity = None
-            st.verify_url = ""
+    if st is not None and st.phase not in ("unbound", "bound"):
+        return st.snapshot()
+
+    identity = await _whoami(uid)
+
+    # Re-check after the await: a concurrent start() (or unbind()) may have
+    # taken ownership while the probe was in flight. Writing unconditionally
+    # here would stomp a freshly-set `starting` back to `unbound`, and the UI
+    # would show "not bound" for a flow that is actually running.
+    st = _STATES.get(uid)
+    if st is not None and st.task and not st.task.done():
+        return st.snapshot()
+    if st is not None and st.phase not in ("unbound", "bound"):
+        return st.snapshot()
+
+    st = _state(uid)
+    if identity is not None:
+        st.phase = "bound"
+        st.identity = identity
+        st.verify_url = ""
+        st.error = ""
+    else:
+        st.phase = "unbound"
+        st.identity = None
+        st.verify_url = ""
     return st.snapshot()
 
 
 async def unbind(uid: str) -> None:
-    """Cancel any in-flight flow, log out (tolerantly) and wipe CLI state."""
+    """Cancel any in-flight flow, log out (tolerantly) and wipe CLI state.
+
+    Holds `_LOCK` for the *whole* teardown. An earlier version released it
+    around the cancel/logout/rmtree, which let a concurrent start() install a
+    new task that the final state reset then dropped on the floor — an orphan
+    flow still running against a user who believes they are unbound. Blocking
+    start() until teardown finishes keeps the semantics idempotent.
+    """
     async with _LOCK:
         st = _state(uid)
         task = st.task
         st.task = None
-    if task and not task.done():
-        task.cancel()
+
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover - flow already logs its own
+                _LOG.warning("lark flow errored during unbind for %s", uid, exc_info=True)
+
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            await _run(uid, ["auth", "logout"], LOGOUT_TIMEOUT)
+        except Exception:  # pragma: no cover - logout is best-effort
+            _LOG.warning("lark auth logout failed for %s", uid, exc_info=True)
 
-    try:
-        await _run(uid, ["auth", "logout"], LOGOUT_TIMEOUT)
-    except Exception:  # pragma: no cover - logout is best-effort
-        _LOG.warning("lark auth logout failed for %s", uid, exc_info=True)
+        try:
+            shutil.rmtree(user_home(uid) / ".lark-cli", ignore_errors=True)
+        except Exception:  # pragma: no cover
+            _LOG.warning("lark state cleanup failed for %s", uid, exc_info=True)
 
-    try:
-        shutil.rmtree(user_home(uid) / ".lark-cli", ignore_errors=True)
-    except Exception:  # pragma: no cover
-        _LOG.warning("lark state cleanup failed for %s", uid, exc_info=True)
-
-    async with _LOCK:
         _STATES[uid] = _State()

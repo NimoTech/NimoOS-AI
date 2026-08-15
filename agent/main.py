@@ -2542,23 +2542,36 @@ async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias
     return {"status": "ok"}
 
 
+def _lark_uid(x_user_id: str) -> str:
+    """Validate the user id before it is used to build a filesystem path.
+
+    `binding.user_home()` joins this onto HOMES_ROOT, so a `../` would escape
+    the per-user home (and DELETE would rmtree outside it). Rejected at the
+    edge, so nothing downstream has to trust it.
+    """
+    from lark import binding as _lark
+    if not _lark.valid_uid(x_user_id):
+        raise HTTPException(400, "invalid_user_id")
+    return x_user_id
+
+
 @app.post("/agent/lark/binding")
 async def lark_binding_start(x_user_id: str = Header(..., alias="X-User-Id")):
     from lark import binding as _lark
-    return JSONResponse(await _lark.start(x_user_id), status_code=202)
+    return JSONResponse(await _lark.start(_lark_uid(x_user_id)), status_code=202)
 
 
 @app.get("/agent/lark/binding")
 async def lark_binding_status(x_user_id: str = Header(..., alias="X-User-Id")):
     # Never 404s: a user who has never bound simply reports phase=unbound.
     from lark import binding as _lark
-    return await _lark.status(x_user_id)
+    return await _lark.status(_lark_uid(x_user_id))
 
 
 @app.delete("/agent/lark/binding", status_code=204)
 async def lark_binding_delete(x_user_id: str = Header(..., alias="X-User-Id")):
     from lark import binding as _lark
-    await _lark.unbind(x_user_id)
+    await _lark.unbind(_lark_uid(x_user_id))
     return Response(status_code=204)
 
 

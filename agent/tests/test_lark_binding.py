@@ -41,6 +41,7 @@ UID = "u1"
 VERIFY_URL_INIT = "https://open.feishu.cn/page/cli?user_code=ZA28-RX4U&lpv=1.0.85&from=cli"
 VERIFY_URL_LOGIN = "https://open.feishu.cn/suite/passport/oauth/device?user_code=WXYZ-1234"
 DEVICE_CODE = "dev-code-abc123"
+SECRET = "SECRET-TOKEN-DO-NOT-LEAK"
 
 NOT_CONFIGURED = json.dumps(
     {
@@ -72,6 +73,10 @@ EOF
 
 case "$1 $2" in
   "config show")
+    if [ -f "__SHOW_HANG__" ]; then
+      for _ in $(seq 1 400); do sleep 0.05; done
+      exit 0
+    fi
     [ -f "$D/config.json" ] || not_configured
     echo '{"ok":true,"app_id":"cli_fake"}' >&2
     ;;
@@ -98,8 +103,16 @@ case "$1 $2" in
     [ -f "$D/config.json" ] || not_configured
     if [ "$3" = "--device-code" ]; then
       [ "$4" = "__DEVICE_CODE__" ] || { echo '{"ok":false,"error":{"message":"bad code"}}' >&2; exit 5; }
+      if [ -f "__POLL_BLOCK__" ]; then
+        echo $$ > "__POLL_PID__"
+        # Poll like the real CLI does, until the "user" authorizes.
+        for _ in $(seq 1 400); do
+          [ -f "__POLL_DONE__" ] && break
+          sleep 0.05
+        done
+      fi
       mkdir -p "$D" && echo '{}' > "$D/token.json"
-      echo '{"ok":true,"data":{"user_name":"Probe User"}}' >&2
+      echo '{"ok":true,"data":{"user_name":"Probe User","access_token":"__SECRET__"}}' >&2
     else
       echo '{"ok":true,"data":{"device_code":"__DEVICE_CODE__","verification_url":"__URL_LOGIN__","expires_in":600}}' >&2
     fi
@@ -108,9 +121,10 @@ case "$1 $2" in
     echo "Logged out." >&2
     ;;
   "whoami"*)
+    [ -f "__WHOAMI_SLOW__" ] && sleep 0.5
     [ -f "$D/config.json" ] || not_configured
     [ -f "$D/token.json" ] || { echo '{"ok":false,"error":{"type":"auth","subtype":"not_logged_in"}}' >&2; exit 3; }
-    echo '{"ok":true,"identity":"user","user":{"name":"Probe User","open_id":"ou_fake"}}'
+    echo '{"ok":true,"identity":"user","token_status":"active","access_token":"__SECRET__","user":{"name":"Probe User","open_id":"ou_fake","refresh_token":"__SECRET__"}}'
     ;;
   *)
     echo '{"ok":false,"error":{"type":"validation"}}' >&2
@@ -133,6 +147,11 @@ def lark_env(tmp_path, monkeypatch):
     env_dump = tmp_path / "env.dump"
     init_done = tmp_path / "init.done"
     init_fail = tmp_path / "init.fail"
+    show_hang = tmp_path / "show.hang"
+    poll_block = tmp_path / "poll.block"
+    poll_done = tmp_path / "poll.done"
+    poll_pid = tmp_path / "poll.pid"
+    whoami_slow = tmp_path / "whoami.slow"
 
     script = (
         FAKE_CLI.replace("__NOT_CONFIGURED__", NOT_CONFIGURED)
@@ -142,6 +161,12 @@ def lark_env(tmp_path, monkeypatch):
         .replace("__ENV_DUMP__", str(env_dump))
         .replace("__INIT_DONE__", str(init_done))
         .replace("__INIT_FAIL__", str(init_fail))
+        .replace("__SHOW_HANG__", str(show_hang))
+        .replace("__POLL_BLOCK__", str(poll_block))
+        .replace("__POLL_DONE__", str(poll_done))
+        .replace("__POLL_PID__", str(poll_pid))
+        .replace("__WHOAMI_SLOW__", str(whoami_slow))
+        .replace("__SECRET__", SECRET)
     )
     fake = tmp_path / "lark-cli"
     fake.write_text(script)
@@ -155,6 +180,11 @@ def lark_env(tmp_path, monkeypatch):
             "env_dump": env_dump,
             "init_done": init_done,
             "init_fail": init_fail,
+            "show_hang": show_hang,
+            "poll_block": poll_block,
+            "poll_done": poll_done,
+            "poll_pid": poll_pid,
+            "whoami_slow": whoami_slow,
             "bin": fake,
         }
     finally:
@@ -502,3 +532,222 @@ def test_url_regex_matches_recorded_config_init_output():
     assert "&from=cli" in url
     # the ASCII QR block that precedes the URL must not confuse the scrape
     assert "█" not in url
+
+
+# ==========================================================================
+# Review round 1 regressions
+# ==========================================================================
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def test_c1_unbind_kills_polling_subprocess(lark_env):
+    """C1: cancelling the flow task must kill the child, not orphan it.
+
+    An orphaned `auth login --device-code` keeps polling and writes a fresh
+    token into ~/.lark-cli *after* unbind's rmtree — silently resurrecting the
+    binding the user just destroyed.
+    """
+    lark_env["init_done"].write_text("ok")   # config init completes immediately
+    lark_env["poll_block"].write_text("ok")  # ...but the device-code poll hangs
+
+    async def scenario():
+        await binding.start(UID)
+        await _await_phase("polling")
+        for _ in range(100):  # the pid file is written by the child itself
+            if lark_env["poll_pid"].exists():
+                break
+            await asyncio.sleep(0.05)
+        pid = int(lark_env["poll_pid"].read_text().strip())
+        assert _alive(pid), "fake CLI poll process should be running"
+
+        await binding.unbind(UID)
+
+        for _ in range(40):
+            if not _alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _alive(pid), f"pid {pid} survived unbind (orphaned poll)"
+        # ...and it therefore could not re-create the token after the rmtree.
+        assert not (lark_env["homes"] / UID / ".lark-cli").exists()
+
+    run_async(scenario())
+
+
+def test_c2_missing_cli_reports_unbound_not_500(lark_env, monkeypatch):
+    """C2: an uninstalled lark-cli is the *default* state of a fresh box."""
+    monkeypatch.setenv("NIMOOS_LARK_CLI", str(lark_env["homes"] / "nope" / "lark-cli"))
+
+    async def scenario():
+        return await binding.status(UID)
+
+    st = run_async(scenario())
+    assert st["phase"] == "unbound"
+    assert st["identity"] is None
+
+
+def test_c2_missing_cli_get_endpoint_returns_200(lark_env, monkeypatch):
+    monkeypatch.setenv("NIMOOS_LARK_CLI", str(lark_env["homes"] / "nope" / "lark-cli"))
+    r = _client().get("/agent/lark/binding", headers=H)
+    assert r.status_code == 200
+    assert r.json()["phase"] == "unbound"
+
+
+def test_c2_missing_cli_start_fails_with_clear_error(lark_env, monkeypatch):
+    """Starting a bind with no CLI must say so, not silently try to create an
+    app (which is what treating rc!=0 as 'not configured' would do)."""
+    monkeypatch.setenv("NIMOOS_LARK_CLI", str(lark_env["homes"] / "nope" / "lark-cli"))
+
+    async def scenario():
+        await binding.start(UID)
+        return await _await_phase("failed")
+
+    st = run_async(scenario())
+    assert "not installed" in st["error"]
+
+
+def test_i3_concurrent_unbind_and_start_leaves_no_orphan_task(lark_env):
+    """I3: unbind used to drop the lock around teardown, so a start() racing it
+    installed a task that the final state reset then discarded — still running,
+    unreachable, against a user who believes they are unbound."""
+
+    async def scenario():
+        await binding.start(UID)
+        await _await_phase("await_verify")
+
+        u = asyncio.create_task(binding.unbind(UID))
+        s = asyncio.create_task(binding.start(UID))
+        await asyncio.gather(u, s)
+
+        registered = binding._STATES.get(UID)
+        registered_task = registered.task if registered else None
+        live_flows = [
+            t for t in asyncio.all_tasks()
+            if not t.done() and getattr(t.get_coro(), "__name__", "") == "_flow"
+        ]
+        orphans = [t for t in live_flows if t is not registered_task]
+        assert not orphans, f"{len(orphans)} orphaned flow task(s) outside _STATES"
+
+        await binding.unbind(UID)
+
+    run_async(scenario())
+
+
+def test_i4_status_probe_does_not_stomp_concurrent_start(lark_env):
+    """I4: status() awaited whoami and then wrote unconditionally, knocking a
+    freshly-set `starting` back to `unbound` — the UI would show 'not bound'
+    for a flow that is actually running."""
+    lark_env["whoami_slow"].write_text("ok")  # widen the await window
+
+    async def scenario():
+        probe = asyncio.create_task(binding.status(UID))
+        await asyncio.sleep(0.1)  # let status() get inside the whoami await
+        started = await binding.start(UID)
+        assert started["phase"] == "starting"
+
+        await probe
+        st = await binding.status(UID)
+        assert st["phase"] != "unbound", "concurrent probe stomped the new flow"
+        await binding.unbind(UID)
+
+    run_async(scenario())
+
+
+def test_i5_log_and_identity_are_redacted(lark_env):
+    """I5: the CLI's success envelopes carry access/refresh tokens, and both
+    `log` and `identity` go straight to the browser."""
+
+    async def scenario():
+        lark_env["init_done"].write_text("ok")
+        await binding.start(UID)
+        st = await _await_phase("bound")
+
+        assert SECRET not in st["log"], "token leaked via log tail"
+        assert SECRET not in json.dumps(st["identity"]), "token leaked via identity"
+        assert SECRET not in st["error"]
+
+        # ...while the useful fields survive.
+        assert st["identity"]["user"]["name"] == "Probe User"
+        assert st["identity"]["user"]["open_id"] == "ou_fake"
+        assert st["identity"]["token_status"] == "active"
+        # unknown/secret keys are dropped by the whitelist projection
+        assert "access_token" not in st["identity"]
+        assert "refresh_token" not in st["identity"]["user"]
+
+    run_async(scenario())
+
+
+def test_i5_redact_helpers():
+    doc = {"access_token": "s", "nested": {"refresh_token": "s", "name": "keep"},
+           "list": [{"api_key": "s"}], "token_status": "active"}
+    out = binding._redact(doc)
+    assert out["access_token"] == "[redacted]"
+    assert out["nested"]["refresh_token"] == "[redacted]"
+    assert out["nested"]["name"] == "keep"
+    assert out["list"][0]["api_key"] == "[redacted]"
+    assert out["token_status"] == "active"  # not a secret; UI shows it
+
+
+def test_i5_redact_text_covers_non_json_streams():
+    out = binding._redact_text("some log\naccess_token: abc123\nfine: yes")
+    assert "abc123" not in out
+    assert "fine: yes" in out
+
+
+def test_i6_traversal_uid_rejected_at_endpoint(lark_env):
+    c = _client()
+    for bad in ("../evil", "a/b", "", "x" * 65, "we!rd"):
+        for call in (
+            lambda u: c.get("/agent/lark/binding", headers={"X-User-Id": u}),
+            lambda u: c.post("/agent/lark/binding", headers={"X-User-Id": u}),
+            lambda u: c.delete("/agent/lark/binding", headers={"X-User-Id": u}),
+        ):
+            r = call(bad)
+            assert r.status_code in (400, 401, 422), f"{bad!r} -> {r.status_code}"
+    # nothing was created outside the per-user home
+    assert not (lark_env["homes"] / "evil").exists()
+    assert list(lark_env["homes"].iterdir()) == []
+
+
+def test_i6_valid_uid_predicate():
+    assert binding.valid_uid("u1")
+    assert binding.valid_uid("A-b_9" * 4)
+    assert not binding.valid_uid("../evil")
+    assert not binding.valid_uid("a/b")
+    assert not binding.valid_uid("")
+    assert not binding.valid_uid("x" * 65)
+    assert not binding.valid_uid("a\x00b")
+
+
+def test_m7_probe_timeout_does_not_create_a_new_feishu_app(lark_env, monkeypatch):
+    """M7: `_is_configured` collapsing a timeout into 'not configured' would
+    run `config init --new`, which really does create a Feishu app — an
+    irreversible side effect triggered by a 5s blip."""
+    monkeypatch.setattr(binding, "PROBE_TIMEOUT", 0.3)
+    lark_env["show_hang"].write_text("ok")
+
+    async def scenario():
+        await binding.start(UID)
+        return await _await_phase("failed")
+
+    st = run_async(scenario())
+    assert "probe timeout" in st["error"]
+    assert st["verify_url"] == "", "config init must not have run"
+    assert not (lark_env["homes"] / UID / ".lark-cli" / "config.json").exists()
+
+
+def test_m7_is_configured_is_tristate(lark_env, monkeypatch):
+    async def scenario():
+        # not configured -> 1
+        assert await binding._is_configured(UID) == 1
+        # missing CLI -> RC_NO_CLI
+        monkeypatch.setenv("NIMOOS_LARK_CLI", str(lark_env["homes"] / "nope"))
+        assert await binding._is_configured(UID) == binding.RC_NO_CLI
+
+    run_async(scenario())
