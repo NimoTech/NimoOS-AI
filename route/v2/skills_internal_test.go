@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
 )
 
@@ -222,6 +225,106 @@ func TestSkillsRemoveInternal_RequiresID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	err := h.RemoveInternal(e.NewContext(req, rec))
 	if he, ok := err.(*echo.HTTPError); !ok || he.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %v", err)
+	}
+}
+
+// F1 regression: a failed reinstall (bad content) must not lose the
+// existing bundle. InstallOrReplace previously deleted the old user bundle
+// before validating the new content, so a too-large SKILL.md on reinstall
+// left the skill permanently gone.
+func TestSkillsInstallInternal_FailedReinstallKeepsOldBundle(t *testing.T) {
+	h, _ := newTestSkillsHandler(t)
+	e := echo.New()
+	rec1 := httptest.NewRecorder()
+	if err := h.InstallInternal(e.NewContext(installReq(t, "9", map[string]any{
+		"name": "lark-approval", "description": "original", "trigger": "auto", "md": "## original",
+	}), rec1)); err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first install code=%d body=%s", rec1.Code, rec1.Body.String())
+	}
+
+	oversized := strings.Repeat("x", service.MaxSkillMDBytes+10)
+	rec2 := httptest.NewRecorder()
+	err := h.InstallInternal(e.NewContext(installReq(t, "9", map[string]any{
+		"name": "lark-approval", "description": "replacement", "trigger": "auto", "md": oversized,
+	}), rec2))
+	if err == nil {
+		t.Fatalf("expected reinstall with oversized md to fail, got 200 body=%s", rec2.Body.String())
+	}
+	if he, ok := err.(*echo.HTTPError); !ok || he.Code == http.StatusOK {
+		t.Fatalf("expected an error status, got %v", err)
+	}
+
+	list, lerr := h.svc.Skills().List("9")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	found := false
+	for _, sk := range list {
+		if sk.ID == "lark-approval" {
+			found = true
+			if sk.Description != "original" || !strings.Contains(sk.MD, "original") {
+				t.Fatalf("expected original bundle intact, got description=%q md=%q", sk.Description, sk.MD)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected lark-approval to still exist after a failed reinstall, but it's gone")
+	}
+}
+
+// F2 regression: installing a name that slugifies to an existing *built-in*
+// skill id must 409 (matching the public POST /skills handler), not 500.
+// newTestSkillsHandler seeds a "hello" built-in.
+func TestSkillsInstallInternal_BuiltinCollisionReturns409(t *testing.T) {
+	h, _ := newTestSkillsHandler(t)
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	err := h.InstallInternal(e.NewContext(installReq(t, "9", map[string]any{
+		"name": "hello", "description": "d", "trigger": "auto", "md": "## hello",
+	}), rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %v", err)
+	}
+}
+
+// F3 regression: user_id flows unvalidated into SkillsStore.UserPath, so a
+// value containing path separators/traversal must be rejected before any
+// disk I/O happens, for both install and remove.
+func TestSkillsInstallInternal_RejectsBadUserID(t *testing.T) {
+	h, store := newTestSkillsHandler(t)
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	err := h.InstallInternal(e.NewContext(installReq(t, "../../evil", map[string]any{
+		"name": "lark-x", "description": "d", "trigger": "auto", "md": "## x",
+	}), rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %v", err)
+	}
+	if !strings.Contains(he.Message.(string), "bad_user_id") {
+		t.Fatalf("expected bad_user_id message, got %v", he.Message)
+	}
+	escaped := filepath.Clean(filepath.Join(store.Root, "users", "../../evil"))
+	if _, statErr := os.Stat(escaped); !os.IsNotExist(statErr) {
+		t.Fatalf("expected no directory written outside skills root, stat err=%v", statErr)
+	}
+}
+
+func TestSkillsRemoveInternal_RejectsBadUserID(t *testing.T) {
+	h, _ := newTestSkillsHandler(t)
+	e := echo.New()
+	body, _ := json.Marshal(map[string]any{"user_id": "../../evil", "id": "lark-x"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/skills/remove", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	err := h.RemoveInternal(e.NewContext(req, rec))
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package v2
 import (
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/NimoTech/NimoOS-AI/service"
@@ -159,6 +160,21 @@ type internalSkillInstallBody struct {
 	Skill  skillCreateBody `json:"skill"`
 }
 
+// internalUserIDRe bounds the internal-endpoint user_id the same way a real
+// user id looks (JWT claims.ID is a decimal string today, see route/v2.go),
+// but is intentionally permissive enough for other trusted local callers.
+// This isn't cosmetic: unlike the public endpoints (user_id comes from a
+// verified JWT), these two loopback endpoints take user_id straight from the
+// request body, and it flows unvalidated into SkillsStore.UserPath(userID,
+// id) = filepath.Join(root, "users", userID, id). A value like "../../evil"
+// would let a caller escape the skills root entirely. No dots, slashes, or
+// other path metacharacters allowed.
+var internalUserIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func validInternalUserID(uid string) bool {
+	return internalUserIDRe.MatchString(uid)
+}
+
 // sanitizeSkillDescription cleans an upstream-supplied skill description for
 // safe injection into the agent's system prompt, mirroring the rules
 // validateSkillDescription (skills_store.go) enforces on the public
@@ -202,6 +218,9 @@ func (h *SkillsHandler) InstallInternal(c echo.Context) error {
 	if strings.TrimSpace(b.UserID) == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
 	}
+	if !validInternalUserID(b.UserID) {
+		return echo.NewHTTPError(http.StatusBadRequest, "bad_user_id")
+	}
 	sk := b.Skill
 	sk.Description = sanitizeSkillDescription(sk.Description)
 	files := make([]service.SkillFileUpload, 0, len(sk.Scripts))
@@ -215,6 +234,12 @@ func (h *SkillsHandler) InstallInternal(c echo.Context) error {
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, service.ErrDuplicateSkill):
+			// The slugified name collides with a *built-in* skill id (the
+			// only case InstallOrReplace doesn't pre-empt by deleting: it
+			// only removes an existing *user* bundle at that id before
+			// retrying). Align with the public POST /skills handler's 409.
+			return echo.NewHTTPError(http.StatusConflict, err.Error())
 		case errors.Is(err, service.ErrBadSkillID),
 			errors.Is(err, service.ErrBadDescription),
 			errors.Is(err, service.ErrBadPath),
@@ -239,6 +264,9 @@ func (h *SkillsHandler) RemoveInternal(c echo.Context) error {
 	}
 	if strings.TrimSpace(b.UserID) == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "user_id required")
+	}
+	if !validInternalUserID(b.UserID) {
+		return echo.NewHTTPError(http.StatusBadRequest, "bad_user_id")
 	}
 	if strings.TrimSpace(b.ID) == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "id required")

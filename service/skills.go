@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -304,9 +305,30 @@ func (s *skillsService) CreateUser(userID string, r CreateSkillReq) (*Skill, err
 // startup, and re-registering the same skill twice should be idempotent
 // rather than 409. CreateFromForm itself has no overwrite mode, so this
 // deletes the existing bundle first when one is present.
+//
+// Atomicity: the naive "delete old, then CreateUser" order loses the old
+// bundle for good if CreateUser's own validation (bad id, bad description,
+// oversized MD, bad upload paths) fails — the delete already happened, and
+// CreateFromForm never runs long enough to write a replacement. So here we
+// re-run every content-only check CreateFromForm will perform *before*
+// touching the existing bundle; only once the incoming content is known to
+// pass do we delete the old bundle and call CreateUser; CreateFromForm's
+// own re-validation on the way in is then guaranteed to pass on content
+// grounds; anything up to a bare filesystem I/O failure in CreateFromForm's
+// temp-dir+rename write itself remains a real dataloss window, but that's
+// no worse than any other os.Rename-based writer.
 func (s *skillsService) InstallOrReplace(userID string, r CreateSkillReq) (*Skill, error) {
 	id := slugify(r.Name)
 	if err := ValidateSkillID(id); err != nil {
+		return nil, err
+	}
+	if err := validateSkillDescription(r.Description); err != nil {
+		return nil, err
+	}
+	if len(r.MD) > MaxSkillMDBytes {
+		return nil, fmt.Errorf("SKILL.md exceeds %d bytes (got %d)", MaxSkillMDBytes, len(r.MD))
+	}
+	if err := checkUploads(r.Scripts); err != nil {
 		return nil, err
 	}
 	if _, err := os.Stat(s.store.UserPath(userID, id)); err == nil {
