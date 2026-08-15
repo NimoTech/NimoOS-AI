@@ -49,6 +49,8 @@ services:
       # skills root: Go (host) seeds builtin/ here and builds the .runtime/<user>/ symlink
       # view; the container's Python list_skills/read_skill_file only scans read-only, hence read_only.
       - { type: bind, source: /var/lib/nimoos/ai/skills, target: /var/lib/nimoos/ai/skills, read_only: true }
+      - { type: bind, source: /var/lib/nimoos/ai/toolbox, target: /opt/toolbox, bind: { create_host_path: true } }
+      - { type: bind, source: /var/lib/nimoos/ai/homes, target: /var/lib/nimoos/ai/homes, bind: { create_host_path: true } }
       # NOTE: /etc/nimoos is no longer mounted (P2c). Agent config goes entirely through
       # NIMOOS_* env vars and never reads /etc/nimoos; this mount used to expose
       # ai_master.key/service config to root commands. Mount masking is hard-blocked by

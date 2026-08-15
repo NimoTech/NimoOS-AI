@@ -67,6 +67,22 @@ WORK_ROOT = Path(os.environ.get(
     str(Path.home() / ".nimoos" / "agent"),
 ))
 
+HOMES_ROOT = Path(os.environ.get("NIMOOS_HOMES_ROOT", "/var/lib/nimoos/ai/homes"))
+
+
+def _user_home_env() -> dict:
+    from skills.skills_registry import USER_ID_VAR
+    uid = (USER_ID_VAR.get() or "").strip()
+    if not uid or not HOMES_ROOT.is_dir():
+        return {}
+    home = HOMES_ROOT / uid
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}
+    return {"HOME": str(home)}
+
+
 _NETWORK_HINT = ("\n(System hint: the command may have failed because the sandbox is offline by default. "
                  "If network access is genuinely needed, retry with network=true — the user will be asked to confirm.)")
 
@@ -136,7 +152,7 @@ async def _run(command: str, timeout_sec: int, network: bool,
         # Lazy import: keeps bwrap mode loadable even if netns package is absent.
         from netns import client as netns_client  # noqa: PLC0415
         exit_code, output = await netns_client.run_command(
-            command, timeout_sec, env={}, cwd=str(work)
+            command, timeout_sec, env=_user_home_env(), cwd=str(work)
         )
         return f"[exit {exit_code}]\n{output}"
 

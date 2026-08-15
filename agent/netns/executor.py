@@ -91,6 +91,15 @@ DEFAULT_SOCK_PATH = "/var/run/nimoos/agent-exec.sock"
 DEFAULT_PID_FILE = "/var/run/nimoos/agent-exec.pid"
 MCP_SOCK_DIR = os.environ.get("NIMOOS_MCP_SOCK_DIR", "/var/run/nimoos")
 
+TOOLBOX_BIN = os.environ.get("NIMOOS_TOOLBOX_BIN", "/opt/toolbox/bin")
+_BASE_PATH = "/usr/bin:/usr/sbin:/bin:/sbin"
+
+
+def _sandbox_path() -> str:
+    if os.path.isdir(TOOLBOX_BIN):
+        return f"{TOOLBOX_BIN}:{_BASE_PATH}"
+    return _BASE_PATH
+
 PROXY_BASE_URL = f"http://{bootstrap.PROXY_IP}:8888"
 
 PRLIMIT_BIN = os.environ.get("PRLIMIT_PATH", "/usr/bin/prlimit")
@@ -178,7 +187,7 @@ def _build_proxy_env(extra_env: dict) -> dict:
     """
     base_env = {
         "HOME": "/work",
-        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "PATH": _sandbox_path(),
         "TERM": "dumb",
     }
     # Layer 2: runtime vars from the executor's own environment.
@@ -423,7 +432,7 @@ def _execute(req: dict) -> dict:
     # by passing env={"HTTP_PROXY": "http://evil"}.
     base_env = {
         "HOME": "/work",
-        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "PATH": _sandbox_path(),
         "TERM": "dumb",
     }
     base_env.update(extra_env)
