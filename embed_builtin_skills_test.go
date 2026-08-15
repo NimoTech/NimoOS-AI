@@ -79,7 +79,8 @@ func TestAllBuiltinBundlesPassValidation(t *testing.T) {
 		ids = append(ids, m.ID)
 	}
 	require.Contains(t, ids, "desktop-app-builder")
-	// 7 pre-existing bundles + desktop-app-builder. A silently-skipped
-	// (invalid) bundle would make this count drop.
-	require.Len(t, ms, 8)
+	require.Contains(t, ids, "toolbox-helper")
+	// 7 pre-existing bundles + desktop-app-builder + toolbox-helper. A
+	// silently-skipped (invalid) bundle would make this count drop.
+	require.Len(t, ms, 9)
 }
