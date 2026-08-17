@@ -228,7 +228,7 @@ def _reset_run_allowlist():
     """ContextVars set in a sync test leak into later tests in the same
     process — always hand the gate back an empty run allowlist."""
     yield
-    shell.RUN_ALLOWLIST_VAR.set([])
+    shell.RUN_ALLOWLIST_VAR.set(())
 
 
 def _shell_setup(monkeypatch, mgr=None, sink=None, unattended=True):
@@ -240,7 +240,7 @@ def _shell_setup(monkeypatch, mgr=None, sink=None, unattended=True):
     shell.DB_VAR.set(conn)
     shell.CONFIRM_MGR_VAR.set(None if unattended else mgr)
     shell.EVENT_QUEUE_VAR.set(None if unattended else sink)
-    shell.RUN_ALLOWLIST_VAR.set([])
+    shell.RUN_ALLOWLIST_VAR.set(())
     monkeypatch.setattr("shell_guard.backstop.prepare_backstop",
                         lambda paths, trash_root=None: __import__(
                             "shell_guard.backstop", fromlist=["BackstopResult"]
@@ -330,7 +330,7 @@ def test_empty_run_allowlist_leaves_behavior_unchanged(monkeypatch):
         return "ask"
     monkeypatch.setattr(shell, "judge_command", _ask)
 
-    assert shell.RUN_ALLOWLIST_VAR.get() == []
+    assert not shell.RUN_ALLOWLIST_VAR.get()
     assert asyncio.run(shell._guard_command("ls -la")) is None       # safe
     msg = asyncio.run(shell._guard_command("rm -rf /DATA/x"))        # dangerous
     assert msg is not None and "no confirmation channel" in msg
@@ -343,3 +343,165 @@ def test_run_allowlist_does_not_write_persistent_allowlist(monkeypatch):
     asyncio.run(shell._guard_command("rm -rf /DATA/x"))
     from shell_guard import allowlist as AL
     assert AL.list_entries(conn) == []
+
+
+# ── fix round 1: I1 interpreter escape hatch ─────────────────────────────────
+
+# Each of these hides its real work in a string argument that `classify` cannot
+# read — several classify as GRAY, so the `protected` exclusion alone would not
+# have stopped them.  A run rule that literally names the interpreter must still
+# not vouch for them.
+_INTERPRETER_BYPASSES = [
+    ("sh -c ", "sh -c \"cat /$(echo etc)/shadow\""),
+    ("sh -c ", "sh -c 'rm -rf $HOME'"),
+    ("bash -c ", "bash -c 'cat /etc/shadow'"),
+    ("python3 -c ", "python3 -c 'import os; os.system(\"rm -rf /DATA/x\")'"),
+    ("perl -e ", "perl -e 'unlink glob \"/DATA/*\"'"),
+    ("node -e ", "node -e 'require(\"fs\").rmSync(\"/DATA\",{recursive:true})'"),
+    ("find /DATA ", "find /DATA -name '*.tmp' -exec rm -f {} ;"),
+    # `env`/`nohup`/assignments are unwrapped first, so the interpreter behind
+    # them is still recognized.
+    ("env python3 -c ", "env python3 -c 'import os; os.system(\"rm -rf /DATA/x\")'"),
+]
+
+
+@pytest.mark.parametrize("rule_value,command", _INTERPRETER_BYPASSES)
+def test_run_allowlist_never_covers_interpreters(monkeypatch, rule_value, command):
+    """I1 RED LINE: an interpreter/exec-flag command is refused even when a run
+    rule names it exactly — its payload is invisible to the classifier, so
+    pre-authorizing it would be pre-authorizing anything."""
+    _shell_setup(monkeypatch)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
+    shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": rule_value},
+                                 {"kind": "regex", "value": ".*"}])
+    msg = asyncio.run(shell._guard_command(command))
+    assert msg is not None, command
+    assert "NOT executed" in msg or "no confirmation channel" in msg, command
+
+
+def test_run_allowlist_interpreter_check_is_run_scoped_only(monkeypatch):
+    """The persistent allowlist is untouched by the interpreter rule — that is
+    existing, human-maintained behavior and a separate follow-up."""
+    conn = _shell_setup(monkeypatch)
+    from shell_guard import allowlist as AL
+    AL.add(conn, "prefix", "sh -c ", "user")
+    assert AL.match(conn, "sh -c 'rm -rf $HOME'") is True
+
+
+def test_run_allowlist_still_passes_a_normal_command(monkeypatch):
+    """Control for I1: the interpreter rule must not swallow ordinary tools."""
+    _shell_setup(monkeypatch)
+
+    async def _boom(_cmd):
+        raise AssertionError("judge must not be consulted")
+    monkeypatch.setattr(shell, "judge_command", _boom)
+
+    shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": "lark-cli "}])
+    assert asyncio.run(shell._guard_command("lark-cli im chats list")) is None
+
+
+# ── fix round 1: I2 regex cost bounds ────────────────────────────────────────
+
+def test_shell_match_skips_regex_for_overlong_command():
+    """I2: a catastrophic pattern must not be run against a long command —
+    `^(a+)+$` over 30 chars already blocks the whole event loop for ~29 s."""
+    import time
+    from tasks import preauth
+    rules = [{"kind": "regex", "value": r"^(a+)+$"}]
+    long_cmd = "a" * (preauth.MAX_REGEX_COMMAND_LEN + 1) + "b"
+    t0 = time.monotonic()
+    assert preauth.shell_match(rules, long_cmd) is False
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_shell_match_regex_still_applies_below_the_bound():
+    from tasks import preauth
+    rules = [{"kind": "regex", "value": r"^gh pr list"}]
+    assert preauth.shell_match(rules, "gh pr list --limit 5") is True
+
+
+def test_shell_match_prefix_unaffected_by_length_bound():
+    """Prefix matching is linear — length must not disable it."""
+    from tasks import preauth
+    rules = [{"kind": "prefix", "value": "lark-cli "}]
+    assert preauth.shell_match(rules, "lark-cli " + "x" * 5000) is True
+
+
+def test_parse_truncates_oversized_rule_lists():
+    from tasks import preauth
+    doc = {"shell": [{"kind": "prefix", "value": f"c{i} "} for i in range(200)],
+           "egress_domains": [f"h{i}.example.com" for i in range(100)]}
+    p = preauth.parse(doc)
+    assert len(p["shell"]) == preauth.MAX_RULES
+    assert len(p["egress_domains"]) == preauth.MAX_RULES
+    assert p["shell"][0] == {"kind": "prefix", "value": "c0 "}   # head kept
+
+
+def test_shell_match_caps_rules_even_if_not_parsed():
+    """shell_match is also called with raw rule lists (defense in depth)."""
+    from tasks import preauth
+    rules = ([{"kind": "prefix", "value": "nope "}] * preauth.MAX_RULES
+             + [{"kind": "prefix", "value": "yes "}])
+    assert preauth.shell_match(rules, "yes go") is False
+
+
+# ── fix round 1: I3 audit the MCP wildcard grant ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_mcp_wildcard_grant_is_audited(tmp_path):
+    """I3: a wildcard grant skips the confirmation card, so without this the
+    call would leave no trace anywhere."""
+    import json
+    import audit as A
+    A.set_audit_path_for_test(str(tmp_path / "audit.log"))
+    try:
+        _mgr, q = _mcp_setup(conn=_FakeConn())
+        mc._CONFIRMED_TOOLS_VAR.set({"1::*"})
+        assert await mc._ensure_confirmed(
+            {"id": 1, "name": "git"}, "search", {"q": "hi"}) is True
+        recs = [json.loads(line) for line
+                in (tmp_path / "audit.log").read_text().splitlines()]
+    finally:
+        A.set_audit_path_for_test(None)
+    hits = [r for r in recs if r["event"] == "mcp_call"]
+    assert len(hits) == 1
+    assert hits[0]["reason"] == "run-preauth-wildcard"
+    assert hits[0]["tool"] == "search" and hits[0]["server"] == 1
+    assert q.events == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_exact_confirmation_is_not_audited_as_wildcard(tmp_path):
+    """Control: the pre-existing exact-key path must not start emitting the
+    new record (it is covered by the confirmation trail)."""
+    import json
+    import audit as A
+    A.set_audit_path_for_test(str(tmp_path / "audit.log"))
+    try:
+        _mgr, _q = _mcp_setup(conn=_FakeConn())
+        mc._CONFIRMED_TOOLS_VAR.set({"1::search"})
+        assert await mc._ensure_confirmed({"id": 1, "name": "git"}, "search", {}) is True
+        logf = tmp_path / "audit.log"
+        recs = ([json.loads(line) for line in logf.read_text().splitlines()]
+                if logf.exists() else [])
+    finally:
+        A.set_audit_path_for_test(None)
+    assert [r for r in recs if r["event"] == "mcp_call"] == []
+
+
+# ── fix round 1: Minor5 immutable ContextVar default ─────────────────────────
+
+def test_run_allowlist_var_default_is_immutable():
+    """Minor5: a mutable default is shared by every context that never set the
+    var — a single accidental in-place append would grant it to every run."""
+    import contextvars
+
+    def _read():
+        return shell.RUN_ALLOWLIST_VAR.get()
+
+    value = contextvars.Context().run(_read)   # empty context → declared default
+    assert value == () and not isinstance(value, list)

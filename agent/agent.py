@@ -633,7 +633,12 @@ class AgentRunner:
             shell_skills.EVENT_QUEUE_VAR.set(sink)
             # Run-scoped shell pre-authorization (scheduled tasks). Always set —
             # a run without preauth gets [], which is the pre-existing behavior.
-            # The token lets the finally block hand the context back untouched.
+            # THAT unconditional set (plus the fact that every run executes in
+            # its own asyncio task, i.e. its own copy of the context) is what
+            # actually guarantees no cross-run bleed. The token/reset below is
+            # best-effort housekeeping only: it is ~260 lines above the try, so
+            # a failure in between skips the reset entirely — harmless, because
+            # the context dies with the task and the next run re-sets the var.
             _run_allow_token = shell_skills.RUN_ALLOWLIST_VAR.set(
                 list(run_shell_allowlist or []))
 
@@ -1038,11 +1043,12 @@ class AgentRunner:
                 # in main.py for replay; we just remove it from the hot-path
                 # egress routing table.
                 self._active_sinks.pop(session_id, None)
-                # Drop the run-scoped shell grant as soon as the run ends.
+                # Drop the run-scoped shell grant as soon as the run ends
+                # (best-effort — see the note at the set site above).
                 try:
                     shell_skills.RUN_ALLOWLIST_VAR.reset(_run_allow_token)
                 except Exception:  # noqa: BLE001 — token from another context
-                    shell_skills.RUN_ALLOWLIST_VAR.set([])
+                    shell_skills.RUN_ALLOWLIST_VAR.set(())
                 await mcp_client.close_run_conns()
                 await sink.put({"type": "done"})
 

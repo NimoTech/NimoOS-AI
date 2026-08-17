@@ -53,9 +53,12 @@ EVENT_QUEUE_VAR: ContextVar = ContextVar("shell_event_queue", default=None)
 # Run-scoped shell allowlist (scheduled tasks' `preauth.shell`).  Unlike the
 # persistent `shell_allowlist` table this lives only for the duration of one
 # agent run and is NEVER written to the DB.  Set by agent.py::run() from the
-# run's pre-authorization; default [] means "no run-scoped grant" and keeps the
-# gate bit-identical to its pre-preauth behavior.
-RUN_ALLOWLIST_VAR: ContextVar[list] = ContextVar("shell_run_allowlist", default=[])
+# run's pre-authorization; the empty default means "no run-scoped grant" and
+# keeps the gate bit-identical to its pre-preauth behavior.  The default is an
+# immutable tuple on purpose — a mutable default object is shared by every
+# context that never set the var.  Readers must treat it as read-only.
+RUN_ALLOWLIST_VAR: ContextVar[tuple | list] = ContextVar(
+    "shell_run_allowlist", default=())
 
 EXEC_MODE = os.environ.get("NIMOOS_AGENT_EXEC_MODE", "netns")
 
@@ -250,6 +253,25 @@ def _argv_is_atomic(seg) -> bool:
     )
 
 
+# Commands whose real work lives in a STRING ARGUMENT the classifier never sees.
+# `sh -c 'cat /etc/shadow'` classifies as GRAY (argv is just `sh`, `-c`, and an
+# opaque string), so the `protected` exclusion below would not fire and a run
+# rule like prefix "sh -c " would wave the payload through unattended. The
+# persistent allowlist has the same hole, but that is a human-maintained,
+# per-machine decision and is out of scope here (tracked follow-up); a
+# run-scoped grant must never be usable as an interpreter escape hatch.
+_RUN_INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "busybox",
+    "python", "python2", "python3", "perl", "ruby", "php", "lua",
+    "node", "nodejs", "deno", "bun", "awk", "gawk", "mawk",
+    # `env` is normally unwrapped by _effective_argv; it only survives in its
+    # degenerate form (`env -i`), which is still not something to pre-authorize.
+    "env",
+}
+# Flags that hand a command/expression to another process for execution.
+_RUN_EXEC_FLAGS = {"-c", "-e", "-exec", "-execdir", "-ok", "-okdir"}
+
+
 def _run_allowlist_match(command: str, decision) -> bool:
     """True if the run-scoped pre-authorization vouches for `command`.
 
@@ -261,11 +283,14 @@ def _run_allowlist_match(command: str, decision) -> bool:
       that is a human-maintained, per-machine decision.  A run-scoped grant
       comes from a scheduled task's stored document and runs with nobody
       watching, so protected always falls through to the refusal path.
+    * Interpreters / exec-flags are never covered (see _RUN_INTERPRETERS): their
+      payload is invisible to `classify`, so the protected exclusion above would
+      be trivially bypassable.
     * Same anti-smuggling shape as `shell_guard.allowlist.match`: a SINGLE
       simple command, no chaining (`;`/`&&`/`|`/subshells) and no redirection,
       so a benign matched prefix can't vouch for a destructive tail.
     """
-    rules = RUN_ALLOWLIST_VAR.get() or []
+    rules = RUN_ALLOWLIST_VAR.get() or ()   # read-only: never mutate in place
     if not rules:
         return False
     if decision.level == "protected":
@@ -275,6 +300,16 @@ def _run_allowlist_match(command: str, decision) -> bool:
     if segs is None or len(segs) != 1:
         return False
     if segs[0].redirect_targets or segs[0].read_targets:
+        return False
+    # Unwrap `env`/`nohup`/`X=1 …` first, so `env python3 -c …` is judged as the
+    # python3 it actually runs (same unwrapping the classifier uses).
+    from shell_guard.rules import _effective_argv  # noqa: PLC0415
+    argv = _effective_argv(segs[0].argv)
+    if not argv:
+        return False
+    if os.path.basename(argv[0]) in _RUN_INTERPRETERS:
+        return False
+    if any(tok in _RUN_EXEC_FLAGS for tok in argv[1:]):
         return False
     from tasks import preauth as _preauth  # noqa: PLC0415
     return _preauth.shell_match(rules, command)

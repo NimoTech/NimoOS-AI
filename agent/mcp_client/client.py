@@ -20,6 +20,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST, METHOD_NOT_FOUND
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 
+from audit import audit as _audit
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
 from mcp_client.status import OK, FAILED, WARMING, CONFIG_ERROR, ServerStatus
@@ -297,7 +298,15 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     # pre-authorization (agent.py passes pre_confirmed_tools). It waives
     # confirmation for that server only — there is deliberately no broader
     # form (a bare "*" matches no key and vouches for nothing).
-    if key in _confirmed or f"{server['id']}::*" in _confirmed:
+    if key in _confirmed:
+        return True
+    if f"{server['id']}::*" in _confirmed:
+        # A wildcard grant skips the card entirely, so the confirmation trail
+        # that normally records the decision does not exist — audit it here or
+        # the call leaves no trace at all (mirrors shell.py's "run-preauth").
+        _audit("mcp_call", session_id=SESSION_ID_VAR.get(),
+               server=server["id"], tool=tool_name,
+               reason="run-preauth-wildcard", outcome="allowlisted")
         return True
     mgr = CONFIRM_MGR_VAR.get()
     queue = EVENT_QUEUE_VAR.get()
