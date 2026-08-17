@@ -314,6 +314,36 @@ async def _notes_distill_scanner_startup():
     notes_distill_scan.start_scanner(_db())
 
 
+# Kept alive for the process's lifetime: an asyncio.Task with no strong
+# reference anywhere can be garbage-collected mid-await.
+_tasks_workers = {}
+
+
+@app.on_event("startup")
+async def _tasks_runner_startup():
+    """Scheduled-task run worker.
+
+    Registered BEFORE the scheduler on purpose: start_worker() reconciles runs
+    left 'queued'/'running' by the previous process (marking them failed, never
+    replaying them), and doing that after the scheduler's first tick would
+    kill runs it had just legitimately enqueued.
+    """
+    try:
+        from tasks import runner as tasks_runner
+        _tasks_workers["runner"] = tasks_runner.start_worker(_db())
+    except Exception:
+        _LOG.exception("tasks runner startup failed; scheduled tasks will not run")
+
+
+@app.on_event("startup")
+async def _tasks_scheduler_startup():
+    try:
+        from tasks import scheduler as tasks_scheduler
+        _tasks_workers["scheduler"] = tasks_scheduler.start_worker(_db())
+    except Exception:
+        _LOG.exception("tasks scheduler startup failed; scheduled tasks will not fire")
+
+
 _channel_manager = None
 
 
