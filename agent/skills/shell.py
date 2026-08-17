@@ -267,21 +267,32 @@ _RUN_INTERPRETERS = {
     "pwsh", "powershell", "tclsh", "expect", "Rscript", "osascript",
     # Not interpreters in the language sense, but they all take a command (or a
     # recipe/playbook naming one) and run it, so the argv the classifier sees is
-    # never the work that happens.
+    # never the work that happens.  `xargs` in particular is ALSO an exec
+    # wrapper, so it is only caught by the pre-unwrap check below: its argv
+    # names one command but the arguments come from stdin, which nothing here
+    # can see.
     "xargs", "make", "systemd-run", "ansible-playbook",
-    # `env` is normally unwrapped by _effective_argv; it only survives in its
-    # degenerate form (`env -i`), which is still not something to pre-authorize.
-    "env",
+    # NOT listed: `env` / `nohup` / `nice` / `timeout` / `sudo` … — plain exec
+    # wrappers.  Whatever they wrap is revealed by _effective_argv and judged on
+    # its own merits (`env python3 -c …` is refused as python3), so listing them
+    # would only break honest invocations like `env LC_ALL=C sort -c f.txt`.
 }
 # find-family flags that hand a command to another process.  Unambiguous (no
 # other common tool spells them), so they are checked on every command.
 #
-# `-c` / `-e` are NOT checked: they only mean "execute this string" for the
-# interpreters above, which are already refused wholesale by name, while for
-# ordinary tools they are everyday flags — `curl -e`, `sed -e`, `sort -c`,
-# `cut -c`, `tar -cf`, `git commit -c`, `gcc -c`, `docker run -e`, `jq -e`,
-# `ssh -e`, `openssl enc -e`.  Refusing those broke the only use case this
-# feature has (unattended runs), for no security gain (review round 2, M2).
+# `-c` / `-e` are NOT checked (review round 2, M2): as everyday flags on
+# ordinary tools — `curl -e`, `sed -e`, `sort -c`, `cut -c`, `tar -cf`,
+# `git commit -c`, `gcc -c`, `docker run -e`, `jq -e`, `ssh -e`,
+# `openssl enc -e` — refusing them broke the only use case this feature has.
+#
+# That trade is NOT free, and the earlier "no security gain" claim was wrong.
+# It gives up coverage of launchers whose argv[0] is not itself an interpreter
+# but that still run an arbitrary command through a `-c`-ish option, e.g.
+# `git -c core.pager='rm -rf /DATA' log` or `uv run python -c …`.  Mitigation
+# today is authoring discipline: a rule should name the whole invocation
+# (prefix `git log`), not just the binary (prefix `git `).  FOLLOW-UP: an
+# option-aware per-tool deny list (git -c/-C/--exec-path, uv/uvx/npx/pipx run,
+# find -printf %h, …) rather than a blanket flag scan.
 _RUN_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
 
 
@@ -315,13 +326,20 @@ def _run_allowlist_match(command: str, decision) -> bool:
         return False
     if segs[0].redirect_targets or segs[0].read_targets:
         return False
-    # Unwrap `env`/`nohup`/`X=1 …` first, so `env python3 -c …` is judged as the
-    # python3 it actually runs (same unwrapping the classifier uses).
+    # Check the command BOTH as written and as it will actually run.
+    # `_effective_argv` unwraps `env`/`nohup`/`xargs`/`X=1 …`, which is what
+    # makes `env python3 -c …` resolve to python3 — but it also *removes* the
+    # wrapper, so checking only the unwrapped form let `xargs rm -rf …` through
+    # as a plain `rm`.  Every name that was peeled off is checked too.
     from shell_guard.rules import _effective_argv  # noqa: PLC0415
-    argv = _effective_argv(segs[0].argv)
+    raw_argv = segs[0].argv
+    argv = _effective_argv(raw_argv)
     if not argv:
         return False
-    if os.path.basename(argv[0]) in _RUN_INTERPRETERS:
+    peeled = raw_argv[:max(0, len(raw_argv) - len(argv))]
+    names = [os.path.basename(tok) for tok in peeled]
+    names.append(os.path.basename(argv[0]))
+    if any(name in _RUN_INTERPRETERS for name in names):
         return False
     if any(tok in _RUN_EXEC_FLAGS for tok in argv[1:]):
         return False

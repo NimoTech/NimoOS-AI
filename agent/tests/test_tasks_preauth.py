@@ -47,28 +47,21 @@ def test_parse_tolerates_none_and_wrong_shapes():
                      "mcp_tools": [], "fs_write": []}
 
 
-def test_shell_match_prefix_and_regex():
+def test_shell_match_prefix():
     from tasks import preauth
     rules = [{"kind": "prefix", "value": "lark-cli "},
-             {"kind": "regex", "value": r"^gh (pr|issue) list"}]
+             {"kind": "prefix", "value": "gh pr list"}]
     assert preauth.shell_match(rules, "lark-cli im chats list")
     assert preauth.shell_match(rules, "gh pr list --limit 5")
     assert not preauth.shell_match(rules, "rm -rf /DATA")
     assert not preauth.shell_match(rules, "echo lark-cli ")  # 前缀不是子串
 
 
-def test_shell_match_bad_regex_is_not_a_match():
+def test_shell_match_does_not_strip_the_command():
+    """Leading whitespace is part of what the author would have authorized."""
     from tasks import preauth
-    assert not preauth.shell_match([{"kind": "regex", "value": "("}], "anything")
-
-
-def test_shell_match_regex_is_anchored_at_start():
-    """An unanchored pattern must not vouch for a command that merely CONTAINS
-    it — matching is start-anchored regardless of what the rule author wrote."""
-    from tasks import preauth
-    rules = [{"kind": "regex", "value": r"gh pr list"}]
-    assert preauth.shell_match(rules, "gh pr list")
-    assert not preauth.shell_match(rules, "rm -rf /DATA && gh pr list")
+    rules = [{"kind": "prefix", "value": "lark-cli "}]
+    assert not preauth.shell_match(rules, "  lark-cli im chats list")
 
 
 def test_shell_match_empty_rules_and_junk():
@@ -390,7 +383,7 @@ def test_run_allowlist_never_covers_interpreters(monkeypatch, rule_value, comman
     monkeypatch.setattr(shell, "judge_command", _ask)
 
     shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": rule_value},
-                                 {"kind": "regex", "value": ".*"}])
+                                 {"kind": "prefix", "value": ""}])
     msg = asyncio.run(shell._guard_command(command))
     assert msg is not None, command
     assert "NOT executed" in msg or "no confirmation channel" in msg, command
@@ -417,24 +410,67 @@ def test_run_allowlist_still_passes_a_normal_command(monkeypatch):
     assert asyncio.run(shell._guard_command("lark-cli im chats list")) is None
 
 
-# ── fix round 1: I2 regex cost bounds ────────────────────────────────────────
+# ── round 3: regex is gone — nothing from a document is ever compiled ────────
 
-def test_shell_match_skips_regex_for_overlong_command():
-    """I2 (secondary bound): regex rules are skipped past the length cap. The
-    pattern here WOULD match — being skipped is the point. This bounds the
-    polynomial cases the shape check does not catch; the exponential PoC is
-    covered by test_shell_match_redos_poc_is_fast."""
+# The patterns that killed two rounds of static detection. Round 2's detector
+# only recognized a QUANTIFIED GROUP, so it accepted all three (measured then:
+# 4.95 s / 31 s / 7 s of dead event loop each, ×64 rules → minutes).
+_REDOS_PATTERNS = [
+    r"^a*a*a*a*a*a*a*a*a*a*$",
+    r"^(a?){30}a{30}$",
+    r"^\s*\s*\s*\s*\s*\s*\s*\s*\s*\s*$",
+    r"^(a+)+$",
+]
+_REDOS_INPUTS = ["a" * 30 + "b", "a" * 30 + "b", " " * 30 + "b", "a" * 30 + "b"]
+
+
+@pytest.mark.parametrize("pattern,command", list(zip(_REDOS_PATTERNS, _REDOS_INPUTS)))
+def test_redos_patterns_are_never_executed(pattern, command):
+    """A regex rule is not a rule any more: it is dropped, so the pattern is
+    never compiled and the input length stops mattering."""
     from tasks import preauth
-    rules = [{"kind": "regex", "value": r"^a+b$"}]
-    long_cmd = "a" * (preauth.MAX_REGEX_COMMAND_LEN + 1) + "b"
-    assert preauth.shell_match(rules, "a" * 10 + "b") is True
-    assert preauth.shell_match(rules, long_cmd) is False
+    t0 = time.perf_counter()
+    assert preauth.shell_match([{"kind": "regex", "value": pattern}],
+                               command) is False
+    assert time.perf_counter() - t0 < 0.05
 
 
-def test_shell_match_regex_still_applies_below_the_bound():
+def test_full_document_of_redos_rules_stays_fast():
+    """Even MAX_RULES×2 of them, which used to multiply into minutes."""
     from tasks import preauth
-    rules = [{"kind": "regex", "value": r"^gh pr list"}]
-    assert preauth.shell_match(rules, "gh pr list --limit 5") is True
+    rules = [{"kind": "regex", "value": p}
+             for p in _REDOS_PATTERNS] * (preauth.MAX_RULES // 2)
+    t0 = time.perf_counter()
+    assert preauth.shell_match(rules, "a" * 30 + "b") is False
+    assert time.perf_counter() - t0 < 0.05
+
+
+@pytest.mark.parametrize("pattern", _REDOS_PATTERNS)
+def test_parse_drops_regex_rules_and_reports_them(pattern):
+    from tasks import preauth
+    doc, report = preauth.parse_with_report({"shell": [
+        {"kind": "regex", "value": pattern},
+        {"kind": "prefix", "value": "lark-cli "}]})
+    assert doc["shell"] == [{"kind": "prefix", "value": "lark-cli "}]
+    assert report["rejected_rules"] == [
+        {"field": "shell", "value": pattern,
+         "reason": "regex_rules_not_supported"}]
+
+
+def test_regex_rule_cannot_grant_anything_at_the_gate(monkeypatch):
+    """End-to-end: a document whose only rule is a (previously valid) regex
+    grants nothing — the command falls back to the normal gate."""
+    _shell_setup(monkeypatch)
+
+    async def _ask(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _ask)
+
+    from tasks import preauth
+    shell.RUN_ALLOWLIST_VAR.set(preauth.parse(
+        {"shell": [{"kind": "regex", "value": r"^lark-cli .*"}]})["shell"])
+    msg = asyncio.run(shell._guard_command("lark-cli im chats list"))
+    assert msg is not None and "no confirmation channel" in msg
 
 
 def test_shell_match_prefix_unaffected_by_length_bound():
@@ -555,84 +591,13 @@ async def test_mcp_exact_confirmation_is_not_audited_as_wildcard(tmp_path):
     assert [r for r in recs if r["event"] == "mcp_call"] == []
 
 
-# ── fix round 1: Minor5 immutable ContextVar default ─────────────────────────
-
-# ── fix round 2: M1 the regex bound must stop the ACTUAL PoC ─────────────────
-
-_REDOS_POC = r"^(a+)+$"
-_REDOS_INPUT = "a" * 30 + "b"     # 31 chars — blocks for ~29 s unguarded
-
-
-def test_shell_match_redos_poc_is_fast():
-    """M1: the finding's own PoC. Unguarded this blocks the event loop ~29 s;
-    the round-1 512-char input cap did nothing for it (31-char input)."""
-    from tasks import preauth
-    t0 = time.perf_counter()
-    assert preauth.shell_match([{"kind": "regex", "value": _REDOS_POC}],
-                               _REDOS_INPUT) is False
-    assert time.perf_counter() - t0 < 0.1
-
-
-def test_parse_rejects_redos_poc_and_reports_it():
-    from tasks import preauth
-    doc, report = preauth.parse_with_report({"shell": [
-        {"kind": "regex", "value": _REDOS_POC},
-        {"kind": "prefix", "value": "lark-cli "}]})
-    assert doc["shell"] == [{"kind": "prefix", "value": "lark-cli "}]
-    assert report["rejected_rules"] == [
-        {"field": "shell", "value": _REDOS_POC, "reason": "unsafe_or_invalid_regex"}]
-
-
-def test_full_rule_list_of_poc_patterns_stays_fast():
-    """The per-command cost must not be multipliable by a long rule list."""
-    from tasks import preauth
-    rules = [{"kind": "regex", "value": _REDOS_POC}] * (preauth.MAX_RULES * 2)
-    t0 = time.perf_counter()
-    assert preauth.shell_match(rules, _REDOS_INPUT) is False
-    assert time.perf_counter() - t0 < 0.1
-
-
-@pytest.mark.parametrize("pattern", [
-    r"^(a+)+$", r"(a*)*$", r"(a|a)+$", r"(?:\s+)+$", r"^(x+x+)+y",
-    r"([a-z]+)+$", r"(\d+|\w+)*", r"(a+){2,}",
-])
-def test_catastrophic_shapes_are_detected(pattern):
-    from tasks import preauth
-    assert preauth._is_catastrophic_regex(pattern) is True
-
-
-@pytest.mark.parametrize("pattern", [
-    r"^gh (pr|issue) list", r"^lark-cli \S+", r"^git (status|log)$",
-    r"^ls -la?$", r"(abc)+", r"^rsync -a /DATA/\w+ /DATA/backup$",
-])
-def test_benign_patterns_are_not_rejected(pattern):
-    """The guard must not eat ordinary rules: an alternation group is fine as
-    long as it is not itself quantified."""
-    from tasks import preauth
-    assert preauth._is_catastrophic_regex(pattern) is False
-    assert preauth.parse({"shell": [{"kind": "regex", "value": pattern}]})["shell"]
-
-
-def test_benign_regex_still_matches_after_the_guard():
-    from tasks import preauth
-    rules = preauth.parse({"shell": [
-        {"kind": "regex", "value": r"^gh (pr|issue) list"}]})["shell"]
-    assert preauth.shell_match(rules, "gh pr list --limit 5") is True
-
-
-def test_uncompilable_regex_is_rejected_at_parse_time():
-    from tasks import preauth
-    doc, report = preauth.parse_with_report({"shell": [
-        {"kind": "regex", "value": "("}]})
-    assert doc["shell"] == []
-    assert report["rejected_rules"][0]["reason"] == "unsafe_or_invalid_regex"
-
-
 # ── fix round 2: M2 no over-refusal of everyday flags ────────────────────────
 
 # `-c` / `-e` are everyday flags on ordinary tools. Round 1 refused every
 # command carrying them, which broke the only use case this feature has.
 _COMMON_FLAG_COMMANDS = [
+    "curl -e https://ref https://x.com/a",
+    "sed -e s/a/b/ f.txt",
     "sort -c f.txt",
     "cut -c 1-5 f.txt",
     "tar -c -f a.tar d",
@@ -646,26 +611,53 @@ _COMMON_FLAG_COMMANDS = [
 
 
 @pytest.mark.parametrize("cmd", _COMMON_FLAG_COMMANDS)
-def test_run_allowlist_allows_common_flag_commands(monkeypatch, cmd):
-    """M2: a run rule naming one of these must actually cover it."""
+def test_run_allowlist_allows_common_flag_commands(monkeypatch, tmp_path, cmd):
+    """M2: a run rule naming one of these must actually cover it.
+
+    `classify` resolves relative tokens against a cwd, and its verdict for some
+    of these DEPENDS on that cwd (under the agent's own install dir, `s/a/b/`
+    and a bare URL resolve to paths it calls protected). The run gate always
+    passes the session work dir, so the test pins an explicit neutral cwd
+    instead of inheriting pytest's — otherwise it would pass or fail based on
+    where it was invoked from (round-3 finding)."""
     _shell_setup(monkeypatch)
-    decision = shell_guard.classify(cmd)
+    decision = shell_guard.classify(cmd, cwd=str(tmp_path))
     assert decision.level != "protected", f"{cmd} — precondition changed"
     shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": cmd}])
     assert shell._run_allowlist_match(cmd, decision) is True
 
 
-@pytest.mark.parametrize("cmd", ["curl -e https://ref https://x.com/a",
-                                 "sed -e s/a/b/ f.txt"])
-def test_curl_and_sed_blocked_by_classifier_not_by_flags(cmd):
-    """These two stay refused, but NOT because of the flag: `classify` already
-    calls them `protected` (a URL / a sed expression parsed as a path), and a
-    protected command is never covered by a run grant. Documented so the cause
-    isn't misattributed to the flag check — the control below carries no flag
-    at all and is classified the same way."""
-    assert shell_guard.classify(cmd).level == "protected"
-    assert shell_guard.classify("curl -sS https://x.com/a").level == "protected"
+# ── round 3: xargs must be caught BEFORE the wrapper is unwrapped ────────────
 
+@pytest.mark.parametrize("cmd", [
+    "xargs rm -rf /DATA/x",
+    "xargs -0 rm -rf /DATA/x",
+    "xargs sh -c 'rm -rf /DATA'",
+    "nohup xargs rm -rf /DATA/x",
+    "xargs",
+])
+def test_run_allowlist_never_covers_xargs(monkeypatch, tmp_path, cmd):
+    """`_effective_argv` peels `xargs` off, so checking only the unwrapped argv
+    saw a plain `rm` and let it through. Every peeled name is checked too."""
+    _shell_setup(monkeypatch)
+    decision = shell_guard.classify(cmd, cwd=str(tmp_path))
+    shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": cmd}])
+    assert shell._run_allowlist_match(cmd, decision) is False
+
+
+@pytest.mark.parametrize("cmd", ["timeout 5 lark-cli im chats list",
+                                 "nice -n 10 rsync -a /DATA/a /DATA/b",
+                                 "env LC_ALL=C sort -c f.txt"])
+def test_run_allowlist_still_covers_benign_wrappers(monkeypatch, tmp_path, cmd):
+    """Control: peeling a harmless wrapper must not become a refusal."""
+    _shell_setup(monkeypatch)
+    decision = shell_guard.classify(cmd, cwd=str(tmp_path))
+    assert decision.level != "protected", f"{cmd} — precondition changed"
+    shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": cmd}])
+    assert shell._run_allowlist_match(cmd, decision) is True
+
+
+# ── fix round 1: Minor5 immutable ContextVar default ─────────────────────────
 
 def test_run_allowlist_var_default_is_immutable():
     """Minor5: a mutable default is shared by every context that never set the
