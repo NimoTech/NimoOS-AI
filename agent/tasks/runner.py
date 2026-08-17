@@ -6,7 +6,8 @@ contract is testable without an LLM, the egress-proxy or a real agent run:
 
     claim_run → get_task → resolve model+credentials → create session →
     attach_session → grant_fs → grant_egress → assemble the run-scoped
-    pre-authorization → start_run → TaskRunDriver.drive → finish_run → prune
+    pre-authorization → start_run → TaskRunDriver.drive → finish_run →
+    notify.send_result → prune
 
 The order is not cosmetic:
 
@@ -40,7 +41,7 @@ import time
 
 from notes import store as notes_store
 
-from . import grants, preauth, store
+from . import grants, notify, preauth, store
 
 logger = logging.getLogger("nimoos-agent.tasks")
 
@@ -299,6 +300,7 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                        cancel=cancel_sink,
                        evict=evict_sink,
                        max_turns_reader=_default_max_turns_reader,
+                       notify=notify.send_result,
                        keep_runs: int = KEEP_RUNS) -> bool:
     """Claim and execute at most one run. False only when there was nothing
     to do — the caller uses that to decide whether to sleep.
@@ -415,6 +417,25 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                              run_id)
         return True
     finally:
+        # Notification: re-read task+run fresh so it always reflects exactly
+        # what finish_run (or the deleted-task/no-model/no-creds early exits)
+        # just committed, regardless of which branch above set it. This is
+        # the ONE call point for every terminal path, on purpose — a broken
+        # notification must never touch the run result already persisted, so
+        # it lives in `finally`, wrapped in its own try/except, ahead of the
+        # bookkeeping below.
+        try:
+            notified_task = store.get_task(conn, task_id, user_id)
+            if notified_task is not None:
+                notified_run = conn.execute(
+                    "SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+                if notified_run is not None:
+                    await notify(conn, notified_task, notified_run)
+        except Exception:                   # noqa: BLE001 — never affect the
+            # already-committed run result.
+            logger.warning("tasks runner: notify failed for run %s", run_id,
+                           exc_info=True)
+
         # Bookkeeping: it runs whatever happened above, and no failure in here
         # may undo the finish_run that just landed.
         if sink is not None and session_id:

@@ -435,6 +435,61 @@ async def test_no_preauth_note_when_nothing_was_auto_approved(conn):
     assert "preauth used" not in _run_row(conn, rid)["summary"]
 
 
+# -- notify (Task 6) -----------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_notify_is_called_once_per_run_with_the_committed_result(conn):
+    tid = _mk(conn)
+    rid = _queue(conn, tid)
+    h = Harness({"status": "succeeded", "summary": "done", "error": "",
+                 "denied": [], "auto_approved": []})
+    calls = []
+
+    async def fake_notify(conn_arg, task_row, run_row):
+        calls.append((task_row["id"], run_row["id"], run_row["status"],
+                      run_row["summary"]))
+        return True
+
+    await h.run(conn, notify=fake_notify)
+    assert calls == [(tid, rid, "succeeded", "done")]
+
+
+@pytest.mark.asyncio
+async def test_notify_failure_does_not_affect_the_recorded_result(conn):
+    """A broken channel (dead adapter, bad notify_channel, whatever) must
+    never take the committed run result down with it — `finish_run` already
+    landed before `notify` is even called."""
+    tid = _mk(conn)
+    rid = _queue(conn, tid)
+    h = Harness({"status": "succeeded", "summary": "all good", "error": "",
+                 "denied": [], "auto_approved": []})
+
+    async def boom(conn_arg, task_row, run_row):
+        raise RuntimeError("channel exploded")
+
+    assert await h.run(conn, notify=boom) is True
+    row = _run_row(conn, rid)
+    assert row["status"] == "succeeded"
+    assert row["summary"] == "all good"
+
+
+@pytest.mark.asyncio
+async def test_notify_skipped_when_task_was_deleted(conn):
+    tid = _mk(conn)
+    rid = _queue(conn, tid)
+    store.delete_task(conn, tid, "u1")
+    h = Harness()
+    calls = []
+
+    async def fake_notify(conn_arg, task_row, run_row):
+        calls.append(1)
+        return True
+
+    assert await h.run(conn, notify=fake_notify) is True
+    assert calls == []
+    assert _run_row(conn, rid)["status"] == "failed"
+
+
 # -- pruning + session deletion ----------------------------------------------
 
 def _seed_history(conn, task_id, count, snaps_root=None):
