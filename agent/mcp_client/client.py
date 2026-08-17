@@ -304,7 +304,14 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
         # A wildcard grant skips the card entirely, so the confirmation trail
         # that normally records the decision does not exist — audit it here or
         # the call leaves no trace at all (mirrors shell.py's "run-preauth").
-        _audit("mcp_call", session_id=SESSION_ID_VAR.get(),
+        try:
+            # Same per-run identity the skills use; lazy import keeps
+            # mcp_client free of a skills-package import at module load.
+            from skills.skills_registry import USER_ID_VAR  # noqa: PLC0415
+            _uid = USER_ID_VAR.get() or None
+        except Exception:  # noqa: BLE001 — auditing must never break the call
+            _uid = None
+        _audit("mcp_call", user_id=_uid, session_id=SESSION_ID_VAR.get(),
                server=server["id"], tool=tool_name,
                reason="run-preauth-wildcard", outcome="allowlisted")
         return True

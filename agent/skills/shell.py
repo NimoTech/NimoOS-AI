@@ -264,12 +264,25 @@ _RUN_INTERPRETERS = {
     "sh", "bash", "zsh", "dash", "ash", "ksh", "busybox",
     "python", "python2", "python3", "perl", "ruby", "php", "lua",
     "node", "nodejs", "deno", "bun", "awk", "gawk", "mawk",
+    "pwsh", "powershell", "tclsh", "expect", "Rscript", "osascript",
+    # Not interpreters in the language sense, but they all take a command (or a
+    # recipe/playbook naming one) and run it, so the argv the classifier sees is
+    # never the work that happens.
+    "xargs", "make", "systemd-run", "ansible-playbook",
     # `env` is normally unwrapped by _effective_argv; it only survives in its
     # degenerate form (`env -i`), which is still not something to pre-authorize.
     "env",
 }
-# Flags that hand a command/expression to another process for execution.
-_RUN_EXEC_FLAGS = {"-c", "-e", "-exec", "-execdir", "-ok", "-okdir"}
+# find-family flags that hand a command to another process.  Unambiguous (no
+# other common tool spells them), so they are checked on every command.
+#
+# `-c` / `-e` are NOT checked: they only mean "execute this string" for the
+# interpreters above, which are already refused wholesale by name, while for
+# ordinary tools they are everyday flags — `curl -e`, `sed -e`, `sort -c`,
+# `cut -c`, `tar -cf`, `git commit -c`, `gcc -c`, `docker run -e`, `jq -e`,
+# `ssh -e`, `openssl enc -e`.  Refusing those broke the only use case this
+# feature has (unattended runs), for no security gain (review round 2, M2).
+_RUN_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
 
 
 def _run_allowlist_match(command: str, decision) -> bool:
@@ -283,9 +296,10 @@ def _run_allowlist_match(command: str, decision) -> bool:
       that is a human-maintained, per-machine decision.  A run-scoped grant
       comes from a scheduled task's stored document and runs with nobody
       watching, so protected always falls through to the refusal path.
-    * Interpreters / exec-flags are never covered (see _RUN_INTERPRETERS): their
-      payload is invisible to `classify`, so the protected exclusion above would
-      be trivially bypassable.
+    * Interpreters and find-style exec flags are never covered (see
+      _RUN_INTERPRETERS): their payload is invisible to `classify`, so the
+      protected exclusion above would be trivially bypassable.  Ordinary tools'
+      flags are NOT inspected — that only over-refused honest commands.
     * Same anti-smuggling shape as `shell_guard.allowlist.match`: a SINGLE
       simple command, no chaining (`;`/`&&`/`|`/subshells) and no redirection,
       so a benign matched prefix can't vouch for a destructive tail.
