@@ -90,13 +90,40 @@ _SECRET_LINE_RE = re.compile(
 # Identity is echoed to the UI, so it is a whitelist projection: unknown keys
 # are dropped rather than passed through. Anything not listed here simply does
 # not reach the browser.
+#
+# Task 11 real-machine calibration: the actual `whoami` envelope (v1.0.85,
+# 118) is camelCase, not the snake_case this list was guessed as:
+#   {"profile":..., "appId":..., "brand":"feishu", "defaultAs":"auto",
+#    "identity":"user", "identitySource":"auto_detect", "available":true,
+#    "tokenStatus":"ready",
+#    "onBehalfOf":{"userName":"...", "openId":"ou_..."}}
+# `default_as`, `identity_source`, `available` and `on_behalf_of` are new
+# entries added to cover it; everything else already existed and now matches
+# via the case/separator-insensitive comparison in `_project_identity`
+# (`appId`/`app_id`, `tokenStatus`/`token_status`, `userName`/`user_name`,
+# `openId`/`open_id` are the same normalised key).
 _IDENTITY_KEYS = frozenset({
     "name", "user_name", "en_name", "nick_name", "display_name",
     "user_id", "open_id", "union_id", "employee_id",
     "tenant_key", "tenant_name", "app_id", "app_name",
-    "identity", "identity_type", "profile", "brand", "domain",
+    "identity", "identity_type", "identity_source", "profile", "brand", "domain",
     "status", "token_status", "expires_at", "avatar_url", "email",
+    "default_as", "available", "on_behalf_of",
 })
+
+
+def _normalize_key(key: str) -> str:
+    """Fold a key to lower-case with `_`/`-` stripped for whitelist matching.
+
+    The CLI's real envelopes mix snake_case (`token_status`) and camelCase
+    (`tokenStatus`, `onBehalfOf`) depending on the command, and the plan's
+    original whitelist only ever anticipated snake_case. Comparing normalised
+    forms lets one whitelist entry cover both without doubling every key.
+    """
+    return re.sub(r"[_-]", "", key).lower()
+
+
+_IDENTITY_KEYS_NORM = frozenset(_normalize_key(k) for k in _IDENTITY_KEYS)
 
 # ---------------------------------------------------------------------------
 # state
@@ -472,7 +499,10 @@ def _project_identity(doc: dict) -> dict:
     Unknown keys are dropped, not passed through — the bound-state envelope is
     unrecorded (Task 11), so an allow-list is the only way to be sure a token
     field we never anticipated does not reach the UI. Nested dicts are walked
-    so `{"user": {"name": ...}}` survives.
+    so `{"user": {"name": ...}}` (or the real `onBehalfOf: {userName, openId}`)
+    survives. The whitelist check itself is case/separator-insensitive
+    (`_normalize_key`) so `appId`/`tokenStatus`/`userName`/`openId` match their
+    snake_case whitelist entries without needing duplicate camelCase keys.
     """
     out: dict = {}
     for k, v in doc.items():
@@ -481,7 +511,7 @@ def _project_identity(doc: dict) -> dict:
             nested = _project_identity(v)
             if nested:
                 out[key] = nested
-        elif key in _IDENTITY_KEYS:
+        elif _normalize_key(key) in _IDENTITY_KEYS_NORM:
             out[key] = _redact({key: v})[key]
     return out
 

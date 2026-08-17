@@ -712,6 +712,67 @@ def test_i5_redact_text_covers_non_json_streams():
     assert "fine: yes" in out
 
 
+def test_i5_project_identity_real_whoami_envelope():
+    """Task 11 real-machine calibration: the actual `whoami` envelope on 118
+    (lark-cli v1.0.85, captured via both the container and the sandboxed
+    netns client) is camelCase with the display name nested under
+    `onBehalfOf`, not the snake_case shape the whitelist originally assumed.
+    Before the camelCase/nested fix this collapsed to just
+    {"profile", "brand", "identity"} and silently dropped the user's name.
+    """
+    real_envelope = {
+        "profile": "cli_a93fc96a4ef99bdb",
+        "appId": "cli_a93fc96a4ef99bdb",
+        "brand": "feishu",
+        "defaultAs": "auto",
+        "identity": "user",
+        "identitySource": "auto_detect",
+        "available": True,
+        "tokenStatus": "ready",
+        "onBehalfOf": {
+            "userName": "雷浩文",
+            "openId": "ou_3cb3f733f973e530d44a4c18b34f31f1",
+            # Simulates a field we did not anticipate; must still be dropped.
+            "accessToken": "SECRET-SHOULD-NOT-SURVIVE",
+        },
+    }
+
+    out = binding._project_identity(real_envelope)
+
+    assert out["profile"] == "cli_a93fc96a4ef99bdb"
+    assert out["appId"] == "cli_a93fc96a4ef99bdb"
+    assert out["brand"] == "feishu"
+    assert out["defaultAs"] == "auto"
+    assert out["identity"] == "user"
+    assert out["identitySource"] == "auto_detect"
+    assert out["available"] is True
+    assert out["tokenStatus"] == "ready"
+    assert out["onBehalfOf"]["userName"] == "雷浩文"
+    assert out["onBehalfOf"]["openId"] == "ou_3cb3f733f973e530d44a4c18b34f31f1"
+
+    # The whitelist projection drops unknown keys outright, so an unanticipated
+    # token field never even reaches the redactor.
+    assert "accessToken" not in out["onBehalfOf"]
+    assert "SECRET-SHOULD-NOT-SURVIVE" not in json.dumps(out)
+
+
+def test_i5_project_identity_drops_unwhitelisted_top_level_secret():
+    """Belt-and-suspenders: an injected top-level `access_token` alongside the
+    real fields must be dropped by the whitelist (it is not one of the
+    accepted identity keys, whitelisted or not) rather than merely relying on
+    `_redact` to catch it."""
+    doc = {
+        "profile": "cli_a93fc96a4ef99bdb",
+        "tokenStatus": "ready",
+        "accessToken": "SECRET-SHOULD-NOT-SURVIVE",
+    }
+    out = binding._project_identity(doc)
+    assert out["profile"] == "cli_a93fc96a4ef99bdb"
+    assert out["tokenStatus"] == "ready"
+    assert "accessToken" not in out
+    assert "SECRET-SHOULD-NOT-SURVIVE" not in json.dumps(out)
+
+
 def test_i6_traversal_uid_rejected_at_endpoint(lark_env):
     c = _client()
     for bad in ("../evil", "a/b", "", "x" * 65, "we!rd"):
