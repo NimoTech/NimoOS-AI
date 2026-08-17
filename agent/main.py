@@ -14,6 +14,27 @@ from typing import AsyncGenerator
 
 _LOG = logging.getLogger("nimoos-agent")
 
+# The container starts this file with `python main.py`, so it executes as
+# `__main__`. Anything that reaches back into it by name — `tasks/runner.py`,
+# `tasks/notify.py` — does `import main`, which would otherwise execute this
+# file a SECOND time and hand out a DIFFERENT module object: a second
+# AgentRunner, a second sqlite connection, a second ConfirmManager.
+#
+# That split silently broke every scheduled task that needed the network
+# (found on 118, 2026-08-17): a task run registered its sink on
+# `main._runner._active_sinks`, while `/internal/egress-confirm` — served by
+# the app in `__main__` — looked in `__main__._runner._active_sinks`, found
+# nothing, and fail-closed. The egress-proxy then answered 403 "blocked by
+# policy" for every outbound connection an unattended run made, no matter what
+# `preauth.egress_domains` allowed. Interactive chats and channels were
+# unaffected because they never import this module by name.
+#
+# Aliasing the two names makes `import main` return this very module. Safe
+# because every `import main` in the codebase is deferred inside a function
+# (never at module import time), so nobody observes a half-initialized module.
+if __name__ == "__main__":
+    sys.modules.setdefault("main", sys.modules["__main__"])
+
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_MD_BYTES = 50 * 1024
 
