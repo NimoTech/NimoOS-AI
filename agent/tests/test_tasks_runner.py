@@ -1040,3 +1040,192 @@ async def test_delete_task_still_removes_the_task_if_a_session_is_stuck(
                         (tid,)).fetchone()["c"] == 0
     assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                         (old[0][1],)).fetchone() is None
+
+
+# -- bounded deletion (N2) ----------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_delete_task_returns_within_its_budget(conn, tmp_path, monkeypatch):
+    """A slow vector cleanup must not park the HTTP request.
+
+    Each session's cleanup awaits Parser behind a 10s timeout; with 50 kept runs
+    that is ~500s inside a request whose reverse proxy sets no timeout of its
+    own. The delete gets a budget, and the rest moves to the background.
+    """
+    tid = _mk(conn)
+    _seed_history(conn, tid, 8)
+    fake_clock = {"t": 0.0}
+    deleted = []
+
+    async def slow(conn_, user_id, session_id):
+        fake_clock["t"] += 4.0          # 4 "seconds" per session
+        deleted.append(session_id)
+
+    spawned = []
+
+    assert await store.delete_task(
+        conn, tid, "u1", session_deleter=slow, budget_seconds=10,
+        monotonic=lambda: fake_clock["t"], spawn=spawned.append) is True
+
+    # 10s of budget at 4s per session: three sessions, then the hand-off.
+    assert len(deleted) == 3
+    assert len(spawned) == 1
+    # The task is gone for the caller, and the leftover runs are still in the
+    # table WITH their sessions — a state the continuation can finish.
+    assert conn.execute("SELECT COUNT(*) c FROM scheduled_tasks WHERE id=?",
+                        (tid,)).fetchone()["c"] == 0
+    left = conn.execute("SELECT session_id FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchall()
+    assert len(left) == 5
+    for row in left:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (row["session_id"],)).fetchone() is not None
+
+    # Running the continuation finishes the job, nothing lost.
+    await spawned[0]
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0
+    assert len(deleted) == 8
+
+
+@pytest.mark.asyncio
+async def test_delete_task_within_budget_spawns_nothing(conn, tmp_path, monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    _seed_history(conn, tid, 3, snaps_root=snaps)
+    spawned = []
+
+    assert await store.delete_task(conn, tid, "u1", session_deleter=deleter,
+                                   spawn=spawned.append) is True
+    assert spawned == []
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_purge_runs_is_retryable_after_an_interruption(conn, tmp_path,
+                                                             monkeypatch):
+    """Interrupt the purge and no session is left unreferenced: the runs that
+    remain still point at theirs, so re-running finishes the job. The old shape
+    (delete every run row, then walk the ids from memory) lost them."""
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 4, snaps_root=snaps)
+
+    boom = old[2][1]
+
+    async def interrupted(conn_, user_id, session_id):
+        if session_id == boom:
+            raise asyncio.CancelledError()
+        await deleter(conn_, user_id, session_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await store.purge_runs(conn, tid, "u1", session_deleter=interrupted)
+
+    # Every surviving run row still names a session that still exists.
+    rows = conn.execute("SELECT session_id FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchall()
+    assert rows
+    for row in rows:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (row["session_id"],)).fetchone() is not None
+    # And nothing is orphaned: every session that still exists is referenced.
+    referenced = {r["session_id"] for r in rows}
+    for _, sid in old:
+        exists = conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                              (sid,)).fetchone() is not None
+        assert exists == (sid in referenced)
+
+    # Retry completes it.
+    assert await store.purge_runs(conn, tid, "u1", session_deleter=deleter) is True
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_purge_runs_does_not_spin_on_an_undeletable_session(conn, tmp_path,
+                                                                 monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 3, snaps_root=snaps)
+    doomed = old[0][1]
+
+    async def flaky(conn_, user_id, session_id):
+        if session_id == doomed:
+            raise RuntimeError("session busy")
+        await deleter(conn_, user_id, session_id)
+
+    assert await store.purge_runs(conn, tid, "u1", session_deleter=flaky) is True
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reclaim_orphaned_runs_finishes_an_abandoned_delete(conn, tmp_path,
+                                                                  monkeypatch):
+    """The durability net: the process died after the task row went, leaving
+    runs nothing else can find (every other path walks by task_id)."""
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 3, snaps_root=snaps)
+    for i, (_, sid) in enumerate(old):
+        _seed_agent_run(conn, sid, f"ar-{i}")
+    # A second, live task whose run must survive the reclaim untouched.
+    # (Seeded by hand: _seed_history names its sessions old-<i>, which would
+    # collide with the ones above.)
+    live = _mk(conn, name="still here")
+    live_sid = "live-session"
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at, "
+        "agent_type, source) VALUES (?,?,?,?,?,?,?)",
+        (live_sid, "u1", None, NOW, NOW, "general", "task"))
+    live_run = store.create_run(conn, live, "u1", "cron")
+    store.attach_session(conn, live_run, live_sid)
+    store.finish_run(conn, live_run, "succeeded", summary="live")
+    conn.commit()
+
+    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (tid,))
+    conn.commit()
+
+    assert await store.reclaim_orphaned_runs(conn, session_deleter=deleter) == 3
+
+    for i, (_, sid) in enumerate(old):
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (sid,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM event_log WHERE run_id=?",
+                            (f"ar-{i}",)).fetchone() is None
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (live,)).fetchone()["c"] == 1
+    assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                        (live_sid,)).fetchone() is not None
+    # Idempotent.
+    assert await store.reclaim_orphaned_runs(conn, session_deleter=deleter) == 0
+
+
+@pytest.mark.asyncio
+async def test_purge_runs_caps_one_hanging_session_at_the_budget(conn, tmp_path,
+                                                                monkeypatch):
+    """A single session whose vector cleanup hangs must not push the delete
+    past its deadline — Parser's own timeout is 10s, which would double a 10s
+    budget on its own. The run row survives, so the continuation retries it."""
+    tid = _mk(conn)
+    old = _seed_history(conn, tid, 3)
+
+    async def hangs(conn_, user_id, session_id):
+        await asyncio.sleep(30)
+
+    started = asyncio.get_running_loop().time()
+    loop = asyncio.get_running_loop()
+    done = await store.purge_runs(conn, tid, "u1", session_deleter=hangs,
+                                  deadline=loop.time() + 0.2,
+                                  monotonic=loop.time)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert done is False
+    assert elapsed < 2.0, f"purge took {elapsed:.2f}s despite a 0.2s budget"
+    # Nothing lost: the run rows are all still there with their sessions.
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 3
+    for _, sid in old:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (sid,)).fetchone() is not None

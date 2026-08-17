@@ -54,6 +54,10 @@ POLL_SECONDS = 5
 # short enough that a queue of due runs drains promptly.
 SPAWN_GAP_SECONDS = 0.05
 
+# Strong references to start-up side tasks (asyncio.create_task keeps only a
+# weak one, so a collected task would abandon its work half-done).
+_STARTUP_TASKS: set = set()
+
 # Run history kept per task; older rows (and the sessions they own) are pruned
 # after every run.
 KEEP_RUNS = 50
@@ -498,6 +502,26 @@ async def worker_loop(conn, *, stop_event, process=None,
                     len(inflight))
 
 
+async def _reclaim_orphaned_runs(conn) -> None:
+    """Background half of start_worker: clear runs whose task is gone.
+
+    Separate from `requeue_orphaned_runs` (which is sync and only re-labels
+    interrupted runs) because deleting a session is async. This is the
+    durability net under `store.delete_task`'s background continuation — if the
+    process died mid-purge, nothing else would ever find those rows, since every
+    other path walks by task_id.
+    """
+    try:
+        n = await store.reclaim_orphaned_runs(conn, session_deleter=delete_session)
+        if n > 0:
+            logger.info("tasks runner: reclaimed %d run(s) whose task was "
+                        "already deleted", n)
+    except Exception:                       # noqa: BLE001 — start-up must not
+        # depend on this; the next start-up tries again.
+        logger.warning("tasks runner: orphaned-run reclaim failed",
+                       exc_info=True)
+
+
 def start_worker(conn):
     """Launch the run worker; returns (task, stop_event)."""
     n = store.requeue_orphaned_runs(conn)
@@ -505,4 +529,10 @@ def start_worker(conn):
         logger.info("tasks runner: marked %d interrupted run(s) failed", n)
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker_loop(conn, stop_event=stop_event))
+    # Fired alongside the loop rather than awaited: a slow Parser must not hold
+    # up the agent's start-up, and the reclaim races nothing (it only touches
+    # rows whose task no longer exists, which no live code path can recreate).
+    reclaim = asyncio.create_task(_reclaim_orphaned_runs(conn))
+    _STARTUP_TASKS.add(reclaim)
+    reclaim.add_done_callback(_STARTUP_TASKS.discard)
     return task, stop_event

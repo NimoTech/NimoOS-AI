@@ -7,6 +7,7 @@ run history. All timestamps are int seconds (time.time()).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -143,12 +144,139 @@ def update_task(conn, task_id: str, user_id: str, **fields) -> bool:
     return True
 
 
-async def delete_task(conn, task_id: str, user_id: str, *,
-                      session_deleter=None) -> bool:
-    """Delete a task **and everything it produced**.
+# Wall-clock budget for one DELETE. The row work is microseconds; the cost is
+# the per-session vector cleanup, which awaits Parser behind its own 10s
+# timeout — with KEEP_RUNS=50 runs to clear that is up to ~500s spent inside an
+# HTTP request, and `route/v2/agent.go`'s ReverseProxy sets no timeout of its
+# own. Past the budget the remainder moves to the background (see delete_task).
+DELETE_BUDGET_SECONDS = 10
 
-    The runs have to go first, and they have to go here. `task_runs` has no FK
-    cascade to `scheduled_tasks`, and the only path that ever deletes a run row
+# Sentinel so `budget_seconds` defaults to the CONSTANT ABOVE AS OF CALL TIME,
+# not as of import time. A plain default argument would freeze the value, which
+# would make the constant unmonkeypatchable and the knob a lie. None stays
+# meaningful and distinct: no budget at all.
+_DEFAULT_BUDGET = object()
+
+# Strong references to background purge continuations. asyncio.create_task only
+# keeps a weak one, so without this a continuation can be garbage collected
+# mid-await and the cleanup would be silently dropped.
+_PURGE_TASKS: set = set()
+
+
+async def purge_runs(conn, task_id: str, user_id: str, *, session_deleter,
+                     deadline=None, monotonic=time.monotonic) -> bool:
+    """Delete every run of `task_id`, one run at a time, session before row.
+
+    Returns True when nothing is left, False when `deadline` (a `monotonic()`
+    reading) passed with runs remaining. The deadline is a real bound, not a
+    checkpoint: each session's cleanup is capped at whatever is left of it.
+
+    The order inside each iteration is the whole point. "Delete all the run
+    rows, then walk the session ids" only works if the walk always finishes:
+    the ids live in memory, so an interrupted walk leaves sessions that nothing
+    in the database points at — exactly the orphan class this milestone exists
+    to close. Deleting one run's session and then that one run row, committing
+    as it goes, means any interruption leaves a task with fewer runs, each
+    still pointing at its own session: a state a retry finishes.
+    """
+    while True:
+        row = conn.execute(
+            "SELECT id, session_id FROM task_runs WHERE task_id=? "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        remaining = None if deadline is None else deadline - monotonic()
+        if remaining is not None and remaining <= 0:
+            return False
+        if row["session_id"]:
+            try:
+                if remaining is None:
+                    await session_deleter(conn, user_id, row["session_id"])
+                else:
+                    # Capped by what is left of the budget, not just checked
+                    # after the fact: one session's vector cleanup can itself
+                    # take 10s (Parser's own timeout), which would put the
+                    # whole delete a full 10s past its deadline. Timing out
+                    # here leaves the run row in place, so this run is simply
+                    # the continuation's first piece of work.
+                    await asyncio.wait_for(
+                        session_deleter(conn, user_id, row["session_id"]),
+                        timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning("tasks store: session %s of run %s did not "
+                               "finish deleting within the remaining budget; "
+                               "leaving the run for the continuation",
+                               row["session_id"], row["id"])
+                return False
+            except Exception:               # noqa: BLE001
+                # The run row goes anyway. Keeping it would make the SELECT
+                # above return the same row forever — one logged orphan session
+                # beats a delete that never terminates.
+                logger.warning("tasks store: could not delete session %s of "
+                               "run %s (task %s); dropping the run row anyway",
+                               row["session_id"], row["id"], task_id,
+                               exc_info=True)
+        conn.execute("DELETE FROM task_runs WHERE id=?", (row["id"],))
+        conn.commit()
+
+
+async def reclaim_orphaned_runs(conn, *, session_deleter) -> int:
+    """Delete runs whose task no longer exists, with their sessions.
+
+    The durability net under `delete_task`'s background continuation: if this
+    process dies between the task row going and the last run being cleared,
+    those runs are unreachable by every other path (`prune_runs` walks by
+    task_id, and the task is gone). Called once at worker start-up, so the
+    reclaim happens on the next boot at the latest — and it also mops up rows
+    left by the versions of this code that had no cascade at all.
+    """
+    reclaimed = 0
+    while True:
+        row = conn.execute(
+            "SELECT id, user_id, session_id FROM task_runs WHERE task_id NOT IN "
+            "(SELECT id FROM scheduled_tasks) ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return reclaimed
+        if row["session_id"]:
+            try:
+                await session_deleter(conn, row["user_id"], row["session_id"])
+            except Exception:               # noqa: BLE001 — same trade as
+                # purge_runs: never spin on one bad row.
+                logger.warning("tasks store: could not delete session %s of "
+                               "orphaned run %s", row["session_id"], row["id"],
+                               exc_info=True)
+        conn.execute("DELETE FROM task_runs WHERE id=?", (row["id"],))
+        conn.commit()
+        reclaimed += 1
+
+
+def _spawn(coro) -> None:
+    """Run `coro` detached, keeping a strong reference. No loop = run inline is
+    NOT an option here (the caller is already inside one); a missing loop only
+    happens in a sync test, where the coroutine is closed rather than leaked."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        logger.warning("tasks store: no running loop; purge continuation "
+                       "skipped (the next worker start-up reclaims it)")
+        return
+    handle = loop.create_task(coro)
+    _PURGE_TASKS.add(handle)
+    handle.add_done_callback(_PURGE_TASKS.discard)
+
+
+async def delete_task(conn, task_id: str, user_id: str, *,
+                      session_deleter=None,
+                      budget_seconds=_DEFAULT_BUDGET,
+                      monotonic=time.monotonic, spawn=None) -> bool:
+    """Delete a task **and everything it produced**, in bounded time.
+
+    The runs have to go, and they have to go here. `task_runs` has no FK
+    cascade to `scheduled_tasks`, and the only other path that deletes a run row
     (`prune_runs`) walks by `task_id` — so dropping the task row on its own
     strands every run it ever made, each with its session, that session's
     messages, its `agent_runs`/`event_log` rows and its snapshot directory, and
@@ -156,8 +284,13 @@ async def delete_task(conn, task_id: str, user_id: str, *,
     the live box was already carrying 27k such orphan event rows. Same failure
     class as wiki's `file_events` reaching 129M rows.
 
-    `keep=0` is exactly "prune everything", so this reuses `prune_runs` rather
-    than repeating its ordering.
+    Bounded, because this runs inside an HTTP request: `purge_runs` gets
+    `budget_seconds`, and if it runs out the task row still goes (the caller
+    asked for the task to be gone) and the remaining runs — still in the table,
+    still pointing at their own sessions — are finished by a background
+    continuation, or by `reclaim_orphaned_runs` at the next worker start-up if
+    this process does not live that long. Nothing is dropped silently; every
+    hand-off is logged.
 
     A run that is queued or running for this task is deleted too. That is the
     intent of "delete this task" — but it means an in-flight run will fail on
@@ -176,24 +309,32 @@ async def delete_task(conn, task_id: str, user_id: str, *,
     if session_deleter is None:
         from .runner import delete_session as session_deleter  # noqa: PLC0415
 
-    for session_id in prune_runs(conn, task_id, keep=0):
-        # Per-session try, same reasoning as the runner's prune loop: one
-        # undeletable session must not strand the rest — the run rows are
-        # already gone, so a skipped session is an orphan nobody comes back
-        # for. The task row still goes; a stuck session is not a reason to
-        # keep a task the user asked to delete.
-        try:
-            await session_deleter(conn, user_id, session_id)
-        except Exception:                   # noqa: BLE001
-            logger.warning("tasks store: could not delete session %s while "
-                           "deleting task %s", session_id, task_id,
-                           exc_info=True)
+    if budget_seconds is _DEFAULT_BUDGET:
+        budget_seconds = DELETE_BUDGET_SECONDS
+    # Resolved here, not as a default argument: a default would capture this
+    # module's function object at import time, past the reach of a monkeypatch.
+    spawn = spawn or _spawn
+    deadline = None if budget_seconds is None else monotonic() + budget_seconds
+    done = await purge_runs(conn, task_id, user_id,
+                            session_deleter=session_deleter, deadline=deadline,
+                            monotonic=monotonic)
 
     cur = conn.execute(
         "DELETE FROM scheduled_tasks WHERE id=? AND user_id=?",
         (task_id, user_id),
     )
     conn.commit()
+
+    if not done:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_runs WHERE task_id=?",
+            (task_id,)).fetchone()["c"]
+        logger.warning("tasks store: delete of task %s exceeded its %ss budget "
+                       "with %d run(s) left; continuing in the background",
+                       task_id, budget_seconds, remaining)
+        spawn(purge_runs(conn, task_id, user_id,
+                         session_deleter=session_deleter, deadline=None))
+
     return cur.rowcount > 0
 
 

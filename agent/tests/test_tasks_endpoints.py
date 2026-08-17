@@ -590,3 +590,68 @@ def test_task_sessions_stay_out_of_the_chat_list(client, conn):
 
     listed = client.get("/agent/sessions", headers=H).json()
     assert [s["id"] for s in listed] == ["s-web"]
+
+
+def test_delete_returns_bounded_when_vector_cleanup_is_slow(client, conn,
+                                                            monkeypatch):
+    """HTTP-level bound (N2): the request must not wait for every session's
+    Parser round-trip. Each cleanup awaits Parser behind a 10s timeout, so 50
+    kept runs is ~500s inside a DELETE whose reverse proxy has no timeout.
+    """
+    import asyncio
+    import time as _time
+
+    from tasks import store as _store
+
+    import session_purge
+
+    async def slow(user_id, session_id):
+        await asyncio.sleep(0.15)
+    monkeypatch.setattr(session_purge, "default_vector_cleanup", slow)
+    monkeypatch.setattr(_store, "DELETE_BUDGET_SECONDS", 0.3)
+    spawned = []
+    monkeypatch.setattr(_store, "_spawn", spawned.append)
+
+    tid = _create_id(client)
+    for i in range(10):
+        _seed_finished_run(conn, tid, session_id=f"s-{i}", run_id=f"ar-{i}",
+                           events=2)
+
+    started = _time.monotonic()
+    assert client.delete(f"/agent/tasks/{tid}", headers=H).status_code == 204
+    elapsed = _time.monotonic() - started
+
+    # Unbounded this would be ~1.5s (10 x 0.15); bounded it stops at the first
+    # session past 0.3s. The assertion is deliberately loose — it only has to
+    # separate "bounded" from "walks all ten".
+    assert elapsed < 1.0, f"DELETE took {elapsed:.2f}s — the budget did not apply"
+    assert len(spawned) == 1, "the remainder must be handed to the background"
+    # Collected instead of scheduled, so close it explicitly: an un-awaited
+    # coroutine would otherwise warn at collection time. The continuation's
+    # work is driven deterministically at the end of this test.
+    spawned[0].close()
+
+    # The state left behind is consistent and finishable: the task is gone, and
+    # every run still in the table still points at a session that still exists.
+    assert client.get(f"/agent/tasks/{tid}", headers=H).status_code == 404
+    left = conn.execute("SELECT session_id FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchall()
+    assert left, "the test is meaningless if the budget cleared everything"
+    for row in left:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (row["session_id"],)).fetchone() is not None
+
+    # Finishing the purge (what the continuation does) leaves no residue.
+    async def noop(user_id, session_id):
+        pass
+    monkeypatch.setattr(session_purge, "default_vector_cleanup", noop)
+    from tasks import runner as _runner
+    asyncio.run(_store.purge_runs(conn, tid, "u1",
+                                  session_deleter=_runner.delete_session))
+    for i in range(10):
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (f"s-{i}",)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM event_log WHERE run_id=?",
+                            (f"ar-{i}",)).fetchone() is None
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0

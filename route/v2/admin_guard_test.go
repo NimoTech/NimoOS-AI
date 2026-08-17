@@ -1,0 +1,115 @@
+package v2
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/labstack/echo/v4"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNormalizeRequestPathDecodesAndCleans(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/v1/ai/agent/tasks", "/v1/ai/agent/tasks"},
+		{"/v1/ai/agent/ta%73ks", "/v1/ai/agent/tasks"},
+		{"/v1/ai/agent/ta%2573ks", "/v1/ai/agent/tasks"},   // double-encoded
+		{"/v1/ai/agent/ta%252573ks", "/v1/ai/agent/tasks"}, // triple
+		{"/v1/ai/agent/tasks%2fabc", "/v1/ai/agent/tasks/abc"},
+		{"/v1/ai/agent/tasks%2Fabc", "/v1/ai/agent/tasks/abc"}, // uppercase hex
+		{"/v1/ai/agent/tasks/", "/v1/ai/agent/tasks"},
+		{"//v1/ai//agent//tasks", "/v1/ai/agent/tasks"},
+		{"/v1/ai/agent/./tasks", "/v1/ai/agent/tasks"},
+		{"/v1/ai/agent/toolbox/../tasks", "/v1/ai/agent/tasks"},
+		{"v1/ai/agent/tasks", "/v1/ai/agent/tasks"}, // no leading slash
+		// A stray '%' cannot be decoded; the function must still return
+		// something judgable rather than erroring or looping.
+		{"/v1/ai/agent/ta%zzks", "/v1/ai/agent/ta%zzks"},
+		{"/v1/ai/agent/notes/settings%", "/v1/ai/agent/notes/settings%"},
+	} {
+		require.Equalf(t, tc.want, NormalizeRequestPath(tc.in), "input %q", tc.in)
+	}
+}
+
+func TestIsAdminScopedPath(t *testing.T) {
+	admin := []string{
+		"/v1/ai/agent/tasks",
+		"/v1/ai/agent/tasks/abc/runs",
+		"/v1/ai/agent/toolbox",
+		"/v1/ai/agent/toolbox/install",
+		"/v1/ai/agent/shell-allowlist",
+		"/v1/ai/agent/notes/settings",
+		"/v1/ai/agent/notes/dir-info",
+		"/v1/ai/agent/channels/instances/xyz",
+	}
+	for _, p := range admin {
+		require.Truef(t, IsAdminScopedPath("/v1/ai", p), "%q must be admin-scoped", p)
+	}
+
+	perUser := []string{
+		"/v1/ai/agent/sessions",
+		"/v1/ai/agent/notes",         // the notes surface itself is per-user
+		"/v1/ai/agent/notes/abc",     // one note
+		"/v1/ai/agent/tasksomething", // prefix but not a path segment
+		"/v1/ai/agent/toolboxes",     // ditto
+		"/v1/ai/agent/channels/pairing-code",
+		"/v1/ai/agent/lark/binding",
+		"/v1/ai/agent/health",
+		"/v1/ai/search/query",
+	}
+	for _, p := range perUser {
+		require.Falsef(t, IsAdminScopedPath("/v1/ai", p), "%q must NOT be admin-scoped", p)
+	}
+}
+
+// The guard has to make its decision from the request URL, never from the
+// matched route — that independence is the whole point.
+func TestAdminPathGuardIgnoresTheMatchedRoute(t *testing.T) {
+	us := fakeUserService(t, "user")
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	reached := 0
+	// Registered ONLY as a wildcard, exactly how an encoded path is routed.
+	e.Use(AdminPathGuard(dir, "/v1/ai"))
+	e.Any("/v1/ai/agent/*", func(c echo.Context) error {
+		reached++
+		return c.String(http.StatusOK, "ok")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/ai/agent/ta%73ks", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Equal(t, 0, reached, "the handler must not run")
+
+	// A per-user path through the same wildcard is untouched.
+	req = httptest.NewRequest(http.MethodGet, "/v1/ai/agent/sessions", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, reached)
+}
+
+// Fail closed: if UserService cannot be reached, an admin-scoped path is 503,
+// never proxied.
+func TestAdminPathGuardFailsClosed(t *testing.T) {
+	e := echo.New()
+	reached := 0
+	e.Use(AdminPathGuard(t.TempDir(), "/v1/ai")) // no user-service.url
+	e.Any("/v1/ai/agent/*", func(c echo.Context) error {
+		reached++
+		return c.String(http.StatusOK, "ok")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/ai/agent/tasks%2fabc", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, 0, reached)
+}

@@ -263,3 +263,102 @@ func TestRealRouterTaskEndpointsRequireAJWT(t *testing.T) {
 		t.Fatalf("an unauthenticated request reached the agent at %s", p)
 	}
 }
+
+// -- percent-encoded spellings (N3) -----------------------------------------
+
+// Echo routes on url.RawPath when it is set, i.e. on the ENCODED path, while
+// the agent proxy forwards url.Path, the DECODED one. Every AdminOnly route
+// therefore only ever covered the literal spelling: measured on 118 before the
+// fix, a non-admin token on GET /v1/ai/agent/ta%73ks got 200 and the agent
+// served it as /agent/tasks. Same for tasks%2fabc, shell-%61llowlist,
+// toolbo%78 and notes/setting%73 — i.e. the M-1 gate, the M1 toolbox gate and
+// the pre-existing shell-allowlist / notes-settings gates all at once.
+var encodedAdminPaths = []string{
+	"/v1/ai/agent/ta%73ks",           // s
+	"/v1/ai/agent/tasks%2fabc",       // %2f becomes a separator once decoded
+	"/v1/ai/agent/shell-%61llowlist", // a
+	"/v1/ai/agent/toolbo%78",         // x
+	"/v1/ai/agent/notes/setting%73",  // s
+	"/v1/ai/agent/channels/instance%73",
+	"/v1/ai/agent/ta%2573ks",          // double-encoded: %25 -> % -> s
+	"/v1/ai/agent/toolbo%2578",        // double-encoded
+	"/v1/ai/agent/tasks/",             // trailing slash
+	"/v1/ai/agent/notes/setting%73/x", // subtree through an encoded parent
+	"/v1/ai/agent/./tasks",            // dot segment, no encoding at all
+	"/v1/ai/agent/toolbox/../tasks",   // dot-dot segment
+}
+
+func TestRealRouterEncodedAdminPathsRejectNonAdmin(t *testing.T) {
+	h, users, agent, token := newRealRouter(t)
+	users.role.Store("user")
+
+	for _, p := range encodedAdminPaths {
+		for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+			if code := call(t, h, m, p, token); code != http.StatusForbidden {
+				t.Fatalf("%s %s: got %d, want 403 — an encoded spelling must not "+
+					"bypass the admin gate", m, p, code)
+			}
+			if q := agent.lastPath(); q != "" {
+				t.Fatalf("%s %s reached the agent at %s despite the gate", m, p, q)
+			}
+		}
+	}
+}
+
+func TestRealRouterEncodedAdminPathsStillWorkForAdmin(t *testing.T) {
+	h, users, agent, token := newRealRouter(t)
+	users.role.Store("admin")
+
+	// The guard must gate, not break: an admin's encoded request is proxied
+	// exactly as the plain spelling is.
+	for _, tc := range []struct{ path, wantUpstream string }{
+		{"/v1/ai/agent/ta%73ks", "/agent/tasks"},
+		{"/v1/ai/agent/toolbo%78", "/agent/toolbox"},
+		{"/v1/ai/agent/tasks%2fabc", "/agent/tasks/abc"},
+	} {
+		if code := call(t, h, http.MethodGet, tc.path, token); code != http.StatusOK {
+			t.Fatalf("GET %s: got %d, want 200 for an admin", tc.path, code)
+		}
+		if q := agent.lastPath(); q != tc.wantUpstream {
+			t.Fatalf("GET %s: agent saw %q, want %q", tc.path, q, tc.wantUpstream)
+		}
+	}
+}
+
+func TestRealRouterEncodedPerUserPathsAreNotGated(t *testing.T) {
+	h, users, agent, token := newRealRouter(t)
+	users.role.Store("user")
+
+	// Encoding a per-user path must not start demanding admin either.
+	for _, tc := range []struct{ path, wantUpstream string }{
+		{"/v1/ai/agent/session%73", "/agent/sessions"},
+		{"/v1/ai/agent/note%73", "/agent/notes"},
+		{"/v1/ai/agent/lark/bindin%67", "/agent/lark/binding"},
+	} {
+		if code := call(t, h, http.MethodGet, tc.path, token); code != http.StatusOK {
+			t.Fatalf("GET %s: got %d, want 200 — per-user endpoint", tc.path, code)
+		}
+		if q := agent.lastPath(); q != tc.wantUpstream {
+			t.Fatalf("GET %s: agent saw %q, want %q", tc.path, q, tc.wantUpstream)
+		}
+	}
+	if users.calls.Load() != 0 {
+		t.Fatalf("the admin gate was consulted %d time(s) for per-user endpoints",
+			users.calls.Load())
+	}
+}
+
+// The guard fires before the per-route AdminOnly and marks the request, so an
+// admin's plain (unencoded) request costs exactly ONE UserService lookup, not
+// two.
+func TestRealRouterAdminIsLookedUpOnce(t *testing.T) {
+	h, users, _, token := newRealRouter(t)
+	users.role.Store("admin")
+
+	if code := call(t, h, http.MethodGet, "/v1/ai/agent/tasks", token); code != http.StatusOK {
+		t.Fatalf("got %d, want 200", code)
+	}
+	if n := users.calls.Load(); n != 1 {
+		t.Fatalf("UserService consulted %d times for one admin request, want 1", n)
+	}
+}

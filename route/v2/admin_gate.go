@@ -45,26 +45,47 @@ func IsAdmin(userServiceBaseURL, authHeader string) (bool, error) {
 	return body.Data.Role == adminRole, nil
 }
 
-// AdminOnly gates a route on the caller being a NimoOS admin. Used for
-// channel instance management (system-scoped bot config).
+// enforceAdmin reports whether the caller is an admin. When it is not, the
+// denial response (403, or 503 when UserService cannot be consulted — fail
+// closed, never open) has already been written and the returned error is what
+// the caller must return; `allowed` is the decision, NOT the error, because
+// c.JSON returns a nil error after successfully writing a 403. Shared by
+// AdminOnly (per route) and AdminPathGuard (per decoded path).
+func enforceAdmin(c echo.Context, runtimePath string) (allowed bool, err error) {
+	raw, err := os.ReadFile(
+		filepath.Join(runtimePath, external.UserServiceAddressFilename))
+	if err != nil {
+		return false, c.JSON(http.StatusServiceUnavailable,
+			map[string]string{"message": "user service unavailable"})
+	}
+	ok, err := IsAdmin(strings.TrimSpace(string(raw)),
+		c.Request().Header.Get(echo.HeaderAuthorization))
+	if err != nil {
+		return false, c.JSON(http.StatusServiceUnavailable,
+			map[string]string{"message": "user service unavailable"})
+	}
+	if !ok {
+		return false, c.JSON(http.StatusForbidden,
+			map[string]string{"message": "admin required"})
+	}
+	return true, nil
+}
+
+// AdminOnly gates a route on the caller being a NimoOS admin. Attached to each
+// path in AdminScopedAgentPaths; AdminPathGuard covers the same paths spelled
+// with percent-encoding, which Echo routes elsewhere.
 func AdminOnly(runtimePath string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			raw, err := os.ReadFile(
-				filepath.Join(runtimePath, external.UserServiceAddressFilename))
-			if err != nil {
-				return c.JSON(http.StatusServiceUnavailable,
-					map[string]string{"message": "user service unavailable"})
+			// The guard runs first (e.Use, before route middleware) and has
+			// already asked UserService for this very request when it fired;
+			// asking again would double every admin request's latency.
+			if v, ok := c.Get(adminCheckedContextKey).(bool); ok && v {
+				return next(c)
 			}
-			ok, err := IsAdmin(strings.TrimSpace(string(raw)),
-				c.Request().Header.Get(echo.HeaderAuthorization))
-			if err != nil {
-				return c.JSON(http.StatusServiceUnavailable,
-					map[string]string{"message": "user service unavailable"})
-			}
-			if !ok {
-				return c.JSON(http.StatusForbidden,
-					map[string]string{"message": "admin required"})
+			allowed, err := enforceAdmin(c, runtimePath)
+			if !allowed {
+				return err
 			}
 			return next(c)
 		}

@@ -86,6 +86,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 		},
 	}))
 
+	// Admin enforcement on the DECODED path, after the JWT middleware so an
+	// unauthenticated caller still gets 401 rather than 403. Echo routes on the
+	// ENCODED path (url.RawPath) while the agent proxy forwards the decoded
+	// one, so `/v1/ai/agent/ta%73ks` missed every AdminOnly route below, fell
+	// into the /agent/* wildcard and was served by the agent as /agent/tasks.
+	// This guard does not depend on which route matched.
+	e.Use(v2.AdminPathGuard(runtimePath, common.V2APIPath))
+
 	g := e.Group(common.V2APIPath)
 
 	middleware.RegisterVersionRoute(e, common.V2APIPath+"/version", "AI", common.AIVersion)
@@ -184,27 +192,15 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
-	// Channel instance management is system-scoped (bot config), gate on admin
-	// role before falling through to the general agent proxy wildcard below.
-	g.Any("/agent/channels/instances", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/channels/instances/*", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Shell allowlist governs unattended command execution — admin only.
-	g.Any("/agent/shell-allowlist", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/shell-allowlist/*", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Notes settings moves the system-wide notes root — admin only.
-	g.Any("/agent/notes/settings", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Dir-info probes candidate notes folders for the settings UI — same gate.
-	g.Any("/agent/notes/dir-info", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Toolbox install/uninstall manage global CLI components shared by every
-	// sandbox session — system-scoped, admin only (mirrors shell-allowlist).
-	g.Any("/agent/toolbox", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/toolbox/*", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Scheduled tasks run unattended with a preauth document that hands out
-	// shell prefixes, fs_write roots and egress domains — the same authority
-	// shell-allowlist governs, so the same gate applies. Includes the nested
-	// run history and preauth endpoints.
-	g.Any("/agent/tasks", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/tasks/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Admin-scoped agent endpoints, registered (with their /* subtrees) BEFORE
+	// the general /agent/* wildcard below so the static segment wins. The list
+	// itself lives in v2.AdminScopedAgentPaths, which is also what the
+	// decoded-path guard installed above enforces — one list, both layers, so
+	// a new admin endpoint cannot be gated in one place and open in the other.
+	for _, p := range v2.AdminScopedAgentPaths {
+		g.Any(p, agent.Proxy, v2.AdminOnly(runtimePath))
+		g.Any(p+"/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	}
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
