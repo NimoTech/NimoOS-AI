@@ -26,7 +26,7 @@ import asyncio
 import logging
 import time
 
-from . import cron, store
+from . import cron, notify as notify_mod, store
 
 logger = logging.getLogger("nimoos-agent.tasks")
 
@@ -45,6 +45,11 @@ MISSED_AFTER_SECONDS = TICK_SECONDS * 4
 # ever is — someone hand-edited the row — inserting its trigger_type verbatim
 # would raise IntegrityError instead of recording anything.
 _SCHEDULABLE_TRIGGERS = ("cron", "interval")
+
+# Strong references to in-flight notification tasks. `loop.create_task` only
+# keeps a weak one, so without this set a notification can be garbage
+# collected mid-await and silently never arrive.
+_NOTIFY_TASKS: set = set()
 
 
 def _trigger_of(task) -> str:
@@ -72,19 +77,68 @@ def _next_fire(task, now: int) -> int:
     raise ValueError(f"trigger_type {trigger!r} is not schedulable")
 
 
-def _history(conn, task, status: str, error: str) -> None:
+def _notify(conn, task, run_id: str, notify_fn) -> None:
+    """Best-effort result notification for a run that never reached the runner.
+
+    `tasks/runner.py` owns the single notification call point for runs it
+    executes; the two branches here (`overlap skip`, self-disable) finish a run
+    without ever going through the runner, so without this call a user with
+    `notify_policy=always` would silently never hear about them.
+
+    The policy decision itself stays in `notify.send_result` — this only makes
+    sure it is asked. `tick_once` is synchronous (deliberately: every policy
+    branch stays testable without a loop), so the coroutine is fired onto the
+    running loop rather than awaited, and every failure mode — no loop at all,
+    a missing run row, an exploding adapter — degrades to "no notification".
+    The run row is already committed; nothing here may undo it.
+    """
+    send = notify_fn or notify_mod.send_result
+    try:
+        run_row = conn.execute(
+            "SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    except Exception:                       # noqa: BLE001
+        logger.warning("tasks scheduler: could not read run %s to notify",
+                       run_id, exc_info=True)
+        return
+    if run_row is None:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Called outside an event loop (a direct sync caller). Nothing to
+        # schedule on; the history row stands on its own.
+        logger.debug("tasks scheduler: no running loop, skipping notification "
+                     "for run %s", run_id)
+        return
+
+    async def _send() -> None:
+        try:
+            await send(conn, task, run_row)
+        except Exception:                   # noqa: BLE001 — a channel adapter
+            # must never affect scheduling.
+            logger.warning("tasks scheduler: notify failed for run %s", run_id,
+                           exc_info=True)
+
+    handle = loop.create_task(_send())
+    _NOTIFY_TASKS.add(handle)
+    handle.add_done_callback(_NOTIFY_TASKS.discard)
+
+
+def _history(conn, task, status: str, error: str, notify_fn=None) -> None:
     """Record a terminal run row that never ran (skipped / failed)."""
     run_id = store.create_run(conn, task["id"], task["user_id"], _trigger_of(task))
     store.finish_run(conn, run_id, status, error=error)
+    _notify(conn, task, run_id, notify_fn)
 
 
-def _disable(conn, task, reason: str) -> None:
+def _disable(conn, task, reason: str, notify_fn=None) -> None:
     conn.execute(
         "UPDATE scheduled_tasks SET enabled=0, next_run_at=0, updated_at=? WHERE id=?",
         (int(time.time()), task["id"]),
     )
     conn.commit()
-    _history(conn, task, "failed", reason)
+    _history(conn, task, "failed", reason, notify_fn)
     logger.warning("tasks scheduler: disabled task %s (%s): %s",
                    task["id"], task["name"], reason)
 
@@ -97,12 +151,12 @@ def _has_active_run(conn, task_id: str) -> bool:
     return row is not None
 
 
-def _handle(conn, task, now: int) -> int:
+def _handle(conn, task, now: int, notify_fn=None) -> int:
     """Apply the policies to one due task. Returns 1 if a run was enqueued."""
     try:
         next_at = _next_fire(task, now)
     except (cron.CronError, ValueError) as exc:
-        _disable(conn, task, f"invalid schedule: {exc}")
+        _disable(conn, task, f"invalid schedule: {exc}", notify_fn)
         return 0
 
     missed = (now - int(task["next_run_at"])) > MISSED_AFTER_SECONDS
@@ -116,7 +170,8 @@ def _handle(conn, task, now: int) -> int:
 
     if task["overlap_policy"] == "skip" and _has_active_run(conn, task["id"]):
         _history(conn, task, "skipped",
-                 "previous run still queued or running (overlap_policy=skip)")
+                 "previous run still queued or running (overlap_policy=skip)",
+                 notify_fn)
         store.set_next_run(conn, task["id"], next_at)
         return 0
 
@@ -128,7 +183,7 @@ def _handle(conn, task, now: int) -> int:
     return 1
 
 
-def tick_once(conn, *, now: int) -> int:
+def tick_once(conn, *, now: int, notify=None) -> int:
     """Enqueue every due task's next run. Returns the number enqueued.
 
     One task's failure never blocks the rest: known-unfixable configuration is
@@ -136,11 +191,15 @@ def tick_once(conn, *, now: int) -> int:
     logged and stepped over. Deliberately NOT disabling on an unexpected
     exception — a transient DB error would then silently switch off a user's
     working task.
+
+    `notify` is the test seam for the skipped/self-disabled notifications:
+    `async (conn, task_row, run_row) -> bool`, defaulting to
+    `notify.send_result`. See `_notify`.
     """
     enqueued = 0
     for task in store.due_tasks(conn, now):
         try:
-            enqueued += _handle(conn, task, now)
+            enqueued += _handle(conn, task, now, notify)
         except Exception:                       # noqa: BLE001 — never abort the tick
             logger.exception("tasks scheduler: task %s failed to schedule",
                              task["id"])

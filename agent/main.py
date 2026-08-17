@@ -2602,6 +2602,340 @@ async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Scheduled tasks (M2)
+#
+# Everything below is scoped by X-User-Id. A task that belongs to somebody
+# else must look *absent*, not forbidden: `store.get_task` filters on
+# (id, user_id) and a miss is always 404, so this API cannot be used to probe
+# for other users' task ids. The store's run-level helpers (set_next_run /
+# claim_run / finish_run / list_runs) take no user_id at all — every handler
+# here therefore establishes ownership through `get_task` FIRST and only then
+# touches runs.
+# ---------------------------------------------------------------------------
+
+_TASK_TRIGGERS = ("cron", "interval", "webhook_only")
+_TASK_ENUMS = {
+    "overlap_policy": ("skip", "queue"),
+    "catchup_policy": ("skip", "run_once"),
+    "notify_policy": ("failure", "always", "never"),
+}
+# The scheduler ticks every 15s and a run can outlive its period, so anything
+# under a minute is a foot-gun rather than a feature. The store does not
+# enforce it (it takes whatever it is given); this is the only gate.
+_MIN_INTERVAL_SECONDS = 60
+_MAX_TURNS_RANGE = (1, 100)
+_TIMEOUT_RANGE = (60, 7200)
+_RUNS_LIMIT_RANGE = (1, 200)
+
+
+def _empty_preauth_report() -> dict:
+    """A fresh copy every time — the report goes into a response body and a
+    shared module-level dict would be one mutation away from leaking between
+    requests."""
+    return {"truncated": {}, "rejected_rules": []}
+
+
+def _task_int(value, detail: str) -> int:
+    # bool is an int subclass; `True` as a timeout is a client bug, not 1.
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise HTTPException(400, detail)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(400, detail)
+
+
+def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
+    """Validate a create/update body; return (store fields, preauth report).
+
+    `existing` is None for a create (required fields enforced) and the current
+    row for an update. Schedule validity is checked against the MERGED state:
+    a PUT that only flips `trigger_type` to `interval` must be rejected when
+    the stored `interval_seconds` is still 0, or the scheduler would disable
+    the task on its next tick instead.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid_json")
+    creating = existing is None
+    out: dict = {}
+
+    for field in ("name", "prompt"):
+        if field in body:
+            value = body[field]
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(400, f"{field}_required")
+            out[field] = value.strip() if field == "name" else value
+        elif creating:
+            raise HTTPException(400, f"{field}_required")
+
+    if "trigger_type" in body:
+        if body["trigger_type"] not in _TASK_TRIGGERS:
+            raise HTTPException(400, "bad_trigger_type")
+        out["trigger_type"] = body["trigger_type"]
+    elif creating:
+        raise HTTPException(400, "bad_trigger_type")
+    trigger = out.get("trigger_type") or (existing["trigger_type"] if existing else "")
+
+    if "cron_expr" in body:
+        if not isinstance(body["cron_expr"], str):
+            raise HTTPException(400, "bad_cron")
+        out["cron_expr"] = body["cron_expr"].strip()
+    cron_expr = out.get("cron_expr", existing["cron_expr"] if existing else "")
+
+    if "interval_seconds" in body:
+        out["interval_seconds"] = _task_int(body["interval_seconds"], "bad_interval")
+        if out["interval_seconds"] < 0:
+            raise HTTPException(400, "bad_interval")
+    interval = out.get("interval_seconds",
+                       existing["interval_seconds"] if existing else 0)
+
+    if trigger == "cron":
+        from tasks import cron as _cron
+        try:
+            _cron.validate(cron_expr)
+            # `validate` only parses the fields; an expression like
+            # `0 0 30 2 *` parses fine and never fires, and `store.create_task`
+            # would raise CronError computing next_run_at -> a 500. Resolve it
+            # here so it comes back as the same 400 the user can act on.
+            _cron.next_after(cron_expr, int(time.time()))
+        except (_cron.CronError, ValueError, TypeError):
+            raise HTTPException(400, "bad_cron")
+    elif trigger == "interval" and interval < _MIN_INTERVAL_SECONDS:
+        raise HTTPException(400, "bad_interval")
+
+    if "max_turns" in body:
+        value = _task_int(body["max_turns"], "bad_max_turns")
+        if not (_MAX_TURNS_RANGE[0] <= value <= _MAX_TURNS_RANGE[1]):
+            raise HTTPException(400, "bad_max_turns")
+        out["max_turns"] = value
+
+    if "timeout_seconds" in body:
+        value = _task_int(body["timeout_seconds"], "bad_timeout")
+        if not (_TIMEOUT_RANGE[0] <= value <= _TIMEOUT_RANGE[1]):
+            raise HTTPException(400, "bad_timeout")
+        out["timeout_seconds"] = value
+
+    for field, allowed in _TASK_ENUMS.items():
+        if field in body:
+            if body[field] not in allowed:
+                raise HTTPException(400, f"bad_{field}")
+            out[field] = body[field]
+
+    for field in ("agent_type", "model", "notify_channel"):
+        if field in body:
+            if not isinstance(body[field], str):
+                raise HTTPException(400, f"bad_{field}")
+            out[field] = body[field].strip()
+
+    if "enabled" in body and not creating:
+        out["enabled"] = 1 if body["enabled"] else 0
+
+    report = _empty_preauth_report()
+    if "preauth" in body:
+        from tasks import preauth as _preauth
+        # parse_with_report, never parse: a rule this normalizer drops (a
+        # leftover regex shell rule) would otherwise be accepted silently and
+        # the author would believe their unattended run is pre-authorized.
+        doc, report = _preauth.parse_with_report(body["preauth"])
+        out["preauth"] = doc
+    return out, report
+
+
+def _task_out(row) -> dict:
+    from tasks import preauth as _preauth
+    out = dict(row)
+    out["preauth"] = _preauth.parse(out.pop("preauth_json", "{}"))
+    out["enabled"] = bool(out.get("enabled"))
+    return out
+
+
+def _run_out(row) -> dict:
+    out = dict(row)
+    raw = out.get("denied_actions")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = []
+    out["denied_actions"] = raw if isinstance(raw, list) else []
+    return out
+
+
+async def _task_body(request: Request) -> dict:
+    try:
+        return await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+
+
+def _owned_task(task_id: str, user_id: str):
+    from tasks import store as _store
+    row = _store.get_task(_db(), task_id, user_id)
+    if row is None:
+        raise HTTPException(404, "not_found")
+    return row
+
+
+@app.get("/agent/tasks")
+async def tasks_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    return {"tasks": [_task_out(r) for r in _store.list_tasks(_db(), x_user_id)]}
+
+
+# Registered BEFORE /agent/tasks/{task_id}: FastAPI matches routes in
+# declaration order, so a literal path added after the parameterized one would
+# be swallowed by it and answered with 404 not_found.
+@app.get("/agent/tasks/notify-targets")
+async def tasks_notify_targets(x_user_id: str = Header(..., alias="X-User-Id")):
+    """Chats this user can point `notify_channel` at.
+
+    Sourced from `channel_chats`, which is written the first time a paired
+    account actually messages the bot — a just-paired channel legitimately
+    does not show up here yet.
+    """
+    from channels import store as channel_store
+    return {"targets": channel_store.list_chats_for_user(_db(), x_user_id)}
+
+
+@app.post("/agent/tasks", status_code=201)
+async def tasks_create(request: Request,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    fields, report = _task_payload(await _task_body(request))
+    task_id = _store.create_task(_db(), x_user_id, **fields)
+    return {"id": task_id, "preauth_report": report}
+
+
+@app.get("/agent/tasks/{task_id}")
+async def tasks_get(task_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    return _task_out(_owned_task(task_id, x_user_id))
+
+
+@app.put("/agent/tasks/{task_id}")
+async def tasks_update(task_id: str, request: Request,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    existing = _owned_task(task_id, x_user_id)
+    fields, report = _task_payload(await _task_body(request), existing)
+    _store.update_task(_db(), task_id, x_user_id, **fields)
+    return {"status": "ok", "preauth_report": report}
+
+
+@app.delete("/agent/tasks/{task_id}", status_code=204)
+async def tasks_delete(task_id: str,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    if not _store.delete_task(_db(), task_id, x_user_id):
+        raise HTTPException(404, "not_found")
+    return Response(status_code=204)
+
+
+@app.post("/agent/tasks/{task_id}/run", status_code=202)
+async def tasks_run_now(task_id: str,
+                        x_user_id: str = Header(..., alias="X-User-Id")):
+    """Queue one run immediately. The runner worker picks it up on its own.
+
+    Allowed on a disabled task on purpose: "run it now" is how a user tests a
+    task before switching the schedule on. overlap_policy is not consulted
+    either — an explicit human request outranks it.
+    """
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    run_id = _store.create_run(_db(), task_id, x_user_id, "manual")
+    return JSONResponse({"run_id": run_id}, status_code=202)
+
+
+@app.get("/agent/tasks/{task_id}/runs")
+async def tasks_runs(task_id: str, limit: int = 50,
+                     x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    limit = max(_RUNS_LIMIT_RANGE[0], min(_RUNS_LIMIT_RANGE[1], limit))
+    return {"runs": [_run_out(r)
+                     for r in _store.list_runs(_db(), task_id, limit)]}
+
+
+def _preauth_from_denied(doc: dict, action: dict) -> dict:
+    """Fold one denied action into a preauth document (a copy is returned).
+
+    The vocabulary is `tasks/driver.py`'s normalized kinds; `detail` is what
+    that driver recorded — for `fs` the FIRST path that was not covered, not
+    the card's first path, so the rule generated here actually changes the
+    outcome next time.
+    """
+    kind = str(action.get("kind") or "")
+    detail = str(action.get("detail") or "").strip()
+    if not detail:
+        raise HTTPException(400, "empty_detail")
+
+    out = {k: list(v) for k, v in doc.items()}
+    if kind == "egress":
+        from tasks.driver import _strip_port
+        # Bare host, no port: that is what the egress gate matches on.
+        value, bucket = _strip_port(detail), "egress_domains"
+    elif kind == "fs":
+        # A denied file grants its directory — `fs_write` entries are roots
+        # and a bare file path would authorize nothing else in that folder.
+        value = os.path.dirname(detail) if os.path.isfile(detail) else detail
+        bucket = "fs_write"
+    elif kind == "mcp_tool":
+        value, bucket = detail, "mcp_tools"          # already "server::tool"
+    elif kind == "shell":
+        # `detail` is non-empty and already stripped, so there is a head token.
+        parts = detail.split()
+        # Command head + a space, so `git ` can never also authorize
+        # `github-cli`. A command that WAS just its head ("date") is the
+        # exception: `"date "` could never prefix-match it again and the
+        # button would be a silent no-op, so the bare token is stored.
+        value = parts[0] if len(parts) == 1 else parts[0] + " "
+        rule = {"kind": "prefix", "value": value}
+        if rule not in out["shell"]:
+            out["shell"].append(rule)
+        return out
+    else:
+        raise HTTPException(400, "unsupported_kind")
+
+    if not value:
+        raise HTTPException(400, "empty_detail")
+    if value not in out[bucket]:
+        out[bucket].append(value)
+    return out
+
+
+@app.post("/agent/tasks/{task_id}/preauth/from-denied")
+async def tasks_preauth_from_denied(
+        task_id: str, request: Request,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    """Adopt one denied action from a past run into the task's preauth."""
+    from tasks import preauth as _preauth
+    from tasks import store as _store
+    task = _owned_task(task_id, x_user_id)
+    body = await _task_body(request)
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid_json")
+    run_id = str(body.get("run_id") or "")
+    index = _task_int(body.get("index", 0), "bad_index")
+
+    # Scoped on task_id AND user_id: `store.list_runs`/`finish_run` take no
+    # user_id, so ownership is established here or not at all.
+    run = _db().execute(
+        "SELECT * FROM task_runs WHERE id=? AND task_id=? AND user_id=?",
+        (run_id, task_id, x_user_id)).fetchone()
+    if run is None:
+        raise HTTPException(404, "not_found")
+    denied = _run_out(run)["denied_actions"]
+    if index < 0 or index >= len(denied) or not isinstance(denied[index], dict):
+        raise HTTPException(404, "denied_action_not_found")
+
+    doc = _preauth.parse(task["preauth_json"])
+    doc = _preauth_from_denied(doc, denied[index])
+    # Re-normalize: MAX_RULES truncation applies to a grown document too.
+    doc, report = _preauth.parse_with_report(doc)
+    _store.update_task(_db(), task_id, x_user_id, preauth=doc)
+    return {"preauth": doc, "preauth_report": report}
+
+
 def _lark_uid(x_user_id: str) -> str:
     """Validate the user id before it is used to build a filesystem path.
 

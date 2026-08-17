@@ -174,6 +174,46 @@ def upsert_chat(conn, instance_id: str, external_chat_id: str,
     conn.commit()
 
 
+def list_chats_for_user(conn, user_id: str) -> list[dict]:
+    """Every chat this user can be addressed in, as notification targets.
+
+    `value` is the `<instance_id>:<external_chat_id>` string that
+    `tasks/notify.py::_resolve_target` parses — the scheduled-task picker
+    stores exactly this.  Rows come from `channel_chats`, which is written
+    lazily on a chat's first non-command message, so a freshly paired account
+    that has never messaged the bot legitimately does not appear here (the UI
+    tells the user to say something to the bot first).  `list_bindings_for_user`
+    cannot substitute: a binding has no `external_chat_id`, and on Discord the
+    chat id is the DM channel snowflake, not the user's.
+
+    Revoked bindings are excluded, and the instance join drops chats whose
+    instance is gone.  There is no chat title in the schema, so the bound
+    account's `external_username` stands in as the human label when present.
+    """
+    rows = conn.execute(
+        "SELECT c.instance_id AS instance_id, "
+        "       c.external_chat_id AS external_chat_id, "
+        "       b.external_username AS external_username, "
+        "       i.channel_type AS channel_type, i.name AS instance_name "
+        "FROM channel_chats c "
+        "JOIN channel_bindings b ON b.id = c.binding_id "
+        "JOIN channel_instances i ON i.id = c.instance_id "
+        "WHERE b.user_id=? AND b.revoked=0 "
+        "ORDER BY c.updated_at DESC, c.rowid DESC",
+        (str(user_id),)).fetchall()
+    out = []
+    for r in rows:
+        item = {
+            "value": f"{r['instance_id']}:{r['external_chat_id']}",
+            "channel_type": r["channel_type"],
+            "instance_name": r["instance_name"] or "",
+        }
+        if r["external_username"]:
+            item["chat_title"] = r["external_username"]
+        out.append(item)
+    return out
+
+
 def create_channel_session(conn, user_id: str, source: str) -> str:
     session_id = str(uuid.uuid4())
     now = int(time.time())

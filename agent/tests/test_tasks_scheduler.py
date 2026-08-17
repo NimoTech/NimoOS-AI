@@ -200,6 +200,83 @@ def test_one_broken_task_does_not_block_the_others(conn):
     assert len(_runs(conn, good)) == 1
 
 
+# -- notifications for runs that never reach the runner ----------------------
+#
+# `_history` writes a terminal run row directly, bypassing tasks/runner.py's
+# `finally` block — the single call point for notifications. Without an
+# explicit call here, a user with notify_policy=always is never told that a
+# run was skipped or that their task disabled itself.
+
+@pytest.mark.asyncio
+async def test_overlap_skip_notifies(conn):
+    import asyncio
+    sent = []
+
+    async def fake_notify(c, task_row, run_row):
+        sent.append((task_row["id"], run_row["status"]))
+        return True
+
+    tid = _mk(conn, overlap_policy="skip", notify_policy="always")
+    store.create_run(conn, tid, "u1", "cron")
+    store.set_next_run(conn, tid, NOW - 5)
+
+    assert scheduler.tick_once(conn, now=NOW, notify=fake_notify) == 0
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert sent == [(tid, "skipped")]
+
+
+@pytest.mark.asyncio
+async def test_self_disable_notifies(conn):
+    import asyncio
+    sent = []
+
+    async def fake_notify(c, task_row, run_row):
+        sent.append((task_row["id"], run_row["status"], run_row["error"]))
+        return True
+
+    tid = _mk(conn, notify_policy="always")
+    conn.execute("UPDATE scheduled_tasks SET cron_expr=? WHERE id=?",
+                 ("nonsense", tid))
+    conn.commit()
+    store.set_next_run(conn, tid, NOW - 5)
+
+    assert scheduler.tick_once(conn, now=NOW, notify=fake_notify) == 0
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(sent) == 1
+    assert sent[0][1] == "failed" and "cron" in sent[0][2].lower()
+
+
+@pytest.mark.asyncio
+async def test_notify_failure_never_breaks_the_tick(conn):
+    import asyncio
+
+    async def boom(c, task_row, run_row):
+        raise RuntimeError("channel down")
+
+    tid = _mk(conn, overlap_policy="skip")
+    store.create_run(conn, tid, "u1", "cron")
+    store.set_next_run(conn, tid, NOW - 5)
+
+    assert scheduler.tick_once(conn, now=NOW, notify=boom) == 0
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # the skipped row and the advanced schedule are still correct
+    assert [r["status"] for r in _runs(conn, tid)] == ["skipped", "queued"]
+    assert _task(conn, tid)["next_run_at"] > NOW
+
+
+def test_tick_outside_an_event_loop_still_works(conn):
+    """No running loop (a sync caller) — the tick must not raise; the
+    notification is simply dropped."""
+    tid = _mk(conn, overlap_policy="skip")
+    store.create_run(conn, tid, "u1", "cron")
+    store.set_next_run(conn, tid, NOW - 5)
+    assert scheduler.tick_once(conn, now=NOW) == 0
+    assert len(_runs(conn, tid)) == 2
+
+
 # -- worker wiring -----------------------------------------------------------
 
 @pytest.mark.asyncio
