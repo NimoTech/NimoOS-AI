@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from tasks.driver import TaskRunDriver
+from tasks.driver import TaskRunDriver, egress_allowed, fs_allowed
 
 SID = "sess-1"
 
@@ -253,6 +253,76 @@ async def test_fs_empty_path_is_denied():
     await _driver(mgr, {"fs_write": ["/DATA"]}).drive(
         FakeSink(past=[_access(""), {"type": "done"}]))
     assert mgr.calls == [("c1", False, SID)]
+
+
+@pytest.mark.asyncio
+async def test_fs_batch_denial_records_the_offending_path_not_the_allowed_one(tmp_path):
+    # paths[0] is inside the preauthorized root; /etc is what sinks the card.
+    # Recording paths[0] would name an ALLOWED path and hide the violation,
+    # and Task 7's from-denied would generate a no-op rule from it.
+    root = tmp_path / "reports"
+    root.mkdir()
+    mgr = FakeConfirmManager()
+    out = await _driver(mgr, {"fs_write": [str(root)]}).drive(FakeSink(past=[
+        _access(str(root / "a"), paths=[str(root / "a"), "/etc"]),
+        {"type": "done"}]))
+    assert mgr.calls == [("c1", False, SID)]
+    assert out["denied"] == [{"kind": "fs", "detail": "/etc"}]
+
+
+# --------------------------------------------------------------------------
+# Malformed preauth documents must fail CLOSED (never trust the caller)
+# --------------------------------------------------------------------------
+
+def test_bare_string_preauth_lists_authorize_nothing():
+    # Iterating a string yields chars: "/DATA/reports"[0] == "/" would be
+    # treated as a root and authorize the entire filesystem.
+    assert fs_allowed("/root/.ssh/id_rsa", "/DATA/reports") is False
+    assert egress_allowed("open.feishu.cn", "open.feishu.cn") is False
+
+
+def test_dict_preauth_lists_authorize_nothing():
+    # Iterating a dict yields its KEYS, silently authorizing them.
+    assert egress_allowed("open.feishu.cn", {"open.feishu.cn": 1}) is False
+    assert fs_allowed("/DATA/reports/a", {"/DATA/reports": 1}) is False
+    assert egress_allowed("open.feishu.cn", None) is False
+    assert fs_allowed("/DATA/reports/a", None) is False
+
+
+def test_bare_star_is_not_a_wildcard_for_every_domain():
+    assert egress_allowed("evil.com", ["*"]) is False
+    assert egress_allowed("evil.com", ["*."]) is False
+    assert egress_allowed("example.com", ["*.com"]) is True   # explicit, still deliberate
+
+
+@pytest.mark.asyncio
+async def test_malformed_event_is_denied_and_later_confirms_still_answered():
+    # A non-string host used to raise out of drive(); every confirmation
+    # registered afterwards then had nobody to answer it.
+    mgr = FakeConfirmManager()
+    sink = FakeSink(past=[
+        {"type": "confirmation_required", "confirm_id": "c1",
+         "action": "egress_confirm", "host": 12345},
+        _egress("open.feishu.cn", cid="c2"),
+        {"type": "message", "content": "carried on"},
+        {"type": "done"}])
+    out = await _driver(mgr, {"egress_domains": ["open.feishu.cn"]}).drive(sink)
+    assert mgr.calls == [("c1", False, SID), ("c2", True, SID)]
+    assert out["denied"] == [{"kind": "egress", "detail": ""}]
+    assert out["auto_approved"] == [{"kind": "egress", "detail": "open.feishu.cn"}]
+    assert out["summary"] == "carried on"
+
+
+@pytest.mark.asyncio
+async def test_malformed_preauth_document_denies_instead_of_opening_everything():
+    mgr = FakeConfirmManager()
+    out = await _driver(mgr, {"egress_domains": "open.feishu.cn",
+                              "fs_write": "/DATA/reports"}).drive(FakeSink(past=[
+        _egress("open.feishu.cn", cid="c1"),
+        _access("/DATA/reports/a.md", cid="c2"),
+        {"type": "done"}]))
+    assert mgr.calls == [("c1", False, SID), ("c2", False, SID)]
+    assert out["auto_approved"] == []
 
 
 # --------------------------------------------------------------------------

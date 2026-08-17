@@ -68,6 +68,14 @@ def _norm_host(host: str) -> str:
 def egress_allowed(host: str, domains) -> bool:
     """True if `host` is covered by one of the preauthorized `domains`.
 
+    `domains` must be the list `preauth.parse()` produces.  A bare string must
+    NOT be iterated (it would decompose into chars, and a one-char "domain"
+    matches nothing useful but proves the shape was never validated), and
+    neither must a dict (iterating one yields its KEYS, which would silently
+    authorize them).  Both are rejected outright rather than trusted to the
+    caller: this function is the gate that decides whether an unattended run
+    reaches the network, so it validates its own input.
+
     Case-insensitive, port-insensitive, trailing-dot-insensitive.  `*.a.com`
     matches any subdomain of `a.com` but NOT the apex `a.com` (the author has
     to name it explicitly) and never a suffix-confusion neighbour such as
@@ -75,6 +83,8 @@ def egress_allowed(host: str, domains) -> bool:
     to be written per domain, and letting one character open all egress in an
     unattended run is not a trade this file makes.
     """
+    if isinstance(domains, str) or not isinstance(domains, (list, tuple)):
+        return False
     h = _norm_host(host)
     if not h or not domains:
         return False
@@ -109,7 +119,15 @@ def fs_allowed(path: str, roots) -> bool:
     `grants.grant_fs`, which only does `os.path.isdir` on the roots; the two
     are independent gates and this one is the one that can be attacked with a
     crafted path, so it resolves.
+
+    `roots` must be the list `preauth.parse()` produces.  A bare string must
+    NOT be iterated: `"/DATA/reports"` would decompose into chars whose first
+    element is `"/"` — i.e. a malformed document would grant the WHOLE
+    filesystem.  A dict would iterate its keys.  Both are rejected here rather
+    than trusted to the caller, for the same reason as `egress_allowed`.
     """
+    if isinstance(roots, str) or not isinstance(roots, (list, tuple)):
+        return False
     if not path or not isinstance(path, str) or not roots:
         return False
     p = _real(path)
@@ -173,11 +191,19 @@ class TaskRunDriver:
 
     # -- confirmations ----------------------------------------------------
 
-    def _decide(self, ev: dict) -> bool:
+    def _decide(self, ev: dict) -> tuple[bool, str]:
+        """(approve, offending_detail).
+
+        `offending_detail` is non-empty only when a specific element of the
+        request is what sank it — currently the first non-preauthorized path of
+        a batch fs card.  Recording `paths[0]` there would name a path that was
+        actually ALLOWED and hide the one that was not, and Task 7's from-denied
+        generator would then propose a rule that changes nothing.
+        """
         kind = _kind_of(ev)
         if kind == _KIND_EGRESS:
             return egress_allowed(ev.get("host") or "",
-                                  self._preauth.get("egress_domains") or [])
+                                  self._preauth.get("egress_domains") or []), ""
         if kind == _KIND_FS:
             roots = self._preauth.get("fs_write") or []
             # A batch card (`request_access_batch`) carries every path in
@@ -186,15 +212,30 @@ class TaskRunDriver:
             paths = ev.get("paths")
             if not isinstance(paths, (list, tuple)) or not paths:
                 paths = [ev.get("path") or ""]
-            return all(fs_allowed(p, roots) for p in paths)
+            for p in paths:
+                if not fs_allowed(p, roots):
+                    return False, (p if isinstance(p, str) else "")
+            return True, ""
         # shell / mcp_tool / mcp_install / toolbox_install / elicitation …
         # Their pre-authorization is injected before the tool runs, so a card
         # here means "not preauthorized".
-        return False
+        return False, ""
 
     def _handle_confirm(self, ev: dict) -> None:
-        record = {"kind": _kind_of(ev), "detail": _detail_of(ev)}
-        approve = self._decide(ev)
+        # Classification and matching run INSIDE the try: a malformed event
+        # (e.g. a non-string `host`) must not escape into drive(), because the
+        # confirmations registered AFTER it would then have nobody to answer
+        # them and would park their tool coroutines on wait()'s 24h default.
+        kind, approve, detail = "unknown", False, ""
+        try:
+            kind = _kind_of(ev)
+            approve, offending = self._decide(ev)
+            detail = offending or _detail_of(ev)
+        except Exception:                   # noqa: BLE001 — deny, never propagate
+            logger.warning("task driver: malformed confirmation event (kind=%s); "
+                           "denying", kind, exc_info=True)
+            approve, detail = False, ""
+        record = {"kind": kind, "detail": detail}
         cid = ev.get("confirm_id")
         if not cid:
             # Nothing is waiting on an id-less card (elicitation cards get their
