@@ -2096,7 +2096,9 @@ def _start_run(session_id: str, user_id: str, message: str,
                auth_header: str = "",
                user_lang: str = "",
                mcp_servers: "list | ConfigUnavailable | None" = None,
-               channel_send_file=None) -> RunSink:
+               channel_send_file=None,
+               pre_confirmed_tools: "set[str] | None" = None,
+               run_shell_allowlist: "list | None" = None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -2132,6 +2134,10 @@ def _start_run(session_id: str, user_id: str, message: str,
                 user_lang=user_lang,
                 mcp_servers=mcp_servers,
                 channel_send_file=channel_send_file,
+                # Run-scoped pre-authorization (scheduled tasks); None for
+                # every interactive path, which keeps the gates unchanged.
+                pre_confirmed_tools=pre_confirmed_tools,
+                run_shell_allowlist=run_shell_allowlist,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean

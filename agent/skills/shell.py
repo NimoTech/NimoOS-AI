@@ -50,6 +50,12 @@ DB_VAR: ContextVar = ContextVar("shell_db", default=None)
 USER_PATTERNS_VAR: ContextVar[list] = ContextVar("shell_user_patterns", default=[])
 CONFIRM_MGR_VAR: ContextVar = ContextVar("shell_confirm_mgr", default=None)
 EVENT_QUEUE_VAR: ContextVar = ContextVar("shell_event_queue", default=None)
+# Run-scoped shell allowlist (scheduled tasks' `preauth.shell`).  Unlike the
+# persistent `shell_allowlist` table this lives only for the duration of one
+# agent run and is NEVER written to the DB.  Set by agent.py::run() from the
+# run's pre-authorization; default [] means "no run-scoped grant" and keeps the
+# gate bit-identical to its pre-preauth behavior.
+RUN_ALLOWLIST_VAR: ContextVar[list] = ContextVar("shell_run_allowlist", default=[])
 
 EXEC_MODE = os.environ.get("NIMOOS_AGENT_EXEC_MODE", "netns")
 
@@ -244,6 +250,36 @@ def _argv_is_atomic(seg) -> bool:
     )
 
 
+def _run_allowlist_match(command: str, decision) -> bool:
+    """True if the run-scoped pre-authorization vouches for `command`.
+
+    Deliberately STRICTER than the persistent allowlist:
+
+    * ``protected`` is never covered.  The persistent allowlist *does* pass some
+      protected commands (a `path_scope` entry, or a `prefix` entry on a mass
+      delete under /DATA, whose paths aren't "protected paths" individually) —
+      that is a human-maintained, per-machine decision.  A run-scoped grant
+      comes from a scheduled task's stored document and runs with nobody
+      watching, so protected always falls through to the refusal path.
+    * Same anti-smuggling shape as `shell_guard.allowlist.match`: a SINGLE
+      simple command, no chaining (`;`/`&&`/`|`/subshells) and no redirection,
+      so a benign matched prefix can't vouch for a destructive tail.
+    """
+    rules = RUN_ALLOWLIST_VAR.get() or []
+    if not rules:
+        return False
+    if decision.level == "protected":
+        return False
+    from shell_guard.parse import segments as _seg  # noqa: PLC0415
+    segs = _seg(command)
+    if segs is None or len(segs) != 1:
+        return False
+    if segs[0].redirect_targets or segs[0].read_targets:
+        return False
+    from tasks import preauth as _preauth  # noqa: PLC0415
+    return _preauth.shell_match(rules, command)
+
+
 async def _guard_command(command: str) -> str | None:
     """Classify `command`; return a refusal string to block, or None to allow.
 
@@ -273,14 +309,19 @@ async def _guard_command(command: str) -> str | None:
     if decision.level == "safe":
         return None
 
-    # user-maintained allowlist wins (runs even unattended)
-    if db is not None and guard_allowlist.match(db, command):
+    # user-maintained allowlist wins (runs even unattended); a run-scoped
+    # pre-authorization (scheduled tasks) is a second, narrower source of the
+    # same waiver — see _run_allowlist_match for how it is stricter.
+    _persistent_ok = db is not None and guard_allowlist.match(db, command)
+    _run_ok = False if _persistent_ok else _run_allowlist_match(command, decision)
+    if _persistent_ok or _run_ok:
         # Allowlisted: skip confirmation, but still build the backstop for
         # destructive commands (defense in depth — a pre-approved rm still
         # gets a recoverable snapshot/trash).
         if decision.level in ("dangerous", "protected"):
             guard_backstop.prepare_backstop(decision.paths)
-        _rec("allowlisted", decision.level, "allowlist")
+        _rec("allowlisted", decision.level,
+             "allowlist" if _persistent_ok else "run-preauth")
         return None
 
     # gray → judge; allow verdict passes through, else fall to confirm

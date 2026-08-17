@@ -575,6 +575,8 @@ class AgentRunner:
         user_lang: str = "",
         mcp_servers: "list | ConfigUnavailable | None" = None,
         channel_send_file=None,
+        pre_confirmed_tools: "set[str] | None" = None,
+        run_shell_allowlist: "list | None" = None,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -596,7 +598,12 @@ class AgentRunner:
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
-            mcp_client._CONFIRMED_TOOLS_VAR.set(set())
+            # Seeded (not merely cleared) so a scheduled task's pre-authorized
+            # MCP tools survive: this line runs AFTER _start_run, so setting the
+            # var earlier would be wiped here. A copy, never the caller's set —
+            # _ensure_confirmed mutates it in place when the user says
+            # "remember", and that must not leak back into the task's document.
+            mcp_client._CONFIRMED_TOOLS_VAR.set(set(pre_confirmed_tools or ()))
             mcp_client._RUN_CONNS_VAR.set({})
             mcp_client._RUN_CONN_LOCKS_VAR.set({})
             mb_skills.SESSION_ID_VAR.set(session_id)
@@ -624,6 +631,11 @@ class AgentRunner:
             shell_skills.USER_PATTERNS_VAR.set(user_patterns or [])
             shell_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             shell_skills.EVENT_QUEUE_VAR.set(sink)
+            # Run-scoped shell pre-authorization (scheduled tasks). Always set —
+            # a run without preauth gets [], which is the pre-existing behavior.
+            # The token lets the finally block hand the context back untouched.
+            _run_allow_token = shell_skills.RUN_ALLOWLIST_VAR.set(
+                list(run_shell_allowlist or []))
 
             from skills import tool_gating as _gat
             import db as _db
@@ -1026,6 +1038,11 @@ class AgentRunner:
                 # in main.py for replay; we just remove it from the hot-path
                 # egress routing table.
                 self._active_sinks.pop(session_id, None)
+                # Drop the run-scoped shell grant as soon as the run ends.
+                try:
+                    shell_skills.RUN_ALLOWLIST_VAR.reset(_run_allow_token)
+                except Exception:  # noqa: BLE001 — token from another context
+                    shell_skills.RUN_ALLOWLIST_VAR.set([])
                 await mcp_client.close_run_conns()
                 await sink.put({"type": "done"})
 

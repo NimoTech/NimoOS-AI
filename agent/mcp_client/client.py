@@ -292,7 +292,12 @@ def _gate_args(args: dict, patterns: list[str]) -> None:
 
 async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     key = f"{server['id']}::{tool_name}"
-    if key in _CONFIRMED_TOOLS_VAR.get(set()):
+    _confirmed = _CONFIRMED_TOOLS_VAR.get(set())
+    # `<server_id>::*` is a per-server wildcard, seeded by a scheduled task's
+    # pre-authorization (agent.py passes pre_confirmed_tools). It waives
+    # confirmation for that server only — there is deliberately no broader
+    # form (a bare "*" matches no key and vouches for nothing).
+    if key in _confirmed or f"{server['id']}::*" in _confirmed:
         return True
     mgr = CONFIRM_MGR_VAR.get()
     queue = EVENT_QUEUE_VAR.get()
