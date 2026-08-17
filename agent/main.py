@@ -2637,14 +2637,13 @@ _RUNS_LIMIT_RANGE = (1, 200)
 # database, /etc, and the service units that start them. Both are refused at
 # the edge with `bad_fs_write` rather than trimmed silently, so the author
 # finds out their document was not accepted.
-_FS_WRITE_DENY_ROOTS = (
-    "/etc", "/proc", "/sys", "/dev", "/boot", "/bin", "/sbin", "/lib",
-    "/lib64", "/usr", "/root", "/run", "/var/lib/nimoos",
-)
-
-
+#
+# The deny list itself lives in `tasks/driver.py` (single source of truth) and
+# is re-applied there at run time, because this check can only judge the string
+# as it is today — see `driver.fs_root_denied`.
 def _check_fs_write(paths) -> None:
     """Reject `/`, system roots and non-absolute entries in `fs_write`."""
+    from tasks.driver import fs_root_denied
     for raw in paths or []:
         path = (raw or "").strip()
         # Relative paths would be resolved against whatever CWD the run
@@ -2653,12 +2652,16 @@ def _check_fs_write(paths) -> None:
             raise HTTPException(400, "bad_fs_write")
         # Judge the same string the gate will: it realpaths before matching,
         # so a symlink under an innocuous name must not launder a denied root.
-        real = os.path.realpath(path)
-        if real == "/":
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            # An embedded NUL raises ValueError here (and OSError is possible
+            # on some platforms). A path that cannot be resolved cannot be
+            # judged, and an unjudgeable rule must not be stored — without
+            # this the exception escaped as a 500.
             raise HTTPException(400, "bad_fs_write")
-        for root in _FS_WRITE_DENY_ROOTS:
-            if real == root or real.startswith(root + "/"):
-                raise HTTPException(400, "bad_fs_write")
+        if fs_root_denied(real):
+            raise HTTPException(400, "bad_fs_write")
 
 
 def _empty_preauth_report() -> dict:

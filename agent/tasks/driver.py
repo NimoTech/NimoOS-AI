@@ -110,12 +110,45 @@ def _real(path: str) -> str | None:
         return None
 
 
+# Locations that must never authorize an unattended write. Enforced at BOTH
+# ends: the API refuses to store them (`main.py::_check_fs_write`, which
+# imports this list) and `fs_allowed` refuses to honor them.
+#
+# Two ends are needed because the API check judges a string at one point in
+# time. A rule stored as a real directory can be turned into a symlink to `/`
+# afterwards — `_real` then resolves it to "/", every absolute path prefix-
+# matches it, and the run is pre-authorized to write /etc/shadow and the
+# agent's own database. Re-checking here also covers rows that never went
+# through the API at all (hand-edited, restored from a backup, or test
+# residue in a live DB).
+FS_DENY_ROOTS = (
+    "/etc", "/proc", "/sys", "/dev", "/boot", "/bin", "/sbin", "/lib",
+    "/lib64", "/usr", "/root", "/run", "/var/lib/nimoos",
+)
+
+
+def fs_root_denied(real_root: str) -> bool:
+    """True if an ALREADY-RESOLVED fs_write root is `/` or a system location.
+
+    Takes the realpath, not the raw string: judging the raw value is what the
+    symlink swap above defeats. `deny + "/"` keeps the comparison on a path
+    component boundary, so `/lib` never denies `/libreoffice-data`.
+    """
+    if not real_root or real_root == "/":
+        return True
+    for deny in FS_DENY_ROOTS:
+        if real_root == deny or real_root.startswith(deny + "/"):
+            return True
+    return False
+
+
 def fs_allowed(path: str, roots) -> bool:
     """True if `path` resolves inside one of the preauthorized `roots`.
 
     realpath on BOTH sides (so a symlink cannot smuggle a write out of an
     authorized tree), then a component-boundary comparison — `/DATA/reports`
-    must never authorize `/DATA/reports-evil`.  Stricter than
+    must never authorize `/DATA/reports-evil`.  A root that resolves to `/` or
+    a system location grants nothing at all (see `fs_root_denied`).  Stricter than
     `grants.grant_fs`, which only does `os.path.isdir` on the roots; the two
     are independent gates and this one is the one that can be attacked with a
     crafted path, so it resolves.
@@ -138,6 +171,12 @@ def fs_allowed(path: str, roots) -> bool:
             continue
         r = _real(raw)
         if r is None:
+            continue
+        if fs_root_denied(r):
+            # Not "deny the request" — just "this root grants nothing", so a
+            # document with one poisoned entry still honors its good ones.
+            logger.warning("task driver: ignoring fs_write root %r; it "
+                           "resolves to %r, which is never grantable", raw, r)
             continue
         if p == r or p.startswith(r.rstrip(os.sep) + os.sep):
             return True

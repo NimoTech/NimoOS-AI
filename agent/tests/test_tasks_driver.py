@@ -271,6 +271,60 @@ async def test_fs_batch_denial_records_the_offending_path_not_the_allowed_one(tm
 
 
 # --------------------------------------------------------------------------
+# A stored root that resolves somewhere ungrantable grants NOTHING
+#
+# The API refuses to store "/" or a system root, but that check judges the
+# string once, at write time. These pin the run-time half: the same rule can
+# become dangerous later (symlink swap), or can have entered the DB without
+# ever passing the API.
+# --------------------------------------------------------------------------
+
+def test_root_slash_authorizes_nothing():
+    assert fs_allowed("/etc/shadow", ["/"]) is False
+    assert fs_allowed("/DATA/anything", ["/"]) is False
+
+
+@pytest.mark.parametrize("root", ["/etc", "/usr/share/nimoos/agent",
+                                  "/var/lib/nimoos/ai/agent", "/proc"])
+def test_system_roots_authorize_nothing(root):
+    assert fs_allowed(root + "/x", [root]) is False
+
+
+def test_root_swapped_for_a_symlink_to_slash_stops_authorizing(tmp_path):
+    """The attack the write-time check cannot see: the rule was stored while
+    it pointed at a real directory, and was repointed at / afterwards."""
+    root = tmp_path / "reports"
+    root.mkdir()
+    rule = [str(root)]
+    assert fs_allowed(str(root / "a"), rule) is True          # legitimate today
+    assert fs_allowed("/etc/shadow", rule) is False
+
+    root.rmdir()
+    root.symlink_to("/")                                       # …and now it is /
+    assert fs_allowed("/etc/shadow", rule) is False
+    assert fs_allowed("/var/lib/nimoos/ai/agent/agent.db", rule) is False
+    assert fs_allowed("/DATA/anything", rule) is False
+
+
+def test_one_poisoned_root_does_not_disarm_the_good_ones(tmp_path):
+    good = tmp_path / "reports"
+    good.mkdir()
+    assert fs_allowed(str(good / "a"), ["/", str(good)]) is True
+    assert fs_allowed("/etc/shadow", ["/", str(good)]) is False
+
+
+def test_deny_roots_are_component_boundaries(tmp_path):
+    # /lib must not deny /libreoffice-data; the check is on a path boundary.
+    lookalike = tmp_path / "libreoffice-data"
+    lookalike.mkdir()
+    from tasks.driver import fs_root_denied
+    assert fs_root_denied("/libreoffice-data") is False
+    assert fs_root_denied("/lib") is True
+    assert fs_root_denied("/lib/x86_64-linux-gnu") is True
+    assert fs_root_denied("") is True
+
+
+# --------------------------------------------------------------------------
 # Malformed preauth documents must fail CLOSED (never trust the caller)
 # --------------------------------------------------------------------------
 

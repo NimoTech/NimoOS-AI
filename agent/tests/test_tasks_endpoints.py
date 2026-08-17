@@ -9,16 +9,18 @@ No `with TestClient(...)`: the repo-wide convention here is to construct the
 client bare so lifespan/startup never runs (it would touch the MCP session
 manager singleton and start the scheduler/runner workers).
 
-**These tests must never touch `main._conn`.**  `conftest.py` only does
-`os.environ.setdefault("AGENT_DB_PATH", ":memory:")`, and inside the agent
-container that variable is already set to `/var/lib/nimoos/ai/agent/agent.db`
-— the live database — so `setdefault` is a no-op and `main._conn` is the
-production connection.  An earlier version of this file cleaned its tables
-through it and destroyed a user's real channel bindings.  Isolation therefore
-uses the repo's existing seam (see test_context_usage_endpoint.py): point
-`main._DB_PATH` at a tmp file and let `main._db()` open a fresh DB, which is
-what every endpoint below calls.  The fixture asserts the connection is not
-the live one, so this can never silently regress.
+**These tests must never touch `main._conn`.**  An earlier version of this
+file cleaned its tables through it; because `conftest.py` used
+`os.environ.setdefault("AGENT_DB_PATH", ":memory:")` and the agent container
+already sets that variable to the live `/var/lib/nimoos/ai/agent/agent.db`,
+the setdefault was a no-op, `main._conn` was the production connection, and
+the cleanup destroyed a user's real channel bindings.  conftest now assigns
+unconditionally, so `main._conn` is in-memory even inside the container — but
+that is a backstop, not the isolation: this file uses the repo's existing seam
+(see test_context_usage_endpoint.py) and points `main._DB_PATH` at a tmp file,
+letting `main._db()` open a fresh DB, which is what every endpoint below calls.
+The fixture still asserts the connection is not the import-time one, so a
+regression in either layer fails loudly instead of writing somewhere real.
 """
 import json
 import sys
@@ -241,6 +243,13 @@ def test_fs_write_refuses_root_and_system_paths(client, path):
     r = _create(client, preauth={"fs_write": [path]})
     assert r.status_code == 400, r.text
     assert r.json()["detail"] == "bad_fs_write"
+
+
+def test_fs_write_refuses_an_unresolvable_path(client):
+    # os.path.realpath raises ValueError on an embedded NUL; unresolvable
+    # means unjudgeable, and it must be a 400, not an escaped 500.
+    r = _create(client, preauth={"fs_write": ["/DATA/\x00x"]})
+    assert r.status_code == 400 and r.json()["detail"] == "bad_fs_write"
 
 
 def test_fs_write_refuses_a_symlink_to_root(client, tmp_path):
