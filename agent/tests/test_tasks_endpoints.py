@@ -488,3 +488,105 @@ def test_notify_targets_route_is_not_shadowed_by_task_id(client):
     # /agent/tasks/{task_id} must not swallow the literal path.
     _create_id(client)
     assert client.get("/agent/tasks/notify-targets", headers=H).status_code == 200
+
+
+# -- reclaiming what a task produced ----------------------------------------
+
+def _seed_finished_run(conn, task_id, *, session_id, run_id="ar-1",
+                       events=3, user_id="u1"):
+    """One finished run with everything a real one leaves behind: its session,
+    a message, the `agent_runs` row the SSE layer writes and that row's
+    `event_log` rows."""
+    import time as _time
+    now = int(_time.time())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at, "
+        "agent_type, source) VALUES (?,?,?,?,?,?,?)",
+        (session_id, user_id, None, now, now, "general", "task"))
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"m-{session_id}", session_id, "assistant", "[]", now))
+    conn.execute(
+        "INSERT INTO agent_runs (id, session_id, user_id, status, "
+        "user_message, created_at) VALUES (?,?,?,?,?,?)",
+        (run_id, session_id, user_id, "done", "go", now))
+    for seq in range(events):
+        conn.execute(
+            "INSERT INTO event_log (run_id, seq, payload, created_at) "
+            "VALUES (?,?,?,?)", (run_id, seq, "{}", now))
+    tr_id = store.create_run(conn, task_id, user_id, "cron")
+    store.attach_session(conn, tr_id, session_id)
+    store.finish_run(conn, tr_id, "succeeded", summary="ok")
+    conn.commit()
+    return tr_id
+
+
+def _counts(conn, session_id, task_id, run_id="ar-1"):
+    q = lambda sql, *p: conn.execute(sql, p).fetchone()[0]  # noqa: E731
+    return {
+        "task_runs": q("SELECT COUNT(*) FROM task_runs WHERE task_id=?", task_id),
+        "sessions": q("SELECT COUNT(*) FROM sessions WHERE id=?", session_id),
+        "messages": q("SELECT COUNT(*) FROM messages WHERE session_id=?", session_id),
+        "agent_runs": q("SELECT COUNT(*) FROM agent_runs WHERE session_id=?", session_id),
+        "event_log": q("SELECT COUNT(*) FROM event_log WHERE run_id=?", run_id),
+    }
+
+
+def test_delete_task_leaves_no_orphan_rows(client, conn, monkeypatch):
+    """Deleting a task must reclaim its runs and everything they own.
+
+    `task_runs` has no FK cascade and `prune_runs` only ever walks by task_id,
+    so a task row deleted on its own strands all of it with nothing left
+    pointing at it — the wiki `file_events` failure class.
+    """
+    import session_purge
+
+    async def no_parser(user_id, session_id):
+        pass
+    monkeypatch.setattr(session_purge, "default_vector_cleanup", no_parser)
+
+    tid = _create_id(client)
+    _seed_finished_run(conn, tid, session_id="s-1")
+    before = _counts(conn, "s-1", tid)
+    assert before == {"task_runs": 1, "sessions": 1, "messages": 1,
+                      "agent_runs": 1, "event_log": 3}
+
+    assert client.delete(f"/agent/tasks/{tid}", headers=H).status_code == 204
+    assert client.get(f"/agent/tasks/{tid}", headers=H).status_code == 404
+    assert _counts(conn, "s-1", tid) == {"task_runs": 0, "sessions": 0,
+                                         "messages": 0, "agent_runs": 0,
+                                         "event_log": 0}
+
+
+def test_delete_task_does_not_touch_another_users_task(client, conn, monkeypatch):
+    import session_purge
+
+    async def no_parser(user_id, session_id):
+        pass
+    monkeypatch.setattr(session_purge, "default_vector_cleanup", no_parser)
+
+    tid = _create_id(client)
+    _seed_finished_run(conn, tid, session_id="s-1")
+    # u2 must not be able to wipe u1's history through the delete cascade.
+    assert client.delete(f"/agent/tasks/{tid}", headers=H2).status_code == 404
+    assert _counts(conn, "s-1", tid) == {"task_runs": 1, "sessions": 1,
+                                         "messages": 1, "agent_runs": 1,
+                                         "event_log": 3}
+
+
+def test_task_sessions_stay_out_of_the_chat_list(client, conn):
+    """A task opens a fresh session per run, titled NULL, sorted by
+    updated_at — without the filter they bury the user's real conversations.
+    """
+    now = 1_800_000_000
+    for sid, source, updated in (("s-task", "task", now + 100),
+                                 ("s-web", "web", now)):
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, title, created_at, updated_at, "
+            "agent_type, source) VALUES (?,?,?,?,?,?,?)",
+            (sid, "u1", None, now, updated, "general", source))
+    conn.commit()
+
+    listed = client.get("/agent/sessions", headers=H).json()
+    assert [s["id"] for s in listed] == ["s-web"]

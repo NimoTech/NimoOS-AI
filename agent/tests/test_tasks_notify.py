@@ -117,6 +117,15 @@ def test_format_message_failure_includes_error_and_denied():
     assert "shell: rm -rf /" in text
 
 
+def test_format_message_skipped_does_not_claim_failure():
+    task = {"name": "daily digest"}
+    run = {"status": "skipped", "summary": "", "denied_actions": "[]",
+           "error": "previous run still queued or running (overlap_policy=skip)"}
+    text = notify.format_message(task, run)
+    assert text.startswith("\u23ed\ufe0f daily digest skipped")
+    assert "failed" not in text
+
+
 def test_format_message_failure_without_error_or_denied():
     task = {"name": "daily digest"}
     run = {"status": "timeout", "summary": "", "error": "",
@@ -156,8 +165,13 @@ def test_summary_is_cut_to_800_chars():
     ("failure", "succeeded", False),
     ("failure", "failed", True),
     ("failure", "timeout", True),
+    # A skip is not a failure: overlap_policy=skip writes one on every fire
+    # while a slow run is still going, so counting them as failures turns a
+    # `failure` subscription into a notification storm.
+    ("failure", "skipped", False),
     ("always", "succeeded", True),
     ("always", "failed", True),
+    ("always", "skipped", True),   # `always` still means every terminal run
 ])
 async def test_policy_matrix(conn, policy, status, expect_sent):
     instance_id, chat_id = _pair(conn)

@@ -295,3 +295,97 @@ func TestToolboxGateAdminPassthrough(t *testing.T) {
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code, "POST /agent/toolbox/install admin must pass through")
 }
+
+// TestTasksGateRoutePrecedence proves /agent/tasks[/*] is admin-gated before
+// falling through to the general /agent/* proxy wildcard. Scheduled tasks are
+// unattended runs whose preauth document hands out shell prefixes, fs_write
+// roots and egress domains — the same authority shell-allowlist governs.
+func TestTasksGateRoutePrecedence(t *testing.T) {
+	us := fakeUserService(t, "user") // non-admin: gate must reject with 403
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxied := 0
+	proxy := func(c echo.Context) error { proxied++; return c.String(http.StatusOK, "proxied") }
+	// Mirror route/v2.go registration order: gated routes first, wildcard last.
+	e.Any("/agent/tasks", proxy, AdminOnly(dir))
+	e.Any("/agent/tasks/*", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		req := httptest.NewRequest(m, "/agent/tasks", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusForbidden, rec.Code,
+			"%s /agent/tasks must hit the gated route, not the wildcard", m)
+	}
+
+	// Every nested task endpoint, including the two-segment ones.
+	nested := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/agent/tasks/notify-targets"},
+		{http.MethodGet, "/agent/tasks/abc123"},
+		{http.MethodPut, "/agent/tasks/abc123"},
+		{http.MethodDelete, "/agent/tasks/abc123"},
+		{http.MethodPost, "/agent/tasks/abc123/run"},
+		{http.MethodGet, "/agent/tasks/abc123/runs"},
+		{http.MethodPost, "/agent/tasks/abc123/preauth/from-denied"},
+	}
+	for _, c := range nested {
+		req := httptest.NewRequest(c.method, c.path, nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusForbidden, rec.Code,
+			"%s %s must hit the gated route, not the wildcard", c.method, c.path)
+	}
+
+	// Per-user sibling endpoints must stay ungated.
+	for _, path := range []string{"/agent/lark/binding", "/agent/sessions"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusOK, rec.Code, "%s must stay ungated", path)
+	}
+	require.Equal(t, 2, proxied)
+}
+
+// TestTasksGateAdminPassthrough proves an admin caller passes through the gate
+// to reach the proxy on the collection and on a nested task endpoint.
+func TestTasksGateAdminPassthrough(t *testing.T) {
+	us := fakeUserService(t, "admin")
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxy := func(c echo.Context) error { return c.String(http.StatusOK, "proxied") }
+	e.Any("/agent/tasks", proxy, AdminOnly(dir))
+	e.Any("/agent/tasks/*", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		req := httptest.NewRequest(m, "/agent/tasks", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusOK, rec.Code, "%s admin must pass through", m)
+	}
+
+	for _, c := range []struct{ method, path string }{
+		{http.MethodDelete, "/agent/tasks/abc123"},
+		{http.MethodPost, "/agent/tasks/abc123/run"},
+	} {
+		req := httptest.NewRequest(c.method, c.path, nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusOK, rec.Code,
+			"%s %s admin must pass through", c.method, c.path)
+	}
+}

@@ -97,10 +97,18 @@ def format_message(task_row, run_row) -> str:
     Reintroducing one here would undo that.
     """
     name = task_row["name"] or "(unnamed task)"
-    if run_row["status"] == "succeeded":
+    status = run_row["status"]
+    if status == "succeeded":
         summary = _truncate(str(run_row["summary"] or ""), _SUMMARY_MAX_CHARS)
         header = f"✅ {name}"
         return f"{header}\n\n{summary}" if summary else header
+
+    # Only reachable under `always` (see `_should_notify`), and it must not
+    # claim the run failed — nothing was attempted.
+    if status == "skipped":
+        header = f"⏭️ {name} skipped"
+        reason = str(run_row["error"] or "").strip()
+        return f"{header}\n\n{reason}" if reason else header
 
     header = f"⚠️ {name} failed"
     parts = [header]
@@ -113,11 +121,22 @@ def format_message(task_row, run_row) -> str:
     return "\n\n".join(parts)
 
 
+# What `failure` means: the run was attempted and did not work. Deliberately
+# NOT "anything that is not succeeded" — that also catches `skipped`, which
+# `overlap_policy=skip` writes on EVERY fire while a slow run is still going.
+# A task on a 1-minute schedule that takes 10 minutes then pushes ten "failed"
+# notifications per run, and the useful failure notification drowns in them.
+# A skip is not a failure: nothing was attempted and nothing is broken; the
+# run history still records it. Users who want to see them opt in with
+# `always`, which keeps meaning literally every terminal run.
+_FAILURE_STATUSES = ("failed", "timeout")
+
+
 def _should_notify(policy: str, status: str) -> bool:
     if policy == "always":
         return True
     if policy == "failure":
-        return status != "succeeded"
+        return status in _FAILURE_STATUSES
     return False  # 'never', or anything unrecognized — degrade to silent
 
 

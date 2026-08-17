@@ -250,7 +250,11 @@ async def test_no_model_configured_fails_the_run_loudly(conn):
 async def test_deleted_task_fails_the_orphaned_run(conn):
     tid = _mk(conn)
     rid = _queue(conn, tid)
-    store.delete_task(conn, tid, "u1")
+    # The task row is dropped WITHOUT store.delete_task, which now takes the
+    # queued run with it. This is the residual race the branch still guards:
+    # a run claimed just before the delete lands (or a hand-edited DB).
+    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (tid,))
+    conn.commit()
     h = Harness()
 
     assert await h.run(conn) is True
@@ -477,7 +481,8 @@ async def test_notify_failure_does_not_affect_the_recorded_result(conn):
 async def test_notify_skipped_when_task_was_deleted(conn):
     tid = _mk(conn)
     rid = _queue(conn, tid)
-    store.delete_task(conn, tid, "u1")
+    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (tid,))  # see above
+    conn.commit()
     h = Harness()
     calls = []
 
@@ -898,3 +903,140 @@ async def test_worker_loop_survives_a_raising_process(conn):
     await asyncio.wait_for(loop_task, timeout=2)
     assert calls                                   # it ran
     assert loop_task.exception() is None           # and never died
+
+
+# -- reclaiming rows the run leaves behind ------------------------------------
+
+def _seed_agent_run(conn, session_id, run_id, events=3):
+    """The rows the SSE layer writes for one agent turn: an `agent_runs` row
+    and its `event_log` payloads. Neither has an FK to sessions, so neither is
+    reclaimed by anything except an explicit delete."""
+    conn.execute(
+        "INSERT INTO agent_runs (id, session_id, user_id, status, "
+        "user_message, created_at) VALUES (?,?,?,?,?,?)",
+        (run_id, session_id, "u1", "done", "go", NOW))
+    for seq in range(events):
+        conn.execute(
+            "INSERT INTO event_log (run_id, seq, payload, created_at) "
+            "VALUES (?,?,?,?)", (run_id, seq, "{}", NOW))
+    conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_delete_session_reclaims_agent_runs_and_event_log(conn, tmp_path,
+                                                                monkeypatch):
+    """The measured leak: ~591 event_log rows per run, and the runner's own
+    session delete never touched them (nor `agent_runs`, which is the only way
+    back to them)."""
+    monkeypatch.setattr(runner, "_snapshots_root", lambda: str(tmp_path))
+    tid = _mk(conn)
+    sid = _seed_history(conn, tid, 1)[0][1]
+    _seed_agent_run(conn, sid, "ar-1")
+    # A second session's rows must survive — the delete has to be scoped.
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at, "
+        "agent_type, source) VALUES (?,?,?,?,?,?,?)",
+        ("keep-me", "u1", None, NOW, NOW, "general", "task"))
+    _seed_agent_run(conn, "keep-me", "ar-keep")
+    conn.commit()
+
+    async def noop(user_id, session_id):
+        pass
+
+    await runner.delete_session(conn, "u1", sid, vector_cleanup=noop)
+
+    assert conn.execute("SELECT COUNT(*) c FROM agent_runs WHERE session_id=?",
+                        (sid,)).fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM event_log WHERE run_id=?",
+                        ("ar-1",)).fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM agent_runs WHERE session_id=?",
+                        ("keep-me",)).fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM event_log WHERE run_id=?",
+                        ("ar-keep",)).fetchone()["c"] == 3
+
+
+@pytest.mark.asyncio
+async def test_prune_reclaims_agent_runs_and_event_log(conn, tmp_path,
+                                                       monkeypatch):
+    """Same thing through the production prune path, not the helper directly."""
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, runner.KEEP_RUNS + 3, snaps_root=snaps)
+    for i, (_, sid) in enumerate(old):
+        _seed_agent_run(conn, sid, f"ar-{i}")
+
+    _queue(conn, tid)
+    await Harness().run(conn, session_deleter=deleter)
+
+    for i, (_, sid) in enumerate(old[:4]):          # the pruned ones
+        assert conn.execute("SELECT COUNT(*) c FROM agent_runs WHERE session_id=?",
+                            (sid,)).fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) c FROM event_log WHERE run_id=?",
+                            (f"ar-{i}",)).fetchone()["c"] == 0
+    kept_index = len(old) - 1
+    assert conn.execute("SELECT COUNT(*) c FROM event_log WHERE run_id=?",
+                        (f"ar-{kept_index}",)).fetchone()["c"] == 3
+
+
+@pytest.mark.asyncio
+async def test_delete_task_reclaims_every_run_and_session(conn, tmp_path,
+                                                          monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 3, snaps_root=snaps)
+    for i, (_, sid) in enumerate(old):
+        _seed_agent_run(conn, sid, f"ar-{i}")
+    queued = _queue(conn, tid)                      # not started yet
+
+    assert await store.delete_task(conn, tid, "u1", session_deleter=deleter) is True
+
+    assert conn.execute("SELECT COUNT(*) c FROM scheduled_tasks WHERE id=?",
+                        (tid,)).fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 0
+    assert _run_row(conn, queued) is None
+    for i, (_, sid) in enumerate(old):
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (sid,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM messages WHERE session_id=?",
+                            (sid,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM agent_runs WHERE session_id=?",
+                            (sid,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM event_log WHERE run_id=?",
+                            (f"ar-{i}",)).fetchone() is None
+        assert not (snaps / sid).exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_task_refuses_another_users_task(conn, tmp_path, monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 2, snaps_root=snaps)
+
+    assert await store.delete_task(conn, tid, "u2", session_deleter=deleter) is False
+
+    assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
+                        (tid,)).fetchone()["c"] == 2
+    for _, sid in old:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (sid,)).fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_still_removes_the_task_if_a_session_is_stuck(
+        conn, tmp_path, monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, 2, snaps_root=snaps)
+    doomed = old[1][1]
+
+    async def flaky(conn_, user_id, session_id):
+        if session_id == doomed:
+            raise RuntimeError("session busy")
+        await deleter(conn_, user_id, session_id)
+
+    assert await store.delete_task(conn, tid, "u1", session_deleter=flaky) is True
+    assert conn.execute("SELECT COUNT(*) c FROM scheduled_tasks WHERE id=?",
+                        (tid,)).fetchone()["c"] == 0
+    assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                        (old[0][1],)).fetchone() is None

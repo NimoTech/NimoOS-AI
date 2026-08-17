@@ -199,6 +199,12 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// sandbox session — system-scoped, admin only (mirrors shell-allowlist).
 	g.Any("/agent/toolbox", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/toolbox/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Scheduled tasks run unattended with a preauth document that hands out
+	// shell prefixes, fs_write roots and egress domains — the same authority
+	// shell-allowlist governs, so the same gate applies. Includes the nested
+	// run history and preauth endpoints.
+	g.Any("/agent/tasks", agent.Proxy, v2.AdminOnly(runtimePath))
+	g.Any("/agent/tasks/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})

@@ -35,10 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import shutil
 import time
 
+import session_purge
 from notes import store as notes_store
 
 from . import grants, notify, preauth, store
@@ -126,58 +125,24 @@ def resolve_max_turns(task, conn, max_turns_reader) -> "int | None":
 
 
 def _snapshots_root() -> str:
-    """Where fs-skill snapshots live. Resolved through `main` so a test (or a
-    non-default deployment) that moves the root is honored here too."""
-    try:
-        import main  # noqa: PLC0415
-        return main._snapshots_root
-    except Exception:                       # noqa: BLE001 — main not importable
-        return os.environ.get("AGENT_SNAPSHOTS_ROOT",
-                              "/var/lib/nimoos/ai/agent/snapshots")
-
-
-async def _default_vector_cleanup(user_id: str, session_id: str) -> None:
-    import recall_index  # noqa: PLC0415
-    await asyncio.wait_for(
-        recall_index._get_parser_client().agent_memory_delete(user_id, session_id),
-        timeout=10)
+    """Where fs-skill snapshots live. Kept as this module's own seam (tests
+    monkeypatch it) over `session_purge.default_snapshots_root`."""
+    return session_purge.default_snapshots_root()
 
 
 async def delete_session(conn, user_id: str, session_id: str, *,
                          vector_cleanup=None) -> None:
-    """Delete a session the way `main.delete_session` does — all four steps.
+    """Delete a pruned run's session — thin wrapper over `session_purge`.
 
-    `messages.session_id` is `REFERENCES sessions(id)` **without** ON DELETE
-    CASCADE (db.py) and `PRAGMA foreign_keys=ON` is set at init, so deleting
-    the session row first raises `IntegrityError: FOREIGN KEY constraint
-    failed` for any session that ever exchanged a message — i.e. every real
-    task run. Messages go first.
-
-    The other two steps are not optional either: the recall vectors would keep
-    a pruned run's content answerable by `recall`, and the snapshot directory
-    would leak disk for the lifetime of the box.
+    The steps (and the order they have to happen in) live in
+    `agent/session_purge.py`, shared with `main.delete_session`'s HTTP
+    handler. This used to be a second copy of them, and the copies drifted:
+    this one never cleared `agent_runs`/`event_log`, so every pruned run left
+    its ~591 event rows behind with nothing pointing at them.
     """
-    owner = conn.execute("SELECT user_id FROM sessions WHERE id=?",
-                         (session_id,)).fetchone()
-    if owner is not None and str(owner["user_id"]) != str(user_id):
-        # main.delete_session scopes its DELETE by user_id; the equivalent here
-        # is refusing outright, because a run row pointing at someone else's
-        # session is corruption, not a permission question.
-        logger.warning("tasks runner: refusing to delete session %s owned by "
-                       "another user", session_id)
-        return
-    cleanup = vector_cleanup or _default_vector_cleanup
-    try:
-        await cleanup(user_id, session_id)
-    except Exception as exc:                # noqa: BLE001 — soft-fail, same as
-        # main.delete_session: deletion must never depend on Parser being up;
-        # a missed cleanup only leaves orphan vectors (logged).
-        logger.warning("tasks runner: vector cleanup failed for session %s: %s",
-                       session_id, exc)
-    conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
-    conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-    conn.commit()
-    shutil.rmtree(os.path.join(_snapshots_root(), session_id), ignore_errors=True)
+    await session_purge.purge_session(
+        conn, user_id, session_id, vector_cleanup=vector_cleanup,
+        snapshots_root=_snapshots_root())
 
 
 async def cancel_sink(sink) -> bool:

@@ -39,6 +39,15 @@ services:
       PHOENIX_OTLP_ENDPOINT: "${PHOENIX_OTLP_ENDPOINT:-http://127.0.0.1:6006/v1/traces}"
       PHOENIX_PROJECT: "${PHOENIX_PROJECT:-nimoos-agent}"
     volumes:
+      # Host timezone. Without this the container is UTC while the box is not,
+      # and `tasks/cron.py` resolves a schedule with `datetime.fromtimestamp`
+      # — i.e. in the container's local zone. A user writing `0 9 * * *` for
+      # "9am" on an America/New_York NAS was getting 05:00 local, and the UI
+      # label ("server local time") was telling them otherwise. glibc reads
+      # /etc/localtime directly, so the file is enough — no TZ env var (an
+      # empty TZ would mean UTC and undo this) and no tzdata in the image.
+      # Picked up on container (re)create, not on a host timezone change.
+      - { type: bind, source: /etc/localtime, target: /etc/localtime, read_only: true }
       # rslave: lets the container see new host mounts made after the container starts
       # (USB→/media, array→/DATA); one-directional, nothing leaks back.
       - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }

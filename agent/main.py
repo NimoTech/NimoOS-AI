@@ -1372,9 +1372,16 @@ def _session_agent_type(session_id: str) -> str:
 
 @app.get("/agent/sessions")
 async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
+    # source != 'task': every scheduled run opens its own session with a NULL
+    # title, and they sort by updated_at like any other — so a task firing
+    # every 5 minutes would push the user's real conversations off the top of
+    # the chat list. Task sessions are reachable through the run history,
+    # which is where they belong. `source` is NOT NULL DEFAULT 'web', so the
+    # comparison never drops a legacy row to a NULL result.
     rows = _db().execute(
         "SELECT id, title, created_at, updated_at, agent_type "
-        "FROM sessions WHERE user_id=? ORDER BY updated_at DESC",
+        "FROM sessions WHERE user_id=? AND source != 'task' "
+        "ORDER BY updated_at DESC",
         (x_user_id,)
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1382,22 +1389,14 @@ async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
 
 @app.delete("/agent/sessions/{session_id}")
 async def delete_session(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
-    # Best-effort vector cleanup BEFORE dropping rows: a deleted session must
-    # not stay recallable. Soft-fail — deletion never depends on Parser being
-    # online; a missed cleanup only leaves orphan vectors (logged).
-    try:
-        import recall_index
-        await asyncio.wait_for(
-            recall_index._get_parser_client().agent_memory_delete(
-                x_user_id, session_id),
-            timeout=10)
-    except Exception as e:
-        _LOG.warning("agent-memory vector cleanup failed for %s: %s",
-                     session_id, e)
-    _conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
-    _conn.execute("DELETE FROM sessions WHERE id=? AND user_id=?", (session_id, x_user_id))
-    _conn.commit()
-    shutil.rmtree(os.path.join(_snapshots_root, session_id), ignore_errors=True)
+    # Every step (vector cleanup, the child tables that have no FK cascade,
+    # the snapshot dir) lives in session_purge, shared with the scheduled-task
+    # runner's prune path — see that module for why the order is fixed. This
+    # handler used to carry its own copy, which cleared neither `agent_runs`
+    # nor `event_log`.
+    import session_purge
+    await session_purge.purge_session(_conn, x_user_id, session_id,
+                                      snapshots_root=_snapshots_root)
     return {"ok": True}
 
 
@@ -2888,7 +2887,10 @@ async def tasks_update(task_id: str, request: Request,
 async def tasks_delete(task_id: str,
                        x_user_id: str = Header(..., alias="X-User-Id")):
     from tasks import store as _store
-    if not _store.delete_task(_db(), task_id, x_user_id):
+    # Awaited: delete_task also reclaims the task's runs and the sessions they
+    # own (see its docstring — without that, deleting a task orphans every row
+    # it ever produced, with nothing left pointing at them).
+    if not await _store.delete_task(_db(), task_id, x_user_id):
         raise HTTPException(404, "not_found")
     return Response(status_code=204)
 

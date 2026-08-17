@@ -8,11 +8,14 @@ run history. All timestamps are int seconds (time.time()).
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 import uuid
 
 from . import cron
+
+logger = logging.getLogger("nimoos-agent.tasks")
 
 # Fields accepted by create_task, with their column defaults when omitted.
 _CREATE_DEFAULTS = {
@@ -140,7 +143,52 @@ def update_task(conn, task_id: str, user_id: str, **fields) -> bool:
     return True
 
 
-def delete_task(conn, task_id: str, user_id: str) -> bool:
+async def delete_task(conn, task_id: str, user_id: str, *,
+                      session_deleter=None) -> bool:
+    """Delete a task **and everything it produced**.
+
+    The runs have to go first, and they have to go here. `task_runs` has no FK
+    cascade to `scheduled_tasks`, and the only path that ever deletes a run row
+    (`prune_runs`) walks by `task_id` — so dropping the task row on its own
+    strands every run it ever made, each with its session, that session's
+    messages, its `agent_runs`/`event_log` rows and its snapshot directory, and
+    nothing left in the database points at any of them. Unreclaimable, forever;
+    the live box was already carrying 27k such orphan event rows. Same failure
+    class as wiki's `file_events` reaching 129M rows.
+
+    `keep=0` is exactly "prune everything", so this reuses `prune_runs` rather
+    than repeating its ordering.
+
+    A run that is queued or running for this task is deleted too. That is the
+    intent of "delete this task" — but it means an in-flight run will fail on
+    its next write to a session that no longer exists. It is already unreadable
+    at that point (its history row is gone), so it fails into the runner's
+    catch-all and is logged; nothing else observes it.
+
+    This is `async` because deleting a session is (vector cleanup awaits
+    Parser). `session_deleter` is `async (conn, user_id, session_id) -> None`,
+    defaulting to `tasks.runner.delete_session` — imported lazily because
+    `runner` imports this module.
+    """
+    if get_task(conn, task_id, user_id) is None:
+        return False
+
+    if session_deleter is None:
+        from .runner import delete_session as session_deleter  # noqa: PLC0415
+
+    for session_id in prune_runs(conn, task_id, keep=0):
+        # Per-session try, same reasoning as the runner's prune loop: one
+        # undeletable session must not strand the rest — the run rows are
+        # already gone, so a skipped session is an orphan nobody comes back
+        # for. The task row still goes; a stuck session is not a reason to
+        # keep a task the user asked to delete.
+        try:
+            await session_deleter(conn, user_id, session_id)
+        except Exception:                   # noqa: BLE001
+            logger.warning("tasks store: could not delete session %s while "
+                           "deleting task %s", session_id, task_id,
+                           exc_info=True)
+
     cur = conn.execute(
         "DELETE FROM scheduled_tasks WHERE id=? AND user_id=?",
         (task_id, user_id),
