@@ -187,8 +187,12 @@ def list_chats_for_user(conn, user_id: str) -> list[dict]:
     chat id is the DM channel snowflake, not the user's.
 
     Revoked bindings are excluded, and the instance join drops chats whose
-    instance is gone.  There is no chat title in the schema, so the bound
-    account's `external_username` stands in as the human label when present.
+    instance is gone.  Disabled instances are excluded too: `ChannelManager`
+    only keeps adapters for enabled instances running, so a chat behind a
+    disabled one is an address nothing can ever be delivered to — offering it
+    in a picker would let a user select a silently dead notification target.
+    There is no chat title in the schema, so the bound account's
+    `external_username` stands in as the human label when present.
     """
     rows = conn.execute(
         "SELECT c.instance_id AS instance_id, "
@@ -198,7 +202,7 @@ def list_chats_for_user(conn, user_id: str) -> list[dict]:
         "FROM channel_chats c "
         "JOIN channel_bindings b ON b.id = c.binding_id "
         "JOIN channel_instances i ON i.id = c.instance_id "
-        "WHERE b.user_id=? AND b.revoked=0 "
+        "WHERE b.user_id=? AND b.revoked=0 AND i.enabled=1 "
         "ORDER BY c.updated_at DESC, c.rowid DESC",
         (str(user_id),)).fetchall()
     out = []

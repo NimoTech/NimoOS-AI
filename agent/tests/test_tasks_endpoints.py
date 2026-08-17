@@ -8,6 +8,17 @@ cannot be used to probe for other users' task ids.
 No `with TestClient(...)`: the repo-wide convention here is to construct the
 client bare so lifespan/startup never runs (it would touch the MCP session
 manager singleton and start the scheduler/runner workers).
+
+**These tests must never touch `main._conn`.**  `conftest.py` only does
+`os.environ.setdefault("AGENT_DB_PATH", ":memory:")`, and inside the agent
+container that variable is already set to `/var/lib/nimoos/ai/agent/agent.db`
+— the live database — so `setdefault` is a no-op and `main._conn` is the
+production connection.  An earlier version of this file cleaned its tables
+through it and destroyed a user's real channel bindings.  Isolation therefore
+uses the repo's existing seam (see test_context_usage_endpoint.py): point
+`main._DB_PATH` at a tmp file and let `main._db()` open a fresh DB, which is
+what every endpoint below calls.  The fixture asserts the connection is not
+the live one, so this can never silently regress.
 """
 import json
 import sys
@@ -26,13 +37,20 @@ H2 = {"X-User-Id": "u2"}
 
 
 @pytest.fixture
-def client():
-    conn = main._conn
-    for table in ("scheduled_tasks", "task_runs", "channel_chats",
-                  "channel_bindings", "channel_instances"):
-        conn.execute(f"DELETE FROM {table}")
-    conn.commit()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "_DB_PATH", str(tmp_path / "agent.db"))
+    conn = main._db()
+    assert conn is not main._conn, (
+        "tasks endpoint tests must run against an isolated DB, never the "
+        "connection main.py opened at import time")
     yield TestClient(main.app)
+
+
+@pytest.fixture
+def conn(client):
+    """The isolated connection the endpoints are writing to. Depends on
+    `client` so the _DB_PATH monkeypatch is already in place."""
+    return main._db()
 
 
 def _create(client, **over):
@@ -187,16 +205,66 @@ def test_update_reports_rejected_preauth_rules(client):
     assert r.json()["status"] == "ok"
 
 
+def test_update_replaces_the_whole_preauth_document(client):
+    """PUT preauth is a REPLACE, not a merge — pinned so Task 8's UI has to
+    send the full document rather than silently wiping the other buckets."""
+    tid = _create_id(client, preauth={"egress_domains": ["a.example.com"],
+                                      "mcp_tools": ["gh::list"]})
+    client.put(f"/agent/tasks/{tid}", headers=H,
+               json={"preauth": {"egress_domains": ["b.example.com"]}})
+    doc = client.get(f"/agent/tasks/{tid}", headers=H).json()["preauth"]
+    assert doc["egress_domains"] == ["b.example.com"]
+    assert doc["mcp_tools"] == []
+
+
+@pytest.mark.parametrize("value", ["abc", ["a"], 7, None])
+def test_preauth_must_be_an_object(client, value):
+    # parse() would turn any of these into an empty document and answer 201,
+    # leaving the author believing the rules were accepted.
+    r = _create(client, preauth=value)
+    assert r.status_code == 400 and r.json()["detail"] == "bad_preauth"
+    tid = _create_id(client, name="t2")
+    r = client.put(f"/agent/tasks/{tid}", headers=H, json={"preauth": value})
+    assert r.status_code == 400 and r.json()["detail"] == "bad_preauth"
+
+
+@pytest.mark.parametrize("path", [
+    "/",                    # one string = write access to the whole filesystem
+    "/etc",
+    "/etc/nimoos",
+    "/usr/share/nimoos/agent",
+    "/var/lib/nimoos/ai/agent",   # the agent's own database
+    "relative/path",
+    " ",
+])
+def test_fs_write_refuses_root_and_system_paths(client, path):
+    r = _create(client, preauth={"fs_write": [path]})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "bad_fs_write"
+
+
+def test_fs_write_refuses_a_symlink_to_root(client, tmp_path):
+    link = tmp_path / "innocent"
+    link.symlink_to("/")
+    r = _create(client, preauth={"fs_write": [str(link)]})
+    assert r.status_code == 400 and r.json()["detail"] == "bad_fs_write"
+
+
+def test_fs_write_accepts_a_normal_data_directory(client, tmp_path):
+    r = _create(client, preauth={"fs_write": [str(tmp_path)]})
+    assert r.status_code == 201
+
+
 # -- manual run + history ----------------------------------------------------
 
-def test_manual_run_enqueues_and_shows_up_in_history(client):
+def test_manual_run_enqueues_and_shows_up_in_history(client, conn):
     tid = _create_id(client)
     r = client.post(f"/agent/tasks/{tid}/run", headers=H)
     assert r.status_code == 202
     run_id = r.json()["run_id"]
 
-    row = main._conn.execute("SELECT * FROM task_runs WHERE id=?",
-                             (run_id,)).fetchone()
+    row = conn.execute("SELECT * FROM task_runs WHERE id=?",
+                       (run_id,)).fetchone()
     assert row["status"] == "queued" and row["trigger"] == "manual"
     assert row["user_id"] == "u1"
 
@@ -232,7 +300,7 @@ def test_manual_run_is_allowed_on_a_disabled_task(client):
 def _run_with_denied(client, denied, tid=None):
     tid = tid or _create_id(client)
     run_id = client.post(f"/agent/tasks/{tid}/run", headers=H).json()["run_id"]
-    store.finish_run(main._conn, run_id, "failed", denied=denied)
+    store.finish_run(main._db(), run_id, "failed", denied=denied)
     return tid, run_id
 
 
@@ -272,11 +340,32 @@ def test_from_denied_shell_uses_the_command_head(client):
     tid, run_id = _run_with_denied(client, [
         {"kind": "shell", "detail": "lark-cli mail list --limit 5"},
         {"kind": "shell", "detail": "date"},
+        {"kind": "shell", "detail": "  rm -rf /tmp/x"},
     ])
-    assert _from_denied(client, tid, run_id, 0).json()["preauth"]["shell"] == [
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.json()["preauth"]["shell"] == [
         {"kind": "prefix", "value": "lark-cli "}]
+    assert r.json()["adopted"] == {"field": "shell",
+                                   "value": {"kind": "prefix",
+                                             "value": "lark-cli "}}
     rules = _from_denied(client, tid, run_id, 1).json()["preauth"]["shell"]
     assert {"kind": "prefix", "value": "date"} in rules
+    rules = _from_denied(client, tid, run_id, 2).json()["preauth"]["shell"]
+    assert {"kind": "prefix", "value": "  rm "} in rules
+
+
+def test_adopted_shell_rules_actually_match_the_denied_command(client):
+    """The whole point of the button: after adopting, the very command that
+    was denied must pass `preauth.shell_match`. `shell_match` does not strip,
+    so a rule generated from a leading-whitespace command has to keep it."""
+    from tasks import preauth as preauth_mod
+    commands = ["lark-cli mail list", "date", "  rm -rf /tmp/x"]
+    tid, run_id = _run_with_denied(
+        client, [{"kind": "shell", "detail": c} for c in commands])
+    for i in range(len(commands)):
+        rules = _from_denied(client, tid, run_id, i).json()["preauth"]["shell"]
+    for command in commands:
+        assert preauth_mod.shell_match(rules, command), command
 
 
 def test_from_denied_mcp_tool(client):
@@ -284,6 +373,30 @@ def test_from_denied_mcp_tool(client):
         client, [{"kind": "mcp_tool", "detail": "github::create_issue"}])
     assert _from_denied(client, tid, run_id, 0).json()["preauth"]["mcp_tools"] \
         == ["github::create_issue"]
+
+
+def test_from_denied_refuses_a_root_fs_path(client):
+    # Adopting a denial must not be the back door that puts "/" in fs_write.
+    tid, run_id = _run_with_denied(client, [{"kind": "fs", "detail": "/"},
+                                            {"kind": "fs", "detail": "/etc/x"}])
+    assert _from_denied(client, tid, run_id, 0).status_code == 400
+    assert _from_denied(client, tid, run_id, 0).json()["detail"] == "bad_fs_write"
+    assert _from_denied(client, tid, run_id, 1).json()["detail"] == "bad_fs_write"
+    assert client.get(f"/agent/tasks/{tid}",
+                      headers=H).json()["preauth"]["fs_write"] == []
+
+
+def test_from_denied_reports_a_full_bucket_instead_of_lying(client):
+    from tasks.preauth import MAX_RULES
+    full = [f"h{i}.example.com" for i in range(MAX_RULES)]
+    tid = _create_id(client, preauth={"egress_domains": full})
+    _, run_id = _run_with_denied(
+        client, [{"kind": "egress", "detail": "new.example.com"}], tid=tid)
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.status_code == 400 and r.json()["detail"] == "preauth_full"
+    # and nothing was written
+    doc = client.get(f"/agent/tasks/{tid}", headers=H).json()["preauth"]
+    assert doc["egress_domains"] == full
 
 
 def test_from_denied_unsupported_kind(client):
@@ -303,13 +416,13 @@ def test_from_denied_bad_index_and_run(client):
     assert _from_denied(client, other, run_id, 0).status_code == 404
 
 
-def test_from_denied_persists_and_survives_reload(client):
+def test_from_denied_persists_and_survives_reload(client, conn):
     tid, run_id = _run_with_denied(
         client, [{"kind": "egress", "detail": "api.example.com"}])
     _from_denied(client, tid, run_id, 0)
     row = client.get(f"/agent/tasks/{tid}", headers=H).json()
     assert row["preauth"]["egress_domains"] == ["api.example.com"]
-    raw = main._conn.execute(
+    raw = conn.execute(
         "SELECT preauth_json FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
     assert json.loads(raw["preauth_json"])["egress_domains"] == ["api.example.com"]
 
@@ -318,7 +431,7 @@ def test_from_denied_persists_and_survives_reload(client):
 
 def _pair_chat(user_id="u1", chat="55501", name="family"):
     from channels import store as channel_store
-    conn = main._conn
+    conn = main._db()
     inst = channel_store.create_instance(
         conn, "telegram", name, {"bot_token": "t"}, user_id, now_ms=1)
     code, _ = channel_store.create_pairing_code(conn, inst["id"], user_id,
@@ -344,10 +457,20 @@ def test_notify_targets_lists_paired_chats(client):
                       headers=H2).json()["targets"] == []
 
 
-def test_notify_targets_hides_revoked_bindings(client):
+def test_notify_targets_hides_revoked_bindings(client, conn):
     from channels import store as channel_store
     _, binding = _pair_chat()
-    channel_store.revoke_binding(main._conn, "u1", binding["id"])
+    channel_store.revoke_binding(conn, "u1", binding["id"])
+    assert client.get("/agent/tasks/notify-targets",
+                      headers=H).json()["targets"] == []
+
+
+def test_notify_targets_hides_disabled_instances(client, conn):
+    from channels import store as channel_store
+    inst, _ = _pair_chat()
+    channel_store.set_instance_enabled(conn, inst["id"], False, now_ms=2)
+    # ChannelManager only runs adapters for enabled instances, so this chat
+    # would be a target nothing could ever be delivered to.
     assert client.get("/agent/tasks/notify-targets",
                       headers=H).json()["targets"] == []
 

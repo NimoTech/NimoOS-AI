@@ -2628,6 +2628,38 @@ _MAX_TURNS_RANGE = (1, 100)
 _TIMEOUT_RANGE = (60, 7200)
 _RUNS_LIMIT_RANGE = (1, 200)
 
+# `fs_write` is the one preauth field that can authorize everything in a single
+# string: `tasks/driver.fs_allowed` realpaths the entry and prefix-matches, so
+# "/" pre-approves every write an unattended run could ever request (verified:
+# `fs_allowed("/etc/shadow", ["/"])` is True), and `grants.grant_fs` would then
+# register that root as a visible resource. A system root is the same problem
+# one level down — it hands an unattended run the agent's own code and
+# database, /etc, and the service units that start them. Both are refused at
+# the edge with `bad_fs_write` rather than trimmed silently, so the author
+# finds out their document was not accepted.
+_FS_WRITE_DENY_ROOTS = (
+    "/etc", "/proc", "/sys", "/dev", "/boot", "/bin", "/sbin", "/lib",
+    "/lib64", "/usr", "/root", "/run", "/var/lib/nimoos",
+)
+
+
+def _check_fs_write(paths) -> None:
+    """Reject `/`, system roots and non-absolute entries in `fs_write`."""
+    for raw in paths or []:
+        path = (raw or "").strip()
+        # Relative paths would be resolved against whatever CWD the run
+        # happens to have — never what the author meant.
+        if not path.startswith("/"):
+            raise HTTPException(400, "bad_fs_write")
+        # Judge the same string the gate will: it realpaths before matching,
+        # so a symlink under an innocuous name must not launder a denied root.
+        real = os.path.realpath(path)
+        if real == "/":
+            raise HTTPException(400, "bad_fs_write")
+        for root in _FS_WRITE_DENY_ROOTS:
+            if real == root or real.startswith(root + "/"):
+                raise HTTPException(400, "bad_fs_write")
+
 
 def _empty_preauth_report() -> dict:
     """A fresh copy every time — the report goes into a response body and a
@@ -2734,10 +2766,16 @@ def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
     report = _empty_preauth_report()
     if "preauth" in body:
         from tasks import preauth as _preauth
+        # `parse` treats a non-dict as an empty document, so a client that
+        # sends a string or a list would get a 201 and an empty report and
+        # believe its rules are live. Reject the shape instead.
+        if not isinstance(body["preauth"], dict):
+            raise HTTPException(400, "bad_preauth")
         # parse_with_report, never parse: a rule this normalizer drops (a
         # leftover regex shell rule) would otherwise be accepted silently and
         # the author would believe their unattended run is pre-authorized.
         doc, report = _preauth.parse_with_report(body["preauth"])
+        _check_fs_write(doc["fs_write"])
         out["preauth"] = doc
     return out, report
 
@@ -2856,16 +2894,18 @@ async def tasks_runs(task_id: str, limit: int = 50,
                      for r in _store.list_runs(_db(), task_id, limit)]}
 
 
-def _preauth_from_denied(doc: dict, action: dict) -> dict:
-    """Fold one denied action into a preauth document (a copy is returned).
+def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:
+    """Fold one denied action into a preauth document.
 
-    The vocabulary is `tasks/driver.py`'s normalized kinds; `detail` is what
-    that driver recorded — for `fs` the FIRST path that was not covered, not
-    the card's first path, so the rule generated here actually changes the
-    outcome next time.
+    Returns `(new document, bucket, adopted entry)` — a copy, never a mutation
+    of `doc`. The vocabulary is `tasks/driver.py`'s normalized kinds; `detail`
+    is what that driver recorded — for `fs` the FIRST path that was not
+    covered, not the card's first path, so the rule generated here actually
+    changes the outcome next time.
     """
     kind = str(action.get("kind") or "")
-    detail = str(action.get("detail") or "").strip()
+    raw_detail = str(action.get("detail") or "")
+    detail = raw_detail.strip()
     if not detail:
         raise HTTPException(400, "empty_detail")
 
@@ -2873,34 +2913,40 @@ def _preauth_from_denied(doc: dict, action: dict) -> dict:
     if kind == "egress":
         from tasks.driver import _strip_port
         # Bare host, no port: that is what the egress gate matches on.
-        value, bucket = _strip_port(detail), "egress_domains"
+        entry, bucket = _strip_port(detail), "egress_domains"
     elif kind == "fs":
         # A denied file grants its directory — `fs_write` entries are roots
         # and a bare file path would authorize nothing else in that folder.
-        value = os.path.dirname(detail) if os.path.isfile(detail) else detail
+        entry = os.path.dirname(detail) if os.path.isfile(detail) else detail
         bucket = "fs_write"
+        # Same gate as create/update: adopting a denial must not become the
+        # back door that puts "/" (or /etc) into a preauth document.
+        _check_fs_write([entry])
     elif kind == "mcp_tool":
-        value, bucket = detail, "mcp_tools"          # already "server::tool"
+        entry, bucket = detail, "mcp_tools"          # already "server::tool"
     elif kind == "shell":
-        # `detail` is non-empty and already stripped, so there is a head token.
         parts = detail.split()
-        # Command head + a space, so `git ` can never also authorize
-        # `github-cli`. A command that WAS just its head ("date") is the
-        # exception: `"date "` could never prefix-match it again and the
-        # button would be a silent no-op, so the bare token is stored.
-        value = parts[0] if len(parts) == 1 else parts[0] + " "
-        rule = {"kind": "prefix", "value": value}
-        if rule not in out["shell"]:
-            out["shell"].append(rule)
-        return out
+        # `preauth.shell_match` is `command.startswith(value)` on the RAW
+        # command — deliberately not stripped there, since leading whitespace
+        # is part of what the author would have had to authorize. So the rule
+        # has to carry the same leading whitespace the denied command had, or
+        # adopting `"  rm -rf x"` would generate `"rm "`, which can never
+        # match it and leaves the button a silent no-op.
+        lead = raw_detail[:len(raw_detail) - len(raw_detail.lstrip())]
+        # Head + a space, so `git ` can never also authorize `github-cli`.
+        # A command that WAS just its head ("date") is the exception: `"date "`
+        # could never prefix-match it either, so the bare token is stored.
+        entry = {"kind": "prefix",
+                 "value": lead + parts[0] + ("" if len(parts) == 1 else " ")}
+        bucket = "shell"
     else:
         raise HTTPException(400, "unsupported_kind")
 
-    if not value:
+    if not entry:
         raise HTTPException(400, "empty_detail")
-    if value not in out[bucket]:
-        out[bucket].append(value)
-    return out
+    if entry not in out[bucket]:
+        out[bucket].append(entry)
+    return out, bucket, entry
 
 
 @app.post("/agent/tasks/{task_id}/preauth/from-denied")
@@ -2929,11 +2975,18 @@ async def tasks_preauth_from_denied(
         raise HTTPException(404, "denied_action_not_found")
 
     doc = _preauth.parse(task["preauth_json"])
-    doc = _preauth_from_denied(doc, denied[index])
+    doc, bucket, entry = _preauth_from_denied(doc, denied[index])
     # Re-normalize: MAX_RULES truncation applies to a grown document too.
     doc, report = _preauth.parse_with_report(doc)
+    if entry not in doc[bucket]:
+        # The bucket was already at MAX_RULES, so normalization dropped the
+        # very rule this call was supposed to add. Writing the document back
+        # and answering 200 would tell the user their action was adopted when
+        # nothing changed; refuse instead so they know to prune first.
+        raise HTTPException(400, "preauth_full")
     _store.update_task(_db(), task_id, x_user_id, preauth=doc)
-    return {"preauth": doc, "preauth_report": report}
+    return {"preauth": doc, "preauth_report": report,
+            "adopted": {"field": bucket, "value": entry}}
 
 
 def _lark_uid(x_user_id: str) -> str:
