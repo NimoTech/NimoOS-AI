@@ -100,8 +100,11 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.GET("/mcp/list", mcp.ListInternal)
 	internal.POST("/mcp/remove", mcp.RemoveInternal)
 	internal.GET("/agent/provider-credentials", v2.ProviderCredentials(svc, runtimePath))
-	internal.POST("/skills/install", skills.InstallInternal)
-	internal.POST("/skills/remove", skills.RemoveInternal)
+	// user_id here comes from the request body, not a JWT, so LocalhostOnly
+	// alone isn't enough (see ValidInternalToken) — require the shared
+	// internal token too, same as provider-credentials.
+	internal.POST("/skills/install", skills.InstallInternal, v2.InternalTokenOnly(runtimePath))
+	internal.POST("/skills/remove", skills.RemoveInternal, v2.InternalTokenOnly(runtimePath))
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -192,6 +195,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.Any("/agent/notes/settings", agent.Proxy, v2.AdminOnly(runtimePath))
 	// Dir-info probes candidate notes folders for the settings UI — same gate.
 	g.Any("/agent/notes/dir-info", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Toolbox install/uninstall manage global CLI components shared by every
+	// sandbox session — system-scoped, admin only (mirrors shell-allowlist).
+	g.Any("/agent/toolbox", agent.Proxy, v2.AdminOnly(runtimePath))
+	g.Any("/agent/toolbox/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})

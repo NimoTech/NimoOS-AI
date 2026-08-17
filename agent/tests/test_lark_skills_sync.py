@@ -278,3 +278,72 @@ def test_remove_all_without_ai_base_is_noop(monkeypatch):
 
     monkeypatch.setattr(skills_sync, "_post_remove", boom)
     run_async(skills_sync.remove_all(UID))  # no exception
+
+
+# --------------------------------------------------------------------------
+# X-Internal-Token: N2 -- Go's /_internal/skills/install|remove now requires
+# it (route/v2.go wires v2.InternalTokenOnly), so the Python side must send
+# it the same way channels/credentials.py does.
+# --------------------------------------------------------------------------
+
+
+class _FakeAsyncClient:
+    """Minimal httpx.AsyncClient stand-in that records the last POST call's
+    headers, mirroring the FakeAsyncClient pattern in test_mcp_runtime.py."""
+
+    calls: list
+
+    def __init__(self, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        self.__class__.calls.append({"url": url, "json": json, "headers": headers or {}})
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"id": json.get("skill", {}).get("name") if json else None}
+
+        return _Resp()
+
+
+def test_post_install_sends_internal_token(monkeypatch):
+    monkeypatch.setattr(skills_sync, "_internal_token", lambda: "known-token-value")
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(skills_sync.httpx, "AsyncClient", _FakeAsyncClient)
+
+    run_async(skills_sync._post_install("http://127.0.0.1:9999", UID, {"name": "lark-base"}))
+
+    assert len(_FakeAsyncClient.calls) == 1
+    assert _FakeAsyncClient.calls[0]["headers"].get("X-Internal-Token") == "known-token-value"
+
+
+def test_post_remove_sends_internal_token(monkeypatch):
+    monkeypatch.setattr(skills_sync, "_internal_token", lambda: "known-token-value")
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(skills_sync.httpx, "AsyncClient", _FakeAsyncClient)
+
+    run_async(skills_sync._post_remove("http://127.0.0.1:9999", UID, "lark-base"))
+
+    assert len(_FakeAsyncClient.calls) == 1
+    assert _FakeAsyncClient.calls[0]["headers"].get("X-Internal-Token") == "known-token-value"
+
+
+def test_post_install_logs_and_still_sends_when_token_unreadable(monkeypatch, caplog):
+    monkeypatch.setattr(skills_sync, "_internal_token", lambda: None)
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(skills_sync.httpx, "AsyncClient", _FakeAsyncClient)
+
+    with caplog.at_level("WARNING"):
+        run_async(skills_sync._post_install("http://127.0.0.1:9999", UID, {"name": "lark-base"}))
+
+    assert len(_FakeAsyncClient.calls) == 1
+    assert "X-Internal-Token" not in _FakeAsyncClient.calls[0]["headers"]
+    assert any("internal token unreadable" in r.message for r in caplog.records)

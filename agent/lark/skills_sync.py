@@ -39,6 +39,7 @@ import re
 
 import httpx
 
+from channels.credentials import _internal_token
 from lark import binding as _binding
 from mcp_client.runtime import _read_ai_base
 
@@ -155,10 +156,31 @@ async def _read_skill_md(uid: str, name: str) -> str | None:
     return out
 
 
+def _internal_headers(uid: str, action: str) -> dict:
+    """X-Internal-Token header for the Go internal endpoints, read the same
+    way `channels/credentials.py` does. Both install/remove now require it
+    (route/v2.go wires v2.InternalTokenOnly onto them) since user_id here
+    comes from the request body, not a JWT -- LocalhostOnly alone doesn't
+    stop the agent's own sandboxed processes, which share loopback via
+    network_mode: host. A missing token isn't fatal here: the request still
+    goes out and degrades to the existing HTTP-failure path (401, caught and
+    logged by the caller) rather than raising a different error shape.
+    """
+    token = _internal_token()
+    if not token:
+        _LOG.warning(
+            "lark skill %s: internal token unreadable, request will be rejected (uid=%s)",
+            action, uid,
+        )
+        return {}
+    return {"X-Internal-Token": token}
+
+
 async def _post_install(base: str, uid: str, skill: dict) -> dict:
     url = base.rstrip("/") + INSTALL_PATH
+    headers = _internal_headers(uid, "install")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, json={"user_id": uid, "skill": skill})
+        resp = await client.post(url, json={"user_id": uid, "skill": skill}, headers=headers)
     if resp.status_code >= 400:
         raise RuntimeError(
             f"install {skill.get('name')!r} failed: HTTP {resp.status_code} {resp.text[:200]}"
@@ -168,8 +190,9 @@ async def _post_install(base: str, uid: str, skill: dict) -> dict:
 
 async def _post_remove(base: str, uid: str, skill_id: str) -> None:
     url = base.rstrip("/") + REMOVE_PATH
+    headers = _internal_headers(uid, "remove")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, json={"user_id": uid, "id": skill_id})
+        resp = await client.post(url, json={"user_id": uid, "id": skill_id}, headers=headers)
     if resp.status_code >= 400:
         raise RuntimeError(
             f"remove {skill_id!r} failed: HTTP {resp.status_code} {resp.text[:200]}"

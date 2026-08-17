@@ -177,6 +177,10 @@ def user_home(uid: str) -> Path:
 
     home = Path(shell.HOMES_ROOT) / uid
     home.mkdir(parents=True, exist_ok=True)
+    try:
+        home.chmod(0o700)
+    except OSError:
+        pass
     return home
 
 

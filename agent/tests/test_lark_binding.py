@@ -230,6 +230,18 @@ def test_user_home_reuses_shell_homes_root(tmp_path, monkeypatch):
     assert home.is_dir()  # lazily created
 
 
+def test_user_home_is_locked_to_0700(tmp_path, monkeypatch):
+    """M11: the per-user HOME holds the Feishu device-flow token on disk;
+    mkdir's default (0o755, minus umask) leaves it world/group readable."""
+    import stat
+
+    from skills import shell
+
+    monkeypatch.setattr(shell, "HOMES_ROOT", tmp_path)
+    home = binding.user_home(UID)
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+
+
 def test_log_is_truncated_to_8kb():
     assert binding.MAX_LOG_BYTES == 8 * 1024
     assert len(binding._clip("x" * 40000).encode()) <= binding.MAX_LOG_BYTES

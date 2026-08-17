@@ -223,3 +223,75 @@ func TestNotesSettingsGateAdminPassthrough(t *testing.T) {
 		require.Equalf(t, http.StatusOK, rec.Code, "%s admin must pass through", m)
 	}
 }
+
+// TestToolboxGateRoutePrecedence proves /agent/toolbox[/*] is admin-gated
+// (installs/removes global CLI components shared by every sandbox session)
+// before falling through to the general /agent/* proxy wildcard. Mirrors
+// TestShellAllowlistGateRoutePrecedence's registration order.
+func TestToolboxGateRoutePrecedence(t *testing.T) {
+	us := fakeUserService(t, "user") // non-admin: gate must reject with 403
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxied := 0
+	proxy := func(c echo.Context) error { proxied++; return c.String(http.StatusOK, "proxied") }
+	// Mirror route/v2.go registration order: gated routes first, wildcard last.
+	e.Any("/agent/toolbox", proxy, AdminOnly(dir))
+	e.Any("/agent/toolbox/*", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		req := httptest.NewRequest(m, "/agent/toolbox", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusForbidden, rec.Code,
+			"%s /agent/toolbox must hit the gated route, not the wildcard", m)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/agent/toolbox/install", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code,
+		"POST /agent/toolbox/install must hit the gated route, not the wildcard")
+
+	// Sibling agent endpoints (e.g. per-user lark binding) must fall through
+	// to the wildcard ungated.
+	req = httptest.NewRequest(http.MethodGet, "/agent/lark/binding", nil)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, proxied)
+}
+
+// TestToolboxGateAdminPassthrough proves an admin caller passes through the
+// gate to reach the proxy on both toolbox verbs.
+func TestToolboxGateAdminPassthrough(t *testing.T) {
+	us := fakeUserService(t, "admin")
+	defer us.Close()
+	dir := t.TempDir()
+	writeURLFile(t, dir, us.URL)
+
+	e := echo.New()
+	proxy := func(c echo.Context) error { return c.String(http.StatusOK, "proxied") }
+	e.Any("/agent/toolbox", proxy, AdminOnly(dir))
+	e.Any("/agent/toolbox/*", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		req := httptest.NewRequest(m, "/agent/toolbox", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		require.Equalf(t, http.StatusOK, rec.Code, "%s admin must pass through", m)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/agent/toolbox/install", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "POST /agent/toolbox/install admin must pass through")
+}
