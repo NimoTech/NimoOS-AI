@@ -500,7 +500,7 @@ async def test_prune_deletes_old_sessions_for_real(conn, tmp_path, monkeypatch):
                         (tid,)).fetchone()["c"]
     assert kept == runner.KEEP_RUNS
 
-    for _, sid in old[:3]:                      # the pruned ones
+    for _, sid in old[:4]:                      # the pruned ones (53 + 1 = 54)
         assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                             (sid,)).fetchone() is None
         assert conn.execute("SELECT 1 FROM messages WHERE session_id=?",
@@ -521,7 +521,12 @@ async def test_one_undeletable_session_does_not_strand_the_batch(conn, tmp_path,
     tid = _mk(conn)
     deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
     old = _seed_history(conn, tid, runner.KEEP_RUNS + 3, snaps_root=snaps)
-    doomed = old[0][1]
+    # 53 seeded runs + this tick's own run = 54, so prune drops 4: old[3]
+    # down to old[0]. prune_runs returns them newest-first, so old[3] is the
+    # FIRST one handled — which is the only position that can prove the try
+    # sits inside the loop. Blowing up on old[0] (the last) would leave the
+    # others already deleted and pass either way.
+    doomed = old[3][1]
 
     async def flaky(conn_, user_id, session_id):
         if session_id == doomed:
@@ -531,10 +536,11 @@ async def test_one_undeletable_session_does_not_strand_the_batch(conn, tmp_path,
     _queue(conn, tid)
     await Harness().run(conn, session_deleter=flaky)
 
-    # The failing one survives; the two after it were still deleted.
+    # The one that failed survives; the three handled after it were still
+    # deleted rather than stranded behind it.
     assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                         (doomed,)).fetchone() is not None
-    for _, sid in old[1:3]:
+    for _, sid in old[0:3]:
         assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                             (sid,)).fetchone() is None
 
@@ -623,6 +629,49 @@ async def test_cancel_sink_really_cancels_the_task():
     # A finished (or absent) task is a no-op, never a second cancel.
     assert await runner.cancel_sink(sink) is False
     assert await runner.cancel_sink(FakeSink()) is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_grace_period_is_actually_bounded(monkeypatch):
+    """A run that swallows CancelledError must not park the worker.
+
+    asyncio.wait_for would: on its own timeout it calls _cancel_and_wait, which
+    waits for the task to unwind with NO deadline. The slot's semaphore would
+    then never be released — silently, since every frame here is inside a
+    try/except — and the queue would stop draining forever.
+    """
+    monkeypatch.setattr(runner, "CANCEL_GRACE_SECONDS", 0.2)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def stubborn():
+        started.set()
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                pass                        # refuses to die
+
+    task = asyncio.create_task(stubborn())
+    await started.wait()
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+
+    # Waited on from the outside, so a regression fails at 2s instead of
+    # hanging the suite: cancelling a wait_for that is itself stuck in
+    # _cancel_and_wait would just block again.
+    call = asyncio.create_task(runner.cancel_sink(FakeSink(task=task)))
+    done, _ = await asyncio.wait({call}, timeout=2)
+    elapsed = loop.time() - t0
+    try:
+        assert call in done, f"cancel_sink still blocked after {elapsed:.2f}s"
+        assert call.result() is True
+        assert 0.15 <= elapsed < 1.0, f"returned after {elapsed:.2f}s"
+        assert not task.done()              # still running, but we moved on
+    finally:
+        release.set()
+        call.cancel()
+        task.cancel()
+        await asyncio.wait({task}, timeout=1)
 
 
 @pytest.mark.asyncio

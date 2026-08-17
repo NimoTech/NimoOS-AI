@@ -187,22 +187,35 @@ async def cancel_sink(sink) -> bool:
     task for exactly this reason). Without this, a timed-out task keeps burning
     the box's CPU, and — because its run row is already terminal —
     `overlap_policy='skip'` would happily enqueue the next fire alongside it.
+
+    `CANCEL_GRACE_SECONDS` is a real bound here, and it has to be:
+    `asyncio.wait_for` would NOT give one. On its own timeout `wait_for` runs
+    `_cancel_and_wait(fut)`, i.e. it cancels and then waits for the task to
+    unwind **without any deadline** — so a run that swallows `CancelledError`
+    (blocking sync code, a subprocess, a tool catching BaseException) parks
+    this coroutine forever. That failure is silent and terminal for the worker:
+    `slot()` never releases its semaphore, the queue stops draining, and every
+    frame involved sits inside a try/except, so there is no exception and no
+    log to notice. `asyncio.wait` returns at the deadline and leaves the task
+    pending instead, which is the trade we want — the run is already doomed;
+    the worker must not be.
     """
     task = getattr(sink, "task", None)
     if task is None or task.done():
         return False
     task.cancel()
-    try:
-        await asyncio.wait_for(task, timeout=CANCEL_GRACE_SECONDS)
-    except asyncio.CancelledError:
-        # The cancellation we asked for, surfacing through wait_for. Not a
-        # BaseException we may propagate here: `process_once` still has a run
-        # row to finish (mirrors main.cancel_session, which swallows it too).
-        pass
-    except Exception:                       # noqa: BLE001 — TimeoutError and
-        # anything the run raised on its way out: why it ended does not matter,
-        # only that we stopped waiting on it.
-        pass
+    done, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+    if pending:
+        logger.warning("tasks runner: run did not unwind within %.0fs of being "
+                       "cancelled; leaving it to finish on its own",
+                       CANCEL_GRACE_SECONDS)
+    for finished in done:
+        if finished.cancelled():
+            continue                        # the cancellation we just asked for
+        try:
+            finished.exception()            # retrieve, so asyncio stays quiet
+        except Exception:                   # noqa: BLE001
+            pass
     return True
 
 
