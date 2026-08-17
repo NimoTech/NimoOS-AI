@@ -353,14 +353,18 @@ def _run_allowlist_match(command: str, decision) -> bool:
     argv = _effective_argv(raw_argv)
     if not argv:
         return False
-    # URL tokens are exempt: `basename()` of a URL is just its last path
-    # segment, so `curl -s https://open.feishu.cn/node` read as an interpreter
-    # named `node` — a silent refusal on the most typical scheduled-task command
-    # there is.  A URL is never a local executable, and the wrapper bypasses
-    # this scan closes (`nice -n 10 sh -c …`) never spell the interpreter as a
-    # URL, so the exemption cannot reopen them.
-    if any(os.path.basename(tok) in _RUN_INTERPRETERS
-           for tok in raw_argv if "://" not in tok):
+    # URL-looking ARGUMENTS are exempt: `basename()` of a URL is just its last
+    # path segment, so `curl -s https://open.feishu.cn/node` read as an
+    # interpreter named `node` — a silent refusal on the most typical
+    # scheduled-task command there is.
+    #
+    # argv[0] is NEVER exempt, however: it is the thing that actually executes,
+    # and POSIX collapses `//` in a path, so `foo://bash` resolves to `foo:/bash`
+    # — an attacker with a writable work dir can `mkdir 'foo:'` and symlink
+    # `foo:/bash` to the real shell, then pass the whole thing off as a URL.
+    # Exempting the command name would hand that straight through.
+    scan = [raw_argv[0]] + [tok for tok in raw_argv[1:] if "://" not in tok]
+    if any(os.path.basename(tok) in _RUN_INTERPRETERS for tok in scan):
         return False
     if any(tok in _RUN_EXEC_FLAGS for tok in argv[1:]):
         return False
