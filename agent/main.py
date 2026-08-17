@@ -151,6 +151,14 @@ EGRESS_PROXY_BIN    = _env_str("NIMOOS_EGRESS_PROXY_BIN",   "/usr/local/bin/egre
 EGRESS_TOFU         = _env_bool("NIMOOS_EGRESS_TOFU",       True)
 # Upload byte threshold above which egress is flagged for confirmation
 EGRESS_UPLOAD_BYTES = _env_int("NIMOOS_EGRESS_UPLOAD_BYTES", 65_536)
+# Timeout (seconds) for the egress-proxy's own -confirm-timeout, i.e. how long
+# the Go proxy's HTTP client will wait on this route before it fail-closes the
+# CONNECT (see egress-proxy/main.go's confirmClient doc for the 2026-08-16
+# incident this fixes: proxy defaulted to 5s, Python defaulted to 24h, so no
+# human could ever click the card in time). Keep EGRESS_CONFIRM_TIMEOUT a bit
+# ABOVE the 110s passed to mgr.wait() below, so Python resolves (and can log a
+# clean "timed out, denied") before the proxy's own HTTP call times out.
+EGRESS_CONFIRM_TIMEOUT = _env_int("NIMOOS_EGRESS_CONFIRM_TIMEOUT", 120)
 
 # Subprocess handles for orchestrated children (executor + proxy).
 # Populated by the startup handler; used by the shutdown handler.
@@ -578,6 +586,7 @@ def _build_proxy_argv(
     dns: str = "169.254.7.1:53",
     confirm_url: str = "http://127.0.0.1:8282/internal/egress-confirm",
     grant_listen: str = "127.0.0.1:8889",
+    confirm_timeout: int = EGRESS_CONFIRM_TIMEOUT,
 ) -> list[str]:
     """Return the argv list for starting the egress-proxy.
 
@@ -588,6 +597,13 @@ def _build_proxy_argv(
     inspection allow-listing) but main.py does not call it in this phase — there
     is no content judge, so the grant channel has no caller.  Proxy grant support
     is wired at the process level; P1 will add the judge that calls it.
+
+    `confirm_timeout` defaults to EGRESS_CONFIRM_TIMEOUT (env-overridable via
+    NIMOOS_EGRESS_CONFIRM_TIMEOUT, default 120s) and is passed through as the
+    proxy's `-confirm-timeout` flag — see egress-proxy/main.go's confirmClient
+    doc comment for why this must give a human real time to answer a
+    confirmation card, and must stay a bit above the 110s the egress_confirm
+    route below passes to ConfirmManager.wait().
     """
     return [
         proxy_bin,
@@ -595,6 +611,7 @@ def _build_proxy_argv(
         "-dns", dns,
         "-confirm-url", confirm_url,
         "-grant-listen", grant_listen,
+        "-confirm-timeout", f"{confirm_timeout}s",
     ]
 
 
@@ -819,7 +836,14 @@ async def egress_confirm(req: _EgressConfirmRequest):
             "reason": req.reason,
             "description": description,
         })
-        granted = await _confirm_mgr.wait(cid)
+        # 110s, NOT the ConfirmManager 24h default: this call is answering a
+        # synchronous HTTP POST from the Go egress-proxy, which itself gives up
+        # after -confirm-timeout (default 120s — see EGRESS_CONFIRM_TIMEOUT /
+        # egress-proxy/main.go's confirmClient doc for the incident this fixes).
+        # 110 < 120 so THIS wait times out first and we can log/attribute a
+        # clean "timed out, denied" instead of the proxy just seeing its own
+        # HTTP client deadline expire with no explanation.
+        granted = await _confirm_mgr.wait(cid, timeout=110)
         from audit import audit as _audit  # noqa: PLC0415
         _audit("egress_grant", session_id=session_id, host=req.host,
                bytes=req.bytes, reason=req.reason,

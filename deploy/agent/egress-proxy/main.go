@@ -218,9 +218,42 @@ type confirmResp struct {
 	Allow bool `json:"allow"`
 }
 
-// confirmClient is the HTTP client used for egress-confirm callbacks.
-// A 5-second timeout ensures fail-closed behaviour on slow/hung control planes.
-var confirmClient = &http.Client{Timeout: 5 * time.Second}
+// confirmTimeout is the HTTP timeout for egress-confirm callbacks, configurable
+// via -confirm-timeout (default 120s — see confirmClient below for why).
+var confirmTimeout = 120 * time.Second
+
+// confirmClient is the HTTP client used for egress-confirm callbacks, and ONLY
+// for those callbacks (the grant server, DNS forwarder, and the proxied
+// CONNECT/plain-HTTP dials each have their own independent timeouts — this
+// var must not be reused for any of them).
+//
+// 2026-08-16 incident: this was hardcoded to 5s while the Python-side
+// confirmation card (agent/confirm.py ConfirmManager.wait) defaulted to a
+// 24-HOUR wait. A human cannot read a confirmation card and click "allow"
+// in 5 seconds — every real confirmation timed out on the Go side and was
+// denied before the person even saw the prompt (observed: card registered at
+// 02:44:37, proxy gave up at 02:44:42.662 with "context deadline exceeded",
+// CONNECT then rejected as "blocked by policy"). Fail-closed-on-timeout is
+// still the right behaviour for a HUNG control plane; the bug was the
+// timeout being shorter than a human reaction time, not the fail-closed
+// policy itself. 120s is a deliberately generous but bounded human-reaction
+// budget; it is paired with a slightly shorter timeout on the Python side
+// (agent/main.py's egress_confirm route calls mgr.wait(cid, timeout=110))
+// so Python resolves (and can log/attribute a clean "timed out, denied")
+// before this HTTP call itself times out.
+//
+// Side effect worth knowing about: this widens the window during which the
+// CONNECT client (e.g. curl, lark-cli) sitting on the OTHER end of the proxy
+// is itself blocked waiting for the CONNECT response. If that client's own
+// timeout is shorter than the time a human actually takes to click the
+// button, the client gives up and errors out even though the confirmation
+// eventually succeeds server-side. That is an acceptable, self-healing
+// degradation: once a host is confirmed it is TOFU-cached (see
+// confirmedHosts / tofuTTL, default 1h), so the very next retry of the same
+// call sails through with no confirm round-trip at all. Do not "fix" this by
+// trying to extend arbitrary third-party client timeouts — that is not ours
+// to control, and it is not needed.
+var confirmClient = &http.Client{Timeout: confirmTimeout}
 
 // callConfirm calls the confirm URL and returns whether the request is allowed.
 // Returns false on any error (fail-closed): network errors, timeouts, non-200,
@@ -926,6 +959,9 @@ func main() {
 	grantTTLFlag := flag.Duration("grant-ttl", 10*time.Minute, "TTL for synthetic post-confirm upload grants")
 	uploadThreshFlag := flag.Int64("upload-threshold", 65536, "bytes before an external upload asks confirm")
 	dnsMaxNameFlag := flag.Int("dns-max-name", 200, "max DNS query-name length; longer queries are dropped as possible tunneling (0=disabled)")
+	confirmTimeoutFlag := flag.Duration("confirm-timeout", 120*time.Second,
+		"HTTP timeout for the egress-confirm callback ONLY (must exceed realistic human "+
+			"reaction time to a confirmation card; see confirmClient doc comment)")
 	flag.Parse()
 
 	confirmURL = *confirmURLFlag
@@ -933,6 +969,12 @@ func main() {
 	grantTTL = *grantTTLFlag
 	uploadThreshold = *uploadThreshFlag
 	dnsMaxNameLen = *dnsMaxNameFlag
+	confirmTimeout = *confirmTimeoutFlag
+	// confirmClient was constructed at package-init time with the pre-flag-parse
+	// default; re-apply here so -confirm-timeout actually takes effect. Timeout
+	// is a plain struct field, safe to mutate before the client does its first
+	// request (no requests happen before main() reaches this point).
+	confirmClient.Timeout = confirmTimeout
 
 	// Resolve upstream if not set.
 	upstreamAddr := *upstream
