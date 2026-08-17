@@ -118,7 +118,12 @@ def test_grant_fs_empty_list(conn):
 
 
 @pytest.mark.asyncio
-async def test_grant_egress_appends_443_and_returns_mapping(monkeypatch):
+async def test_grant_egress_uses_bare_host_and_returns_mapping(monkeypatch):
+    """The egress-proxy's consumer side (handleConnect/pumpUploadGated in
+    deploy/agent/egress-proxy/main.go) does net.SplitHostPort(hostport) and
+    then looks grants up by the resulting bare host — a key with a port
+    attached would never match. register_grant must therefore be called with
+    the plain domain, no port appended."""
     from tasks import grants
 
     calls = []
@@ -133,11 +138,14 @@ async def test_grant_egress_appends_443_and_returns_mapping(monkeypatch):
 
     assert result == {"api.example.com": True, "other.example.com": True}
     hosts = [c[0] for c in calls]
-    assert hosts == ["api.example.com:443", "other.example.com:443"]
+    assert hosts == ["api.example.com", "other.example.com"]
 
 
 @pytest.mark.asyncio
-async def test_grant_egress_preserves_existing_port(monkeypatch):
+async def test_grant_egress_strips_port_if_present(monkeypatch):
+    """If a preauth document's domain entry carries a port (e.g. someone
+    wrote "api.example.com:443"), it must be stripped before registering —
+    matching the proxy's bare-host lookup, not appended to it."""
     from tasks import grants
 
     calls = []
@@ -148,7 +156,7 @@ async def test_grant_egress_preserves_existing_port(monkeypatch):
 
     await grants.grant_egress(["api.example.com:8443"])
 
-    assert calls == ["api.example.com:8443"]
+    assert calls == ["api.example.com"]
 
 
 @pytest.mark.asyncio

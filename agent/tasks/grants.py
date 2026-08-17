@@ -85,9 +85,18 @@ async def grant_egress(
     each call runs in the default executor to keep the event loop free —
     same pattern as `skills/shell.py`'s A-path upload grant.
 
-    A domain without an explicit port is given `:443` — `register_grant`
-    keys grants by `host:port`, and preauthorized domains are always plain
-    hostnames (HTTPS is the only egress path).
+    Grants are keyed by a **bare host, no port** — the egress-proxy's
+    consumer side strips the port before ever looking a grant up:
+    `handleConnect` does `net.SplitHostPort(hostport)` and `pumpUploadGated`
+    calls `hasGrant(host)` / `consumeGrant(host, ...)` with that bare host
+    (`deploy/agent/egress-proxy/main.go`). A key with `:443` attached would
+    simply never match, silently making every grant here dead weight. The
+    existing A-path precedent (`skills/shell.py`) agrees: it passes
+    `intent.host`, which comes from `urlparse().hostname` in
+    `egress/parse.py` and never carries a port. If a preauthorized domain
+    happens to be written with a port (e.g. `"api.example.com:443"` in a
+    task's `fs_write`/`egress_domains` document), the port is stripped before
+    registering — never appended.
 
     Never raises: a failure to reach the egress-proxy (or any other
     unexpected error) is recorded as `False` for that domain and the loop
@@ -95,8 +104,8 @@ async def grant_egress(
     not aborting the run.
 
     Returns `{domain: granted}` keyed by the *original* domain strings (not
-    the `:443`-qualified host), so the caller can match results back against
-    the preauth document's `egress_domains` list.
+    the bare host used for registration), so the caller can match results
+    back against the preauth document's `egress_domains` list.
     """
     results: dict[str, bool] = {}
     if not domains:
@@ -105,7 +114,9 @@ async def grant_egress(
     for domain in domains:
         if not isinstance(domain, str) or not domain:
             continue
-        host = domain if ":" in domain else f"{domain}:443"
+        # Bare host only — see the docstring above for why appending a port
+        # would make the grant unmatchable by the proxy.
+        host = domain.rsplit(":", 1)[0] if ":" in domain else domain
         try:
             ok = await loop.run_in_executor(
                 None,
