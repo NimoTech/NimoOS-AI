@@ -241,6 +241,101 @@ def _load_l2_tools(pairs: list[tuple[str, int]]) -> dict[str, "int | None"]:
     return asyncio.run(_load_l2_tools_async(pairs))
 
 
+async def _fetch_and_build(slug: str, server_id: int) -> list:
+    """Fetch one server's tool schemas (cache-first) and build its FunctionTools.
+
+    The ONLY place this repo turns a (slug, server_id) pair into live
+    FunctionTools. Both callers go through here on purpose:
+      - _load_l2_tools_async — mid-run expand_tools(["mcp:<slug>"]);
+      - rehydrate_unlocked_mcp_tools — run start, for gates already open.
+    A second, parallel implementation is exactly how the deleted
+    build_mcp_tools and its inline replacement drifted apart on the
+    `listed_at == 0` trust sentinel (see AS-BUILT §2.3): one honoured it, the
+    other built tools from a degraded response. Keep it single.
+
+    Delegates cache-check + fetch + that sentinel to _metas_for_server, which
+    also emits the UI warning event on failure. Returns [] when the fetch
+    degraded to (0, []) — never a half-trusted tool list.
+    """
+    import mcp_client.client as _mc
+
+    servers_by_id = _mc._RUN_SERVERS_VAR.get(None) or {}
+    # Fall back to a minimal stand-in when this run's server snapshot doesn't
+    # have the id MCP_HANDLES_VAR resolved to (should not happen in practice —
+    # both are derived from the same server list — but this keeps the tool's
+    # NAME/identity correct even then; a real call against it would fail with
+    # the normal "[MCP error] cannot connect" message rather than the gate
+    # silently doing nothing).
+    server = servers_by_id.get(server_id) or {"id": server_id, "name": slug}
+    schemas, _status, _detail = await _mc._metas_for_server(server)
+    built = []
+    for meta in schemas:
+        if not isinstance(meta, dict) or not meta.get("name"):
+            continue
+        built.append(_mc._wrap_tool(server, meta, slug=slug))
+    return built
+
+
+async def rehydrate_unlocked_mcp_tools() -> tuple[list, set[str]]:
+    """Rebuild the FunctionTools of every MCP server whose gate is ALREADY open
+    for this session, for inclusion in this run's initial tool list.
+
+    Why this exists: the unlock gate is session-scoped (persisted in
+    sessions.unlocked_tool_categories, reloaded into UNLOCKED_VAR at every run
+    start) but the tools it authorizes were only ever run-scoped — mid-run
+    expand_tools splices them into the live Agent object, which is discarded
+    when the run ends. So from the SECOND user message onward the model was
+    told (by the L0 prompt line, by the persisted gate, and by its own history)
+    that a server's tools were loaded while the request's tool array no longer
+    contained them; calling one raised ModelBehaviorError "Tool
+    mcp__<slug>__<tool> not found in agent". This closes that gap by making the
+    persisted gate actually load-bearing at run start.
+
+    Costs no third-party network: _fetch_and_build -> _metas_for_server reads
+    the process-level _SCHEMA_CACHE first (which spans runs) and otherwise asks
+    Go over loopback. Servers whose gate is closed are never even looked at, so
+    a fresh session's first turn does exactly zero work here.
+
+    Returns (tools, loaded_slugs) — loaded_slugs feeds the L0/L1 wording so it
+    can say "already in your tool list" for these and "call expand_tools" for
+    the rest. Never raises: MCP is additive and must not stop a run from
+    starting.
+    """
+    from skills import mcp_gating as _mcp   # local import: mcp_gating imports this module
+    import mcp_client.client as _mc
+
+    unlocked = current_unlocked()
+    handles = _mcp.MCP_HANDLES_VAR.get({}) or {}
+    servers_by_id = _mc._RUN_SERVERS_VAR.get(None) or {}
+    tools: list = []
+    loaded: set[str] = set()
+    # Iterating this run's handles (not the gate keys) means a gate whose
+    # server is gone from this run's list — deleted, or disabled in settings —
+    # is skipped silently. The key is deliberately NOT pruned from the
+    # persisted set on absence: disabling and re-enabling a server must not
+    # revoke anything (the rev-1 defect this branch exists to keep fixed), and
+    # "deleted" is indistinguishable from "temporarily disabled" here.
+    for slug, server_id in sorted(handles.items()):
+        if _mcp.gate_key(server_id) not in unlocked:
+            continue
+        # Never advertise a server Go flagged as having undecryptable
+        # credentials as connectable — same rule _build_mcp_for_run applies to
+        # the status snapshot.
+        if (servers_by_id.get(server_id) or {}).get("config_error"):
+            continue
+        try:
+            built = await _fetch_and_build(slug, server_id)
+        except Exception:
+            _LOG.warning("MCP rehydration failed for %r (server_id=%s); "
+                         "continuing without its tools", slug, server_id,
+                         exc_info=True)
+            continue
+        if built:
+            tools.extend(built)
+            loaded.add(slug)
+    return tools, loaded
+
+
 async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int | None"]:
     """Fetch each server's full tool schemas and inject its FunctionTools into
     the live run's agent. Reads RUN_AGENT_VAR from mcp_client.client (imported
@@ -256,7 +351,6 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
     if agent is None:          # no run in progress (e.g. called outside a run)
         return {slug: 0 for slug, _ in pairs}
 
-    servers_by_id = _mc._RUN_SERVERS_VAR.get(None) or {}
     for slug, server_id in pairs:
         if slug in counts:
             # Defense in depth against a duplicate (slug, server_id) pair
@@ -276,33 +370,9 @@ async def _load_l2_tools_async(pairs: list[tuple[str, int]]) -> dict[str, "int |
         if any(getattr(t, "name", "").startswith(prefix) for t in agent.tools):
             counts[slug] = None
             continue
-        # Fall back to a minimal stand-in when this run's server snapshot
-        # doesn't have the id MCP_HANDLES_VAR resolved to (should not happen
-        # in practice — both are derived from the same server list — but
-        # this keeps the tool's NAME/identity correct even then; a real call
-        # against it would fail with the normal "[MCP error] cannot connect"
-        # message rather than the gate silently doing nothing).
-        server = servers_by_id.get(server_id) or {"id": server_id, "name": slug}
-        # Delegate cache-check + fetch + the fetched_at==0 trust sentinel to
-        # _metas_for_server (the same helper build_mcp_tools used) instead of
-        # re-implementing it here. The earlier inline version cache-checked
-        # correctly but then built tools from `schemas` unconditionally even
-        # when fetch_schemas degraded to (0, []) -- harmless only because Go
-        # never emitted that exact combination (listed_at == 0 alongside a
-        # non-empty schemas array) at the time this was written. A
-        # transport-relevant Update now deletes the runtime AND schemas rows
-        # together (see route/v2/mcp.go's Update handler), so that state is
-        # reachable, and this call must never silently inject the pre-edit
-        # server's tools as though they were live and trusted.
-        # _metas_for_server also emits the UI warning event on failure, which
-        # this call site relied on _cache_put's write-guard alone to avoid
-        # doing before.
-        schemas, _status, _detail = await _mc._metas_for_server(server)
-        built = []
-        for meta in schemas:
-            if not isinstance(meta, dict) or not meta.get("name"):
-                continue
-            built.append(_mc._wrap_tool(server, meta, slug=slug))
+        # Shared with run-start rehydration — see _fetch_and_build for why the
+        # fetch + trust-sentinel + build sequence lives in exactly one place.
+        built = await _fetch_and_build(slug, server_id)
 
         if built:
             # New list, never mutate in place: get_all_tools walks self.tools

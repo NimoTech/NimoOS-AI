@@ -457,9 +457,13 @@ async def _build_mcp_for_run(mcp_servers):
     This is the L0/L1 half of progressive disclosure: the system-prompt line
     (render_prompt_line) and expand_tools(["mcp"])'s catalogue
     (render_expand_section) are rendered entirely from this snapshot. L2 — a
-    single server's real FunctionTools — is loaded later, mid-run, by
-    skills.tool_gating.expand_tools(["mcp:<handle>"]) once the model asks for
-    that specific server (see that module for the fetch + injection).
+    single server's real FunctionTools — is loaded only for servers whose gate
+    is open: mid-run by skills.tool_gating.expand_tools(["mcp:<handle>"]) the
+    first time the model asks for one, and at run start by
+    skills.tool_gating.rehydrate_unlocked_mcp_tools for gates this session
+    opened in an earlier run. Neither dials a third party (both read the
+    cross-run schema cache, else ask Go over loopback), so the zero-connection
+    contract above covers the whole of run start, not just this function.
 
     Never raises — MCP is additive. Returns (empty tool list,
     McpStatusSnapshot | None); a None snapshot means MCP is not in play (or
@@ -504,6 +508,22 @@ async def _build_mcp_for_run(mcp_servers):
         return [], mcp_status.McpStatusSnapshot(servers=statuses)
     except Exception:
         return [], None
+
+
+def _mark_mcp_loaded(snapshot, loaded_slugs) -> None:
+    """Flag the servers whose tools this run's rehydration actually put in the
+    tool list, so render_prompt_line/render_expand_section can say "already in
+    your tool list" for them and "load with expand_tools" for the rest.
+
+    Must run BEFORE _apply_mcp_status (which both publishes the snapshot for
+    expand_tools and renders the prompt line from it). Never raises — a wording
+    detail must not be able to stop a run."""
+    try:
+        for s in getattr(snapshot, "servers", None) or []:
+            if s.slug and s.slug in loaded_slugs:
+                s.loaded = True
+    except Exception:
+        pass
 
 
 def _apply_mcp_status(full_prompt: str, snapshot) -> str:
@@ -925,18 +945,43 @@ class AgentRunner:
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
             mcp_tools, mcp_snapshot = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            # Rebuild the tools of every server whose gate this session already
+            # opened. The gate is session-scoped (reloaded into UNLOCKED_VAR
+            # above from sessions.unlocked_tool_categories) but mid-run
+            # expand_tools only ever put the tools on the run's Agent object, so
+            # before this the second message in a conversation had an open gate,
+            # a prompt line saying "N tools ready", and no such tools in the
+            # request — the model called one and the SDK raised "Tool
+            # mcp__<slug>__<tool> not found in agent". Placed here, ahead of the
+            # _overhead estimate below, so these tokens are counted against the
+            # compaction budget; splicing them in after Agent construction (the
+            # mid-run path) would hide ~14k tokens from compact_for_run.
+            # Opens zero third-party connections — see
+            # rehydrate_unlocked_mcp_tools.
+            if _mcp_allowed:
+                _mcp_l2_tools, _mcp_loaded_slugs = await _gat.rehydrate_unlocked_mcp_tools()
+            else:
+                _mcp_l2_tools, _mcp_loaded_slugs = [], set()
+            _mark_mcp_loaded(mcp_snapshot, _mcp_loaded_slugs)
             full_prompt = _apply_mcp_status(full_prompt, mcp_snapshot)
-            # mcp_tools is always [] here (Task 16: run start opens zero
-            # connections and builds zero tools) — L2 (skills/tool_gating.py)
-            # injects a server's real FunctionTools straight into the live
-            # Agent object mid-run instead, once the model asks for that
-            # specific server (see RUN_AGENT_VAR). `+ mcp_tools` is kept
-            # (rather than dropped) purely so this stays correct if that
-            # contract is ever revisited; there is no per-category gating to
-            # apply here anymore (the old gate_runtime_tools wrapper was
-            # deleted as dead code — nothing ever reached it non-empty).
+            # mcp_tools is always [] here: Task 16's contract is that run start
+            # opens zero THIRD-PARTY connections, and _build_mcp_for_run honours
+            # it by building nothing at all. `+ mcp_tools` is kept (rather than
+            # dropped) purely so this stays correct if that is ever revisited.
+            # _mcp_l2_tools is the other half of L2 and does not weaken that
+            # contract — it only rebuilds servers whose gate is ALREADY open,
+            # from the cross-run schema cache or Go over loopback, never by
+            # dialling a third party. A gate the model opens for the FIRST time
+            # is still served mid-run by skills/tool_gating.py splicing straight
+            # onto the live Agent object (see RUN_AGENT_VAR); both paths share
+            # _fetch_and_build. There is no per-category gating to apply here
+            # (the old gate_runtime_tools wrapper was deleted as dead code —
+            # nothing ever reached it non-empty), and MCP tools deliberately
+            # carry no is_enabled callback: which ones exist is decided at build
+            # time, because estimate_tools_tokens below counts every tool in the
+            # list whether is_enabled would hide it or not.
             run_tools = select_tools_for_run(
-                attachment_ids, session_id=session_id, profile=profile) + mcp_tools
+                attachment_ids, session_id=session_id, profile=profile) + mcp_tools + _mcp_l2_tools
             try:
                 _overhead = (context_compaction.estimate_tokens(full_prompt)
                              + context_compaction.estimate_tools_tokens(run_tools))

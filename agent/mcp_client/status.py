@@ -38,6 +38,17 @@ class ServerStatus:
     instructions: str = ""                             # server's full instructions text (L2 only)
     stale: bool = False                                # tool_names/instructions are cached from
                                                         # before the current failure, not live
+    loaded: bool = False                               # this server's FunctionTools are ALREADY in
+                                                        # this run's tool list, so the model can call
+                                                        # them without expand_tools first. Set by
+                                                        # agent.py from the run-start rehydration
+                                                        # result (skills.tool_gating
+                                                        # .rehydrate_unlocked_mcp_tools). Purely a
+                                                        # wording input: saying "N tools ready" for a
+                                                        # server whose tools are NOT in the array is
+                                                        # what made the model call
+                                                        # mcp__<slug>__<tool> and hit "not found in
+                                                        # agent".
 
 
 @dataclass
@@ -132,7 +143,16 @@ def _summary(s: ServerStatus) -> str:
             # deliberately does not try to detect — see render_expand_section).
             # "0 tools ready" would read as a working, expandable server.
             return f"{label}: connected, published no tools"
-        return f"{label}: {n} tool{'s' if n != 1 else ''} ready"
+        plural = "s" if n != 1 else ""
+        if s.loaded:
+            return f"{label}: {n} tool{plural}, already in your tool list"
+        # Never bare "N tools ready": that reads as callable, and the tools are
+        # NOT in the request's tool array until this server's gate is opened.
+        token = _slug_token(s)
+        if not token:
+            return f"{label}: {n} tool{plural}, not loaded yet"
+        return (f"{label}: {n} tool{plural}, load with "
+                f'expand_tools(["mcp:{token}"])')
     if s.status == WARMING:
         return f"{label}: starting up, tools available shortly"
     stale_tag = " [stale]" if s.stale else ""
@@ -198,7 +218,14 @@ def render_expand_section(snapshot) -> list[str]:
             # No trustworthy slug (see _slug_token) -> suppress the hint
             # rather than guess: advertising no token beats advertising a
             # wrong one that resolves to a different server.
-            expand_hint = f" expand as: mcp:{token} for full tool schemas;" if token else ""
+            if s.loaded:
+                # Its tools are already in the tool list (run-start
+                # rehydration): telling the model to expand it again wastes a
+                # step, and "expand as:" next to callable tools reads as "not
+                # callable yet".
+                expand_hint = " these are already in your tool list — call them directly;"
+            else:
+                expand_hint = f" expand as: mcp:{token} for full tool schemas;" if token else ""
             # trailing ";" terminates this server's tool list — without it,
             # weaker models read the unbulleted server lines as sub-items of
             # the preceding tool instead of parallel lists of callable tools

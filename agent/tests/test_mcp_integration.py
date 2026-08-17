@@ -59,7 +59,7 @@ def test_apply_mcp_status_appends_line_and_publishes_var():
         st.ServerStatus(name="g", status=st.OK, tool_names=["a", "b"])])
     out = agent_mod._apply_mcp_status("BASE", snap)
     assert out.startswith("BASE\n\n[MCP servers: ")
-    assert "g: 2 tools ready" in out
+    assert "g: 2 tools, not loaded yet" in out
     assert st.MCP_STATUS_VAR.get() is snap      # expand_tools reads the same snapshot
 
 

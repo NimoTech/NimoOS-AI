@@ -71,6 +71,37 @@ def test_run_config_disabled(monkeypatch):
     assert rc.tracing_disabled is True
 
 
+def test_run_config_recovers_from_unknown_tool_instead_of_killing_the_run():
+    """A call to a tool that isn't in the tool list defaults to
+    ModelBehaviorError, which ends the whole turn. That is reachable whenever
+    the model calls an mcp__* tool whose gate isn't loaded this run, so both
+    paths (tracing on and off) must carry the recovery configuration."""
+    import importlib, phoenix_tracing as pt
+    m = importlib.reload(pt)
+    for enabled in (True, False):
+        rc = m.build_trace_run_config(enabled, "s1", "u1", "deepseek-x", "chat")
+        assert rc.tool_not_found_behavior == "return_error_to_model"
+        assert rc.tool_error_formatter is not None
+
+
+def test_tool_error_formatter_rewrites_only_mcp_tool_not_found():
+    import importlib, phoenix_tracing as pt
+    from skills import mcp_gating as mg
+
+    class _Args:
+        def __init__(self, kind, tool_name):
+            self.kind, self.tool_name = kind, tool_name
+
+    m = importlib.reload(pt)
+    mg.MCP_HANDLES_VAR.set({"github": 5})
+    out = m._tool_error_formatter(_Args("tool_not_found", "mcp__github__get_me"))
+    assert 'expand_tools(["mcp:github"])' in out
+    # None => keep the SDK's own default message
+    assert m._tool_error_formatter(_Args("tool_not_found", "read_file")) is None
+    assert m._tool_error_formatter(_Args("approval_rejected", "mcp__github__get_me")) is None
+    assert m._tool_error_formatter(object()) is None      # malformed args never raise
+
+
 def test_setup_tracing_instruments_openai_client(monkeypatch):
     # The OpenAI client instrumentor must be wired to the same provider so the
     # enable/disable gate covers its spans too.

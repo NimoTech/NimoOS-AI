@@ -29,10 +29,46 @@ def test_prompt_line_mixed_statuses():
         st.ServerStatus(name="old", status=st.CONFIG_ERROR, detail="decrypt failed"),
     ))
     assert line.startswith("[MCP servers: ") and line.endswith("]")
-    assert "Mygithub: 32 tools ready" in line
+    # No slug and no fq tool names to recover one from -> no expand token to
+    # advertise, but still never a bare "ready" (see the two tests below).
+    assert "Mygithub: 32 tools, not loaded yet" in line
     assert "supabase: failed to load (timeout)" in line
     assert "fs: starting up" in line
     assert "old: configuration error (decrypt failed)" in line
+
+
+def test_prompt_line_unloaded_server_names_the_gate_instead_of_claiming_ready():
+    # Regression, the whole point of this branch's fix: a server whose gate is
+    # NOT open this run has no tools in the request's tool array. The old
+    # wording ("N tools ready") read as callable, so the model called
+    # mcp__<slug>__<tool> directly and the SDK raised "Tool ... not found in
+    # agent", killing the turn. The line must instead name the exact token
+    # that loads them.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github",
+                        tool_names=["mcp__github__get_me"] * 44)))
+    assert 'github: 44 tools, load with expand_tools(["mcp:github"])' in line
+    assert "ready" not in line
+
+
+def test_prompt_line_loaded_server_says_the_tools_are_callable_now():
+    # After run-start rehydration (skills.tool_gating.rehydrate_unlocked_mcp_tools)
+    # the tools ARE in the tool array, so the line must not send the model
+    # through expand_tools for them again.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github", loaded=True,
+                        tool_names=["mcp__github__get_me"] * 44)))
+    assert "github: 44 tools, already in your tool list" in line
+    assert "expand_tools" not in line
+
+
+def test_expand_section_loaded_server_does_not_advertise_its_gate():
+    lines = st.render_expand_section(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github", loaded=True,
+                        tool_names=["mcp__github__get_me"])))
+    joined = "\n".join(lines)
+    assert "already in your tool list — call them directly;" in joined
+    assert "expand as:" not in joined
 
 
 def test_prompt_line_ok_server_with_zero_tools_is_not_misrepresented_as_ready():
