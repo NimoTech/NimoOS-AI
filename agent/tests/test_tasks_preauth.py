@@ -382,8 +382,11 @@ def test_run_allowlist_never_covers_interpreters(monkeypatch, rule_value, comman
         return "ask"
     monkeypatch.setattr(shell, "judge_command", _ask)
 
+    # Second rule is a catch-all: a single space prefixes nothing here, but it
+    # must be a NON-empty value — an empty one is skipped by shell_match and the
+    # "even with a blanket rule" part of this test would be vacuous.
     shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": rule_value},
-                                 {"kind": "prefix", "value": ""}])
+                                 {"kind": "prefix", "value": command[:1]}])
     msg = asyncio.run(shell._guard_command(command))
     assert msg is not None, command
     assert "NOT executed" in msg or "no confirmation channel" in msg, command
@@ -643,6 +646,37 @@ def test_run_allowlist_never_covers_xargs(monkeypatch, tmp_path, cmd):
     decision = shell_guard.classify(cmd, cwd=str(tmp_path))
     shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": cmd}])
     assert shell._run_allowlist_match(cmd, decision) is False
+
+
+@pytest.mark.parametrize("cmd", [
+    # `_effective_argv` stops unwrapping at a flag's VALUE, so an interpreter
+    # behind `nice -n 10` / `timeout -s KILL 5` / `sudo -u root` / `ionice -c 2`
+    # / `env -u FOO` is never revealed by unwrapping — only the full-argv scan
+    # catches these (round-4 finding).
+    "nice -n 10 sh -c 'rm -rf /DATA'",
+    "nice -n 10 python3 -c 'x'",
+    "timeout -s KILL 5 bash -c 'rm -rf /DATA'",
+    "ionice -c 2 python3 -c 'x'",
+    "sudo -u root python3 -c 'x'",
+    "env -u FOO python3 -c 'x'",
+    "nice -n 10 xargs rm -rf /DATA/x",
+])
+def test_run_allowlist_never_covers_wrapped_interpreters(monkeypatch, tmp_path, cmd):
+    _shell_setup(monkeypatch)
+    decision = shell_guard.classify(cmd, cwd=str(tmp_path))
+    shell.RUN_ALLOWLIST_VAR.set([{"kind": "prefix", "value": cmd}])
+    assert shell._run_allowlist_match(cmd, decision) is False
+
+
+def test_effective_argv_early_stop_is_documented_not_fixed(tmp_path):
+    """The same early stop degrades `classify` itself: `nice -n 10 rm -rf /DATA`
+    is gray while the bare command is protected, and `rm` is not an interpreter
+    so the argv scan does not catch it either. Pinned as a KNOWN GAP so the
+    follow-up in shell_guard has a failing-shaped record; NOT a claim that this
+    is acceptable."""
+    assert shell_guard.classify("rm -rf /DATA", cwd=str(tmp_path)).level == "protected"
+    assert shell_guard.classify("nice -n 10 rm -rf /DATA",
+                                cwd=str(tmp_path)).level == "gray"
 
 
 @pytest.mark.parametrize("cmd", ["timeout 5 lark-cli im chats list",

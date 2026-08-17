@@ -267,15 +267,16 @@ _RUN_INTERPRETERS = {
     "pwsh", "powershell", "tclsh", "expect", "Rscript", "osascript",
     # Not interpreters in the language sense, but they all take a command (or a
     # recipe/playbook naming one) and run it, so the argv the classifier sees is
-    # never the work that happens.  `xargs` in particular is ALSO an exec
-    # wrapper, so it is only caught by the pre-unwrap check below: its argv
-    # names one command but the arguments come from stdin, which nothing here
-    # can see.
+    # never the work that happens.  `xargs` also takes its arguments from stdin,
+    # which no static check here can see.
     "xargs", "make", "systemd-run", "ansible-playbook",
-    # NOT listed: `env` / `nohup` / `nice` / `timeout` / `sudo` … — plain exec
-    # wrappers.  Whatever they wrap is revealed by _effective_argv and judged on
-    # its own merits (`env python3 -c …` is refused as python3), so listing them
-    # would only break honest invocations like `env LC_ALL=C sort -c f.txt`.
+    # NOT listed: `env` / `nohup` / `nice` / `timeout` / `sudo` / `ionice` — plain
+    # exec wrappers.  Listing them would refuse honest invocations
+    # (`env LC_ALL=C sort -c f.txt`, `nice -n 10 rsync …`), and what they wrap is
+    # caught anyway by the full-argv scan in _run_allowlist_match.  Note this is
+    # NOT because unwrapping reveals it: `_effective_argv` stops at a flag's
+    # value, so `nice -n 10 sh -c …` never unwraps to `sh` at all (see the scan's
+    # comment).  A stale version of this comment claimed otherwise.
 }
 # find-family flags that hand a command to another process.  Unambiguous (no
 # other common tool spells them), so they are checked on every command.
@@ -326,20 +327,33 @@ def _run_allowlist_match(command: str, decision) -> bool:
         return False
     if segs[0].redirect_targets or segs[0].read_targets:
         return False
-    # Check the command BOTH as written and as it will actually run.
-    # `_effective_argv` unwraps `env`/`nohup`/`xargs`/`X=1 …`, which is what
-    # makes `env python3 -c …` resolve to python3 — but it also *removes* the
-    # wrapper, so checking only the unwrapped form let `xargs rm -rf …` through
-    # as a plain `rm`.  Every name that was peeled off is checked too.
+    # An interpreter anywhere in the command line disqualifies it — the scan is
+    # over EVERY token of the segment as written, not just the command name.
+    #
+    # Narrower checks were tried and both leaked, because `_effective_argv` only
+    # skips tokens starting with `-` (plus one operand for timeout/chroot) and
+    # therefore stops unwrapping at a flag's VALUE: `nice -n 10 sh -c …` halts on
+    # `10`, so neither the peeled prefix nor the unwrapped argv[0] is ever `sh`.
+    # Same for `timeout -s KILL 5 bash -c`, `sudo -u root python3 -c`,
+    # `ionice -c 2 python3 -c`, `env -u FOO python3 -c`, and
+    # `nice -n 10 xargs rm -rf …`.  Scanning all tokens costs nothing and closes
+    # the whole family; the price is refusing a command that merely *mentions* an
+    # interpreter name as an argument (`apt install make`), which is a
+    # pre-authorization the author can simply phrase differently.
+    #
+    # STILL NOT COVERED (deliberately, and out of scope here): the same early
+    # stop also degrades `classify` itself.  `nice -n 10 rm -rf /DATA` is GRAY
+    # while `rm -rf /DATA` is PROTECTED, so the protected exclusion above does
+    # not fire and a rule naming it grants it — and `rm` is not an interpreter,
+    # so this scan does not catch it either.  The defect is in
+    # shell_guard._effective_argv and equally affects the persistent allowlist
+    # and the judge path; fixing it there is a separate follow-up.
     from shell_guard.rules import _effective_argv  # noqa: PLC0415
     raw_argv = segs[0].argv
     argv = _effective_argv(raw_argv)
     if not argv:
         return False
-    peeled = raw_argv[:max(0, len(raw_argv) - len(argv))]
-    names = [os.path.basename(tok) for tok in peeled]
-    names.append(os.path.basename(argv[0]))
-    if any(name in _RUN_INTERPRETERS for name in names):
+    if any(os.path.basename(tok) in _RUN_INTERPRETERS for tok in raw_argv):
         return False
     if any(tok in _RUN_EXEC_FLAGS for tok in argv[1:]):
         return False
