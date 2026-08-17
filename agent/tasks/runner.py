@@ -21,6 +21,12 @@ The order is not cosmetic:
   rather than set afterwards, because `AgentRunner.run` seeds the contextvars
   itself (agent.py) — anything set from out here would be overwritten.
 
+Three things happen after the driver returns that are easy to miss, and each of
+them leaks something permanently if skipped: a timed-out run is CANCELLED (the
+driver only stops watching it), its sink is EVICTED from `main._active_runs`
+(which only ever inserts), and pruned sessions are deleted messages-first,
+together with their vectors and snapshots (see `delete_session`).
+
 Nothing in here raises. A scheduled run has nobody watching, so every failure
 mode has to land in the run row as a status a human can read later.
 """
@@ -28,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import time
 
 from notes import store as notes_store
@@ -49,6 +57,17 @@ SPAWN_GAP_SECONDS = 0.05
 # Run history kept per task; older rows (and the sessions they own) are pruned
 # after every run.
 KEEP_RUNS = 50
+
+# How long to wait for a cancelled run to actually unwind before moving on.
+# Same 5s as main.cancel_session.
+CANCEL_GRACE_SECONDS = 5.0
+
+# Fallback for a task whose timeout_seconds is 0 or negative. Deliberately NOT
+# "0 means no limit" — that reading is right for max_turns (and is what
+# resolve_max_turns implements) but inverted here: a 0 deadline makes
+# TaskRunDriver return `timeout` on its very first check, so every run of such
+# a task would fail instantly. The column's own default is 1800.
+DEFAULT_TIMEOUT_SECONDS = 1800
 
 # Cap for the "[preauth used: …]" footer, so a run that auto-approved hundreds
 # of cards cannot bloat the summary a UI has to render.
@@ -105,9 +124,106 @@ def resolve_max_turns(task, conn, max_turns_reader) -> "int | None":
     return None if raw == 0 else raw
 
 
-def _delete_session(conn, session_id: str) -> None:
+def _snapshots_root() -> str:
+    """Where fs-skill snapshots live. Resolved through `main` so a test (or a
+    non-default deployment) that moves the root is honored here too."""
+    try:
+        import main  # noqa: PLC0415
+        return main._snapshots_root
+    except Exception:                       # noqa: BLE001 — main not importable
+        return os.environ.get("AGENT_SNAPSHOTS_ROOT",
+                              "/var/lib/nimoos/ai/agent/snapshots")
+
+
+async def _default_vector_cleanup(user_id: str, session_id: str) -> None:
+    import recall_index  # noqa: PLC0415
+    await asyncio.wait_for(
+        recall_index._get_parser_client().agent_memory_delete(user_id, session_id),
+        timeout=10)
+
+
+async def delete_session(conn, user_id: str, session_id: str, *,
+                         vector_cleanup=None) -> None:
+    """Delete a session the way `main.delete_session` does — all four steps.
+
+    `messages.session_id` is `REFERENCES sessions(id)` **without** ON DELETE
+    CASCADE (db.py) and `PRAGMA foreign_keys=ON` is set at init, so deleting
+    the session row first raises `IntegrityError: FOREIGN KEY constraint
+    failed` for any session that ever exchanged a message — i.e. every real
+    task run. Messages go first.
+
+    The other two steps are not optional either: the recall vectors would keep
+    a pruned run's content answerable by `recall`, and the snapshot directory
+    would leak disk for the lifetime of the box.
+    """
+    owner = conn.execute("SELECT user_id FROM sessions WHERE id=?",
+                         (session_id,)).fetchone()
+    if owner is not None and str(owner["user_id"]) != str(user_id):
+        # main.delete_session scopes its DELETE by user_id; the equivalent here
+        # is refusing outright, because a run row pointing at someone else's
+        # session is corruption, not a permission question.
+        logger.warning("tasks runner: refusing to delete session %s owned by "
+                       "another user", session_id)
+        return
+    cleanup = vector_cleanup or _default_vector_cleanup
+    try:
+        await cleanup(user_id, session_id)
+    except Exception as exc:                # noqa: BLE001 — soft-fail, same as
+        # main.delete_session: deletion must never depend on Parser being up;
+        # a missed cleanup only leaves orphan vectors (logged).
+        logger.warning("tasks runner: vector cleanup failed for session %s: %s",
+                       session_id, exc)
+    conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
     conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
     conn.commit()
+    shutil.rmtree(os.path.join(_snapshots_root(), session_id), ignore_errors=True)
+
+
+async def cancel_sink(sink) -> bool:
+    """Stop the agent task behind `sink`. Returns True if it was still running.
+
+    The driver's `cancel_session` only answers pending confirmation cards — it
+    does NOT stop the run (see main.py's /cancel endpoint, which cancels the
+    task for exactly this reason). Without this, a timed-out task keeps burning
+    the box's CPU, and — because its run row is already terminal —
+    `overlap_policy='skip'` would happily enqueue the next fire alongside it.
+    """
+    task = getattr(sink, "task", None)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=CANCEL_GRACE_SECONDS)
+    except asyncio.CancelledError:
+        # The cancellation we asked for, surfacing through wait_for. Not a
+        # BaseException we may propagate here: `process_once` still has a run
+        # row to finish (mirrors main.cancel_session, which swallows it too).
+        pass
+    except Exception:                       # noqa: BLE001 — TimeoutError and
+        # anything the run raised on its way out: why it ended does not matter,
+        # only that we stopped waiting on it.
+        pass
+    return True
+
+
+def evict_sink(session_id: str, sink=None) -> None:
+    """Drop this run's sink from `main._active_runs`.
+
+    `_start_run` only ever inserts (main.py); the web path keeps the sink
+    around so a late reconnect can replay the stream. A scheduled run has no
+    reconnecting client, so leaving it there pins every event of every run in
+    memory forever — a 5-minute task alone is 288 sinks/day.
+    """
+    try:
+        import main  # noqa: PLC0415
+    except Exception:                       # noqa: BLE001
+        return
+    current = main._active_runs.get(session_id)
+    if current is None:
+        return
+    if sink is not None and current is not sink:
+        return                              # someone else's run; leave it alone
+    main._active_runs.pop(session_id, None)
 
 
 # -- default (production) dependencies ---------------------------------------
@@ -166,6 +282,9 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                        grant_fs=grants.grant_fs,
                        grant_egress=grants.grant_egress,
                        prune=store.prune_runs,
+                       session_deleter=None,
+                       cancel=cancel_sink,
+                       evict=evict_sink,
                        max_turns_reader=_default_max_turns_reader,
                        keep_runs: int = KEEP_RUNS) -> bool:
     """Claim and execute at most one run. False only when there was nothing
@@ -182,6 +301,9 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
     run_id, task_id, user_id = run["id"], run["task_id"], run["user_id"]
     creds = None
     task = None
+    sink = None
+    session_id = ""
+    session_deleter = session_deleter or delete_session
     try:
         task = store.get_task(conn, task_id, user_id)
         if task is None:
@@ -236,21 +358,43 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             run_shell_allowlist=doc["shell"],
         )
 
+        timeout_seconds = int(task["timeout_seconds"] or 0)
+        if timeout_seconds <= 0:
+            timeout_seconds = DEFAULT_TIMEOUT_SECONDS
         driver = driver_factory(session_id=session_id, preauth=doc,
-                               run_timeout=int(task["timeout_seconds"] or 0))
+                                run_timeout=timeout_seconds)
         result = await driver.drive(sink) or {}
+
+        status = str(result.get("status") or "failed")
+        if status == "timeout":
+            # The wall-clock watchdog: the driver stopped WATCHING the run, the
+            # run itself is still going. Kill it before recording the timeout —
+            # otherwise it burns CPU to completion and the next scheduled fire
+            # starts alongside it despite overlap_policy='skip' (the run row is
+            # already terminal, so nothing counts it as active any more).
+            if await cancel(sink):
+                logger.warning("tasks runner: cancelled run %s after %ds",
+                               run_id, timeout_seconds)
 
         summary = str(result.get("summary") or "")
         note = format_preauth_note(result.get("auto_approved") or [])
         if note:
             summary = f"{summary}\n\n{note}" if summary else note
-        store.finish_run(conn, run_id, str(result.get("status") or "failed"),
+        store.finish_run(conn, run_id, status,
                          summary=summary, error=str(result.get("error") or ""),
                          denied=result.get("denied") or [])
         return True
     except Exception as exc:                # noqa: BLE001 — never escape
         msg = _redact(str(exc) or type(exc).__name__, creds)
         logger.exception("tasks runner: run %s failed: %s", run_id, msg)
+        if sink is not None:
+            # The agent task outlives whatever broke out here (a driver bug, a
+            # DB error while recording): same reasoning as the timeout path.
+            try:
+                await cancel(sink)
+            except Exception:               # noqa: BLE001
+                logger.warning("tasks runner: cancel after failure did not "
+                               "complete for run %s", run_id, exc_info=True)
         try:
             store.finish_run(conn, run_id, "failed", error=msg)
         except Exception:                   # noqa: BLE001
@@ -258,14 +402,30 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                              run_id)
         return True
     finally:
-        # Pruning is bookkeeping: it runs whatever happened above, and its own
-        # failure must not undo the finish_run that just landed.
+        # Bookkeeping: it runs whatever happened above, and no failure in here
+        # may undo the finish_run that just landed.
+        if sink is not None and session_id:
+            try:
+                evict(session_id, sink)
+            except Exception:               # noqa: BLE001
+                logger.warning("tasks runner: could not evict sink for %s",
+                               session_id, exc_info=True)
         try:
-            for session_id in prune(conn, task_id, keep=keep_runs) or ():
-                _delete_session(conn, session_id)
+            dropped = prune(conn, task_id, keep=keep_runs) or ()
         except Exception:                   # noqa: BLE001
             logger.warning("tasks runner: prune failed for task %s", task_id,
                            exc_info=True)
+            dropped = ()
+        for old_session in dropped:
+            # Per-session try: one undeletable session (a locked snapshot dir,
+            # a Parser hiccup) must not strand the rest of the batch — the run
+            # rows are already gone, so a skipped session is an orphan nobody
+            # will ever come back for.
+            try:
+                await session_deleter(conn, user_id, old_session)
+            except Exception:               # noqa: BLE001
+                logger.warning("tasks runner: could not delete pruned session %s",
+                               old_session, exc_info=True)
 
 
 async def _process_with_defaults(conn) -> bool:

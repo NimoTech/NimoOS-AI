@@ -28,7 +28,11 @@ def conn(tmp_path):
 # -- fakes -------------------------------------------------------------------
 
 class FakeSink:
-    """Stand-in for main.RunSink; the fake driver never reads it."""
+    """Stand-in for main.RunSink. `task` is the agent coroutine's task, which
+    is what the timeout path has to cancel."""
+
+    def __init__(self, task=None):
+        self.task = task
 
 
 class FakeDriver:
@@ -67,6 +71,9 @@ class Harness:
         self.sessions = []
         self.driver = None
         self.sink = FakeSink()
+        self.cancelled = []
+        self.evicted = []
+        self.deleted = []
 
     # start_run(session_id, user_id, message, creds, *, max_turns,
     #           pre_confirmed_tools, run_shell_allowlist) -> sink
@@ -102,11 +109,23 @@ class Harness:
         self.egress_calls.append(list(domains))
         return {d: True for d in domains}
 
+    async def cancel(self, sink):
+        self.cancelled.append(sink)
+        return True
+
+    def evict(self, session_id, sink=None):
+        self.evicted.append((session_id, sink))
+
+    async def session_deleter(self, conn, user_id, session_id):
+        self.deleted.append((user_id, session_id))
+
     async def run(self, conn, **over):
         kw = dict(start_run=self.start_run, creds_resolver=self.creds_resolver,
                   driver_factory=self.driver_factory,
                   session_factory=self.session_factory,
                   grant_fs=self.grant_fs, grant_egress=self.grant_egress,
+                  cancel=self.cancel, evict=self.evict,
+                  session_deleter=self.session_deleter,
                   now=NOW)
         kw.update(over)
         return await runner.process_once(conn, **kw)
@@ -416,37 +435,242 @@ async def test_no_preauth_note_when_nothing_was_auto_approved(conn):
     assert "preauth used" not in _run_row(conn, rid)["summary"]
 
 
-# -- pruning -----------------------------------------------------------------
+# -- pruning + session deletion ----------------------------------------------
 
-@pytest.mark.asyncio
-async def test_prune_drops_old_runs_and_their_sessions(conn):
-    tid = _mk(conn)
-    old_ids = []
-    for i in range(runner.KEEP_RUNS + 3):
-        rid = store.create_run(conn, tid, "u1", "cron")
+def _seed_history(conn, task_id, count, snaps_root=None):
+    """`count` finished runs, each owning a session that has EXCHANGED
+    MESSAGES — the shape every real task run has, and the one that makes a
+    naive `DELETE FROM sessions` raise (messages.session_id is a plain
+    REFERENCES with no ON DELETE CASCADE, and foreign_keys is ON)."""
+    out = []
+    for i in range(count):
+        rid = store.create_run(conn, task_id, "u1", "cron")
         sid = f"old-{i}"
         conn.execute(
             "INSERT INTO sessions (id, user_id, title, created_at, updated_at, "
             "agent_type, source) VALUES (?,?,?,?,?,?,?)",
             (sid, "u1", None, NOW, NOW, "general", "task"))
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"msg-{i}", sid, "assistant", "[]", NOW))
         store.attach_session(conn, rid, sid)
         store.finish_run(conn, rid, "succeeded", summary="old")
-        old_ids.append((rid, sid))
+        if snaps_root is not None:
+            d = snaps_root / sid
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "snap.json").write_text("{}")
+        out.append((rid, sid))
     conn.commit()
+    return out
+
+
+def _real_deleter(monkeypatch, tmp_path):
+    """process_once's production session deleter, with only the Parser call
+    stubbed out — the SQL and the snapshot rmtree are the real thing."""
+    snaps = tmp_path / "snapshots"
+    snaps.mkdir(exist_ok=True)
+    monkeypatch.setattr(runner, "_snapshots_root", lambda: str(snaps))
+    calls = []
+
+    async def no_parser(user_id, session_id):
+        calls.append((user_id, session_id))
+
+    async def deleter(conn_, user_id, session_id):
+        await runner.delete_session(conn_, user_id, session_id,
+                                    vector_cleanup=no_parser)
+
+    return deleter, snaps, calls
+
+
+@pytest.mark.asyncio
+async def test_prune_deletes_old_sessions_for_real(conn, tmp_path, monkeypatch):
+    """The regression: sessions with messages, deleted through the production
+    path. A `DELETE FROM sessions` without the messages delete first raises
+    IntegrityError here, which the finally-block would swallow into a warning
+    — leaving every pruned session behind forever."""
+    tid = _mk(conn)
+    deleter, snaps, parser_calls = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, runner.KEEP_RUNS + 3, snaps_root=snaps)
 
     _queue(conn, tid)
-    await Harness().run(conn)
+    await Harness().run(conn, session_deleter=deleter)
 
     kept = conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
                         (tid,)).fetchone()["c"]
     assert kept == runner.KEEP_RUNS
-    # The oldest runs' sessions are gone, the newest ones are still there.
-    gone = [sid for _, sid in old_ids[:3]]
-    for sid in gone:
+
+    for _, sid in old[:3]:                      # the pruned ones
         assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                             (sid,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM messages WHERE session_id=?",
+                            (sid,)).fetchone() is None
+        assert not (snaps / sid).exists()       # snapshots dir gone
+        assert ("u1", sid) in parser_calls      # vectors dropped too
+    # And the surviving history is untouched.
+    keep_sid = old[-1][1]
     assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
-                        (old_ids[-1][1],)).fetchone() is not None
+                        (keep_sid,)).fetchone() is not None
+    assert conn.execute("SELECT 1 FROM messages WHERE session_id=?",
+                        (keep_sid,)).fetchone() is not None
+
+
+@pytest.mark.asyncio
+async def test_one_undeletable_session_does_not_strand_the_batch(conn, tmp_path,
+                                                                 monkeypatch):
+    tid = _mk(conn)
+    deleter, snaps, _ = _real_deleter(monkeypatch, tmp_path)
+    old = _seed_history(conn, tid, runner.KEEP_RUNS + 3, snaps_root=snaps)
+    doomed = old[0][1]
+
+    async def flaky(conn_, user_id, session_id):
+        if session_id == doomed:
+            raise RuntimeError("session busy")
+        await deleter(conn_, user_id, session_id)
+
+    _queue(conn, tid)
+    await Harness().run(conn, session_deleter=flaky)
+
+    # The failing one survives; the two after it were still deleted.
+    assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                        (doomed,)).fetchone() is not None
+    for _, sid in old[1:3]:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                            (sid,)).fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_survives_a_dead_parser(conn, tmp_path, monkeypatch):
+    """Vector cleanup is best-effort: Parser being down must not stop the row
+    deletion (same contract as main.delete_session)."""
+    monkeypatch.setattr(runner, "_snapshots_root", lambda: str(tmp_path))
+    tid = _mk(conn)
+    sid = _seed_history(conn, tid, 1)[0][1]
+
+    async def dead(user_id, session_id):
+        raise OSError("parser unreachable")
+
+    await runner.delete_session(conn, "u1", sid, vector_cleanup=dead)
+    assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                        (sid,)).fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_refuses_another_users_session(conn, tmp_path,
+                                                            monkeypatch):
+    monkeypatch.setattr(runner, "_snapshots_root", lambda: str(tmp_path))
+    tid = _mk(conn)
+    sid = _seed_history(conn, tid, 1)[0][1]
+
+    async def noop(user_id, session_id):
+        pass
+
+    await runner.delete_session(conn, "someone-else", sid, vector_cleanup=noop)
+    assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
+                        (sid,)).fetchone() is not None
+    assert conn.execute("SELECT 1 FROM messages WHERE session_id=?",
+                        (sid,)).fetchone() is not None
+
+
+# -- cancellation, sink eviction --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_timeout_cancels_the_still_running_agent_task(conn):
+    """spec §5: the wall-clock watchdog CANCELS the run, then records timeout.
+    The driver only stops reading the stream — without this the model keeps
+    burning CPU and the next fire starts alongside it despite overlap=skip."""
+    tid = _mk(conn)
+    rid = _queue(conn, tid)
+    h = Harness({"status": "timeout", "summary": "", "error": "timeout",
+                 "denied": [], "auto_approved": []})
+
+    await h.run(conn)
+
+    assert h.cancelled == [h.sink]
+    assert _run_row(conn, rid)["status"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_success_does_not_cancel_anything(conn):
+    tid = _mk(conn)
+    _queue(conn, tid)
+    h = Harness()
+    await h.run(conn)
+    assert h.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_failure_after_start_run_also_cancels(conn):
+    tid = _mk(conn)
+    _queue(conn, tid)
+    h = Harness(driver_raises=RuntimeError("boom"))
+    await h.run(conn)
+    assert h.cancelled == [h.sink]
+
+
+@pytest.mark.asyncio
+async def test_cancel_sink_really_cancels_the_task():
+    """The production `cancel_sink`, against a real asyncio task."""
+    async def forever():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(forever())
+    await asyncio.sleep(0)
+    sink = FakeSink(task=task)
+
+    assert await runner.cancel_sink(sink) is True
+    assert task.cancelled()
+    # A finished (or absent) task is a no-op, never a second cancel.
+    assert await runner.cancel_sink(sink) is False
+    assert await runner.cancel_sink(FakeSink()) is False
+
+
+@pytest.mark.asyncio
+async def test_finished_run_is_evicted_from_active_runs(conn):
+    """main._active_runs only ever inserts (main.py). A scheduled run has no
+    client that could reconnect, so its sink must be dropped or every run's
+    events stay resident forever."""
+    import main
+
+    tid = _mk(conn)
+    _queue(conn, tid)
+    h = Harness()
+    main._active_runs["sess-0"] = h.sink
+    other = FakeSink()
+    main._active_runs["someone-else"] = other
+    try:
+        await h.run(conn, evict=runner.evict_sink)
+        assert "sess-0" not in main._active_runs
+        assert main._active_runs["someone-else"] is other
+    finally:
+        main._active_runs.pop("sess-0", None)
+        main._active_runs.pop("someone-else", None)
+
+
+@pytest.mark.asyncio
+async def test_evict_leaves_a_foreign_sink_alone():
+    import main
+    mine, theirs = FakeSink(), FakeSink()
+    main._active_runs["sess-x"] = theirs
+    try:
+        runner.evict_sink("sess-x", mine)
+        assert main._active_runs["sess-x"] is theirs
+    finally:
+        main._active_runs.pop("sess-x", None)
+
+
+@pytest.mark.asyncio
+async def test_zero_timeout_falls_back_instead_of_expiring_instantly(conn):
+    """0 means unlimited for max_turns but would mean "already expired" for a
+    deadline — the driver would return timeout on its first check."""
+    tid = _mk(conn, timeout_seconds=1800)
+    conn.execute("UPDATE scheduled_tasks SET timeout_seconds=0 WHERE id=?", (tid,))
+    conn.commit()
+    _queue(conn, tid)
+    h = Harness()
+
+    await h.run(conn)
+    assert h.driver.run_timeout == runner.DEFAULT_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -509,6 +733,46 @@ def _run_row_first_queued(conn):
     row = conn.execute(
         "SELECT id FROM task_runs WHERE status='queued' LIMIT 1").fetchone()
     return row["id"] if row else None
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_never_exceeds_max_concurrent(conn):
+    """MAX_CONCURRENT is the whole point of the semaphore: two slow runs may
+    overlap, a third has to wait for a slot."""
+    tid = _mk(conn)
+    for _ in range(3):
+        _queue(conn, tid)
+    started, finished = [], []
+    release = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def process(conn_):
+        started.append(1)
+        await release.wait()
+        finished.append(1)
+        return True
+
+    loop_task = asyncio.create_task(
+        runner.worker_loop(conn, stop_event=stop, process=process,
+                           poll_seconds=0.01))
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if len(started) >= runner.MAX_CONCURRENT:
+                break
+        await asyncio.sleep(0.1)                 # give it every chance to overrun
+        assert len(started) == runner.MAX_CONCURRENT
+
+        release.set()                            # free both slots
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if len(started) > runner.MAX_CONCURRENT:
+                break
+        assert len(started) > runner.MAX_CONCURRENT
+    finally:
+        release.set()
+        stop.set()
+        await asyncio.wait_for(loop_task, timeout=2)
 
 
 @pytest.mark.asyncio
