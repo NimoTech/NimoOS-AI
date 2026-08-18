@@ -49,24 +49,31 @@ def normalize_url(raw: str) -> tuple[str, str]:
         return "", "url is empty"
     if len(s) > MAX_URL_LEN:
         return "", f"url too long (>{MAX_URL_LEN} characters)"
-    parts = urlsplit(s)
-    scheme = (parts.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        return "", f"unsupported url scheme {scheme or '(none)'!r} — only http/https"
-    host = (parts.hostname or "").lower()
-    if not host:
-        return "", "url has no host"
+    try:
+        parts = urlsplit(s)
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return "", f"unsupported url scheme {scheme or '(none)'!r} — only http/https"
+        host = (parts.hostname or "").lower()
+        if not host:
+            return "", "url has no host"
+        port = parts.port
+    except ValueError as exc:
+        # urlsplit()/.port raise ValueError on out-of-range ports, non-numeric
+        # ports, and broken IPv6 literals — all ordinary garbage a model can
+        # hand us from a page it just read, not something to let propagate.
+        return "", f"malformed url: {exc}"
     # Drop userinfo: credentials in a URL are never something to forward.
-    netloc = host
-    if parts.port:
-        netloc = f"{host}:{parts.port}"
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
     return urlunsplit(("https", netloc, parts.path or "/",
                        parts.query, "")), ""
 
 
 def _content_type_ok(ctype: str) -> bool:
     head = (ctype or "").split(";")[0].strip().lower()
-    return head in _OK_TYPES or head.endswith("+xml")
+    return head in _OK_TYPES
 
 
 async def _read_capped(resp: httpx.Response) -> str:
@@ -110,6 +117,12 @@ async def _fetch_once(client: httpx.AsyncClient, url: str) -> dict:
                              f"documents (PDF, Office files) use read_document "
                              f"instead"}
         return {"_body": await _read_capped(resp)}
+    except httpx.TimeoutException:
+        return {"error": f"timed out after {TIMEOUT_SEC:.0f}s fetching {url}"}
+    except httpx.HTTPError as exc:
+        # Covers a connection that stalls or drops mid-body (ReadTimeout is
+        # already caught above; RemoteProtocolError etc. land here).
+        return {"error": f"fetch failed: {exc}"}
     finally:
         await resp.aclose()
 
@@ -140,10 +153,18 @@ async def fetch_page(url: str, *, max_chars: int = 30000, client=None) -> dict:
                 target = raw["_redirect"]
                 if not target:
                     return {"error": f"redirect from {current} had no Location"}
-                if urlsplit(target).hostname != urlsplit(current).hostname:
+                # Run the redirect target through the same hygiene as the
+                # initial URL (scheme upgrade, userinfo strip, IPv6 bracket)
+                # before comparing hosts or dialing it — a redirect is not a
+                # trusted URL just because it came from a host we already
+                # confirmed.
+                norm_target, err = normalize_url(target)
+                if err:
+                    return {"error": err}
+                if urlsplit(norm_target).hostname != urlsplit(current).hostname:
                     # Hand it back; do NOT dial the new host ourselves.
-                    return {"redirect_to": target}
-                current = target
+                    return {"redirect_to": norm_target}
+                current = norm_target
                 continue
             body = raw["_body"]
             md = extract.to_markdown(body, url=current)

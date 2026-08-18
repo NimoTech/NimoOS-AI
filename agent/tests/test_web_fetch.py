@@ -141,3 +141,76 @@ async def test_proxy_unreachable_is_a_clear_error_not_a_hang():
 
     assert "error" in out
     assert "egress proxy" in out["error"]
+
+
+def test_normalize_rejects_malformed_url_without_raising():
+    for raw in ("https://x.test:99999999/a",
+                "https://x.test:abc/a",
+                "https://[::1/a"):
+        url, err = fetch.normalize_url(raw)
+        assert url == "" and err, raw
+
+
+@pytest.mark.asyncio
+async def test_max_bytes_cap_truncates_streamed_body(monkeypatch):
+    monkeypatch.setattr(fetch, "MAX_BYTES", 100)
+    body = "<html><body><p>" + ("z" * 5000) + "</p></body></html>"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html=body)
+
+    async with _client(handler) as c:
+        out = await fetch.fetch_page("https://x.test/a", client=c)
+
+    assert "content_markdown" in out
+    assert len(out["content_markdown"]) < 5000
+
+
+@pytest.mark.asyncio
+async def test_same_host_redirect_upgrades_scheme_back_to_https():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/a":
+            return httpx.Response(301, headers={"Location": "http://x.test/b"})
+        assert request.url.scheme == "https"
+        return httpx.Response(200, html="<html><body><p>landed</p></body></html>")
+
+    async with _client(handler) as c:
+        out = await fetch.fetch_page("https://x.test/a", client=c)
+
+    assert out["final_url"] == "https://x.test/b"
+    assert "landed" in out["content_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_error_responses_are_not_cached():
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    async with _client(handler) as c:
+        a = await fetch.fetch_page("https://x.test/err", client=c)
+        b = await fetch.fetch_page("https://x.test/err", client=c)
+
+    assert "error" in a and "error" in b
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_host_redirect_is_not_cached():
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(302, headers={"Location": "https://other.test/b"})
+
+    async with _client(handler) as c:
+        a = await fetch.fetch_page("https://x.test/redir", client=c)
+        b = await fetch.fetch_page("https://x.test/redir", client=c)
+
+    assert a["redirect_to"] == "https://other.test/b"
+    assert b["redirect_to"] == "https://other.test/b"
+    assert calls == 2
