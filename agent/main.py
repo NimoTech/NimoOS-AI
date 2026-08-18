@@ -925,6 +925,27 @@ async def egress_confirm(req: _EgressConfirmRequest):
     Fail-closed: any condition that prevents us from finding an active session
     or registering a confirmation returns {"allow": false}.
     """
+    # A configured search backend must not raise a card on every TOFU miss:
+    # the TTL is an hour, so an interactive user would be asked all day for a
+    # host an administrator already chose. Checked BEFORE the session lookup
+    # so an unattended run gets the same answer as an interactive one.
+    #
+    # This is not a gate bypass primitive: the sandbox can POST here (the
+    # proxy's internal-target branch reaches container loopback), but the
+    # response only carries a verdict — markConfirmed happens inside the Go
+    # proxy after it receives `true`, so there is no state here to write.
+    try:
+        from web import settings as _web_settings  # noqa: PLC0415
+        _preapproved = _web_settings.preapproved_hosts(
+            _web_settings.load(_db()))
+    except Exception:  # noqa: BLE001 — a config read must never gate egress open
+        _preapproved = set()
+    if req.host.lower() in _preapproved:
+        from audit import audit as _audit  # noqa: PLC0415
+        _audit("egress_grant", host=req.host, bytes=req.bytes,
+               reason=req.reason, decision="auto_approved_search_backend")
+        return {"allow": True}
+
     # Find an active session — P0 uses last-active heuristic
     session_id: str | None = _runner._last_active_session
     if session_id is not None and session_id not in _runner._active_sinks:
@@ -3736,6 +3757,42 @@ async def archive_note_api(note_id: str, request: Request):
 async def note_backlinks_api(note_id: str, request: Request):
     uid = _notes_uid(request)
     return {"backlinks": notes_store.get_backlinks(_db(), uid, note_id)}
+
+
+# ---------------------------------------------------------------------------
+# Web tools settings (admin-scoped at the Go layer — see
+# route/v2/admin_guard.go's AdminScopedAgentPaths). One global row: the box
+# shares one search backend because the owner pays for the key.
+# ---------------------------------------------------------------------------
+from web import settings as web_settings_mod
+
+
+class WebSettingsPayload(BaseModel):
+    backend: str = ""
+    api_key: str | None = None      # None = keep whatever is stored
+    base_url: str = ""
+    enabled: bool = False
+
+
+@app.get("/agent/web-settings")
+async def get_web_settings():
+    return web_settings_mod.public_view(web_settings_mod.load(_db()))
+
+
+@app.put("/agent/web-settings")
+async def put_web_settings(body: WebSettingsPayload):
+    if body.backend and body.backend not in web_settings_mod.VALID_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {web_settings_mod.VALID_BACKENDS}")
+    conn = _db()
+    current = web_settings_mod.load(conn)
+    # The UI never receives the key, so it cannot echo one back: an omitted
+    # api_key means "unchanged", not "clear it". Sending "" clears it.
+    api_key = current["api_key"] if body.api_key is None else body.api_key
+    web_settings_mod.save(conn, backend=body.backend, api_key=api_key,
+                          base_url=body.base_url, enabled=body.enabled)
+    return web_settings_mod.public_view(web_settings_mod.load(conn))
 
 
 if __name__ == "__main__":
