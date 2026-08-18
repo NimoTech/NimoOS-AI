@@ -97,6 +97,7 @@ class Consumer:
         self._task: asyncio.Task | None = None
         self._proc = None
         self._ready = False
+        self._saw_ready = False
         self._stopping = False
 
     @property
@@ -174,17 +175,23 @@ class Consumer:
             _LOG.warning("lark consumer: lark-cli not found at %s", lark_binding.lark_bin())
             return False
         self._proc = proc
-        reached_ready = False
+        self._saw_ready = False
         err_task = asyncio.create_task(self._watch_stderr(proc))
         try:
             while True:
-                line = await proc.stdout.readline()
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError:
+                    # asyncio's readline() reports an over-limit line as a bare
+                    # ValueError, AFTER discarding it and resyncing the buffer —
+                    # so the stream is still good. `except LimitOverrunError`
+                    # never fires, and letting this reach the generic handler
+                    # would restart the whole subscription over one bad line.
+                    _LOG.warning("lark consumer: oversized stdout line dropped")
+                    continue
                 if not line:
                     break
-                reached_ready = reached_ready or self._ready
                 self._emit(line)
-        except asyncio.LimitOverrunError:
-            _LOG.warning("lark consumer: oversized line dropped")
         except asyncio.CancelledError:
             raise
         except Exception:                # noqa: BLE001
@@ -195,16 +202,23 @@ class Consumer:
             with_rc = proc.returncode
             if with_rc is None:
                 await self._terminate_child()
-        return reached_ready or self._ready
+        return self._saw_ready
 
     async def _watch_stderr(self, proc) -> None:
         try:
             while True:
-                line = await proc.stderr.readline()
+                try:
+                    line = await proc.stderr.readline()
+                except ValueError:
+                    _LOG.warning("lark consumer: oversized stderr line dropped")
+                    continue
                 if not line:
                     return
                 text = line.decode("utf-8", "replace").rstrip()
                 if text.startswith(READY_PREFIX):
+                    # Per-run flag: `_ready` is reset in the finally below before
+                    # the return, so it cannot answer "did this run ever come up?"
+                    self._saw_ready = True
                     self._set_ready(True)
                 # lark-cli's stderr is its own diagnostic channel; keep it at
                 # debug so a healthy subscription does not spam the log.

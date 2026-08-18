@@ -229,3 +229,71 @@ async def test_stop_is_idempotent_and_survives_a_missing_cli(monkeypatch, tmp_pa
     assert c.ready is False
     await c.stop()
     await c.stop()           # second stop must be a no-op
+
+
+# ---- oversized-line handling & "ready-but-eventless" start accounting ----
+
+@pytest.mark.asyncio
+async def test_an_oversized_stdout_line_is_dropped_without_ending_the_stream(stub):
+    """One giant line must cost one line, not the whole subscription."""
+    stub("""
+        import sys, time
+        print("[event] ready event_key=k", file=sys.stderr, flush=True)
+        print("x" * 2_000_000, flush=True)
+        print('{"n": 2}', flush=True)
+        time.sleep(5)
+        """)
+    got = []
+    c = lark_cli.Consumer("1", "k", lambda ev: got.append(ev))
+    await c.start()
+    try:
+        await asyncio.sleep(1.0)
+        assert got == [{"n": 2}], "the line after the oversized one must arrive"
+        assert c.ready is True, "the subscription must still be up"
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_stderr_line_does_not_kill_readiness(stub):
+    stub("""
+        import sys, time
+        print("y" * 2_000_000, file=sys.stderr, flush=True)
+        print("[event] ready event_key=k", file=sys.stderr, flush=True)
+        time.sleep(5)
+        """)
+    c = lark_cli.Consumer("1", "k", lambda ev: None)
+    await c.start()
+    try:
+        await asyncio.sleep(1.0)
+        assert c.ready is True, "a huge stderr line must not end readiness watching"
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_ready_but_eventless_run_counts_as_started(stub):
+    """Silence is the normal state for a card-click channel: a quiet connection
+    that exits cleanly must reset the backoff, not grow it."""
+    stub("""
+        import sys
+        print("[event] ready event_key=k", file=sys.stderr, flush=True)
+        """)
+    c = lark_cli.Consumer("1", "k", lambda ev: None)
+    started = await c._run_once_streaming()          # noqa: SLF001
+    assert started is True
+    await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_reaches_ready_counts_as_failed(stub):
+    """The other half: a config failure must still back off."""
+    stub("""
+        import sys
+        print("[event] some other diagnostic", file=sys.stderr, flush=True)
+        sys.exit(2)
+        """)
+    c = lark_cli.Consumer("1", "k", lambda ev: None)
+    started = await c._run_once_streaming()          # noqa: SLF001
+    assert started is False
+    await c.stop()
