@@ -229,6 +229,13 @@ func TestNotesSettingsGateAdminPassthrough(t *testing.T) {
 // before falling through to the general /agent/* proxy wildcard. Mirrors
 // TestShellAllowlistGateRoutePrecedence's registration order.
 func TestToolboxGateRoutePrecedence(t *testing.T) {
+// TestWebSettingsRequiresAdmin proves /agent/web-settings is admin-gated
+// (governs the box-wide search provider and API key, which every user's
+// web_search then spends) before falling through to the general /agent/*
+// proxy wildcard. A non-admin request must be refused and must never reach
+// the agent proxy. Mirrors TestNotesSettingsGateRoutePrecedence's
+// registration order.
+func TestWebSettingsRequiresAdmin(t *testing.T) {
 	us := fakeUserService(t, "user") // non-admin: gate must reject with 403
 	defer us.Close()
 	dir := t.TempDir()
@@ -244,6 +251,12 @@ func TestToolboxGateRoutePrecedence(t *testing.T) {
 
 	for _, m := range []string{http.MethodGet, http.MethodPost} {
 		req := httptest.NewRequest(m, "/agent/toolbox", nil)
+	// Mirror route/v2.go registration order: gated route first, wildcard last.
+	e.Any("/agent/web-settings", proxy, AdminOnly(dir))
+	e.Any("/agent/*", proxy)
+
+	for _, m := range []string{http.MethodGet, http.MethodPut} {
+		req := httptest.NewRequest(m, "/agent/web-settings", nil)
 		req.Header.Set("Authorization", "Bearer tok")
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
@@ -388,4 +401,15 @@ func TestTasksGateAdminPassthrough(t *testing.T) {
 		require.Equalf(t, http.StatusOK, rec.Code,
 			"%s %s admin must pass through", c.method, c.path)
 	}
+}
+			"%s /agent/web-settings must hit the gated route, not the wildcard", m)
+	}
+	require.Equal(t, 0, proxied, "non-admin request must never reach the agent proxy")
+
+	// Sibling agent endpoints must fall through to the wildcard ungated.
+	req := httptest.NewRequest(http.MethodGet, "/agent/health", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, proxied)
 }
