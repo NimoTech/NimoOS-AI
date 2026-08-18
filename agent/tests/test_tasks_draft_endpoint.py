@@ -7,6 +7,7 @@
 DB 隔离照 test_tasks_endpoints.py 的既有缝:monkeypatch `main._DB_PATH`,
 绝不碰 `main._conn`(容器里那是生产库)。
 """
+import asyncio
 import json
 import sys
 import time
@@ -115,16 +116,130 @@ def test_empty_session_yields_empty_draft_not_error(client):
     assert r.json()["prompt"] == ""
 
 
+def _db_snapshot(conn):
+    """Row counts for every table plus the full contents of the two tables
+    this endpoint reads — an in-place UPDATE would not change a count."""
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()]
+    counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in tables}
+    sessions = [tuple(r) for r in conn.execute("SELECT * FROM sessions").fetchall()]
+    messages = [tuple(r) for r in conn.execute("SELECT * FROM messages").fetchall()]
+    return counts, sessions, messages
+
+
 def test_draft_writes_nothing(client):
     c, conn = client
-    _seed_session(conn, "s1", "u1", [{"role": "user", "content": "hi"}])
-    before = conn.execute("SELECT COUNT(*) FROM scheduled_tasks").fetchone()[0]
-    c.post("/agent/tasks/draft-from-session", json={"session_id": "s1"}, headers=H)
-    after = conn.execute("SELECT COUNT(*) FROM scheduled_tasks").fetchone()[0]
-    assert before == after == 0
+    _seed_session(conn, "s1", "u1", [
+        {"role": "user", "content": "hi"},
+        {"type": "function_call", "name": "run_command",
+         "arguments": '{"command": "gh pr list"}'},
+    ])
+    before = _db_snapshot(conn)
+    r = c.post("/agent/tasks/draft-from-session", json={"session_id": "s1"}, headers=H)
+    assert r.status_code == 200
+    assert _db_snapshot(conn) == before
 
 
 def test_bad_body_400(client):
     c, _ = client
     r = c.post("/agent/tasks/draft-from-session", json={}, headers=H)
+    assert r.status_code == 400
+
+
+class _Msg:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Choice:
+    def __init__(self, content):
+        self.message = _Msg(content)
+
+
+class _Resp:
+    def __init__(self, content):
+        self.choices = [_Choice(content)]
+
+
+def _patch_model(monkeypatch, behavior):
+    """Swap main.AsyncOpenAI for a stub whose completions.create runs `behavior`
+    (which returns a _Resp or raises)."""
+    class _Completions:
+        async def create(self, **kwargs):
+            return behavior(**kwargs)
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self.chat = _Chat()
+
+    monkeypatch.setattr(main, "AsyncOpenAI", _Client)
+
+
+def test_model_draft_wins_when_the_model_answers(client, monkeypatch):
+    c, conn = client
+    _seed_session(conn, "s1", "u1", [{"role": "user", "content": "拉数据"}])
+    _patch_model(monkeypatch,
+                 lambda **kw: _Resp('{"name": "汇总", "prompt": "每天拉数据并汇总"}'))
+    body = c.post("/agent/tasks/draft-from-session",
+                  json={"session_id": "s1", "model": "m"}, headers=H).json()
+    assert body["prompt_fallback"] is False
+    assert body["name"] == "汇总"
+    assert body["prompt"] == "每天拉数据并汇总"
+
+
+def test_unusable_model_output_falls_back(client, monkeypatch):
+    c, conn = client
+    _seed_session(conn, "s1", "u1", [{"role": "user", "content": "拉数据"}])
+    _patch_model(monkeypatch, lambda **kw: _Resp("not json at all"))
+    body = c.post("/agent/tasks/draft-from-session",
+                  json={"session_id": "s1", "model": "m"}, headers=H).json()
+    assert body["prompt_fallback"] is True
+    assert body["prompt"] == "拉数据"
+
+
+def test_model_exception_is_not_a_500(client, monkeypatch):
+    def _boom(**kwargs):
+        raise RuntimeError("upstream down")
+    c, conn = client
+    _seed_session(conn, "s1", "u1", [{"role": "user", "content": "拉数据"}])
+    _patch_model(monkeypatch, _boom)
+    r = c.post("/agent/tasks/draft-from-session",
+               json={"session_id": "s1", "model": "m"}, headers=H)
+    assert r.status_code == 200
+    assert r.json()["prompt_fallback"] is True
+
+
+def test_model_timeout_falls_back(client, monkeypatch):
+    def _slow(**kwargs):
+        raise asyncio.TimeoutError()
+    c, conn = client
+    _seed_session(conn, "s1", "u1", [{"role": "user", "content": "拉数据"}])
+    _patch_model(monkeypatch, _slow)
+    r = c.post("/agent/tasks/draft-from-session",
+               json={"session_id": "s1", "model": "m"}, headers=H)
+    assert r.status_code == 200
+    assert r.json()["prompt_fallback"] is True
+
+
+def test_non_dict_history_items_do_not_crash_the_model_branch(client, monkeypatch):
+    # 回归用例:history 是数据库里的不可信 JSON。一串非 dict 元素曾让摘要
+    # 抽取抛 AttributeError,变成 500 而不是文档承诺的兜底。
+    c, conn = client
+    _seed_session(conn, "s1", "u1", ["just a plain string", 42])
+    _patch_model(monkeypatch, lambda **kw: _Resp('{"name":"n","prompt":"p"}'))
+    r = c.post("/agent/tasks/draft-from-session",
+               json={"session_id": "s1", "model": "m"}, headers=H)
+    assert r.status_code == 200
+    assert r.json()["prompt_fallback"] is True
+
+
+def test_malformed_json_body_is_400_not_500(client):
+    c, _ = client
+    r = c.post("/agent/tasks/draft-from-session", data="{not json",
+               headers={**H, "Content-Type": "application/json"})
     assert r.status_code == 400

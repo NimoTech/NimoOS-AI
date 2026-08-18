@@ -2880,7 +2880,7 @@ async def tasks_draft_from_session(
     """
     from tasks import draft as _draft
 
-    body = await request.json()
+    body = await _task_body(request)
     if not isinstance(body, dict):
         raise HTTPException(400, "bad_body")
     session_id = (body.get("session_id") or "").strip()
@@ -2922,8 +2922,13 @@ async def tasks_draft_from_session(
             servers = await fetch_mcp_servers(x_agent_mcp_ticket)
             if isinstance(servers, list):
                 for s in servers:
-                    if isinstance(s, dict) and s.get("id") and s.get("name"):
+                    if not isinstance(s, dict) or not s.get("id") or not s.get("name"):
+                        continue
+                    try:
                         mcp_id_by_slug[_slug(s["name"])] = str(s["id"])
+                    except Exception:
+                        # 一条畸形条目不该让其余服务器的建议一起消失
+                        continue
         except Exception:
             _LOG.exception("draft-from-session: MCP server list unavailable; "
                            "MCP tools will not be suggested")
@@ -2936,9 +2941,13 @@ async def tasks_draft_from_session(
 
     model = (body.get("model") or "").strip()
     if model and history:
-        excerpt = title_gen.extract_history_excerpt(history)
-        if excerpt:
-            try:
+        try:
+            # `history` is untrusted JSON out of the DB and
+            # extract_history_excerpt assumes every item is a dict, so it
+            # belongs INSIDE the guard: a malformed history must degrade to
+            # the fallback draft, never to a 500.
+            excerpt = title_gen.extract_history_excerpt(history)
+            if excerpt:
                 client = AsyncOpenAI(base_url=x_agent_provider_url,
                                      api_key=x_agent_provider_key)
                 resp = await asyncio.wait_for(
@@ -2962,11 +2971,11 @@ async def tasks_draft_from_session(
                 if parsed:
                     name, prompt = parsed
                     fallback = False
-            except (asyncio.TimeoutError, Exception):
-                # Never fail the request over the model: a fallback draft the
-                # user edits by hand still beats an error dialog.
-                _LOG.exception("draft-from-session: model unavailable; "
-                               "falling back to raw user messages")
+        except (asyncio.TimeoutError, Exception):
+            # Never fail the request over the model: a fallback draft the
+            # user edits by hand still beats an error dialog.
+            _LOG.exception("draft-from-session: model unavailable; "
+                           "falling back to raw user messages")
 
     return {
         "name": name,
