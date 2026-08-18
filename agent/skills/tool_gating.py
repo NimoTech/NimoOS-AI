@@ -149,14 +149,16 @@ def expand_categories(categories: list[str]) -> str:
     lines = [f"Unlocked: {', '.join(categories)}. The following tools are now available:"]
     for c in static_categories:
         for t in _reg.CATEGORY_TOOLS[c]:
-            if c == "mcp":
-                # label the admin tool and terminate with ";" so it reads as
-                # one line among peers, not as the sole tool that "owns" the
-                # server tool lists rendered below (doubao misread that layout
-                # and kept calling the register tool instead of mcp__* tools)
-                lines.append(f"System tool: {_name(t)};")
-            else:
-                lines.append(f"- {_name(t)}")
+            # Every callable tool is one bullet, "mcp" included. The admin tool
+            # used to be rendered as an unbulleted 'System tool: add_mcp_server;'
+            # to set it apart from the server lines below; that reading was
+            # wrong twice over — it made the ONE tool that is genuinely in the
+            # tool list look like a special annotation rather than a callable,
+            # and the unbulleted server lines below it then read as its
+            # sub-items (the exact layout confusion the label was meant to
+            # prevent). One flat bulleted list, server lines bulleted too
+            # (mcp_client.status.render_expand_section), is unambiguous.
+            lines.append(f"- {_name(t)}")
         if c == "mcp":
             lines.extend(_mcp_runtime_lines())
 

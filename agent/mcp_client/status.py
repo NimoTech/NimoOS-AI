@@ -76,8 +76,8 @@ def _short(text, max_len: int = _DETAIL_MAX) -> str:
     text (`detail`, `summary`, `instructions`) before it reaches the model:
     without the whitespace collapse, an embedded newline in e.g. `summary`
     can make one server's L1 entry visually split into what looks like a
-    second, independently parseable "MCP server ..." line — see the
-    trailing-";" boundary convention in render_expand_section, which this
+    second, independently parseable "MCP server ..." line — see the leading
+    "- " / trailing-";" row convention in render_expand_section, which this
     normalization protects.
     """
     d = " ".join(str(text or "").split())
@@ -207,7 +207,7 @@ def render_expand_section(snapshot) -> list[str]:
             # limitation) -- just state the observed fact and stop there, with
             # no "expand as:" hint.
             summary_part = f" — {_short(s.summary)}" if s.summary else ""
-            lines.append(f'MCP server "{label}": connected, but published no tools{summary_part}.')
+            lines.append(f'- MCP server "{label}": connected, but published no tools{summary_part}.')
         elif s.status == OK:
             # list EVERY tool — an elided "… (40 total)" left the model unable
             # to see (and thus call) the hidden names, so it drifted to other tools
@@ -239,10 +239,13 @@ def render_expand_section(snapshot) -> list[str]:
                                " loads them;" if token
                                else " NOT callable yet, and no expand token is"
                                     " available for this server;")
-            # trailing ";" terminates this server's tool list — without it,
-            # weaker models read the unbulleted server lines as sub-items of
-            # the preceding tool instead of parallel lists of callable tools
-            lines.append(f'MCP server "{label}" ({len(s.tool_names)} tools){summary_part}: '
+            # trailing ";" separates this server's tool list from the
+            # callability hint that follows it, so the hint can't be misread as
+            # one more tool name. The line boundary itself is carried by the
+            # leading "- " (every row in expand_tools(["mcp"])'s answer is a
+            # bullet at the same level); before that, weaker models read the
+            # unbulleted server lines as sub-items of the preceding tool.
+            lines.append(f'- MCP server "{label}" ({len(s.tool_names)} tools){summary_part}: '
                          f'{listed};{expand_hint}')
         elif s.status == WARMING:
             # "its tools should appear on a later message" read to the model as
@@ -254,7 +257,7 @@ def render_expand_section(snapshot) -> list[str]:
             # (route/v2/mcp.go's TTL self-check) — so the only useful thing the
             # model can do is stop and hand the turn back to the user. Say that
             # explicitly, and never imply a retry could help.
-            lines.append(f'MCP server "{label}": still connecting in the background, '
+            lines.append(f'- MCP server "{label}": still connecting in the background, '
                          "so its tools cannot be loaded yet. Retrying expand_tools in "
                          "THIS turn cannot change that — tell the user it is still "
                          "connecting and to ask again in a moment, then stop.")
@@ -262,7 +265,7 @@ def render_expand_section(snapshot) -> list[str]:
             degraded = True
             kind = ("configuration error" if s.status == CONFIG_ERROR
                     else "failed to load")
-            line = f'MCP server "{label}": {kind} ({_short(s.detail)})'
+            line = f'- MCP server "{label}": {kind} ({_short(s.detail)})'
             if s.tool_names:
                 # A broken server is shown, not hidden: knowing "this server
                 # exists and offers create_issue/list_prs, but is currently
