@@ -3760,9 +3760,14 @@ async def note_backlinks_api(note_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Web tools settings (admin-scoped at the Go layer — see
-# route/v2/admin_guard.go's AdminScopedAgentPaths). One global row: the box
-# shares one search backend because the owner pays for the key.
+# Web tools settings. One global row: the box shares one search backend
+# because the owner pays for the key.
+#
+# Admin gating lives in the Go layer as an explicit per-route pair in
+# route/v2.go — `g.Any("/agent/web-settings", agent.Proxy,
+# v2.AdminOnly(runtimePath))`, registered ahead of the /agent/* wildcard,
+# same shape as /agent/notes/settings. Until that line exists this endpoint
+# is reachable by any authenticated user, so it must not ship without it.
 # ---------------------------------------------------------------------------
 from web import settings as web_settings_mod
 

@@ -43,6 +43,17 @@ def test_put_without_api_key_keeps_the_stored_one(client):
     assert web_settings.load(main_mod._db())["api_key"] == "tvly-secret"
 
 
+def test_put_with_explicit_empty_api_key_clears_the_stored_one(client):
+    client.put("/agent/web-settings", json={
+        "backend": "tavily", "api_key": "tvly-secret",
+        "base_url": "", "enabled": True})
+    r = client.put("/agent/web-settings", json={
+        "backend": "tavily", "api_key": "", "base_url": "", "enabled": True})
+    assert r.status_code == 200
+    assert r.json()["has_key"] is False
+    assert web_settings.load(main_mod._db())["api_key"] == ""
+
+
 def test_put_rejects_unknown_backend(client):
     r = client.put("/agent/web-settings", json={
         "backend": "nope", "base_url": "", "enabled": True})
