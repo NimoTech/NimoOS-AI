@@ -142,11 +142,21 @@ def test_web_search_is_skipped_when_unconfigured(monkeypatch):
 
 
 def test_web_search_available_reflects_config_and_never_raises(monkeypatch):
+    import sys
+
     import agent as agent_mod
     from web import settings as web_settings
 
     conn = db_module.init_db(":memory:")
-    monkeypatch.setattr(db_module, "get_connection", lambda: conn)
+    # _web_search_available() does `import db as _dbmod` INSIDE its own body,
+    # which resolves against whatever sys.modules["db"] is at call time — not
+    # whatever object this file's top-level `import db as db_module` bound at
+    # collection time. Some other test module (test_egress_confirm_route.py)
+    # swaps sys.modules["db"] for a fresh object and never restores it, so
+    # patching the file-top alias would silently miss that swap when this
+    # test runs after it. Patch the live, currently-registered module object
+    # instead, matching how the function itself resolves it.
+    monkeypatch.setattr(sys.modules["db"], "get_connection", lambda *a, **k: conn)
 
     # unconfigured: no web_search row in user_settings yet.
     assert agent_mod._web_search_available() is False
@@ -156,9 +166,11 @@ def test_web_search_available_reflects_config_and_never_raises(monkeypatch):
                       base_url="", enabled=True)
     assert agent_mod._web_search_available() is True
 
-    # a raising config read must degrade to False, never propagate.
+    # a raising config read must degrade to False, never propagate. Same
+    # module-identity caution as above, even though nothing currently swaps
+    # sys.modules["web.settings"] out from under us.
     def _boom(_conn):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(web_settings, "load", _boom)
+    monkeypatch.setattr(sys.modules["web.settings"], "load", _boom)
     assert agent_mod._web_search_available() is False
