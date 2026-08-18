@@ -11,7 +11,10 @@ or False (not requested).
 
 No method raises: every failure becomes SearchResult.error, because a
 search that cannot run must degrade into a message the model can read, not
-an exception that kills the run.
+an exception that kills the run. This also covers a 200 response whose body
+parses as JSON but has the wrong shape (top-level list, non-dict hit
+entries, etc.) — see _hits_at, which degrades those to fewer/no hits
+instead of raising AttributeError.
 """
 from __future__ import annotations
 
@@ -56,6 +59,28 @@ def _site_prefix(query: str, domains) -> str:
     return f"({clause}) {query}"
 
 
+def _hits_at(doc, *keys) -> list[dict]:
+    """Walk *doc* through nested dict *keys* and return the dict entries of
+    the list found there.
+
+    A 200 response with a parseable-but-wrong-shaped body (top level is a
+    list instead of an object, a hit entry is a string instead of a dict,
+    etc.) must not raise — it degrades to fewer/no hits instead, same as any
+    other failure. Every level of the walk is guarded: a non-dict container
+    at any key, a missing key, or a non-list terminal all yield [];
+    non-dict entries inside the terminal list are skipped rather than
+    raised on.
+    """
+    node = doc
+    for key in keys:
+        if not isinstance(node, dict):
+            return []
+        node = node.get(key)
+    if not isinstance(node, list):
+        return []
+    return [x for x in node if isinstance(x, dict)]
+
+
 class TavilyBackend:
     name = "tavily"
 
@@ -85,7 +110,7 @@ class TavilyBackend:
                       url=str(x.get("url") or ""),
                       snippet=str(x.get("content") or ""),
                       published=str(x.get("published_date") or ""))
-            for x in (doc.get("results") or [])
+            for x in _hits_at(doc, "results")
         ][:max_results]
         return SearchResult(hits=hits, applied={
             "days": "native" if days is not None else False,
@@ -121,7 +146,7 @@ class BraveBackend:
                       url=str(x.get("url") or ""),
                       snippet=str(x.get("description") or ""),
                       published=str(x.get("age") or ""))
-            for x in ((doc.get("web") or {}).get("results") or [])
+            for x in _hits_at(doc, "web", "results")
         ][:max_results]
         return SearchResult(hits=hits, applied={
             "days": "approx" if days is not None else False,
@@ -152,7 +177,7 @@ class SearxngBackend:
                       url=str(x.get("url") or ""),
                       snippet=str(x.get("content") or ""),
                       published=str(x.get("publishedDate") or ""))
-            for x in (doc.get("results") or [])
+            for x in _hits_at(doc, "results")
         ][:max_results]
         return SearchResult(hits=hits, applied={
             "days": "approx" if days is not None else False,

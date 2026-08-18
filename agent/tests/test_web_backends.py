@@ -73,13 +73,66 @@ async def test_searxng_requests_json_and_truncates_to_max_results():
 
     b = backends.SearxngBackend(base_url="http://searx.lan:8080/")
     async with _client(handler) as c:
-        r = await b.search(c, "q", max_results=2, days=40, domains=None)
+        r = await b.search(c, "q", max_results=2, days=40, domains=["s.test"])
 
     assert seen["path"] == "/search"
     assert seen["params"]["format"] == "json"
     assert seen["params"]["time_range"] == "year"   # 40 days → first bucket that covers it is "year"
+    assert seen["params"]["q"] == "(site:s.test) q"
     assert len(r.hits) == 2
-    assert r.applied == {"days": "approx", "domains": False}
+    assert r.applied == {"days": "approx", "domains": "query"}
+
+
+@pytest.mark.asyncio
+async def test_tavily_top_level_list_yields_no_hits_not_exception():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    b = backends.TavilyBackend(api_key="k")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert r.hits == []
+    assert r.error == ""
+
+
+@pytest.mark.asyncio
+async def test_tavily_skips_non_dict_hit_entries():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [
+            "not-a-dict", {"title": "T", "url": "https://a.test/1"}]})
+
+    b = backends.TavilyBackend(api_key="k")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert [h.url for h in r.hits] == ["https://a.test/1"]
+
+
+@pytest.mark.asyncio
+async def test_brave_top_level_list_yields_no_hits_not_exception():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    b = backends.BraveBackend(api_key="k")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert r.hits == []
+    assert r.error == ""
+
+
+@pytest.mark.asyncio
+async def test_searxng_top_level_list_yields_no_hits_not_exception():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    b = backends.SearxngBackend(base_url="http://searx.lan:8080/")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert r.hits == []
+    assert r.error == ""
 
 
 @pytest.mark.asyncio
@@ -116,4 +169,20 @@ def test_build_backend_picks_by_config_and_returns_none_when_unconfigured():
          "base_url": "http://searx.lan:8080"}).name == "searxng"
     assert backends.build_backend(
         {"backend": "tavily", "api_key": "", "base_url": "", "enabled": True}
+    ) is None
+    # disabled, otherwise-complete config
+    assert backends.build_backend(
+        {"backend": "tavily", "api_key": "k", "base_url": "", "enabled": False}
+    ) is None
+    # unknown backend string
+    assert backends.build_backend(
+        {"backend": "duckduckgo", "api_key": "k", "base_url": "", "enabled": True}
+    ) is None
+    # brave with empty api_key
+    assert backends.build_backend(
+        {"backend": "brave", "api_key": "", "base_url": "", "enabled": True}
+    ) is None
+    # searxng with empty base_url
+    assert backends.build_backend(
+        {"backend": "searxng", "api_key": "", "base_url": "", "enabled": True}
     ) is None
