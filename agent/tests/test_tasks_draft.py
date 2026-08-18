@@ -4,6 +4,7 @@
 这里的每条断言都在守一个授权边界:前缀越短权限越大,所以归一化宁可
 多留 token 也不能少留;egress 是从命令文本猜的,所以永远不进 preauth。
 """
+import json
 import sys
 import pathlib
 
@@ -43,19 +44,76 @@ def test_prefix_of_path_invoked_script_keeps_its_subcommand():
             == "/DATA/scripts/deploy.sh production")
 
 
-def test_prefix_stays_a_literal_prefix_of_the_command():
-    cmd = 'lark-cli base "record two" create'
+def test_prefix_gives_up_on_quoted_commands():
+    # 引号一出现,token 就没法映回原文位置。旧实现在这里拼一个 shlex 前缀再
+    # 逐个回退,回退是**放宽**,`lark-cli base` 会授权从未跑过的
+    # `lark-cli base record twofold-delete-everything`。宁可不给建议。
+    for cmd in ['lark-cli base "record two" create',
+                "lark-cli base 'record two' create",
+                '"gh" pr list',
+                "echo 'unbalanced"]:
+        assert draft.normalize_prefix(cmd) is None, cmd
+
+
+def test_prefix_gives_up_on_backslashes():
+    assert draft.normalize_prefix("ls /DATA/a\\ b") is None
+    assert draft.normalize_prefix("gh pr\\ list") is None
+
+
+def test_prefix_preserves_repeated_whitespace_instead_of_widening():
+    # 回归:曾经退化成 'gh',而 `gh` 会把 `gh repo delete --yes` /
+    # `gh auth token` 一并授权给无人值守的运行。
+    cmd = "gh  pr  list --limit 5"
     p = draft.normalize_prefix(cmd)
-    assert p == "lark-cli base"
+    assert p == "gh  pr  list"
+    assert cmd.startswith(p)
+
+    cmd = "docker  compose  up -d"
+    p = draft.normalize_prefix(cmd)
+    assert p == "docker  compose  up"
+    assert cmd.startswith(p)
+
+    cmd = "sudo  systemctl  restart x"
+    p = draft.normalize_prefix(cmd)
+    assert p == "sudo  systemctl  restart"
     assert cmd.startswith(p)
 
 
-def test_prefix_retreats_on_repeated_whitespace():
-    assert draft.normalize_prefix("gh  pr  list") == "gh"
+def test_prefix_preserves_tabs_between_tokens():
+    cmd = "gh\tpr\t list --limit 5"
+    p = draft.normalize_prefix(cmd)
+    assert p == "gh\tpr\t list"
+    assert cmd.startswith(p)
 
 
-def test_prefix_gives_up_when_the_command_starts_with_a_quote():
-    assert draft.normalize_prefix('"gh" pr list') is None
+def test_prefix_is_always_a_literal_prefix_of_the_command():
+    """全模块不变式:任何非 None 的建议都必须能 startswith 回原命令。"""
+    commands = [
+        "lark-cli base record create --app x",
+        "gh pr list --limit 5",
+        "date -u",
+        "curl https://a.com",
+        "cat /DATA/x.txt",
+        "env FOO=1 bar",
+        "/usr/bin/tool",
+        "/usr/bin/env foo",
+        "/DATA/scripts/deploy.sh production",
+        "gh  pr  list --limit 5",
+        "docker  compose  up -d",
+        "gh\tpr\t list",
+        "date",
+        "a && b", "a | b", "a; b", 'x "y"', "z\\ w", "   ",
+    ]
+    for cmd in commands:
+        p = draft.normalize_prefix(cmd)
+        if p is not None:
+            assert cmd.startswith(p), (cmd, p)
+
+
+def test_literal_prefix_helper():
+    assert draft._literal_prefix("gh  pr  list", 2) == "gh  pr"
+    assert draft._literal_prefix("  gh pr", 1) == "  gh"
+    assert draft._literal_prefix("gh pr", 5) is None
 
 
 def test_prefix_rejects_compound_commands():
@@ -188,14 +246,103 @@ def test_scan_survives_unserializable_dict_arguments():
 
 
 def test_scan_covers_all_write_tools():
+    # 参数名以 agent/skills/filesystem.py 的真实签名为准:
+    # write_file/edit_file/delete_path/mkdir 用 `path`,rename 用 `src`/`dst`,
+    # batch_fs 的 RenameOp 才是 `path`/`dst`。
     history = [
+        _call("write_file", '{"path": "/DATA/w/x.md", "content": "x"}'),
         _call("edit_file", '{"path": "/DATA/a/x.md"}'),
+        _call("delete_path", '{"path": "/DATA/z/x.md"}'),
         _call("mkdir", '{"path": "/DATA/b/new"}'),
-        _call("rename", '{"path": "/DATA/c/x", "dst": "/DATA/d/y"}'),
-        _call("batch_fs", '{"operations": [{"op": "mkdir", "path": "/DATA/e/f"}]}'),
+        _call("rename", '{"src": "/DATA/c/x", "dst": "/DATA/d/y"}'),
+        _call("batch_fs", '{"operations": ['
+                          '{"op": "mkdir", "path": "/DATA/e/f"},'
+                          '{"op": "rename", "path": "/DATA/g/x", "dst": "/DATA/h/y"}]}'),
     ]
     out = draft.scan_history(history, mcp_id_by_slug={})
-    assert out["preauth"]["fs_write"] == ["/DATA/a", "/DATA/b", "/DATA/c", "/DATA/d", "/DATA/e"]
+    assert out["preauth"]["fs_write"] == [
+        "/DATA/w", "/DATA/a", "/DATA/z",
+        "/DATA/b/new",            # mkdir 授权的是它建的那个目录本身
+        "/DATA/c", "/DATA/d",     # rename 的真实参数是 src/dst
+        "/DATA/e/f", "/DATA/g", "/DATA/h",
+    ]
+
+
+def test_scan_covers_rename_in_both_shapes():
+    """standalone rename 用 src,batch_fs 的 RenameOp 用 path —— 两种都要覆盖到,
+    否则一次移动只授权了目的地,任务首跑卡在源目录的写确认上。"""
+    out = draft.scan_history(
+        [_call("rename", '{"src": "/DATA/from/x", "dst": "/DATA/to/y"}')],
+        mcp_id_by_slug={})
+    assert out["preauth"]["fs_write"] == ["/DATA/from", "/DATA/to"]
+
+    out = draft.scan_history(
+        [_call("batch_fs", '{"operations": [{"op": "rename", '
+                           '"path": "/DATA/from/x", "dst": "/DATA/to/y"}]}')],
+        mcp_id_by_slug={})
+    assert out["preauth"]["fs_write"] == ["/DATA/from", "/DATA/to"]
+
+
+def test_mkdir_suggests_the_created_directory_not_its_parent():
+    out = draft.scan_history([_call("mkdir", '{"path": "/DATA/reports"}')],
+                             mcp_id_by_slug={})
+    # 父目录会是 /DATA —— 一次 mkdir 换整块用户盘(含 .system_data)。
+    assert out["preauth"]["fs_write"] == ["/DATA/reports"]
+    assert out["evidence"]["fs_write:/DATA/reports"] == "mkdir: /DATA/reports"
+
+
+def test_scan_drops_system_disk_root_and_says_so():
+    out = draft.scan_history([_call("write_file", '{"path": "/DATA/x.md"}')],
+                             mcp_id_by_slug={})
+    assert out["preauth"]["fs_write"] == []
+    assert "write_file: /DATA/x.md" in out["evidence"]["dropped"]
+
+
+def test_scan_drops_denied_system_roots():
+    history = [
+        _call("write_file", '{"path": "/etc/passwd"}'),
+        _call("mkdir", '{"path": "/"}'),
+        _call("edit_file", '{"path": "/var/lib/nimoos/db/x"}'),
+    ]
+    out = draft.scan_history(history, mcp_id_by_slug={})
+    assert out["preauth"]["fs_write"] == []
+    assert len(out["evidence"]["dropped"]) == 3
+
+
+def test_fs_root_rejected_matches_the_driver():
+    from tasks import driver
+    # 单一真相源:两者对系统目录的判定必须一致。
+    for root in ("/", "/etc", "/etc/nginx", "/usr", "/var/lib/nimoos"):
+        assert driver.fs_root_denied(root) is True
+        assert draft.fs_root_rejected(root) is True
+    assert driver.fs_root_denied("/DATA") is False
+    assert draft.fs_root_rejected("/DATA") is True      # 额外一层
+    assert draft.fs_root_rejected("/DATA/reports") is False
+
+
+def test_scan_records_provenance_for_suggested_hosts():
+    history = [
+        _call("run_command", '{"command": "curl https://open.feishu.cn/api"}'),
+        _call("write_note", '{"body": "see https://evil.example.com for more"}'),
+    ]
+    out = draft.scan_history(history, mcp_id_by_slug={})
+    assert out["suggested_egress"] == ["open.feishu.cn", "evil.example.com"]
+    # 命令来源:证据就是命令本身。
+    assert (out["evidence"]["suggested_egress:open.feishu.cn"]
+            == "curl https://open.feishu.cn/api")
+    # 非 shell 来源:证据点名工具,用户才分得清"跑过"和"只是被写进正文"。
+    other = out["evidence"]["suggested_egress:evil.example.com"]
+    assert other.startswith("write_note: ")
+    assert "evil.example.com" in other
+
+
+def test_suggested_host_evidence_is_short():
+    long_body = "https://a.com " + "x" * 500
+    out = draft.scan_history(
+        [_call("write_note", json.dumps({"body": long_body}))],
+        mcp_id_by_slug={})
+    ev = out["evidence"]["suggested_egress:a.com"]
+    assert len(ev) <= len("write_note: ") + draft.EVIDENCE_MAX_CHARS
 
 
 # ---- 兜底与 LLM 输出解析 -------------------------------------------------
