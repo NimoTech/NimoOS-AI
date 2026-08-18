@@ -93,6 +93,44 @@ func (h *AgentHandler) Health(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// WebhookTriggerRoute is the task webhook's route pattern, relative to the API
+// mount point. It is registered as its own route rather than being served by
+// the /agent/* wildcard, because the JWT skipper keys off echo's MATCHED route
+// pattern: only a request echo routed HERE skips authentication, so an encoded
+// or traversed spelling lands on the wildcard instead and still needs a JWT.
+const WebhookTriggerRoute = "/agent/task-webhook/:token"
+
+// IsWebhookTriggerPattern reports whether an echo route pattern is the webhook
+// trigger — i.e. whether this request may skip the JWT middleware.
+//
+// It takes the pattern, never a URL. Matching a URL here would reopen exactly
+// the split that AdminPathGuard exists to close: a caller could spell the path
+// so that this predicate says "skip auth" while echo routes the request
+// somewhere else entirely.
+func IsWebhookTriggerPattern(routePattern string) bool {
+	return routePattern == common.V2APIPath+WebhookTriggerRoute
+}
+
+// ProxyAnonymous forwards a request that carries no authenticated identity.
+//
+// Only the webhook trigger uses it. Proxy() trusts X-NimoOS-User-ID because the
+// JWT middleware has just overwritten it; on this route nothing does, so a
+// caller could otherwise name whichever user they liked and have the agent act
+// as them. Deleting the identity headers before forwarding is what keeps the
+// task's own token the only thing that decides whose task runs.
+func (h *AgentHandler) ProxyAnonymous(c echo.Context) error {
+	if !h.available.Load() {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "nimoos-agent is not available")
+	}
+	r := c.Request()
+	r.Header.Del("X-NimoOS-User-ID")
+	r.Header.Del("X-NimoOS-User-Name")
+	r.Header.Del("X-User-Id")
+	r.Header.Del("X-User-Name")
+	h.proxy.ServeHTTP(c.Response().Writer, r)
+	return nil
+}
+
 // Proxy forwards requests to the Python agent service.
 func (h *AgentHandler) Proxy(c echo.Context) error {
 	userID := c.Request().Header.Get("X-NimoOS-User-ID")

@@ -3038,6 +3038,50 @@ async def tasks_run_now(task_id: str,
     return JSONResponse({"run_id": run_id}, status_code=202)
 
 
+@app.post("/agent/tasks/{task_id}/webhook-token/reset")
+async def tasks_reset_webhook_token(task_id: str,
+                                    x_user_id: str = Header(..., alias="X-User-Id")):
+    """Issue a fresh webhook token, invalidating the old one immediately."""
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    token = _store.reset_webhook_token(_db(), task_id, x_user_id)
+    if not token:
+        raise HTTPException(404, "not_found")
+    return {"webhook_token": token}
+
+
+# The webhook trigger. This is the ONE agent endpoint with no JWT: the Go layer
+# skips authentication for its route and strips every identity header, so the
+# task's own token is the entire credential and the owner comes from the task
+# row — never from the request.
+#
+# Deliberately NOT under /agent/tasks/: that whole subtree is admin-scoped
+# (route/v2/admin_guard.go), which would demand an admin JWT and defeat the
+# point. A sibling path needs no exception carved into the admin gate.
+#
+# The request body is not read at all. Phase one accepts no parameters (spec
+# §9): anything a caller could inject would reach the model as instructions.
+@app.post("/agent/task-webhook/{token}")
+async def task_webhook_trigger(token: str):
+    from tasks import store as _store
+    from tasks.webhook import RATE_LIMITER
+
+    task = _store.get_task_by_webhook_token(_db(), token)
+    # Unknown token is absent, not forbidden — the same rule the rest of this
+    # API follows, and here it also avoids confirming that a token was close.
+    if task is None:
+        raise HTTPException(404, "not_found")
+    # `run now` works on a disabled task on purpose (that is how a human tests
+    # one). A webhook fires unattended, so disabled has to mean disabled.
+    if not task["enabled"]:
+        raise HTTPException(409, "task_disabled")
+    if not RATE_LIMITER.allow(task["id"]):
+        raise HTTPException(429, "rate_limited")
+
+    run_id = _store.create_run(_db(), task["id"], task["user_id"], "webhook")
+    return JSONResponse({"run_id": run_id}, status_code=202)
+
+
 @app.get("/agent/tasks/{task_id}/runs")
 async def tasks_runs(task_id: str, limit: int = 50,
                      x_user_id: str = Header(..., alias="X-User-Id")):

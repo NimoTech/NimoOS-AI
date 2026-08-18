@@ -55,6 +55,13 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 			if p == common.V2APIPath+"/version" {
 				return true
 			}
+			// The task webhook: credential is the task's own token, checked in
+			// Python. Keyed on the MATCHED route pattern, so an encoded or
+			// traversed spelling routes to /agent/* instead and still needs a
+			// JWT — the skip cannot be reached by spelling the URL differently.
+			if v2.IsWebhookTriggerPattern(p) {
+				return true
+			}
 			return v2.MCPDataPath(p) // /v1/ai/mcp[, /*] — token-authed in Python
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
@@ -201,6 +208,12 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 		g.Any(p, agent.Proxy, v2.AdminOnly(runtimePath))
 		g.Any(p+"/*", agent.Proxy, v2.AdminOnly(runtimePath))
 	}
+	// The task webhook trigger (M3). Registered ahead of the wildcard as its
+	// own POST route so echo's matched pattern — which is what the JWT skipper
+	// keys off — identifies it exactly. Unauthenticated by design: the task's
+	// webhook_token is the whole credential, and ProxyAnonymous strips every
+	// identity header so a caller cannot name the user whose task runs.
+	g.POST(v2.WebhookTriggerRoute, agent.ProxyAnonymous)
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})

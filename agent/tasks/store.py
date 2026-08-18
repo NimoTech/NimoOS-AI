@@ -95,6 +95,33 @@ def get_task(conn, task_id: str, user_id: str):
     ).fetchone()
 
 
+def get_task_by_webhook_token(conn, token: str):
+    """Look a task up by its webhook token — the ONLY lookup with no user_id.
+
+    The webhook endpoint has no authenticated caller: the token *is* the
+    credential, and the owner is whatever this row says. Every other read here
+    is scoped by user_id on purpose; this one cannot be, so the caller must
+    treat the returned row's `user_id` as authoritative and never take an
+    identity from the request.
+    """
+    if not token:
+        return None
+    return conn.execute(
+        "SELECT * FROM scheduled_tasks WHERE webhook_token=?", (token,),
+    ).fetchone()
+
+
+def reset_webhook_token(conn, task_id: str, user_id: str) -> str:
+    """Issue a fresh token, invalidating the old one. '' if not this user's."""
+    token = secrets.token_hex(16)
+    cur = conn.execute(
+        "UPDATE scheduled_tasks SET webhook_token=? WHERE id=? AND user_id=?",
+        (token, task_id, user_id),
+    )
+    conn.commit()
+    return token if cur.rowcount > 0 else ""
+
+
 def list_tasks(conn, user_id: str):
     return conn.execute(
         "SELECT * FROM scheduled_tasks WHERE user_id=? ORDER BY created_at DESC",
