@@ -40,10 +40,15 @@ class LarkSetupError(Exception):
 
 
 def parse_identity(raw: str) -> dict | None:
-    """Pull {open_id, name} out of a `lark-cli auth status --json` envelope.
+    """Pull {open_id, name} for the AUTHORISED USER out of `auth status --json`.
 
-    None if the payload is not JSON, has no usable active identity, or the
-    active identity is the bot's own (which carries no personal open_id).
+    Reads `identities.user` directly rather than following the top-level
+    `identity` pointer. That pointer names the CLI's *current default*
+    identity, which may legitimately be "bot" on a setup whose user auth is
+    perfectly usable — and following it would address notifications at the
+    bot itself the day a lark-cli build starts putting an openId on the bot
+    entry. A notification is the bot DMing the human, so the target is
+    always the person's open_id.
     """
     try:
         doc = json.loads(raw)
@@ -51,17 +56,16 @@ def parse_identity(raw: str) -> dict | None:
         return None
     if not isinstance(doc, dict):
         return None
-    which = doc.get("identity")
     identities = doc.get("identities")
-    if not isinstance(which, str) or not isinstance(identities, dict):
+    if not isinstance(identities, dict):
         return None
-    entry = identities.get(which)
-    if not isinstance(entry, dict) or not entry.get("available"):
+    user = identities.get("user")
+    if not isinstance(user, dict) or not user.get("available"):
         return None
-    open_id = entry.get("openId")
+    open_id = user.get("openId")
     if not isinstance(open_id, str) or not open_id:
         return None
-    name = entry.get("userName")
+    name = user.get("userName")
     return {"open_id": open_id, "name": name if isinstance(name, str) else ""}
 
 
@@ -161,8 +165,12 @@ def status(conn, uid: str) -> dict:
     if row is None:
         return {"enabled": False, "instance_id": "", "open_id": "", "name": ""}
     binding = _find_binding(conn, row["id"], uid)
+    # A revoked binding makes the target unresolvable in tasks/notify.py, so
+    # reporting "enabled" off the instance flag alone would promise delivery
+    # that cannot happen.
+    revoked = bool(binding["revoked"]) if binding is not None else True
     return {
-        "enabled": bool(row["enabled"]),
+        "enabled": bool(row["enabled"]) and not revoked,
         "instance_id": row["id"],
         "open_id": binding["external_user_id"] if binding else "",
         "name": (binding["external_username"] or "") if binding else "",

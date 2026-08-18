@@ -150,11 +150,10 @@ def test_identity_parsing_from_real_cli_shapes():
         }
 
     i.e. no top-level "ok"/"data", camelCase "openId"/"userName" nested under
-    `identities[<active identity>]`, gated by that entry's own "available"
-    flag rather than a top-level success flag. The three degradation shapes
-    below are the real-world equivalents of the brief's three cases: not
-    JSON, an active identity with nothing usable (the "bot" identity has no
-    personal open_id at all), and an active identity explicitly unavailable.
+    `identities.user` (read directly, not via the top-level "identity"
+    pointer — see test_identity_is_taken_from_the_user_entry_regardless_of_
+    the_default below for why), gated by that entry's own "available" flag
+    rather than a top-level success flag.
     """
     assert lark_setup.parse_identity(json.dumps({
         "identity": "user",
@@ -165,16 +164,53 @@ def test_identity_parsing_from_real_cli_shapes():
         },
     })) == {"open_id": "ou_x", "name": "N"}
 
-    # Active identity is the bot's own: no personal open_id to address.
-    assert lark_setup.parse_identity(json.dumps({
-        "identity": "bot",
-        "identities": {"bot": {"status": "ready", "available": True}},
-    })) is None
-
     assert lark_setup.parse_identity("not json") is None
 
-    # Active identity present but explicitly not available.
+    # "user" entry present but explicitly not available.
     assert lark_setup.parse_identity(json.dumps({
         "identity": "user",
         "identities": {"user": {"available": False, "openId": "ou_x"}},
     })) is None
+
+
+def test_identity_never_addresses_the_bot_itself():
+    """A notification is the bot DMing the human. If a future CLI build put an
+    openId on the bot entry, following the top-level pointer would send every
+    notification to the bot."""
+    assert lark_setup.parse_identity(json.dumps({
+        "identity": "bot",
+        "identities": {"bot": {"available": True, "openId": "ou_BOT_ITSELF"}},
+    })) is None
+
+
+def test_identity_is_taken_from_the_user_entry_regardless_of_the_default():
+    """`identity` names the CLI's current default, not which identity is usable."""
+    got = lark_setup.parse_identity(json.dumps({
+        "identity": "bot",
+        "identities": {
+            "bot": {"available": True},
+            "user": {"available": True, "openId": "ou_human", "userName": "N"},
+        },
+    }))
+    assert got == {"open_id": "ou_human", "name": "N"}
+
+
+def test_identity_absent_key_is_handled():
+    assert lark_setup.parse_identity(json.dumps({"identities": {}})) is None
+    assert lark_setup.parse_identity(json.dumps({})) is None
+
+
+@pytest.mark.asyncio
+async def test_status_is_not_enabled_while_the_binding_is_revoked(conn, identity):
+    """The generic bindings endpoint revokes rather than deletes; a target the
+    notify path refuses must not be reported as enabled."""
+    out = await lark_setup.enable(conn, "1", now_ms=NOW)
+    conn.execute("UPDATE channel_bindings SET revoked=1 WHERE instance_id=?",
+                 (out["instance_id"],))
+    conn.commit()
+
+    assert lark_setup.status(conn, "1")["enabled"] is False
+
+    # And an explicit re-enable heals it.
+    await lark_setup.enable(conn, "1", now_ms=NOW + 1000)
+    assert lark_setup.status(conn, "1")["enabled"] is True
