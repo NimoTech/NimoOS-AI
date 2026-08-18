@@ -141,7 +141,12 @@ class LarkAdapter(ChannelAdapter):
         return [flag, str(external_chat_id)]
 
     async def _send_args(self, args: list[str]) -> str | None:
-        """Run one send. Returns the message id, or None on any failure."""
+        """Run one send.
+
+        Returns the message id; `""` when the send succeeded but the id could
+        not be parsed (the message reached the user, so this is NOT a failure —
+        only edit-based features degrade); `None` when the send failed.
+        """
         rc, out, err = await lark_cli.run_once(
             self._uid, args, timeout=SEND_TIMEOUT)
         if rc != 0:
@@ -166,6 +171,10 @@ class LarkAdapter(ChannelAdapter):
 
     async def send(self, external_chat_id: str,
                    message: OutboundMessage) -> str | None:
+        """Returns the message id; `""` when the send succeeded but the id
+        could not be parsed (the message reached the user, so this is NOT a
+        failure — only edit-based features degrade); `None` when the send
+        failed."""
         args = ["im", "+messages-send", "--as", "bot",
                 *self._target_args(external_chat_id),
                 "--text", message.text,
@@ -174,6 +183,10 @@ class LarkAdapter(ChannelAdapter):
 
     async def send_buttons(self, external_chat_id: str, text: str,
                            buttons: "list[tuple[str, str]]") -> str | None:
+        """Returns the message id; `""` when the send succeeded but the id
+        could not be parsed (the message reached the user, so this is NOT a
+        failure — only edit-based features degrade); `None` when the send
+        failed."""
         card = _build_card(text, buttons, target=str(external_chat_id))
         args = ["im", "+messages-send", "--as", "bot",
                 *self._target_args(external_chat_id),
@@ -190,11 +203,17 @@ class LarkAdapter(ChannelAdapter):
         late edit legitimately fails; when it does, send a follow-up message
         instead of leaving the user with a card whose buttons do nothing.
         """
+        if not message_id:
+            # Sent, but the id never parsed — there is nothing to update, so go
+            # straight to the follow-up rather than spending a failed API call.
+            await self.send(external_chat_id, OutboundMessage(text=text))
+            return
         card = _build_card(text, [])
         rc, _out, err = await lark_cli.run_once(
             self._uid,
             ["api", "POST", "/open-apis/interactive/v1/card/update",
-             "--body", json.dumps({"card": card}, ensure_ascii=False)],
+             "--as", "bot",
+             "--data", json.dumps({"card": card}, ensure_ascii=False)],
             timeout=SEND_TIMEOUT)
         if rc != 0:
             _LOG.info("lark: card update failed (%s); sending a follow-up",
@@ -213,7 +232,7 @@ def _build_card(text: str, buttons: "list[tuple[str, str]]",
     ownership failure.
     """
     elements: list[dict] = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": text}},
+        {"tag": "div", "text": {"tag": "plain_text", "content": text}},
     ]
     if buttons:
         elements.append({

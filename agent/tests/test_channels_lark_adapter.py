@@ -43,12 +43,23 @@ class _FakeConsumer:
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Capture run_once invocations; return (rc, stdout, stderr) per script."""
+    """Capture run_once invocations; return (rc, stdout, stderr) per script.
+
+    `script["queue"]`, when set to a non-empty list of (rc, out, err) tuples,
+    is consumed one entry per call (front first) — needed for tests where a
+    single `edit_to_resolved` triggers more than one `run_once` call (e.g. a
+    failed card update followed by a follow-up send) and each must return a
+    different result. Falls back to the static rc/out/err once the queue is
+    exhausted (or if it was never set).
+    """
     recorded = []
-    script = {"rc": 0, "out": '{"ok": true, "data": {"message_id": "om_1"}}', "err": ""}
+    script = {"rc": 0, "out": '{"ok": true, "data": {"message_id": "om_1"}}',
+              "err": "", "queue": None}
 
     async def _fake_run_once(uid, args, *, timeout=20.0):
         recorded.append({"uid": uid, "args": list(args), "timeout": timeout})
+        if script["queue"]:
+            return script["queue"].pop(0)
         return script["rc"], script["out"], script["err"]
 
     monkeypatch.setattr(lark_channel.lark_cli, "run_once", _fake_run_once)
@@ -220,6 +231,62 @@ async def test_no_callback_means_no_long_connection(calls):
     assert _FakeConsumer.instances == []
     assert a.buttons_available is False
     await a.stop()                      # must not raise with no consumer
+
+
+@pytest.mark.asyncio
+async def test_an_unparsable_send_result_is_reported_as_sent_not_failed(calls):
+    """The message reached the user; only edit-based features degrade. Returning
+    None here would make router._surface_confirm deny a confirmation whose card
+    was actually delivered."""
+    recorded, script = calls
+    script.update(rc=0, out='{"ok": true, "data": {}}', err="")
+    a = _adapter()
+    mid = await a.send("ou_abc", OutboundMessage(text="x"))
+    assert mid == ""
+    assert mid is not None
+
+
+@pytest.mark.asyncio
+async def test_edit_without_a_message_id_goes_straight_to_a_follow_up(calls):
+    recorded, _ = calls
+    a = _adapter()
+    await a.edit_to_resolved("ou_abc", "", "resolved")
+    assert len(recorded) == 1
+    args = recorded[0]["args"]
+    assert args[0:2] == ["im", "+messages-send"], "should not attempt card/update"
+    assert "resolved" in args
+
+
+@pytest.mark.asyncio
+async def test_a_failed_card_update_still_tells_the_user(calls):
+    recorded, script = calls
+    script["queue"] = [(1, "", "nope"),
+                       (0, '{"ok": true, "data": {"message_id": "om_2"}}', "")]
+    a = _adapter()
+    await a.edit_to_resolved("ou_abc", "om_1", "resolved")
+    # First the update attempt, then the follow-up message.
+    update_args = recorded[0]["args"]
+    assert update_args[0:2] == ["api", "POST"]
+    assert "--as" in update_args and \
+        update_args[update_args.index("--as") + 1] == "bot"
+    # `lark-cli api` only accepts --data for the request body; --body is not a
+    # real flag and would make the update call fail 100% of the time.
+    assert "--data" in update_args, "card/update must use --data, not --body"
+    assert "--body" not in update_args
+    assert recorded[-1]["args"][0:2] == ["im", "+messages-send"]
+
+
+@pytest.mark.asyncio
+async def test_card_text_is_not_rendered_as_markdown(calls):
+    """Confirmation cards show commands; a summary containing a markdown link
+    must not become a live hyperlink in the card."""
+    recorded, _ = calls
+    _got, cb = _recorder()
+    a = _adapter(on_callback=cb)
+    await a.start()
+    await a.send_buttons("ou_abc", "run [x](https://evil.example)", [("Allow", "cf:c1:a")])
+    card = json.loads(recorded[-1]["args"][recorded[-1]["args"].index("--content") + 1])
+    assert card["elements"][0]["text"]["tag"] == "plain_text"
 
 
 def test_registered_in_the_adapter_registry():
