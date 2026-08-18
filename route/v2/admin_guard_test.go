@@ -144,6 +144,15 @@ func TestDraftEndpointNeedsMCPTicket(t *testing.T) {
 		{http.MethodPost, "/v1/ai/agent/tasks/abc/run", true},
 		{http.MethodGet, "/v1/ai/agent/tasks/draft-from-session", false},
 		{http.MethodPost, "/v1/ai/agent/tasks", false},
+		// Same normalization the admin gate relies on: an encoded or traversed
+		// spelling of the real endpoint still needs its ticket.
+		{http.MethodPost, "/v1/ai/agent/ta%73ks/draft-from-session", true},
+		{http.MethodPost, "/v1/ai/agent/tasks%2fdraft-from-session", true},
+		{http.MethodPost, "/v1/ai/agent/tasks/../tasks/draft-from-session", true},
+		// Ends with the endpoint's path but is not the endpoint.
+		{http.MethodPost, "/v1/ai/agent/foo/agent/tasks/draft-from-session", false},
+		// A different endpoint whose name merely ends the same way.
+		{http.MethodPost, "/v1/ai/agent/tasks/x-draft-from-session", false},
 	}
 	for _, c := range cases {
 		req := httptest.NewRequest(c.method, c.path, nil)

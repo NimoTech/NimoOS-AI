@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NimoTech/NimoOS-AI/common"
 	"github.com/NimoTech/NimoOS-AI/pkg/config"
 	"github.com/NimoTech/NimoOS-AI/service"
 	"github.com/labstack/echo/v4"
@@ -303,6 +304,12 @@ func needsMCPTicket(r *http.Request) bool {
 	if isRunEndpoint(r) {
 		return true
 	}
-	return r.Method == http.MethodPost &&
-		strings.HasSuffix(NormalizeRequestPath(r.URL.EscapedPath()), draftFromSessionPath)
+	if r.Method != http.MethodPost {
+		return false
+	}
+	// Anchored from the mount root, not a bare HasSuffix: a nested-duplicate
+	// path like /v1/ai/agent/foo/agent/tasks/draft-from-session ENDS with the
+	// endpoint's path but is a different request that the admin gate does not
+	// cover, and it must not mint a ticket. Mirrors IsAdminScopedPath's shape.
+	return NormalizeRequestPath(r.URL.EscapedPath()) == common.V2APIPath+draftFromSessionPath
 }
