@@ -43,6 +43,21 @@ def test_prefix_of_path_invoked_script_keeps_its_subcommand():
             == "/DATA/scripts/deploy.sh production")
 
 
+def test_prefix_stays_a_literal_prefix_of_the_command():
+    cmd = 'lark-cli base "record two" create'
+    p = draft.normalize_prefix(cmd)
+    assert p == "lark-cli base"
+    assert cmd.startswith(p)
+
+
+def test_prefix_retreats_on_repeated_whitespace():
+    assert draft.normalize_prefix("gh  pr  list") == "gh"
+
+
+def test_prefix_gives_up_when_the_command_starts_with_a_quote():
+    assert draft.normalize_prefix('"gh" pr list') is None
+
+
 def test_prefix_rejects_compound_commands():
     for cmd in ["a && b", "a | b", "a; b", "a > f", "a `b`", "a $(b)", "a\nb"]:
         assert draft.normalize_prefix(cmd) is None, cmd
@@ -70,6 +85,15 @@ def test_extract_hosts():
     assert draft.extract_hosts("no url here") == []
     # 端口剥掉,去重,顺序稳定
     assert draft.extract_hosts("http://a.com:8080 https://a.com/y https://b.io") == ["a.com", "b.io"]
+
+
+def test_extract_hosts_rejects_non_hosts():
+    assert draft.extract_hosts("(see https://a.com)") == ["a.com"]
+    assert draft.extract_hosts("check https://open.feishu.cn.") == ["open.feishu.cn"]
+    assert draft.extract_hosts("https://user:pass@a.com/x") == ["a.com"]
+    assert draft.extract_hosts("https://[::1]:8080/x") == ["[::1]"]
+    # 无方括号的 IPv6 剥端口后是残缺地址,不是主机名 —— 丢掉而不是猜
+    assert draft.extract_hosts("http://2001:db8::1/x") == []
 
 
 # ---- scan_history -------------------------------------------------------
@@ -103,6 +127,16 @@ def test_scan_records_evidence_for_every_rule():
     history = [_call("run_command", '{"command": "gh pr list --limit 5"}')]
     out = draft.scan_history(history, mcp_id_by_slug={})
     assert out["evidence"]["shell:gh pr list"] == "gh pr list --limit 5"
+
+
+def test_scan_records_evidence_for_mcp_and_fs_rules():
+    history = [
+        _call("mcp__my_server__search", '{"q": "x"}'),
+        _call("write_file", '{"path": "/DATA/Documents/r/a.md"}'),
+    ]
+    out = draft.scan_history(history, mcp_id_by_slug={"my_server": "srv-1"})
+    assert out["evidence"]["mcp_tools:srv-1::search"] == "mcp__my_server__search"
+    assert out["evidence"]["fs_write:/DATA/Documents/r"] == "write_file: /DATA/Documents/r/a.md"
 
 
 def test_scan_drops_unresolvable_mcp_server_but_says_so():
@@ -143,6 +177,14 @@ def test_scan_dedupes_and_bounds():
             for i in range(100)]
     out = draft.scan_history(many, mcp_id_by_slug={})
     assert len(out["preauth"]["shell"]) <= draft.MAX_RULES_PER_BUCKET
+
+
+def test_scan_survives_unserializable_dict_arguments():
+    history = [{"type": "function_call", "name": "other_tool",
+                "arguments": {"when": {1, 2, 3}}}]
+    out = draft.scan_history(history, mcp_id_by_slug={})
+    assert out["preauth"]["shell"] == []
+    assert out["suggested_egress"] == []
 
 
 def test_scan_covers_all_write_tools():

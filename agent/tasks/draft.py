@@ -30,6 +30,10 @@ _COMPOUND_RE = re.compile(r"[|;&><`\n]|\$\(")
 
 _URL_RE = re.compile(r"https?://([^\s/'\"<>|]+)", re.IGNORECASE)
 
+# 一个可用的主机名:方括号 IPv6 字面量,或普通域名/主机(字母数字开头结尾)。
+# 抽出来的东西过不了这一关就丢掉 —— 推测项宁缺毋滥。
+_HOST_RE = re.compile(r"^(?:\[[0-9a-f:]+\]|[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)$")
+
 # 任务名硬截断,与 title_gen.TITLE_MAX_CHARS 同值(两处独立,不要互相 import
 # —— title_gen 是会话标题,这里是任务名,将来可以各自调整)。
 NAME_MAX_CHARS = 30
@@ -87,7 +91,19 @@ def normalize_prefix(command) -> str | None:
         if tok.startswith("-") or any(ch in tok for ch in _VALUE_CHARS):
             break
         taken.append(tok)
-    return " ".join(taken)
+
+    # shlex 去掉了引号并按单空格重组,拼出来的前缀未必还是原命令的字面前缀:
+    # `lark-cli base "record two" create` 会拼成 `lark-cli base record two`,
+    # 它既匹配不回原命令,又能匹配一条从未跑过的
+    # `lark-cli base record twofold-delete-everything`(preauth.shell_match 是
+    # 纯 startswith)。授权范围只能是观察到的那条命令的字面前缀,所以逐个回退
+    # 到不变式成立;退到无可退就放弃这条建议。
+    while taken:
+        prefix = " ".join(taken)
+        if text.startswith(prefix):
+            return prefix
+        taken.pop()
+    return None
 
 
 def parse_mcp_call(name) -> tuple[str, str] | None:
@@ -102,15 +118,21 @@ def parse_mcp_call(name) -> tuple[str, str] | None:
 
 
 def extract_hosts(text) -> list[str]:
-    """从任意文本里抽 http(s) host,剥端口,去重保序。"""
+    """从任意文本里抽 http(s) host,剥端口与尾随标点,去重保序。"""
     if not isinstance(text, str):
         return []
     out, seen = [], set()
     for raw in _URL_RE.findall(text):
         host = raw.split("@")[-1]          # 剥掉 user:pass@
-        host = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
-        host = host.strip().lower()
-        if host and host not in seen:
+        # URL 常出现在句子中间:`(见 https://a.com)`、`https://a.com.` ——
+        # 尾随标点不是主机名的一部分。`]` 不在剥离集里,它是 IPv6 字面量的收尾。
+        host = host.strip().rstrip(".,;)}>'\"").lower()
+        # 剥端口;带方括号的 IPv6 字面量除外,它的 ':' 是地址的一部分。
+        if ":" in host and not host.endswith("]"):
+            host = host.rsplit(":", 1)[0]
+        if not host or not _HOST_RE.match(host):
+            continue
+        if host not in seen:
             seen.add(host)
             out.append(host)
     return out
@@ -221,9 +243,14 @@ def scan_history(history, *, mcp_id_by_slug: dict) -> dict:
                     evidence[f"fs_write:{parent}"] = f"{name}: {raw}"
             continue
 
-        # 其余工具的参数里也可能出现 URL(例如带 url 参数的 MCP 工具已在上面
-        # 处理;这里兜住 fetch 类内置工具),只作推测,不影响 preauth。
-        for host in extract_hosts(json.dumps(args, ensure_ascii=False)):
+        # 其余工具的参数里也可能出现 URL,只作推测,不影响 preauth。
+        try:
+            blob = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # arguments 可能是已在内存里的 dict,含不可序列化的值;一条推测
+            # 域名不值得让整趟扫描崩掉。
+            continue
+        for host in extract_hosts(blob):
             _append(suggested_egress, host)
 
     if not evidence["dropped"]:
