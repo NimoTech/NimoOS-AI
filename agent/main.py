@@ -2859,6 +2859,125 @@ async def tasks_notify_targets(x_user_id: str = Header(..., alias="X-User-Id")):
     return {"targets": channel_store.list_chats_for_user(_db(), x_user_id)}
 
 
+# Registered BEFORE /agent/tasks/{task_id} for the same reason
+# notify-targets is: FastAPI matches in definition order, so a later
+# static path would be swallowed by the {task_id} parameter route.
+@app.post("/agent/tasks/draft-from-session")
+async def tasks_draft_from_session(
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_agent_provider_key: str = Header("", alias="X-Agent-Provider-Key"),
+    x_agent_provider_url: str = Header("", alias="X-Agent-Provider-Url"),
+    x_agent_mcp_ticket: str = Header("", alias="X-Agent-MCP-Ticket"),
+):
+    """Turn one chat session into a scheduled-task draft.
+
+    READ-ONLY on purpose: it produces a *suggestion*, and the authorization
+    it suggests only becomes real when the user saves it through the normal
+    POST /agent/tasks path, where preauth.parse and _check_fs_write apply.
+    That is why the M5 red line (agent-created tasks must be disabled with an
+    empty preauth) does not apply here — see spec §6 and §13.
+    """
+    from tasks import draft as _draft
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "bad_body")
+    session_id = (body.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(400, "bad_session_id")
+
+    conn = _db()
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE id=? AND user_id=?",
+        (session_id, x_user_id),
+    ).fetchone()
+    # Absent, not forbidden — same rule as the rest of this section: the API
+    # must not confirm that somebody else's session id exists.
+    if not row:
+        raise HTTPException(404, "session not found")
+
+    last = conn.execute(
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    history = []
+    if last:
+        try:
+            history = json.loads(last["content"]) or []
+        except (json.JSONDecodeError, TypeError):
+            history = []
+    if not isinstance(history, list):
+        history = []
+
+    # slug → server id. Without a ticket (or with an unusable config) the map
+    # is simply empty and every MCP call lands in evidence["dropped"]: a
+    # missing suggestion, never a wrong one.
+    mcp_id_by_slug = {}
+    if x_agent_mcp_ticket:
+        try:
+            from mcp_client.runtime import fetch_mcp_servers
+            from mcp_client.client import _slug
+            servers = await fetch_mcp_servers(x_agent_mcp_ticket)
+            if isinstance(servers, list):
+                for s in servers:
+                    if isinstance(s, dict) and s.get("id") and s.get("name"):
+                        mcp_id_by_slug[_slug(s["name"])] = str(s["id"])
+        except Exception:
+            _LOG.exception("draft-from-session: MCP server list unavailable; "
+                           "MCP tools will not be suggested")
+
+    scanned = _draft.scan_history(history, mcp_id_by_slug=mcp_id_by_slug)
+
+    name = _draft.fallback_name(history)
+    prompt = _draft.fallback_prompt(history)
+    fallback = True
+
+    model = (body.get("model") or "").strip()
+    if model and history:
+        excerpt = title_gen.extract_history_excerpt(history)
+        if excerpt:
+            try:
+                client = AsyncOpenAI(base_url=x_agent_provider_url,
+                                     api_key=x_agent_provider_key)
+                resp = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": _draft.DRAFT_SYSTEM_PROMPT},
+                            {"role": "user", "content": excerpt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=1024,
+                    ),
+                    timeout=30.0,
+                )
+                raw = ""
+                if resp.choices:
+                    msg = resp.choices[0].message
+                    raw = (getattr(msg, "content", None)
+                           or getattr(msg, "reasoning_content", None) or "")
+                parsed = _draft.parse_llm_draft(raw)
+                if parsed:
+                    name, prompt = parsed
+                    fallback = False
+            except (asyncio.TimeoutError, Exception):
+                # Never fail the request over the model: a fallback draft the
+                # user edits by hand still beats an error dialog.
+                _LOG.exception("draft-from-session: model unavailable; "
+                               "falling back to raw user messages")
+
+    return {
+        "name": name,
+        "prompt": prompt,
+        "preauth": scanned["preauth"],
+        "suggested_egress": scanned["suggested_egress"],
+        "evidence": scanned["evidence"],
+        "prompt_fallback": fallback,
+    }
+
+
 @app.post("/agent/tasks", status_code=201)
 async def tasks_create(request: Request,
                        x_user_id: str = Header(..., alias="X-User-Id")):
