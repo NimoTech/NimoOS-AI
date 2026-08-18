@@ -139,3 +139,26 @@ def test_web_search_is_skipped_when_unconfigured(monkeypatch):
              for t in agent_mod.select_tools_for_run([], session_id="s-none")]
     assert "web_fetch" in names
     assert "web_search" not in names
+
+
+def test_web_search_available_reflects_config_and_never_raises(monkeypatch):
+    import agent as agent_mod
+    from web import settings as web_settings
+
+    conn = db_module.init_db(":memory:")
+    monkeypatch.setattr(db_module, "get_connection", lambda: conn)
+
+    # unconfigured: no web_search row in user_settings yet.
+    assert agent_mod._web_search_available() is False
+
+    # configured: an enabled backend with what it needs to run.
+    web_settings.save(conn, backend="tavily", api_key="k",
+                      base_url="", enabled=True)
+    assert agent_mod._web_search_available() is True
+
+    # a raising config read must degrade to False, never propagate.
+    def _boom(_conn):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(web_settings, "load", _boom)
+    assert agent_mod._web_search_available() is False
