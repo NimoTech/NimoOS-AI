@@ -113,3 +113,42 @@ func TestAdminPathGuardFailsClosed(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Equal(t, 0, reached)
 }
+
+// The M6 draft endpoint lives under /agent/tasks, so it inherits the admin
+// gate through subtree matching rather than its own list entry. This test
+// pins that inheritance: it hands out shell prefixes and fs_write roots just
+// like the rest of the tasks API, so it must never become reachable by a
+// non-admin — including through the percent-encoded spellings that motivated
+// AdminPathGuard in the first place.
+func TestDraftEndpointIsAdminScoped(t *testing.T) {
+	for _, raw := range []string{
+		"/v1/ai/agent/tasks/draft-from-session",
+		"/v1/ai/agent/ta%73ks/draft-from-session",
+		"/v1/ai/agent/tasks%2fdraft-from-session",
+		"/v1/ai/agent/tasks/../tasks/draft-from-session",
+		"/v1/ai/agent//tasks//draft-from-session",
+	} {
+		if got := IsAdminScopedPath("/v1/ai", NormalizeRequestPath(raw)); !got {
+			t.Errorf("IsAdminScopedPath(%q) = false, want true", raw)
+		}
+	}
+}
+
+func TestDraftEndpointNeedsMCPTicket(t *testing.T) {
+	cases := []struct {
+		method, path string
+		want         bool
+	}{
+		{http.MethodPost, "/v1/ai/agent/tasks/draft-from-session", true},
+		{http.MethodPost, "/v1/ai/agent/run", true},
+		{http.MethodPost, "/v1/ai/agent/tasks/abc/run", true},
+		{http.MethodGet, "/v1/ai/agent/tasks/draft-from-session", false},
+		{http.MethodPost, "/v1/ai/agent/tasks", false},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(c.method, c.path, nil)
+		if got := needsMCPTicket(req); got != c.want {
+			t.Errorf("needsMCPTicket(%s %s) = %v, want %v", c.method, c.path, got, c.want)
+		}
+	}
+}

@@ -163,7 +163,7 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 
 	// MCP: mint a one-time ticket so the agent can pull this user's decrypted
 	// MCP config from the loopback /_internal/mcp/runtime endpoint without a JWT.
-	if h.tickets != nil && isRunEndpoint(c.Request()) {
+	if h.tickets != nil && needsMCPTicket(c.Request()) {
 		c.Request().Header.Set("X-Agent-MCP-Ticket", h.tickets.Mint(userID))
 	}
 
@@ -290,4 +290,19 @@ func (h *AgentHandler) resolveProviderByID(userID string, id int64) (key, provUR
 
 func isRunEndpoint(r *http.Request) bool {
 	return r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/run")
+}
+
+// draftFromSessionPath is the one non-/run endpoint that needs the user's MCP
+// config: it maps the `mcp__<slug>__<tool>` names recorded in a session's
+// history back to the `<server_id>::<tool>` form a task's preauth document
+// uses. Without the ticket the mapping is empty and MCP tools silently stop
+// being suggested.
+const draftFromSessionPath = "/agent/tasks/draft-from-session"
+
+func needsMCPTicket(r *http.Request) bool {
+	if isRunEndpoint(r) {
+		return true
+	}
+	return r.Method == http.MethodPost &&
+		strings.HasSuffix(NormalizeRequestPath(r.URL.EscapedPath()), draftFromSessionPath)
 }
