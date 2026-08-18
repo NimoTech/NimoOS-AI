@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/labstack/echo/v4"
@@ -412,4 +413,56 @@ func TestTasksGateAdminPassthrough(t *testing.T) {
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, 1, proxied)
+}
+
+// TestAdminGatedAgentPathsPrecedeWildcard asserts, against the source of
+// route/v2.go itself, that every admin-gated agent path is registered
+// before the general "/agent/*" proxy wildcard. This is the one thing the
+// httptest-based precedence tests above (TestAdminGateRoutePrecedence,
+// TestShellAllowlistGateRoutePrecedence, TestNotesSettingsGateRoutePrecedence,
+// TestWebSettingsRequiresAdmin) cannot catch: they all hand-build their own
+// echo.New() and re-register the routes to match what v2.go is *supposed*
+// to do, so none of them would fail if the real registration in v2.go were
+// deleted, reordered after the wildcard, or typo'd. Echo's router falls back
+// to whichever handler is registered for a path, and a wildcard registered
+// ahead of a specific path shadows it — so a gated pair that ends up after
+// "/agent/*" in the source never matches, and the endpoint becomes silently
+// reachable by any authenticated user, not just admins.
+func TestAdminGatedAgentPathsPrecedeWildcard(t *testing.T) {
+	// route/v2.go lives one directory up from this package (route/v2/).
+	const v2GoPath = "../v2.go"
+	raw, err := os.ReadFile(v2GoPath)
+	require.NoErrorf(t, err, "read %s (adjust the relative path if the test binary's working directory changes)", v2GoPath)
+	src := string(raw)
+
+	wildcardRe := regexp.MustCompile(`(?m)^.*g\.Any\("/agent/\*".*$`)
+	wildcardLoc := wildcardRe.FindStringIndex(src)
+	require.NotNilf(t, wildcardLoc, "could not find the /agent/* wildcard registration in %s; this test's assumptions about v2.go's shape are stale", v2GoPath)
+	wildcardOffset := wildcardLoc[0]
+
+	adminGatedPaths := []string{
+		"/agent/channels/instances",
+		"/agent/shell-allowlist",
+		"/agent/notes/settings",
+		"/agent/notes/dir-info",
+		"/agent/web-settings",
+	}
+
+	for _, path := range adminGatedPaths {
+		// Match a single source line that registers this exact path (or its
+		// "/*" subtree sibling) through v2.AdminOnly, e.g.:
+		//   g.Any("/agent/web-settings", agent.Proxy, v2.AdminOnly(runtimePath))
+		lineRe := regexp.MustCompile(
+			`(?m)^.*g\.Any\("` + regexp.QuoteMeta(path) + `(/\*)?".*v2\.AdminOnly.*$`)
+		loc := lineRe.FindStringIndex(src)
+		require.NotNilf(t, loc,
+			"no admin-gated g.Any registration found for %s in %s; "+
+				"if this path was renamed or its gate removed, it is now reachable by any authenticated user",
+			path, v2GoPath)
+		require.Lessf(t, loc[0], wildcardOffset,
+			"%s is admin-gated but registered AFTER the /agent/* wildcard in %s: "+
+				"a route pair registered after the wildcard never matches, so %s "+
+				"is silently open to any authenticated user, not just admins",
+			path, v2GoPath, path)
+	}
 }
