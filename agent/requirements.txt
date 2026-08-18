@@ -23,3 +23,4 @@ opentelemetry-sdk==1.43.0
 opentelemetry-exporter-otlp-proto-http==1.43.0
 discord.py>=2.3
 pyyaml>=6.0
+trafilatura>=1.12
