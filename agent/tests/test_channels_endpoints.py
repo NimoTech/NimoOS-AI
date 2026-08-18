@@ -47,6 +47,28 @@ def test_instance_create_rejects_bad_token_and_type(client):
     assert r.status_code == 422
 
 
+def test_instance_create_rejects_lark_with_422_not_500(client):
+    """Lark is registered in ADAPTERS (the manager runs the instance) but is
+    NOT creatable here — its credentials come from lark-cli, so it has no
+    `validate_token`. Before the capability gate this fell through the
+    membership check and blew up with AttributeError → 500.
+    """
+    r = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "lark", "name": "Feishu",
+        "config": {"bot_token": "anything"}})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "unsupported channel_type"
+
+
+def test_instance_create_still_accepts_telegram(client):
+    """The capability gate must not narrow the endpoint's real clients."""
+    r = client.post("/agent/channels/instances", headers=H, json={
+        "channel_type": "telegram", "name": "still-works",
+        "config": {"bot_token": "good:token"}})
+    assert r.status_code == 201
+    assert r.json()["channel_type"] == "telegram"
+
+
 def test_pairing_and_binding_flow(client):
     iid = client.post("/agent/channels/instances", headers=H, json={
         "channel_type": "telegram",

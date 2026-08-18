@@ -326,3 +326,67 @@ async def test_default_sender_adapter_send_failure_returns_false(conn, monkeypat
     task = _task_row(conn, tid)
 
     assert await notify.send_result(conn, task, run) is False
+
+
+@pytest.mark.asyncio
+async def test_default_sender_treats_a_none_return_as_failure(conn, monkeypatch):
+    """`LarkAdapter.send` never raises — it reports failure by returning None.
+    Discarding the return recorded a send that never happened as delivered."""
+    instance_id, chat_id = _pair(conn)
+
+    class _SilentlyFailingAdapter:
+        async def send(self, chat_id, msg):
+            return None
+
+    monkeypatch.setattr(main, "_channel_manager",
+                        _FakeManager({instance_id: (_SilentlyFailingAdapter(),
+                                                    "{}")}))
+    tid = _mk_task(conn, notify_policy="always",
+                  notify_channel=f"{instance_id}:{chat_id}")
+    run = _mk_run(conn, tid)
+    task = _task_row(conn, tid)
+
+    assert await notify.send_result(conn, task, run) is False
+
+
+@pytest.mark.asyncio
+async def test_default_sender_treats_an_empty_string_return_as_success(
+        conn, monkeypatch):
+    """`""` means "delivered, but the message id could not be parsed" (see
+    `LarkAdapter.send`). It is a SUCCESS — the failure check must be `is None`,
+    never a truthiness test."""
+    instance_id, chat_id = _pair(conn)
+
+    class _IdlessAdapter:
+        async def send(self, chat_id, msg):
+            return ""
+
+    monkeypatch.setattr(main, "_channel_manager",
+                        _FakeManager({instance_id: (_IdlessAdapter(), "{}")}))
+    tid = _mk_task(conn, notify_policy="always",
+                  notify_channel=f"{instance_id}:{chat_id}")
+    run = _mk_run(conn, tid)
+    task = _task_row(conn, tid)
+
+    assert await notify.send_result(conn, task, run) is True
+
+
+@pytest.mark.asyncio
+async def test_default_sender_treats_a_message_id_return_as_success(
+        conn, monkeypatch):
+    """What Telegram/Discord actually return on a successful send."""
+    instance_id, chat_id = _pair(conn)
+
+    class _IdReturningAdapter:
+        async def send(self, chat_id, msg):
+            return "om_abc123"
+
+    monkeypatch.setattr(main, "_channel_manager",
+                        _FakeManager({instance_id: (_IdReturningAdapter(),
+                                                    "{}")}))
+    tid = _mk_task(conn, notify_policy="always",
+                  notify_channel=f"{instance_id}:{chat_id}")
+    run = _mk_run(conn, tid)
+    task = _task_row(conn, tid)
+
+    assert await notify.send_result(conn, task, run) is True

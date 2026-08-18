@@ -486,13 +486,22 @@ async def channel_instance_create(
         x_user_id: str = Header(..., alias="X-User-Id")):
     from channels import store as channel_store
     from channels.manager import ADAPTERS
-    if body.channel_type not in ADAPTERS:
+    adapter_cls = ADAPTERS.get(body.channel_type)
+    # This endpoint creates an instance out of a bot token, so it only accepts
+    # adapters that can vet one. Membership in ADAPTERS is NOT the right gate:
+    # ADAPTERS is the manager's runtime registry, and "lark" lives there so the
+    # manager can run the instance even though its credentials come from
+    # lark-cli, not from a token — it is created through /agent/channels/lark.
+    # Gating on the capability (rather than on the string "lark") means the
+    # next credential-less adapter is rejected with a 422 here instead of
+    # 500-ing on a missing `validate_token` attribute.
+    if adapter_cls is None or not hasattr(adapter_cls, "validate_token"):
         raise HTTPException(status_code=422, detail="unsupported channel_type")
     config = dict(body.config)
     token = (config.get("bot_token") or "").strip()
     if not token:
         raise HTTPException(status_code=422, detail="bot_token required")
-    info = await ADAPTERS[body.channel_type].validate_token(token)
+    info = await adapter_cls.validate_token(token)
     if info is None:
         raise HTTPException(status_code=422, detail="bot token rejected")
     config["bot_token"] = token

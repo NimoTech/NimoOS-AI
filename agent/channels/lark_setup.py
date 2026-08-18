@@ -14,10 +14,12 @@ open_id 寻址。
 `parse_identity` 的形状是照 `lark-cli auth status --json` 的真实输出写的,不是
 `{"ok": ..., "data": ...}` 那种猜测的信封 —— 真实输出是
 `{"identity": "user"|"bot", "identities": {"user": {...}, "bot": {...}}, ...}`,
-当前激活身份的键名在顶层 `identity` 字段里,对应条目里才有 `openId`/`userName`
-(且只在 `available` 为真时可信)。我们要的是**人**的 open_id(机器人能对其发起
-私聊的那个人),所以只在激活身份是 `"user"` 且该条目可用时才返回;`"bot"` 身份
-条目根本不带 openId(bot 没有可寻址的个人身份),此时视为不可用。
+顶层 `identity` 只是 CLI 的**当前默认身份**指针,`openId`/`userName` 在
+`identities` 的各条目里(且只在 `available` 为真时可信)。我们要的是**人**的
+open_id(机器人能对其发起私聊的那个人),所以直接读 `identities.user`、**不跟随**
+顶层 `identity` 指针:默认身份合法地可能是 `"bot"`,而此时 user 授权往往完全可
+用;跟指针走还会在某天 lark-cli 给 bot 条目补上 openId 时把通知发给机器人自己。
+详见 `parse_identity` 的 docstring。
 """
 from __future__ import annotations
 

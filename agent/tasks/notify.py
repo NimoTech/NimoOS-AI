@@ -192,10 +192,18 @@ async def _default_send(instance_id: str, chat_id: str, text: str) -> bool:
     from channels.model import OutboundMessage  # noqa: PLC0415
 
     try:
-        await adapter.send(chat_id, OutboundMessage(text=text))
+        result = await adapter.send(chat_id, OutboundMessage(text=text))
     except Exception:                       # noqa: BLE001 — never raise past send_result
         logger.warning("tasks notify: adapter.send failed (instance %s)",
                        instance_id, exc_info=True)
+        return False
+    # An adapter may report failure by RETURNING falsey rather than raising —
+    # LarkAdapter's contract is "never raise, return falsey", so the except
+    # clause above catches nothing for it. Note `""` is a SUCCESS (delivered,
+    # id unparsable), so this must test `is None`, never truthiness.
+    if result is None:
+        logger.warning("tasks notify: adapter.send reported failure (instance %s)",
+                       instance_id)
         return False
     return True
 
