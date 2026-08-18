@@ -77,7 +77,24 @@ def test_expand_already_unlocked_says_tools_are_in_list(monkeypatch):
     out = tg.expand_categories(["mcp"])
     assert "already unlocked" in out
     assert "ALREADY in your tool list" in out
-    assert "call it directly" in out
+    assert "directly by its exact name" in out
+
+
+def test_expand_already_unlocked_does_not_speak_for_a_warming_server(monkeypatch):
+    """Regression for run debe6e65. With a server still connecting, the old
+    unconditional footer asserted "every tool named above ... is ALREADY in your
+    tool list; call it directly" one line below "its tools should appear on a
+    later message" — two contradictory instructions about the same server, and
+    neither actionable. The model resolved it by calling expand_tools again,
+    three times, until the turn ran out. The footer must now scope itself to the
+    static categories and leave each server's state to that server's own line."""
+    _prep(monkeypatch, st.McpStatusSnapshot(servers=[
+        st.ServerStatus(name="mygithub", status=st.WARMING, slug="mygithub")]))
+    tg.expand_categories(["mcp"])
+    out = tg.expand_categories(["mcp"])
+    assert "cannot be loaded yet" in out          # the server's own true state
+    assert "every tool named" not in out
+    assert "This says nothing about any MCP server" in out
 
 
 def test_expand_mcp_no_servers_is_explicit(monkeypatch):

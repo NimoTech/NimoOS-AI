@@ -33,7 +33,7 @@ def test_prompt_line_mixed_statuses():
     # advertise, but still never a bare "ready" (see the two tests below).
     assert "Mygithub: 32 tools, not loaded yet" in line
     assert "supabase: failed to load (timeout)" in line
-    assert "fs: starting up" in line
+    assert "fs: still connecting, not loadable yet" in line
     assert "old: configuration error (decrypt failed)" in line
 
 
@@ -155,10 +155,20 @@ def test_expand_failed_server_discloses_and_warns():
     assert "Do not register replacement" in joined   # guards against duplicate-registration behavior in field
 
 
-def test_expand_warming_server():
+def test_expand_warming_server_forbids_retrying_in_this_turn():
+    """Regression for run debe6e65: the old text ("its tools should appear on a
+    later message") read as "a later step in this turn", so the model called
+    expand_tools(["mcp"]) three times against an identical answer and burned the
+    whole turn. Go's probe is a background goroutine kicked off by the Runtime
+    GET at run start and cannot finish mid-turn, so the model must be told to
+    stop, not to wait."""
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="fs", status=st.WARMING))))
-    assert '"fs"' in joined and "later message" in joined
+    assert '"fs"' in joined
+    assert "cannot be loaded yet" in joined
+    assert "THIS turn cannot change that" in joined
+    assert "ask again in a moment" in joined
+    assert "later message" not in joined, "must not read as 'a later step in this turn'"
 
 
 def test_expand_config_unavailable():

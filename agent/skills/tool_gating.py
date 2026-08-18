@@ -181,16 +181,36 @@ def expand_categories(categories: list[str]) -> str:
                          "available in your tool list starting your next step")
         else:
             # fetch_schemas degraded to (0, []) — an untrusted/failed response
-            # (network error, non-200, malformed body). The gate is open, but
-            # there is nothing to show for it yet; tell the model plainly
-            # rather than silently pretending nothing was requested.
-            lines.append(f"- mcp:{slug}: gate opened, but no tool schemas could be loaded "
-                         f"right now — try expand_tools([\"mcp:{slug}\"]) again shortly")
+            # (network error, non-200, malformed body), or the server has not
+            # been probed yet. The gate is open, but there is nothing to show
+            # for it yet; tell the model plainly rather than silently
+            # pretending nothing was requested.
+            #
+            # Deliberately NOT "try again shortly": whatever would make this
+            # succeed (Go's background probe, the loopback service coming back)
+            # cannot complete inside this turn, and inviting a retry sent the
+            # model into a loop that burned the whole turn on identical calls
+            # (see status.py's WARMING branch).
+            lines.append(f"- mcp:{slug}: the gate is open, but no tool schemas could be "
+                         "loaded this turn, so none of its tools are callable yet. Do "
+                         "NOT retry expand_tools for it in this turn — tell the user "
+                         "and let them ask again in a moment.")
 
-    if not newly:
-        lines.append("(these categories were already unlocked — every tool named "
-                      "above, with its full description, is ALREADY in your tool "
-                      "list; call it directly by that exact name)")
+    # Scoped to the STATIC categories on purpose, and skipped entirely when
+    # there are none. The old wording claimed "every tool named above ... is
+    # ALREADY in your tool list" unconditionally, which directly contradicted
+    # the line above it whenever a server was still connecting or failed to
+    # load: the model was told in one breath that a server's tools were coming
+    # later and in the next that they were already callable, and resolved the
+    # contradiction by calling expand_tools again (run debe6e65 burned a whole
+    # turn on three identical calls). Each MCP server's own line above already
+    # states its true state, so this must not speak for them.
+    if not newly and static_categories:
+        lines.append("(these categories were already unlocked — the tools listed "
+                     "above under them are ALREADY in your tool list; call one "
+                     "directly by its exact name. This says nothing about any MCP "
+                     "server above: each server's own line states whether its tools "
+                     "are loaded.)")
     return "\n".join(lines)
 
 

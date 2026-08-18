@@ -154,7 +154,10 @@ def _summary(s: ServerStatus) -> str:
         return (f"{label}: {n} tool{plural}, load with "
                 f'expand_tools(["mcp:{token}"])')
     if s.status == WARMING:
-        return f"{label}: starting up, tools available shortly"
+        # No expand token offered on purpose: there is nothing to load yet, and
+        # naming one here sent the model into a retry loop (see
+        # render_expand_section's WARMING branch).
+        return f"{label}: still connecting, not loadable yet"
     stale_tag = " [stale]" if s.stale else ""
     if s.status == CONFIG_ERROR:
         return f"{label}: configuration error ({_short(s.detail)}){stale_tag}"
@@ -232,8 +235,19 @@ def render_expand_section(snapshot) -> list[str]:
             lines.append(f'MCP server "{label}" ({len(s.tool_names)} tools){summary_part}: '
                          f'{listed};{expand_hint}')
         elif s.status == WARMING:
-            lines.append(f'MCP server "{label}": starting up in the background; '
-                         "its tools should appear on a later message.")
+            # "its tools should appear on a later message" read to the model as
+            # "a later step in this turn", so it called expand_tools(["mcp"])
+            # over and over against an unchanged answer until the turn ran out
+            # of steps (observed in run debe6e65, right after the runtime rows
+            # were cleared). Go's probe cannot finish mid-turn — it is a
+            # background goroutine started by the Runtime GET at run start
+            # (route/v2/mcp.go's TTL self-check) — so the only useful thing the
+            # model can do is stop and hand the turn back to the user. Say that
+            # explicitly, and never imply a retry could help.
+            lines.append(f'MCP server "{label}": still connecting in the background, '
+                         "so its tools cannot be loaded yet. Retrying expand_tools in "
+                         "THIS turn cannot change that — tell the user it is still "
+                         "connecting and to ask again in a moment, then stop.")
         else:
             degraded = True
             kind = ("configuration error" if s.status == CONFIG_ERROR

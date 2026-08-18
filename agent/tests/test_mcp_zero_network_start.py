@@ -95,8 +95,14 @@ def test_l2_untrusted_zero_sentinel_injects_no_tools(monkeypatch):
     assert not any(n.startswith("mcp__github__") for n in names), \
         "an untrusted (0, [...]) fetch must never inject tools into the live agent"
     # Truthful reporting: neither silent success nor a fabricated tool count.
-    assert "mcp:github: gate opened, but no tool schemas could be loaded" in out
+    assert "mcp:github: the gate is open, but no tool schemas could be loaded" in out
     assert "1 tool loaded" not in out
+    # ...and no invitation to retry inside this turn: nothing that would make the
+    # fetch succeed (Go's background probe, the loopback service recovering) can
+    # complete mid-turn, and the old "try again shortly" wording produced a loop
+    # that consumed the whole turn on identical calls (run debe6e65).
+    assert "Do NOT retry expand_tools for it in this turn" in out
+    assert "again shortly" not in out
 
 
 def test_l2_reloads_when_the_persisted_gate_is_already_open(monkeypatch):
