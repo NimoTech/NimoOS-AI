@@ -271,12 +271,15 @@ def _clip(text: str) -> str:
     return "...[truncated]\n" + raw[-(MAX_LOG_BYTES - 20):].decode("utf-8", "replace")
 
 
-def _env(uid: str) -> dict:
+def cli_env(uid: str) -> dict:
     """Minimal environment: HOME + PATH (toolbox bin first) + LANG only.
 
     Deliberately built from scratch instead of copying os.environ — the agent
     process carries provider API keys, DB paths and netns config that must
     never reach a third-party CLI's process environment.
+
+    Also used by channels/lark_cli.py — keep this the single source of the
+    child environment.
     """
     toolbox_bin = os.path.dirname(lark_bin()) or "/opt/toolbox/bin"
     return {
@@ -368,7 +371,7 @@ async def _spawn(uid: str, args: list[str]):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_env(uid),
+            env=cli_env(uid),
             cwd=str(user_home(uid)),
         )
     except OSError:
