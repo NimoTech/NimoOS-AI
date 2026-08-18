@@ -23,6 +23,7 @@ import (
 // Why each one is admin-scoped:
 //
 //	channels/instances  bot configuration (tokens, enablement) for the box
+//	channels/lark       enables/disables the box's outbound Feishu bot
 //	shell-allowlist     governs unattended command execution
 //	notes/settings      moves the system-wide notes root, migrating files
 //	notes/dir-info      probes candidate notes folders for that settings UI
@@ -32,6 +33,7 @@ import (
 //	                    domains — the same authority shell-allowlist governs
 var AdminScopedAgentPaths = []string{
 	"/agent/channels/instances",
+	"/agent/channels/lark",
 	"/agent/shell-allowlist",
 	"/agent/notes/settings",
 	"/agent/notes/dir-info",

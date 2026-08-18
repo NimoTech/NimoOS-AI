@@ -525,6 +525,11 @@ async def channel_pairable_instances(
     for r in channel_store.list_instances(_conn):
         if not r["enabled"]:
             continue
+        if r["channel_type"] == "lark":
+            # No inbound path ever redeems a pairing code against Lark: this
+            # milestone consumes only card clicks, never messages. Offering
+            # it here would advertise a pairing flow that can never complete.
+            continue
         cfg = json.loads(r["config_json"])
         item = {"id": r["id"], "channel_type": r["channel_type"],
                 "name": r["name"], "bot_username": cfg.get("bot_username", "")}
@@ -625,6 +630,63 @@ async def channel_binding_download_dir(
     if not ok:
         raise HTTPException(status_code=404, detail="binding not found")
     return {"ok": True}
+
+
+def _lark_buttons_ready(instance_id: str) -> bool:
+    """Runtime truth for the settings page: is the click consumer up?"""
+    mgr = globals().get("_channel_manager")
+    if mgr is None or not instance_id:
+        return False
+    entry = (getattr(mgr, "_running", None) or {}).get(instance_id)
+    if entry is None:
+        return False
+    return bool(getattr(entry[0], "buttons_available", False))
+
+
+async def _reload_channels() -> None:
+    """Apply an instance change to the running adapters. Never fatal."""
+    mgr = globals().get("_channel_manager")
+    if mgr is None:
+        return
+    try:
+        await mgr.reload()
+    except Exception:
+        _LOG.exception("lark channel: manager reload failed")
+
+
+@app.get("/agent/channels/lark")
+async def lark_channel_status(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    st = lark_setup.status(_db(), x_user_id)
+    st["buttons_ready"] = _lark_buttons_ready(st.get("instance_id") or "")
+    return st
+
+
+@app.post("/agent/channels/lark")
+async def lark_channel_enable(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    try:
+        await lark_setup.enable(_db(), x_user_id, now_ms=int(time.time() * 1000))
+    except lark_setup.LarkSetupError:
+        # Not a 500: "lark-cli is not installed or not logged in" is the
+        # DEFAULT state of a fresh box and the first thing the settings page
+        # asks about. (The same 409 also covers a CLI that IS logged in but
+        # only holds the bot identity — resolve_bot_identity cannot tell the
+        # two apart without a Task 3 change, so the user-facing string names
+        # both possibilities; see channelsLarkEnableFailed.)
+        raise HTTPException(409, "lark_unavailable")
+    await _reload_channels()
+    st = lark_setup.status(_db(), x_user_id)
+    st["buttons_ready"] = _lark_buttons_ready(st.get("instance_id") or "")
+    return st
+
+
+@app.delete("/agent/channels/lark", status_code=204)
+async def lark_channel_disable(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    lark_setup.disable(_db(), x_user_id)
+    await _reload_channels()
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

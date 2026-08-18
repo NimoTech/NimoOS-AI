@@ -134,6 +134,18 @@ func TestDraftEndpointIsAdminScoped(t *testing.T) {
 	}
 }
 
+func TestLarkChannelEndpointsAreAdminScoped(t *testing.T) {
+	for _, raw := range []string{
+		"/v1/ai/agent/channels/lark",
+		"/v1/ai/agent/channels/la%72k",
+		"/v1/ai/agent/channels/lark/../lark",
+	} {
+		if !IsAdminScopedPath("/v1/ai", NormalizeRequestPath(raw)) {
+			t.Errorf("%q must be admin-scoped: enabling a channel configures the box", raw)
+		}
+	}
+}
+
 func TestDraftEndpointNeedsMCPTicket(t *testing.T) {
 	cases := []struct {
 		method, path string
