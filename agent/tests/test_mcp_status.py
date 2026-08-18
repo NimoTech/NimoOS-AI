@@ -175,3 +175,19 @@ def test_expand_config_unavailable():
     joined = "\n".join(st.render_expand_section(_snap(config_error="no ticket")))
     assert "could not be fetched" in joined and "no ticket" in joined
     assert "registering" in joined      # also discourages registering new servers
+
+
+def test_l1_names_are_marked_not_callable_until_the_server_is_expanded():
+    """L1 publishes tool NAMES only — no FunctionTool reaches the tool array
+    until expand_tools(["mcp:<slug>"]) builds them (tool_gating._fetch_and_build).
+    The old hint ("expand as: mcp:github for full tool schemas") read as an
+    optional detail upgrade, so the model treated the names printed right above
+    it as callable and called one, which is the same "not found in agent" wall
+    the cross-run gap produced. The precondition has to be stated, not hinted."""
+    lines = st.render_expand_section(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github",
+                        tool_names=["mcp__github__get_me", "mcp__github__list_issues"])))
+    joined = "\n".join(lines)
+    assert "mcp__github__get_me" in joined                    # names still published
+    assert 'NOT callable yet — expand_tools(["mcp:github"]) loads them' in joined
+    assert "for full tool schemas" not in joined

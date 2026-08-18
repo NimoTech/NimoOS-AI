@@ -228,7 +228,17 @@ def render_expand_section(snapshot) -> list[str]:
                 # callable yet".
                 expand_hint = " these are already in your tool list — call them directly;"
             else:
-                expand_hint = f" expand as: mcp:{token} for full tool schemas;" if token else ""
+                # "expand as: mcp:X for full tool schemas" read as an optional
+                # detail upgrade, so the model treated the names just listed as
+                # things it could call right away. They are NOT in the tool
+                # array: L1 publishes names only, and only
+                # expand_tools(["mcp:<slug>"]) builds this server's
+                # FunctionTools (skills/tool_gating.py's _fetch_and_build).
+                # State the precondition instead of hinting at it.
+                expand_hint = (f' NOT callable yet — expand_tools(["mcp:{token}"])'
+                               " loads them;" if token
+                               else " NOT callable yet, and no expand token is"
+                                    " available for this server;")
             # trailing ";" terminates this server's tool list — without it,
             # weaker models read the unbulleted server lines as sub-items of
             # the preceding tool instead of parallel lists of callable tools

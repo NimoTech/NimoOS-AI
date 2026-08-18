@@ -21,7 +21,7 @@ def test_l1_lists_every_tool_name_but_no_descriptions():
     lines = st.render_expand_section(st.McpStatusSnapshot(servers=[mk()]))
     text = "\n".join(lines)
     assert "create_issue" in text and "list_prs" in text
-    assert "expand as: mcp:github" in text
+    assert 'NOT callable yet — expand_tools(["mcp:github"]) loads them' in text
     assert "Tools for GitHub." in text
     assert "Full instructions here." not in text, "full instructions belong to L2, not L1"
 
@@ -65,7 +65,7 @@ def test_slug_token_recovered_from_fully_qualified_tool_name():
     s = st.ServerStatus(name="x", handle="github", status=st.OK,
                          tool_names=["mcp__github_2__create_issue"])
     lines = st.render_expand_section(st.McpStatusSnapshot(servers=[s]))
-    assert "expand as: mcp:github_2" in "\n".join(lines)
+    assert 'expand_tools(["mcp:github_2"])' in "\n".join(lines)
 
 
 def test_never_probed_server_uses_slug_not_raw_name():
