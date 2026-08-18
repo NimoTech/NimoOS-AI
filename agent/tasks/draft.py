@@ -81,16 +81,12 @@ def normalize_prefix(command) -> str | None:
         return None
 
     taken = [tokens[0]]
-    # 首 token 本身若已是"值形态"(路径/URL/host:port/赋值),说明这条命令
-    # 就是直接调用一个可执行文件路径(如 `/usr/bin/env foo`)——后面的
-    # token 是它的参数,不是可信的子命令层级,不能当子命令纳入前缀。
-    if not (tokens[0].startswith("-") or any(ch in tokens[0] for ch in _VALUE_CHARS)):
-        for tok in tokens[1:]:
-            if len(taken) >= MAX_PREFIX_TOKENS:
-                break
-            if tok.startswith("-") or any(ch in tok for ch in _VALUE_CHARS):
-                break
-            taken.append(tok)
+    for tok in tokens[1:]:
+        if len(taken) >= MAX_PREFIX_TOKENS:
+            break
+        if tok.startswith("-") or any(ch in tok for ch in _VALUE_CHARS):
+            break
+        taken.append(tok)
     return " ".join(taken)
 
 

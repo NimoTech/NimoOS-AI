@@ -31,8 +31,16 @@ def test_prefix_stops_at_value_like_token():
 
 
 def test_prefix_always_keeps_first_token():
-    # 首 token 含 '/' 也要留,否则前缀为空 = 授权一切
-    assert draft.normalize_prefix("/usr/bin/env foo") == "/usr/bin/env"
+    # 首 token 必留(否则前缀为空 = 授权一切),而且它是值形态也不终止扫描 ——
+    # 停在 `/usr/bin/env` 会把 `env <任意命令>` 一并授权,比多留一个 token 危险。
+    assert draft.normalize_prefix("/usr/bin/tool") == "/usr/bin/tool"
+    assert draft.normalize_prefix("/usr/bin/env foo") == "/usr/bin/env foo"
+
+
+def test_prefix_of_path_invoked_script_keeps_its_subcommand():
+    # 停在脚本路径就等于授权它的任意参数;多留一个 token 才是收窄。
+    assert (draft.normalize_prefix("/DATA/scripts/deploy.sh production")
+            == "/DATA/scripts/deploy.sh production")
 
 
 def test_prefix_rejects_compound_commands():
