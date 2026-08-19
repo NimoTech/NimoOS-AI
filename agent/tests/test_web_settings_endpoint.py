@@ -88,3 +88,29 @@ def test_egress_confirm_no_auto_approve_when_disabled(client):
                     json={"host": "api.tavily.com", "bytes": 0,
                           "reason": "tofu_unknown_host"})
     assert r.json() == {"allow": False}
+
+
+def test_egress_confirm_does_not_auto_approve_an_upload_gate(client, tmp_path):
+    """The exemption covers the domain gate only, never the upload DLP gate.
+
+    /internal/egress-confirm serves two controls behind one endpoint. Matching
+    on host alone auto-approved BOTH, so configuring a search backend silently
+    removed the >64 KB upload confirmation for that host: an injected page could
+    have the agent put a local file's contents in a web_search query and ship it
+    out with no card. With no active session the request must fail closed.
+    """
+    import audit as audit_mod
+    audit_mod.set_audit_path_for_test(str(tmp_path / "audit.log"))
+    web_settings.save(main_mod._db(), backend="tavily", api_key="k",
+                      base_url="", enabled=True)
+
+    r = client.post("/internal/egress-confirm",
+                    json={"host": "api.tavily.com", "bytes": 200_000,
+                          "reason": "upload_over_threshold"})
+    assert r.status_code == 200
+    assert r.json() == {"allow": False}
+
+    log = tmp_path / "audit.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    assert not any("auto_approved_search_backend" in x for x in lines), (
+        "an upload-gate request must not be recorded as automatically approved")

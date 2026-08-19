@@ -4,6 +4,11 @@ Both results are fenced with fences.fence_untrusted — a search snippet and a
 page body are external text, and the model must read them as data. The fence
 source names ("web-search-results", "web-page") are part of the contract:
 tests assert on them, so renaming one silently drops a guardrail.
+
+Error payloads are fenced too, via _fenced(): they quote the remote end, so
+"it failed" is no safer to hand over raw than "here is the page". The single
+unfenced return is the cross-host redirect notice — that one is the system
+telling the model what to do next, and fencing it would say to ignore it.
 """
 from __future__ import annotations
 
@@ -26,6 +31,19 @@ _PAGE_CAP = 60000
 def _conn():
     """Indirection so tests can point the tools at an in-memory database."""
     return _db.get_connection()
+
+
+def _fenced(doc: dict, source: str, cap: int) -> str:
+    """JSON-encode *doc* and wrap it in the untrusted-data fence.
+
+    Every payload these tools hand back goes through here — success AND error.
+    An error string is not the system's own words: it quotes a status line, a
+    provider's error body, or a header the remote server chose. The one
+    deliberate exception is the cross-host redirect notice, which IS the
+    system's own instruction and stays unfenced.
+    """
+    text = json.dumps(doc, ensure_ascii=False)
+    return fence_untrusted(source, text, cap=cap) or text
 
 
 def _parse_domains(domains):
@@ -54,7 +72,11 @@ async def _web_search_impl(query: str, max_results: int = 5,
     audit("web_search", query=query, backend=backend.name,
           hits=len(result.hits), outcome="error" if result.error else "ok")
     if result.error:
-        return json.dumps({"error": result.error}, ensure_ascii=False)
+        # Fenced like the success payload: a backend error string carries text
+        # the remote server chose (an HTTP status line, a provider's error
+        # body), and the fence is this feature's only injection defence.
+        return _fenced({"error": result.error}, "web-search-results",
+                       _SEARCH_CAP)
     doc = {
         "backend": backend.name,
         "applied": result.applied,
@@ -64,8 +86,7 @@ async def _web_search_impl(query: str, max_results: int = 5,
             for h in result.hits
         ],
     }
-    text = json.dumps(doc, ensure_ascii=False)
-    return fence_untrusted("web-search-results", text, cap=_SEARCH_CAP) or text
+    return _fenced(doc, "web-search-results", _SEARCH_CAP)
 
 
 async def _web_fetch_impl(url: str, max_chars: int = 30000) -> str:
@@ -76,15 +97,18 @@ async def _web_fetch_impl(url: str, max_chars: int = 30000) -> str:
                    else "redirect" if "redirect_to" in out else "ok"),
           final_url=out.get("final_url", ""))
     if "error" in out:
-        return json.dumps({"error": out["error"]}, ensure_ascii=False)
+        # Fenced: fetch errors quote the remote server (its status line, and
+        # historically its Content-Type header verbatim). Unfenced, that is a
+        # direct channel into the region the system prompt tells the model to
+        # trust.
+        return _fenced({"error": out["error"]}, "web-page", _PAGE_CAP)
     if "redirect_to" in out:
         # Unfenced on purpose: this is OUR instruction to the model, not
         # page content. Fencing it would tell the model to ignore it.
         return (f"That URL redirects to a different host: {out['redirect_to']}\n"
                 f"Nothing was fetched. If that destination is what you want, "
                 f"call web_fetch again with the new URL.")
-    text = json.dumps(out, ensure_ascii=False)
-    return fence_untrusted("web-page", text, cap=_PAGE_CAP) or text
+    return _fenced(out, "web-page", _PAGE_CAP)
 
 
 @function_tool

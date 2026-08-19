@@ -186,3 +186,45 @@ def test_build_backend_picks_by_config_and_returns_none_when_unconfigured():
     assert backends.build_backend(
         {"backend": "searxng", "api_key": "", "base_url": "", "enabled": True}
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_search_response_is_an_error_not_an_exception(monkeypatch):
+    """r.json() used to buffer the whole body with no ceiling.
+
+    SearXNG is the pointy case: its address is free text an admin types, and a
+    LAN instance is classified `internal` by the egress proxy, so neither the
+    port policy nor TOFU stands between the agent and an endpoint streaming an
+    endless body. The cap comes from web.fetch, so patching it there must move
+    this limit too — that is the point of not having a second constant.
+    """
+    from web import fetch as fetch_mod
+    monkeypatch.setattr(fetch_mod, "MAX_BYTES", 64)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"results": []}' + b" " * 5000)
+
+    b = backends.SearxngBackend(base_url="http://searx.lan:8080")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert r.hits == []
+    assert "64 byte limit" in r.error
+    assert r.error.startswith("searxng: ")
+
+
+@pytest.mark.asyncio
+async def test_under_cap_search_response_still_parses(monkeypatch):
+    from web import fetch as fetch_mod
+    monkeypatch.setattr(fetch_mod, "MAX_BYTES", 4096)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [
+            {"title": "T", "url": "https://s.test/1", "content": "c"}]})
+
+    b = backends.SearxngBackend(base_url="http://searx.lan:8080")
+    async with _client(handler) as c:
+        r = await b.search(c, "q", max_results=3, days=None, domains=None)
+
+    assert r.error == ""
+    assert [h.url for h in r.hits] == ["https://s.test/1"]

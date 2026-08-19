@@ -904,6 +904,12 @@ async def _egress_shutdown():
 # Internal egress-confirm callback (called by egress-proxy, not by users)
 # ---------------------------------------------------------------------------
 
+# The proxy's reason code for "first connection to a host nobody has confirmed
+# yet" — the domain gate. Its sibling, "upload_over_threshold", is the upload
+# DLP gate; see egress_confirm for why only the former can be auto-approved.
+TOFU_UNKNOWN_HOST_REASON = "tofu_unknown_host"
+
+
 class _EgressConfirmRequest(BaseModel):
     host: str
     bytes: int = 0
@@ -930,6 +936,17 @@ async def egress_confirm(req: _EgressConfirmRequest):
     # host an administrator already chose. Checked BEFORE the session lookup
     # so an unattended run gets the same answer as an interactive one.
     #
+    # Scoped to reason == "tofu_unknown_host" ON PURPOSE. The proxy calls this
+    # one endpoint for two different controls, and the design authorises the
+    # exemption for the domain gate only:
+    #   * "tofu_unknown_host"     — first connection to an unknown host
+    #   * "upload_over_threshold" — this connection pushed >64 KB outward
+    # The second is the DLP control. Matching on host alone would silently
+    # remove the upload confirmation for the configured provider — an injected
+    # page could then have the agent call web_search with a local file's
+    # contents as the query and exfiltrate it with no card raised — and the
+    # proxy would additionally register a byte grant for later connections.
+    #
     # This is not a gate bypass primitive: the sandbox can POST here (the
     # proxy's internal-target branch reaches container loopback), but the
     # response only carries a verdict — markConfirmed happens inside the Go
@@ -940,7 +957,7 @@ async def egress_confirm(req: _EgressConfirmRequest):
             _web_settings.load(_db()))
     except Exception:  # noqa: BLE001 — a config read must never gate egress open
         _preapproved = set()
-    if req.host.lower() in _preapproved:
+    if req.reason == TOFU_UNKNOWN_HOST_REASON and req.host.lower() in _preapproved:
         from audit import audit as _audit  # noqa: PLC0415
         _audit("egress_grant", host=req.host, bytes=req.bytes,
                reason=req.reason, decision="auto_approved_search_backend")

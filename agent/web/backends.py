@@ -11,16 +11,20 @@ or False (not requested).
 
 No method raises: every failure becomes SearchResult.error, because a
 search that cannot run must degrade into a message the model can read, not
-an exception that kills the run. This also covers a 200 response whose body
+an exception that kills the run. That includes an over-large response body:
+reads are capped at web.fetch.MAX_BYTES (see _json_capped). This also covers a 200 response whose body
 parses as JSON but has the wrong shape (top-level list, non-dict hit
 entries, etc.) — see _hits_at, which degrades those to fewer/no hits
 instead of raising AttributeError.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import httpx
+
+from web import fetch as _fetch
 
 TIMEOUT_SEC = 15.0
 
@@ -81,6 +85,37 @@ def _hits_at(doc, *keys) -> list[dict]:
     return [x for x in node if isinstance(x, dict)]
 
 
+async def _json_capped(client, method, url, **kwargs):
+    """Send one request, read at most MAX_BYTES of it, parse JSON.
+
+    Returns (doc, error) — exactly one is meaningful. r.json() buffers the whole
+    body with no ceiling, and the design's 5 MB cap lived only in the fetch
+    layer. A SearXNG instance is the pointy case: its address is free text an
+    admin types, and a LAN instance is classified `internal` by the egress
+    proxy, so neither the port policy nor TOFU stands between the agent and a
+    broken (or hostile) endpoint streaming an endless body. The cap value is
+    imported from web.fetch rather than duplicated, so the two layers cannot
+    drift — and a test monkeypatching fetch.MAX_BYTES moves both.
+
+    Over-cap is an error string, never an exception: the no-method-raises
+    contract of this module holds.
+    """
+    req = client.build_request(method, url, **kwargs)
+    resp = await client.send(req, stream=True)
+    try:
+        resp.raise_for_status()
+        cap = _fetch.MAX_BYTES
+        chunks, total = [], 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > cap:
+                return None, f"response larger than the {cap} byte limit"
+            chunks.append(chunk)
+    finally:
+        await resp.aclose()
+    return json.loads(b"".join(chunks).decode("utf-8", errors="replace")), ""
+
+
 class TavilyBackend:
     name = "tavily"
 
@@ -95,16 +130,16 @@ class TavilyBackend:
         if domains:
             payload["include_domains"] = list(domains)
         try:
-            r = await client.post(
-                "https://api.tavily.com/search",
+            doc, err = await _json_capped(
+                client, "POST", "https://api.tavily.com/search",
                 json=payload,
                 headers={"Authorization": f"Bearer {self._key}"},
                 timeout=TIMEOUT_SEC,
             )
-            r.raise_for_status()
-            doc = r.json()
         except (httpx.HTTPError, ValueError) as exc:
             return SearchResult(error=f"tavily: {exc}")
+        if err:
+            return SearchResult(error=f"tavily: {err}")
         hits = [
             SearchHit(title=str(x.get("title") or ""),
                       url=str(x.get("url") or ""),
@@ -130,17 +165,18 @@ class BraveBackend:
         if days is not None:
             params["freshness"] = _bucket(days, _BRAVE_FRESHNESS)
         try:
-            r = await client.get(
+            doc, err = await _json_capped(
+                client, "GET",
                 "https://api.search.brave.com/res/v1/web/search",
                 params=params,
                 headers={"X-Subscription-Token": self._key,
                          "Accept": "application/json"},
                 timeout=TIMEOUT_SEC,
             )
-            r.raise_for_status()
-            doc = r.json()
         except (httpx.HTTPError, ValueError) as exc:
             return SearchResult(error=f"brave: {exc}")
+        if err:
+            return SearchResult(error=f"brave: {err}")
         hits = [
             SearchHit(title=str(x.get("title") or ""),
                       url=str(x.get("url") or ""),
@@ -166,12 +202,13 @@ class SearxngBackend:
         if days is not None:
             params["time_range"] = _bucket(days, _SEARX_RANGE)
         try:
-            r = await client.get(f"{self._base}/search", params=params,
-                                 timeout=TIMEOUT_SEC)
-            r.raise_for_status()
-            doc = r.json()
+            doc, err = await _json_capped(
+                client, "GET", f"{self._base}/search", params=params,
+                timeout=TIMEOUT_SEC)
         except (httpx.HTTPError, ValueError) as exc:
             return SearchResult(error=f"searxng: {exc}")
+        if err:
+            return SearchResult(error=f"searxng: {err}")
         hits = [
             SearchHit(title=str(x.get("title") or ""),
                       url=str(x.get("url") or ""),
