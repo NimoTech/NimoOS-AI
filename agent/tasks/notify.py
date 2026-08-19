@@ -59,6 +59,36 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit]
 
 
+def _get(row, key, default=None):
+    """Read one column from either a sqlite3.Row or a plain dict.
+
+    Rows carry every column; the dicts that callers and tests hand in carry
+    only the ones they care about. A message must never fail to render because
+    a field it decorates with is absent — sqlite3.Row raises IndexError for an
+    unknown key, dict raises KeyError, and both mean the same thing here.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _duration(run_row) -> str:
+    """`" (42s)"` when the run has a sane elapsed time, `""` otherwise.
+
+    Both timestamps default to 0 in the schema, so a run that never left the
+    queue would otherwise report a duration measured from the epoch.
+    """
+    try:
+        started = int(_get(run_row, "started_at", 0) or 0)
+        finished = int(_get(run_row, "finished_at", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if started <= 0 or finished < started:
+        return ""
+    return f" ({finished - started}s)"
+
+
 def _denied_list(denied_actions) -> list:
     """`run_row['denied_actions']` is the store's JSON text column; a caller
     that already has a parsed list (e.g. a test fixture) is accepted too."""
@@ -100,8 +130,17 @@ def format_message(task_row, run_row) -> str:
     status = run_row["status"]
     if status == "succeeded":
         summary = _truncate(str(run_row["summary"] or ""), _SUMMARY_MAX_CHARS)
-        header = f"✅ {name}"
-        return f"{header}\n\n{summary}" if summary else header
+        parts = [f"✅ {name}{_duration(run_row)}"]
+        if summary:
+            parts.append(summary)
+        # Denied actions on a SUCCESSFUL run: a run can finish cleanly having
+        # been refused everything it actually tried, and the summary alone
+        # ("I could not send it") reads like the agent's opinion rather than a
+        # permission problem the author can fix.
+        denied_text = _denied_summary(_get(run_row, "denied_actions", "[]"))
+        if denied_text:
+            parts.append(f"Denied actions:\n{denied_text}")
+        return "\n\n".join(parts)
 
     # Only reachable under `always` (see `_should_notify`), and it must not
     # claim the run failed — nothing was attempted.
@@ -206,6 +245,49 @@ async def _default_send(instance_id: str, chat_id: str, text: str) -> bool:
                        instance_id)
         return False
     return True
+
+
+def format_start_message(task_row, run_row) -> str:
+    """Render the chat text for a run that is about to begin.
+
+    English, for the same reason `format_message` is (see its docstring).
+    """
+    name = _get(task_row, "name") or "(unnamed task)"
+    trigger = str(_get(run_row, "trigger", "") or "").strip()
+    return f"▶️ {name} started ({trigger})" if trigger else f"▶️ {name} started"
+
+
+async def send_start(conn, task_row, run_row, *, sender=None) -> bool:
+    """Tell the owner a run has begun, if `notify_on_start` says to.
+
+    Deliberately gated on its OWN flag rather than `notify_policy`: a task that
+    only reports failures may still be one whose start the author wants to see.
+    The single exception is `never`, which is a master mute — a user who asked
+    for silence gets silence, whatever the other switch says.
+
+    Same "never raises" contract as `send_result`: the run is about to start
+    and must not depend on a channel adapter behaving.
+    """
+    if not _get(task_row, "notify_on_start", 0):
+        return False
+    if str(_get(task_row, "notify_policy", "") or "") == "never":
+        return False
+
+    target = _resolve_target(conn, task_row,
+                             str(_get(task_row, "notify_channel", "") or "").strip())
+    if target is None:
+        return False
+    instance_id, chat_id = target
+
+    send = sender or _default_send
+    try:
+        ok = await send(instance_id, chat_id,
+                        format_start_message(task_row, run_row))
+    except Exception:                       # noqa: BLE001 — see docstring
+        logger.warning("tasks notify: start message failed for task %s",
+                       _get(task_row, "id", "?"), exc_info=True)
+        return False
+    return bool(ok)
 
 
 async def send_result(conn, task_row, run_row, *, sender=None) -> bool:

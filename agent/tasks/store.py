@@ -30,6 +30,7 @@ _CREATE_DEFAULTS = {
     "catchup_policy": "skip",
     "notify_policy": "failure",
     "notify_channel": "",
+    "notify_on_start": 0,
 }
 
 # Fields update_task is allowed to touch. preauth maps to the preauth_json
@@ -38,6 +39,7 @@ _UPDATABLE_FIELDS = {
     "name", "prompt", "agent_type", "model", "trigger_type", "cron_expr",
     "interval_seconds", "max_turns", "timeout_seconds", "overlap_policy",
     "catchup_policy", "preauth", "notify_policy", "notify_channel", "enabled",
+    "notify_on_start",
 }
 
 # Touching any of these changes when the task next fires, so next_run_at
@@ -74,14 +76,16 @@ def create_task(conn, user_id: str, **fields) -> str:
         "id, user_id, name, prompt, agent_type, model, trigger_type, cron_expr, "
         "interval_seconds, webhook_token, enabled, max_turns, timeout_seconds, "
         "overlap_policy, catchup_policy, preauth_json, notify_policy, "
-        "notify_channel, next_run_at, last_run_at, created_at, updated_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,0,?,?)",
+        "notify_channel, notify_on_start, next_run_at, last_run_at, created_at, "
+        "updated_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,0,?,?)",
         (
             task_id, user_id, fields["name"], fields["prompt"],
             g("agent_type"), g("model"), trigger_type, cron_expr, interval_seconds,
             webhook_token, g("max_turns"), g("timeout_seconds"),
             g("overlap_policy"), g("catchup_policy"), preauth_json,
-            g("notify_policy"), g("notify_channel"), next_run_at, now, now,
+            g("notify_policy"), g("notify_channel"),
+            1 if g("notify_on_start") else 0, next_run_at, now, now,
         ),
     )
     conn.commit()

@@ -270,6 +270,7 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                        evict=evict_sink,
                        max_turns_reader=_default_max_turns_reader,
                        notify=notify.send_result,
+                       notify_start=notify.send_start,
                        keep_runs: int = KEEP_RUNS) -> bool:
     """Claim and execute at most one run. False only when there was nothing
     to do — the caller uses that to decide whether to sleep.
@@ -334,6 +335,17 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             # Same reasoning, plus: grant_egress only pre-pays an upload byte
             # budget. Without it the proxy simply asks again mid-upload.
             logger.warning("tasks runner: grant_egress failed", exc_info=True)
+
+        # Announce the start only once everything that could still abort the
+        # run without ever reaching the agent (missing task, model, or
+        # credentials) is behind us — a "started" the user never gets a result
+        # for is worse than silence. Its own try/except for the same reason
+        # the result notification has one: a channel must never sink a run.
+        try:
+            await notify_start(conn, task, run)
+        except Exception:                   # noqa: BLE001
+            logger.warning("tasks runner: start notification failed for run %s",
+                           run_id, exc_info=True)
 
         sink = start_run(
             session_id, user_id, task["prompt"], creds,

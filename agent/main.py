@@ -2857,6 +2857,9 @@ def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
     if "enabled" in body and not creating:
         out["enabled"] = 1 if body["enabled"] else 0
 
+    if "notify_on_start" in body:
+        out["notify_on_start"] = 1 if body["notify_on_start"] else 0
+
     report = _empty_preauth_report()
     if "preauth" in body:
         from tasks import preauth as _preauth
@@ -2879,6 +2882,7 @@ def _task_out(row) -> dict:
     out = dict(row)
     out["preauth"] = _preauth.parse(out.pop("preauth_json", "{}"))
     out["enabled"] = bool(out.get("enabled"))
+    out["notify_on_start"] = bool(out.get("notify_on_start"))
     return out
 
 

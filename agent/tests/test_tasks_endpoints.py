@@ -655,3 +655,31 @@ def test_delete_returns_bounded_when_vector_cleanup_is_slow(client, conn,
                             (f"ar-{i}",)).fetchone() is None
     assert conn.execute("SELECT COUNT(*) c FROM task_runs WHERE task_id=?",
                         (tid,)).fetchone()["c"] == 0
+
+
+def test_notify_on_start_round_trips_through_the_api(client):
+    """A checkbox that silently fails to persist is indistinguishable from a
+    feature that does not work, so pin create -> read -> update -> read."""
+    r = client.post("/agent/tasks", json={
+        "name": "t", "prompt": "p", "trigger_type": "cron",
+        "cron_expr": "0 9 * * *", "notify_on_start": True},
+        headers=H)
+    assert r.status_code == 201
+    tid = r.json()["id"]
+
+    got = client.get(f"/agent/tasks/{tid}", headers=H).json()
+    assert got["notify_on_start"] is True
+
+    assert client.put(f"/agent/tasks/{tid}", json={"notify_on_start": False},
+                      headers=H).status_code == 200
+    assert client.get(f"/agent/tasks/{tid}",
+                      headers=H).json()["notify_on_start"] is False
+
+
+def test_notify_on_start_defaults_to_off(client):
+    r = client.post("/agent/tasks", json={
+        "name": "t", "prompt": "p", "trigger_type": "cron",
+        "cron_expr": "0 9 * * *"}, headers=H)
+    tid = r.json()["id"]
+    assert client.get(f"/agent/tasks/{tid}",
+                      headers=H).json()["notify_on_start"] is False

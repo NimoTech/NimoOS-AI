@@ -10,6 +10,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import asyncio
+from unittest import mock
 
 import pytest
 
@@ -1229,3 +1230,63 @@ async def test_purge_runs_caps_one_hanging_session_at_the_budget(conn, tmp_path,
     for _, sid in old:
         assert conn.execute("SELECT 1 FROM sessions WHERE id=?",
                             (sid,)).fetchone() is not None
+
+
+# -- start notification ------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_start_notification_fires_before_the_agent_does(conn):
+    """The whole point is telling the user work BEGAN, so it cannot wait for
+    the run to finish — it must be sent before start_run hands the prompt to
+    the agent."""
+    h = Harness()
+    task_id = _mk(conn)
+    _queue(conn, task_id)
+    order = []
+
+    async def notify_start(c, t, r):
+        order.append("start-notify")
+        return True
+
+    real_start_run = h.start_run
+
+    def start_run(*a, **kw):
+        order.append("start-run")
+        return real_start_run(*a, **kw)
+
+    await h.run(conn, notify_start=notify_start, start_run=start_run)
+    assert order == ["start-notify", "start-run"]
+
+
+@pytest.mark.asyncio
+async def test_no_start_notification_when_the_run_never_starts(conn):
+    """A task with no model never reaches the agent; announcing a start the
+    user then never gets a result for is worse than saying nothing."""
+    h = Harness()
+    task_id = _mk(conn, model="")
+    _queue(conn, task_id)
+    called = []
+
+    async def notify_start(c, t, r):
+        called.append(1)
+        return True
+
+    with mock.patch.object(runner.notes_store, "get_background_model",
+                           return_value=""):
+        await h.run(conn, notify_start=notify_start)
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_a_broken_start_notification_does_not_stop_the_run(conn):
+    h = Harness()
+    task_id = _mk(conn)
+    _queue(conn, task_id)
+
+    async def notify_start(c, t, r):
+        raise RuntimeError("channel down")
+
+    await h.run(conn, notify_start=notify_start)
+    row = conn.execute("SELECT status FROM task_runs WHERE task_id=?",
+                       (task_id,)).fetchone()
+    assert row["status"] == "succeeded"

@@ -390,3 +390,144 @@ async def test_default_sender_treats_a_message_id_return_as_success(
     task = _task_row(conn, tid)
 
     assert await notify.send_result(conn, task, run) is True
+
+
+# -- start notifications ---------------------------------------------------
+# A run that takes ten minutes used to be indistinguishable from one that never
+# started. `notify_on_start` is a per-task opt-in, deliberately independent of
+# `notify_policy` — someone who only wants to hear about failures may still want
+# to know the nightly job began — with one exception pinned below: `never` is a
+# master mute, because a user who asked for silence must get silence.
+
+def test_format_start_message():
+    task = {"name": "daily digest"}
+    run = {"trigger": "cron"}
+    assert notify.format_start_message(task, run) == "▶️ daily digest started (cron)"
+
+
+def test_format_start_message_without_a_trigger():
+    assert notify.format_start_message({"name": "daily digest"}, {}) == \
+        "▶️ daily digest started"
+
+
+@pytest.mark.asyncio
+async def test_send_start_requires_the_opt_in(conn):
+    inst, chat = _pair(conn)
+    task_id = _mk_task(conn, notify_policy="always",
+                       notify_channel=f"{inst}:{chat}")
+    run = _mk_run(conn, task_id)
+    sent = []
+
+    async def sender(i, c, text):
+        sent.append(text)
+        return True
+
+    assert await notify.send_start(conn, _task_row(conn, task_id), run,
+                                   sender=sender) is False
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_send_start_sends_when_opted_in(conn):
+    inst, chat = _pair(conn)
+    task_id = _mk_task(conn, notify_policy="failure", notify_on_start=1,
+                       notify_channel=f"{inst}:{chat}")
+    run = _mk_run(conn, task_id)
+    sent = []
+
+    async def sender(i, c, text):
+        sent.append((i, c, text))
+        return True
+
+    assert await notify.send_start(conn, _task_row(conn, task_id), run,
+                                   sender=sender) is True
+    assert len(sent) == 1
+    assert sent[0][0] == inst and sent[0][1] == chat
+    assert sent[0][2].startswith("▶️ daily digest started")
+
+
+@pytest.mark.asyncio
+async def test_never_mutes_the_start_message_too(conn):
+    """`never` is the master mute: a contradictory config must not spam."""
+    inst, chat = _pair(conn)
+    task_id = _mk_task(conn, notify_policy="never", notify_on_start=1,
+                       notify_channel=f"{inst}:{chat}")
+    run = _mk_run(conn, task_id)
+    sent = []
+
+    async def sender(i, c, text):
+        sent.append(text)
+        return True
+
+    assert await notify.send_start(conn, _task_row(conn, task_id), run,
+                                   sender=sender) is False
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_send_start_without_a_channel_is_silent(conn):
+    task_id = _mk_task(conn, notify_on_start=1, notify_channel="")
+    run = _mk_run(conn, task_id)
+    called = []
+
+    async def sender(i, c, text):
+        called.append(text)
+        return True
+
+    assert await notify.send_start(conn, _task_row(conn, task_id), run,
+                                   sender=sender) is False
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_send_start_swallows_a_broken_sender(conn):
+    """Same contract as send_result: a run must never depend on a channel."""
+    inst, chat = _pair(conn)
+    task_id = _mk_task(conn, notify_on_start=1, notify_channel=f"{inst}:{chat}")
+    run = _mk_run(conn, task_id)
+
+    async def sender(i, c, text):
+        raise RuntimeError("channel down")
+
+    assert await notify.send_start(conn, _task_row(conn, task_id), run,
+                                   sender=sender) is False
+
+
+# -- completion message: what actually happened ----------------------------
+
+def test_format_message_success_reports_the_duration():
+    task = {"name": "daily digest"}
+    run = {"status": "succeeded", "summary": "all good", "error": "",
+           "denied_actions": "[]", "started_at": 1000, "finished_at": 1042}
+    assert notify.format_message(task, run) == \
+        "✅ daily digest (42s)\n\nall good"
+
+
+def test_format_message_success_still_lists_denied_actions():
+    """A run can succeed having been refused everything it tried; without this
+    the message reads like the work got done."""
+    task = {"name": "daily digest"}
+    denied = [{"kind": "shell", "detail": "lark-cli im +messages-send"}]
+    run = {"status": "succeeded", "summary": "I could not send it", "error": "",
+           "denied_actions": json.dumps(denied),
+           "started_at": 1000, "finished_at": 1005}
+    text = notify.format_message(task, run)
+    assert "Denied actions:" in text
+    assert "shell: lark-cli im +messages-send" in text
+
+
+def test_format_message_tolerates_rows_without_timestamps():
+    """Callers pass sqlite3.Row in production and bare dicts in tests; a
+    missing timestamp must degrade to "no duration", never raise."""
+    task = {"name": "daily digest"}
+    run = {"status": "succeeded", "summary": "all good", "error": "",
+           "denied_actions": "[]"}
+    assert notify.format_message(task, run) == "✅ daily digest\n\nall good"
+
+
+def test_format_message_hides_a_nonsensical_duration():
+    """started_at is 0 on a run that never left the queue."""
+    task = {"name": "daily digest"}
+    run = {"status": "succeeded", "summary": "s", "error": "",
+           "denied_actions": "[]", "started_at": 0, "finished_at": 1042}
+    assert notify.format_message(task, run) == "✅ daily digest\n\ns"

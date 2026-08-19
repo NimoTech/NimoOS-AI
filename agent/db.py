@@ -404,6 +404,7 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     preauth_json     TEXT NOT NULL DEFAULT '{}',
     notify_policy    TEXT NOT NULL DEFAULT 'failure' CHECK(notify_policy IN ('failure','always','never')),
     notify_channel   TEXT NOT NULL DEFAULT '',
+    notify_on_start  INTEGER NOT NULL DEFAULT 0,
     next_run_at      INTEGER NOT NULL DEFAULT 0,
     last_run_at      INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
@@ -544,6 +545,11 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
         conn.execute("ALTER TABLE notes ADD COLUMN extracted_at INTEGER")
     if "content_hash_at_extraction" not in notes_cols:
         conn.execute("ALTER TABLE notes ADD COLUMN content_hash_at_extraction TEXT")
+    # Idempotent ALTER for task databases predating the start-of-run notification.
+    st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(scheduled_tasks)")}
+    if "notify_on_start" not in st_cols:
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "notify_on_start INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")
