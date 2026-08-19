@@ -297,3 +297,60 @@ async def test_a_run_that_never_reaches_ready_counts_as_failed(stub):
     started = await c._run_once_streaming()          # noqa: SLF001
     assert started is False
     await c.stop()
+
+
+# ---- stdin: the real CLI exits on EOF (found on 118, 2026-08-18) ----------
+
+@pytest.mark.asyncio
+async def test_the_consumer_keeps_stdin_open_so_the_cli_does_not_self_exit(stub, tmp_path):
+    """`lark-cli event consume` treats stdin EOF as a shutdown signal.
+
+    Its own message: "[event] stdin closed — shutting down. consume treats
+    stdin EOF as exit signal (wired for AI subprocess callers)." Spawning it
+    with stdin=DEVNULL therefore gave a subscription that died ~2s after every
+    start and a supervisor that restarted it forever, so `buttons_ready` was
+    false at essentially every moment the settings page could ask.
+
+    The stub below is that CLI: it reaches ready, then exits the moment stdin
+    hits EOF. One start over the window is the whole assertion — a child that
+    is handed a closed stdin restarts several times in the same window.
+    """
+    counter = tmp_path / "starts"
+    stub(f"""
+        import sys
+        open({str(counter)!r}, "a").write("x")
+        print("[event] ready event_key=k", file=sys.stderr, flush=True)
+        sys.stdin.read()          # returns immediately on EOF, blocks otherwise
+        sys.exit(0)
+        """)
+    c = lark_cli.Consumer("1", "k", lambda ev: None, backoff_cap=0.2)
+    await c.start()
+    try:
+        await asyncio.sleep(1.2)
+        assert counter.read_text() == "x"      # started once, still running
+        assert c.ready is True
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_stdin_so_the_cli_can_shut_itself_down(stub, tmp_path):
+    """Closing stdin is one of the CLI's two documented graceful stops, and it
+    is the one that works when the child ignores signals. Pinned because a
+    consumer that holds stdin open forever would leave the subscription up."""
+    marker = tmp_path / "sawEOF"
+    stub(f"""
+        import signal, sys
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # only stdin can end this
+        print("[event] ready event_key=k", file=sys.stderr, flush=True)
+        sys.stdin.read()
+        open({str(marker)!r}, "w").write("eof")
+        sys.exit(0)
+        """)
+    c = lark_cli.Consumer("1", "k", lambda ev: None)
+    await c.start()
+    await asyncio.sleep(0.4)
+    await c.stop()
+    await asyncio.sleep(0.2)
+    assert marker.exists(), "stop() never closed the child's stdin"
+    assert c.ready is False

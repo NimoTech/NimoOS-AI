@@ -40,12 +40,17 @@ STOP_GRACE_SECONDS = 10.0
 MAX_LINE_BYTES = 1_000_000
 
 
-async def _spawn(uid: str, args: list[str]):
-    """create_subprocess_exec with the minimal per-user env, or None if absent."""
+async def _spawn(uid: str, args: list[str], *, stdin=asyncio.subprocess.DEVNULL):
+    """create_subprocess_exec with the minimal per-user env, or None if absent.
+
+    `stdin` is a parameter because the two forms need opposite things:
+    a one-shot send wants no stdin at all, while `event consume` exits the
+    moment stdin reaches EOF (see Consumer._run_once_streaming).
+    """
     try:
         return await asyncio.create_subprocess_exec(
             lark_binding.lark_bin(), *args,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=lark_binding.cli_env(uid),
@@ -137,6 +142,14 @@ class Consumer:
         self._proc = None
         if proc is None or proc.returncode is not None:
             return
+        # Closing stdin is the CLI's other documented graceful stop, and the
+        # one it reacts to first; do both so a build that ignores either still
+        # exits. Never SIGKILL — see below.
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:            # noqa: BLE001 — already-closed transport
+                pass
         try:
             proc.send_signal(signal.SIGTERM)
         except ProcessLookupError:
@@ -170,7 +183,13 @@ class Consumer:
 
     async def _run_once_streaming(self) -> bool:
         args = ["event", "consume", self._key, "--as", "bot"]
-        proc = await _spawn(self._uid, args)
+        # PIPE, not DEVNULL: `event consume` is "wired for AI subprocess
+        # callers" and treats stdin EOF as its shutdown signal, so DEVNULL
+        # made every subscription die ~2s after reaching ready and the loop
+        # below restart it forever. We never write to the pipe; holding it
+        # open is the whole point, and closing it is how stop() asks the CLI
+        # to leave (its own documented graceful path, alongside SIGTERM).
+        proc = await _spawn(self._uid, args, stdin=asyncio.subprocess.PIPE)
         if proc is None:
             _LOG.warning("lark consumer: lark-cli not found at %s", lark_binding.lark_bin())
             return False
