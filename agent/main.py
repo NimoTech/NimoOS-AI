@@ -3212,6 +3212,15 @@ def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:
         entry = {"kind": "prefix",
                  "value": lead + parts[0] + ("" if len(parts) == 1 else " ")}
         bucket = "shell"
+        # A head-derived prefix cannot authorize every command it came from.
+        # The run gate refuses chaining, redirection, interpreters and
+        # `protected` outright — whatever the rules say — so for those the rule
+        # written here would be inert, and the user would walk away believing
+        # the next run is authorized. Ask the gate itself rather than
+        # re-deriving its conditions, and refuse instead of writing a no-op.
+        from skills import shell as _shell
+        if not _shell.run_allowlist_would_cover(raw_detail, [entry]):
+            raise HTTPException(400, "shell_rule_would_not_apply")
     else:
         raise HTTPException(400, "unsupported_kind")
 

@@ -755,3 +755,67 @@ def test_run_allowlist_var_default_is_immutable():
 
     value = contextvars.Context().run(_read)   # empty context → declared default
     assert value == () and not isinstance(value, list)
+
+
+# -- would adopting this denial change anything? ---------------------------
+# `/agent/tasks/{id}/preauth/from-denied` generates a prefix rule from a denied
+# command. For a CHAINED command it generated one that can never match, because
+# the run gate refuses chaining outright — the button wrote a rule and changed
+# nothing, with no way for the user to tell. `run_allowlist_would_cover` is the
+# honest test, and it answers by running the real gate rather than restating
+# its conditions, so it cannot drift from `_run_allowlist_match`.
+
+def test_would_cover_a_single_simple_command(monkeypatch, tmp_path):
+    _shell_setup(monkeypatch)
+    assert shell.run_allowlist_would_cover(
+        "lark-cli im +messages-send --text hi",
+        [{"kind": "prefix", "value": "lark-cli "}], cwd=str(tmp_path)) is True
+
+
+def test_would_not_cover_a_chained_command(monkeypatch, tmp_path):
+    """The exact shape the adopt button produced a useless rule for."""
+    _shell_setup(monkeypatch)
+    assert shell.run_allowlist_would_cover(
+        "which lark-cli && lark-cli --version",
+        [{"kind": "prefix", "value": "which "}], cwd=str(tmp_path)) is False
+
+
+@pytest.mark.parametrize("cmd", [
+    "which crontab; systemctl list-units",
+    # `which crontab || echo no` is deliberately NOT here: classify calls it
+    # `safe`, so it is never gated and never denied in the first place.
+    "systemctl is-active cron || lark-cli whoami",
+    "lark-cli whoami | head -3",
+    "lark-cli whoami > /tmp/out",
+])
+def test_would_not_cover_other_multi_segment_shapes(monkeypatch, tmp_path, cmd):
+    _shell_setup(monkeypatch)
+    rule = [{"kind": "prefix", "value": cmd.split()[0] + " "}]
+    assert shell.run_allowlist_would_cover(cmd, rule, cwd=str(tmp_path)) is False
+
+
+def test_would_not_cover_an_interpreter(monkeypatch, tmp_path):
+    """A run-scoped grant never covers an interpreter, so adopting one is the
+    same silent no-op as a chained command."""
+    _shell_setup(monkeypatch)
+    assert shell.run_allowlist_would_cover(
+        "python3 -c 'import os'",
+        [{"kind": "prefix", "value": "python3 "}], cwd=str(tmp_path)) is False
+
+
+def test_would_cover_a_safe_command_that_was_never_gated(monkeypatch, tmp_path):
+    """`classify` short-circuits `safe` before any allowlist is consulted, so
+    the answer is yes regardless of the rules."""
+    _shell_setup(monkeypatch)
+    assert shell.run_allowlist_would_cover("ls /DATA", [], cwd=str(tmp_path)) is True
+
+
+def test_would_cover_leaves_the_ambient_allowlist_untouched(monkeypatch, tmp_path):
+    """It sets RUN_ALLOWLIST_VAR to answer the question; a leak would grant a
+    live run whatever the last caller asked about."""
+    _shell_setup(monkeypatch)
+    shell.RUN_ALLOWLIST_VAR.set(({"kind": "prefix", "value": "sentinel "},))
+    shell.run_allowlist_would_cover("lark-cli whoami",
+                                    [{"kind": "prefix", "value": "lark-cli "}],
+                                    cwd=str(tmp_path))
+    assert shell.RUN_ALLOWLIST_VAR.get() == ({"kind": "prefix", "value": "sentinel "},)

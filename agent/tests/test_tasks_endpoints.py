@@ -683,3 +683,46 @@ def test_notify_on_start_defaults_to_off(client):
     tid = r.json()["id"]
     assert client.get(f"/agent/tasks/{tid}",
                       headers=H).json()["notify_on_start"] is False
+
+
+def test_from_denied_refuses_a_chained_shell_command(client):
+    """The generator works on the command's HEAD, and the run gate refuses
+    chaining outright — so adopting `which x && x --version` used to write a
+    `"which "` rule that could never match it. Silent no-ops are worse than
+    refusals: the user walks away believing the run is authorized."""
+    tid, run_id = _run_with_denied(client, [
+        {"kind": "shell", "detail": "which lark-cli && lark-cli --version"}])
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "shell_rule_would_not_apply"
+    # and it changed nothing
+    doc = client.get(f"/agent/tasks/{tid}", headers=H).json()["preauth"]
+    assert doc["shell"] == []
+
+
+def test_from_denied_still_adopts_a_single_simple_command(client):
+    tid, run_id = _run_with_denied(client, [
+        {"kind": "shell", "detail": "lark-cli im +messages-send --text hi"}])
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["adopted"] == {"field": "shell",
+                                   "value": {"kind": "prefix", "value": "lark-cli "}}
+
+
+def test_from_denied_refuses_an_interpreter(client):
+    """Same silent no-op, different cause: a run-scoped grant never covers an
+    interpreter, so `"python3 "` would be written and ignored."""
+    tid, run_id = _run_with_denied(client, [
+        {"kind": "shell", "detail": "python3 -c 'import os'"}])
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "shell_rule_would_not_apply"
+
+
+def test_from_denied_egress_is_unaffected_by_the_shell_check(client):
+    tid, run_id = _run_with_denied(client, [
+        {"kind": "egress", "detail": "open.feishu.cn:443"}])
+    r = _from_denied(client, tid, run_id, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["adopted"] == {"field": "egress_domains",
+                                   "value": "open.feishu.cn"}

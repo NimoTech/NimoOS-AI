@@ -297,6 +297,37 @@ _RUN_INTERPRETERS = {
 _RUN_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
 
 
+def run_allowlist_would_cover(command: str, rules, *, cwd: str | None = None) -> bool:
+    """Would granting `rules` for one run actually let `command` through?
+
+    Exists for the "adopt this denied action" flow, which turns a denied
+    command into a preauth rule. That generator works on the command's head, so
+    for a CHAINED command it produced a rule the gate can never honour (chaining
+    is refused outright, whatever the rules say) — the button wrote something
+    and changed nothing, with no way for the user to tell.
+
+    Answers by running the real gate with `rules` temporarily in scope, rather
+    than restating the gate's conditions here: a second copy of "single simple
+    command, no interpreters, never protected" would drift from
+    `_run_allowlist_match` the first time either side changed.
+
+    `safe` is True regardless of `rules`: `handle_shell_confirmation` returns
+    before consulting any allowlist, so such a command was never gated.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    decision = shell_guard.classify(command, cwd=cwd)
+    if decision.level == "safe":
+        return True
+    token = RUN_ALLOWLIST_VAR.set(tuple(rules or ()))
+    try:
+        return _run_allowlist_match(command, decision)
+    finally:
+        # Restore, never just clear: this runs inside a live request, and
+        # leaking the probe's rules would grant them to whatever runs next.
+        RUN_ALLOWLIST_VAR.reset(token)
+
+
 def _run_allowlist_match(command: str, decision) -> bool:
     """True if the run-scoped pre-authorization vouches for `command`.
 
