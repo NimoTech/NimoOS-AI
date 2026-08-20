@@ -28,8 +28,17 @@ TIMEOUT_SEC = 20.0
 CACHE_TTL_SEC = 900          # 15 minutes, same as Claude Code's WebFetch
 MAX_SAME_HOST_HOPS = 3
 
+# RSS/Atom are here because a feed is the only EXACT source an agent-loop
+# digest has: real timestamps, real titles, the publisher's own summary, no
+# API key. Without them a scheduled task reported all three competitor blogs
+# as "feed not supported" and fell back to scraping listing pages, which is
+# how a six-day-old item ends up inside a 72-hour report. `text/xml` and
+# `application/xml` were already listed but no real feed serves those:
+# Shopify's `.atom` sends application/atom+xml, WordPress's `/feed/` and
+# frame.work's `blog.rss` send application/rss+xml.
 _OK_TYPES = ("text/html", "text/plain", "application/json",
-             "application/xhtml+xml", "text/xml", "application/xml")
+             "application/xhtml+xml", "text/xml", "application/xml",
+             "application/rss+xml", "application/atom+xml")
 
 DEFAULT_PROXY_URL = "http://169.254.7.1:8888"
 # os.environ.get() returns "" — not the default — for a variable that is set but
@@ -126,7 +135,12 @@ async def _fetch_once(client: httpx.AsyncClient, url: str) -> dict:
         req = client.build_request(
             "GET", url,
             headers={"User-Agent": _user_agent(),
-                     "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9"},
+                     # Feed types are advertised too: a server that content-
+                     # negotiates would otherwise answer a feed URL with HTML,
+                     # which is precisely not what the caller asked for.
+                     "Accept": "text/html,application/xhtml+xml,"
+                               "application/rss+xml,application/atom+xml,"
+                               "text/plain;q=0.9"},
             timeout=TIMEOUT_SEC,
         )
         resp = await client.send(req, stream=True, follow_redirects=False)
