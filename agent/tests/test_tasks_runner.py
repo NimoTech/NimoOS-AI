@@ -75,6 +75,8 @@ class Harness:
         self.cancelled = []
         self.evicted = []
         self.deleted = []
+        self.workspaces = []
+        self.workspace_path = ""      # "" = this task has no working folder
 
     # start_run(session_id, user_id, message, creds, *, max_turns,
     #           pre_confirmed_tools, run_shell_allowlist) -> sink
@@ -120,6 +122,10 @@ class Harness:
     async def session_deleter(self, conn, user_id, session_id):
         self.deleted.append((user_id, session_id))
 
+    def workspace_ensure(self, task_id, name=""):
+        self.workspaces.append((task_id, name))
+        return self.workspace_path
+
     async def run(self, conn, **over):
         kw = dict(start_run=self.start_run, creds_resolver=self.creds_resolver,
                   driver_factory=self.driver_factory,
@@ -127,6 +133,10 @@ class Harness:
                   grant_fs=self.grant_fs, grant_egress=self.grant_egress,
                   cancel=self.cancel, evict=self.evict,
                   session_deleter=self.session_deleter,
+                  # No workspace unless a test asks for one. The real default
+                  # creates a directory under /DATA, and before this seam
+                  # existed one run of this file left 58 of them on the live box.
+                  workspace_ensure=self.workspace_ensure,
                   now=NOW)
         kw.update(over)
         return await runner.process_once(conn, **kw)
@@ -1290,3 +1300,42 @@ async def test_a_broken_start_notification_does_not_stop_the_run(conn):
     row = conn.execute("SELECT status FROM task_runs WHERE task_id=?",
                        (task_id,)).fetchone()
     assert row["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_the_task_workspace_is_granted_and_briefed(conn):
+    """A task's own folder reaches BOTH gates and the model's prompt.
+
+    Three things have to line up or the folder is useless: `grant_fs` has to
+    receive it (so the fs skill can see it), the driver's preauth document has
+    to contain it (so a write card is auto-approved), and the prompt has to name
+    it (so the model knows it exists at all).
+    """
+    h = Harness()
+    h.workspace_path = "/tmp/ws/t-1"
+    tid = _mk(conn)
+    rid = _queue(conn, tid)
+
+    granted = []
+    h.grant_fs = lambda conn_, sid, paths: granted.append(list(paths)) or len(paths)
+
+    assert await h.run(conn) is True
+
+    assert h.workspaces and h.workspaces[0][0] == tid
+    assert "/tmp/ws/t-1" in granted[0]
+    assert "/tmp/ws/t-1" in h.driver.preauth["fs_write"]
+    assert "/tmp/ws/t-1" in h.start_run_calls[0]["message"]
+    assert rid
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_a_workspace_keeps_the_prompt_verbatim(conn):
+    # The folder can fail to be created (a full disk, a bad root). That costs
+    # the folder, never the run — and the prompt must be untouched.
+    h = Harness()
+    h.workspace_path = ""
+    tid = _mk(conn, prompt="write the report")
+    _queue(conn, tid)
+
+    assert await h.run(conn) is True
+    assert h.start_run_calls[0]["message"] == "write the report"

@@ -40,7 +40,7 @@ import time
 import session_purge
 from notes import store as notes_store
 
-from . import grants, notify, preauth, store
+from . import grants, notify, preauth, store, workspace
 
 logger = logging.getLogger("nimoos-agent.tasks")
 
@@ -146,6 +146,29 @@ def _briefing_command(path: str) -> str:
     return f"{interpreter or 'bash'} {path}"
 
 
+def _workspace_lines(doc) -> list:
+    """The working-folder paragraph, or `[]` when the run has no folder.
+
+    Without this the folder is invisible and therefore useless: nothing else in
+    the run path tells the model where it may write (`format_preauth_note` is
+    after-the-fact provenance appended to the summary, which the model never
+    sees). Saying the folder PERSISTS is the load-bearing half — a model that
+    thinks it is scratch has no reason to keep dedupe state in it, which is the
+    only reason it exists.
+    """
+    path = doc.get("workspace") if isinstance(doc, dict) else ""
+    if not isinstance(path, str) or not path:
+        return []
+    return [
+        f"[Your working folder for this task is {path}",
+        "You may read and write files there, and it PERSISTS between runs — it "
+        "is the same folder your previous run used. Use it for anything you "
+        "need to remember next time: which items you have already reported, a "
+        "cursor, a cache. Read what is there before deciding something is new. "
+        "It is yours alone; no other task can see it.]",
+    ]
+
+
 def format_run_briefing(doc) -> str:
     """Tell the model which scripts it may run, and in exactly what form.
 
@@ -168,8 +191,11 @@ def format_run_briefing(doc) -> str:
     scripts = []
     if isinstance(doc, dict):
         scripts = [s for s in (doc.get("scripts") or []) if isinstance(s, str) and s]
+    ws_lines = _workspace_lines(doc)
     if not scripts:
-        return ""
+        # A workspace alone is still worth briefing — it used to return "" here,
+        # which made the folder unreachable for every task that had no script.
+        return _bounded("\n".join(ws_lines)) if ws_lines else ""
     lines = [
         "[This run is pre-authorized to execute the following script(s). "
         "Use the command EXACTLY as written:",
@@ -196,9 +222,13 @@ def format_run_briefing(doc) -> str:
         f"command (up to {_shell_max_timeout()} seconds, the maximum). If the "
         f"output looks cut off mid-way, it was the per-command timeout, not the "
         f"script finishing.]")
-    note = "\n".join(lines)
+    return _bounded("\n".join(lines + ws_lines))
+
+
+def _bounded(note: str) -> str:
+    """Keep a briefing from crowding out the author's own prompt."""
     if len(note) > BRIEFING_MAX_CHARS:
-        note = note[:BRIEFING_MAX_CHARS - 2] + "…]"
+        return note[:BRIEFING_MAX_CHARS - 2] + "…]"
     return note
 
 
@@ -380,6 +410,7 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                        max_turns_reader=_default_max_turns_reader,
                        notify=notify.send_result,
                        notify_start=notify.send_start,
+                       workspace_ensure=workspace.ensure,
                        keep_runs: int = KEEP_RUNS) -> bool:
     """Claim and execute at most one run. False only when there was nothing
     to do — the caller uses that to decide whether to sleep.
@@ -423,6 +454,24 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             return True
 
         doc = preauth.parse(task["preauth_json"])
+
+        # Every task owns one folder and its run may write there. Injected into
+        # the in-memory document rather than stored: it is derived from the task
+        # id, so persisting it would duplicate a fact that can never disagree —
+        # and a stored copy would go stale the moment ROOT moved. Adding it here
+        # covers BOTH gates at once, since `grant_fs` and
+        # `driver.fs_allowed` each read `doc["fs_write"]`.
+        # Injected like every other side effect here: the default writes under
+        # /DATA, and a test that used it created 58 real directories on the
+        # live box before this seam existed.
+        task_dir = workspace_ensure(task_id, task["name"] or "")
+        if task_dir:
+            if task_dir not in doc["fs_write"]:
+                doc["fs_write"].append(task_dir)
+            # `workspace` is what the briefing reads. Kept separate from
+            # fs_write so the briefing names the ONE folder that belongs to this
+            # task, never whatever else the author happened to authorize.
+            doc["workspace"] = task_dir
 
         session_id = session_factory(conn, user_id, task["agent_type"])
         store.attach_session(conn, run_id, session_id)

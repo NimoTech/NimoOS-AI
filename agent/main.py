@@ -2919,10 +2919,16 @@ def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
 
 def _task_out(row) -> dict:
     from tasks import preauth as _preauth
+    from tasks import workspace as _workspace
     out = dict(row)
     out["preauth"] = _preauth.parse(out.pop("preauth_json", "{}"))
     out["enabled"] = bool(out.get("enabled"))
     out["notify_on_start"] = bool(out.get("notify_on_start"))
+    # Derived, never stored: the folder is a pure function of the task id, so a
+    # persisted copy could only ever go stale or disagree. `path_for` (not
+    # `ensure`) because reading a task must not create directories — the folder
+    # appears on the first run, and the UI shows where it will be.
+    out["workspace"] = _workspace.path_for(str(out.get("id") or ""))
     return out
 
 
