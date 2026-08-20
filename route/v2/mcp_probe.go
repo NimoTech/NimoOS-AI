@@ -2,6 +2,7 @@ package v2
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -244,24 +245,135 @@ func protocolModeFor(era, version string) string {
 	return "auto"
 }
 
-// probeAndPersist calls the Python agent's /agent/mcp/test for m and persists
-// the result as this server's runtime row before returning. env/headers are
-// the already-decrypted plaintext maps (callers must not decrypt twice; see
-// route/v2/mcp.go's decryptMap).
+// --- the probe's single-flight waiter registry ---
 //
-// Order of operations: MarkProbing claims the single-flight lock first; if a
-// probe is already running for this server, this returns the last persisted
-// observation instead of starting a second concurrent probe. Both save paths
-// below (SaveSuccess / SaveFailure) clear the lock themselves, so there is no
-// path that claims it and leaves it held.
+// probeWaitBudget is how long a /test request waits for the probe that
+// already holds the single-flight lock. It is spent inside the browser's own
+// budget for this call (the UI raises its axios timeout to 135s for this one
+// endpoint), so it only ever shortens a wait the caller was willing to make
+// anyway. A var, not a const, so tests can shrink it.
+var probeWaitBudget = 10 * time.Second
+
+// subscribeProbe returns the channel that will be closed once the next probe
+// of serverID has persisted its result.
+//
+// Callers MUST subscribe BEFORE calling MarkProbing. Subscribing afterwards
+// loses the wakeup: the probe holding the lock can finish, broadcast, and
+// find no channel registered, and the late subscriber would then wait out its
+// whole budget for an event that already happened.
+//
+// The channel is shared by every waiter for that server and is closed, never
+// sent on, so one broadcast wakes all of them. broadcastProbeDone removes it
+// from the map as it closes, so the next probe cycle gets a fresh channel and
+// an already-closed one is never handed out.
+func (h *MCPHandler) subscribeProbe(serverID int64) <-chan struct{} {
+	h.probeWaitMu.Lock()
+	defer h.probeWaitMu.Unlock()
+	if h.probeWaiters == nil {
+		h.probeWaiters = map[int64]chan struct{}{}
+	}
+	ch, ok := h.probeWaiters[serverID]
+	if !ok {
+		ch = make(chan struct{})
+		h.probeWaiters[serverID] = ch
+	}
+	return ch
+}
+
+// claimOrWaitForProbe is the only correct way into a probe cycle for a caller
+// that needs the outcome: it either claims the single-flight lock (claimed ==
+// true; the caller now owns the dial and must call dialAndPersist) or hands
+// back the channel the in-flight probe will close when it publishes.
+//
+// It exists so the subscribe-then-claim order cannot be written the other way
+// round at a call site. Reversed, there is a window between the failed claim
+// and the subscription in which the running probe finishes and broadcasts
+// into an empty registry: the caller would then wait out its whole budget for
+// an event that already happened, and answer "still probing" for a probe that
+// had in fact just committed its result.
+func (h *MCPHandler) claimOrWaitForProbe(serverID int64) (bool, <-chan struct{}, error) {
+	waiter := h.subscribeProbe(serverID)
+	claimed, err := h.svc.MCPRuntime().MarkProbing(serverID)
+	if err != nil {
+		return false, nil, err
+	}
+	return claimed, waiter, nil
+}
+
+// broadcastProbeDone wakes every waiter for serverID. dialAndPersist calls it
+// only once the persist has returned — i.e. after the transaction inside
+// SaveSuccess/SaveFailure has committed — because a waiter woken any earlier
+// would read the row the probe was in the middle of replacing and report
+// pre-probe data as its fresh result.
+func (h *MCPHandler) broadcastProbeDone(serverID int64) {
+	h.probeWaitMu.Lock()
+	ch, ok := h.probeWaiters[serverID]
+	if ok {
+		delete(h.probeWaiters, serverID)
+	}
+	h.probeWaitMu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+// awaitProbe waits for the in-flight probe to publish its result. It reports
+// whether that happened: false means the budget ran out or the client hung
+// up, and the caller must NOT fall back to the persisted row (see
+// probeInProgressResult).
+//
+// Giving up here only ends this request's wait — the probe holding the lock
+// keeps running and still persists its result. That asymmetry is deliberate:
+// a browser that navigated away must not cancel a 125-second stdio probe the
+// next reader would otherwise get for free.
+func (h *MCPHandler) awaitProbe(ctx context.Context, waiter <-chan struct{}) bool {
+	timer := time.NewTimer(probeWaitBudget)
+	defer timer.Stop()
+	select {
+	case <-waiter:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// probeAndPersist claims the single-flight lock and, if it wins, runs one
+// probe to completion. It is the entry point for the callers that have
+// nothing to report to a browser — the TTL self-check's background refresh
+// and the migration backfill sweep — so losing the claim is simply a no-op
+// for them: the probe already running will persist the same observation they
+// wanted.
+//
+// A /test request must NOT use this: it owes the user an answer about the
+// server's state right now, so it subscribes to the in-flight probe first and
+// waits for it (see the Test handler in mcp.go).
 func (h *MCPHandler) probeAndPersist(m *service.McpServer, env, headers map[string]string) (probeResult, error) {
 	claimed, err := h.svc.MCPRuntime().MarkProbing(m.ID)
 	if err != nil {
 		return probeResult{}, err
 	}
 	if !claimed {
-		return h.probingInProgressResult(m.ID), nil
+		return probeResult{}, nil
 	}
+	return h.dialAndPersist(m, env, headers)
+}
+
+// dialAndPersist calls the Python agent's /agent/mcp/test for m and persists
+// the result as this server's runtime row before returning. env/headers are
+// the already-decrypted plaintext maps (callers must not decrypt twice; see
+// route/v2/mcp.go's decryptMap).
+//
+// The caller MUST already hold the single-flight lock (MarkProbing returned
+// true). Both save paths below (SaveSuccess / SaveFailure) clear the lock
+// themselves, so there is no path that claims it and leaves it held.
+func (h *MCPHandler) dialAndPersist(m *service.McpServer, env, headers map[string]string) (probeResult, error) {
+	// Deferred, so every exit path below broadcasts, and so the broadcast
+	// necessarily happens after the SaveSuccess/SaveFailure call above it has
+	// returned — i.e. after its transaction committed. See
+	// broadcastProbeDone.
+	defer h.broadcastProbeDone(m.ID)
 
 	var args []string
 	_ = json.Unmarshal([]byte(m.Args), &args)
@@ -450,31 +562,91 @@ func (h *MCPHandler) migrateBackfillIdentityCards() error {
 	return nil
 }
 
-// probingInProgressResult builds the response returned when MarkProbing finds
-// a probe already in flight for this server: the caller must not block
-// forever waiting on someone else's probe, so it gets back the last
-// persisted observation (if any) instead.
-func (h *MCPHandler) probingInProgressResult(serverID int64) probeResult {
+// freshRowResult renders the observation a probe just committed as a /test
+// response body, in the same shape the browser gets when it wins the claim
+// and relays Python's answer directly.
+//
+// It is ONLY legitimate on the woken-waiter path: the caller must have been
+// released by broadcastProbeDone, which dialAndPersist only calls after the
+// persist committed. Reading the row at any other moment reads cache — the
+// exact defect probeInProgressResult exists to avoid.
+//
+// protocol_version comes from protocol_mode, which for a modern server IS the
+// negotiated version string (protocolModeFor pins it there). "auto" and
+// "legacy" carry no version, so the field goes out empty and the settings
+// page simply renders no protocol line — half a sentence would be worse than
+// none. supported_versions is not persisted at all and is therefore absent
+// here; it only ever decorates the line with "also supports".
+func (h *MCPHandler) freshRowResult(m *service.McpServer, env, headers map[string]string) probeResult {
+	serverID := m.ID
+	r, err := h.svc.MCPRuntime().Get(serverID)
+	if err != nil || r == nil {
+		// Woken, yet nothing to read: the probe's persist failed (it logs its
+		// own reason). "Still probing" is the only honest answer left — never
+		// an invented success.
+		if err != nil {
+			log.Printf("mcp probe %d: woken by a finished probe but reading its row failed: %v", serverID, err)
+		}
+		return probeInProgressResult()
+	}
+	var tools []service.ToolMeta
+	_ = json.Unmarshal([]byte(r.ToolsJSON), &tools)
+	names := make([]string, len(tools))
+	for i, tl := range tools {
+		names[i] = tl.Name
+	}
+	version := ""
+	if r.ProtocolEra == "modern" && r.ProtocolMode != "auto" {
+		version = r.ProtocolMode
+	}
+	// config_changed answers "is this observation about the server the user is
+	// looking at?". The probe we waited for may have been dialling the
+	// address, token or command line that was configured BEFORE an edit that
+	// landed while it ran, in which case its result is about the old config
+	// however fresh it is. Reported as a flag rather than retried until the
+	// fingerprints agree: a user correcting a token one keystroke at a time
+	// would invalidate every new probe in turn and the request would spin
+	// forever instead of answering (see the Test handler's "one wait, one
+	// dial" rule). The comparison is against the config THIS request loaded,
+	// so an edit landing later still needs the user's next test to be seen.
+	var args []string
+	_ = json.Unmarshal([]byte(m.Args), &args)
+	currentFP := service.ConfigFP(m.Transport, m.URL, m.Command, args, env, headers)
 	resp := map[string]any{
+		"ok":               r.ProbeState == "ok",
+		"tool_count":       len(names),
+		"tools":            names,
+		"handle":           r.Handle,
+		"summary":          r.Summary,
+		"protocol_era":     r.ProtocolEra,
+		"protocol_version": version,
+		"config_changed":   r.ConfigFP != currentFP,
+	}
+	if r.ProbeState != "ok" {
+		resp["error"] = r.LastError
+		resp["error_key"] = r.LastErrorKey
+	}
+	body, _ := json.Marshal(resp)
+	return probeResult{StatusCode: http.StatusOK, Body: body}
+}
+
+// probeInProgressResult is the answer for a /test request that could not get
+// a fresh observation: a probe was already in flight and it did not publish a
+// result within probeWaitBudget (or the client hung up first).
+//
+// It deliberately carries NO observation. An earlier revision attached the
+// persisted runtime row here — its tool list, handle, summary, and
+// probe_state as this request's `ok` — which made the settings page render a
+// panel built from cache that was indistinguishable from a panel built from a
+// probe that had just run. "Test connection" exists precisely to answer "what
+// does this server do right now", so the honest answer when we do not know is
+// the `probing` flag and nothing else.
+func probeInProgressResult() probeResult {
+	body, _ := json.Marshal(map[string]any{
 		"ok":        false,
 		"probing":   true,
 		"error":     "a probe for this server is already running",
 		"error_key": "probe_in_progress",
-	}
-	if r, _ := h.svc.MCPRuntime().Get(serverID); r != nil {
-		var tools []service.ToolMeta
-		_ = json.Unmarshal([]byte(r.ToolsJSON), &tools)
-		names := make([]string, len(tools))
-		for i, tl := range tools {
-			names[i] = tl.Name
-		}
-		resp["ok"] = r.ProbeState == "ok"
-		resp["tool_count"] = len(tools)
-		resp["tools"] = names
-		resp["handle"] = r.Handle
-		resp["summary"] = r.Summary
-		resp["protocol_era"] = r.ProtocolEra
-	}
-	body, _ := json.Marshal(resp)
+	})
 	return probeResult{StatusCode: http.StatusOK, Body: body}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NimoTech/NimoOS-AI/pkg/mcpparse"
@@ -20,10 +21,20 @@ type MCPHandler struct {
 	tickets   *TicketStore
 	runTokens *RunTokenStore
 	agentURL  string
+
+	// probeWaiters is the in-process registry a /test request uses to wait
+	// for the probe that already holds the single-flight lock, instead of
+	// answering from cache. One channel per server id, closed (never sent
+	// on) by broadcastProbeDone so every waiter for that server wakes at
+	// once. See subscribeProbe in mcp_probe.go for the ordering rule that
+	// makes it lossless.
+	probeWaitMu  sync.Mutex
+	probeWaiters map[int64]chan struct{}
 }
 
 func NewMCPHandler(svc service.Services, tickets *TicketStore, runTokens *RunTokenStore, agentURL string) *MCPHandler {
-	return &MCPHandler{svc: svc, tickets: tickets, runTokens: runTokens, agentURL: agentURL}
+	return &MCPHandler{svc: svc, tickets: tickets, runTokens: runTokens, agentURL: agentURL,
+		probeWaiters: map[int64]chan struct{}{}}
 }
 
 type mcpRequest struct {
@@ -455,7 +466,29 @@ func (h *MCPHandler) Test(c echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	pr, err := h.probeAndPersist(m, h.decryptMap(m.Env), h.decryptMap(m.Headers))
+	env, headers := h.decryptMap(m.Env), h.decryptMap(m.Headers)
+	// Either this request owns the dial or it waits for the probe that does —
+	// see claimOrWaitForProbe for why those two steps must live in one
+	// function. When it wins the claim, the waiter channel is simply the one
+	// its own dialAndPersist broadcast closes; nothing has to unsubscribe.
+	claimed, waiter, err := h.claimOrWaitForProbe(m.ID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if !claimed {
+		// Someone else's probe owns the dial. Wait for it rather than
+		// answering from the persisted row: this endpoint's whole purpose is
+		// to report what the server does right now.
+		if !h.awaitProbe(c.Request().Context(), waiter) {
+			pr := probeInProgressResult()
+			return c.JSONBlob(pr.StatusCode, pr.Body)
+		}
+		// Released by broadcastProbeDone, so the row now holds an observation
+		// that is at most microseconds old — that IS this request's result.
+		pr := h.freshRowResult(m, env, headers)
+		return c.JSONBlob(pr.StatusCode, pr.Body)
+	}
+	pr, err := h.dialAndPersist(m, env, headers)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
