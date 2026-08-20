@@ -117,6 +117,47 @@ func migrate(db *sql.DB) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_mcp_servers_user_id ON mcp_servers(user_id);
 
+	CREATE TABLE IF NOT EXISTS mcp_server_runtime (
+		server_id       INTEGER PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+		server_name     TEXT NOT NULL DEFAULT '',
+		server_title    TEXT NOT NULL DEFAULT '',
+		server_version  TEXT NOT NULL DEFAULT '',
+		handle          TEXT NOT NULL DEFAULT '',
+		instructions    TEXT NOT NULL DEFAULT '',
+		summary         TEXT NOT NULL DEFAULT '',
+		tools_json      TEXT NOT NULL DEFAULT '[]',
+		listed_at       INTEGER NOT NULL DEFAULT 0,
+		ttl_sec         INTEGER NOT NULL DEFAULT 0,
+		config_fp       TEXT NOT NULL DEFAULT '',
+		identity_fp     TEXT NOT NULL DEFAULT '',
+		protocol_mode   TEXT NOT NULL DEFAULT '',
+		protocol_era    TEXT NOT NULL DEFAULT '',
+		probe_state     TEXT NOT NULL DEFAULT '',
+		last_ok_at      INTEGER NOT NULL DEFAULT 0,
+		last_error_at   INTEGER NOT NULL DEFAULT 0,
+		last_error      TEXT NOT NULL DEFAULT '',
+		last_error_key  TEXT NOT NULL DEFAULT '',
+		fail_streak     INTEGER NOT NULL DEFAULT 0,
+		cooldown_until  INTEGER NOT NULL DEFAULT 0,
+		empty_streak    INTEGER NOT NULL DEFAULT 0
+	);
+
+	CREATE TABLE IF NOT EXISTS mcp_server_schemas (
+		server_id    INTEGER PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+		listed_at    INTEGER NOT NULL DEFAULT 0,
+		schemas_json TEXT NOT NULL DEFAULT '[]'
+	);
+
+	CREATE TABLE IF NOT EXISTS mcp_tool_approvals (
+		server_id    INTEGER NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+		tool_name    TEXT NOT NULL,
+		identity_fp  TEXT NOT NULL DEFAULT '',
+		schema_hash  TEXT NOT NULL DEFAULT '',
+		approved_at  INTEGER NOT NULL,
+		last_seen_at INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (server_id, tool_name)
+	);
+
 	CREATE TABLE IF NOT EXISTS privacy_policies (
 		id                INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id           TEXT NOT NULL UNIQUE,
@@ -230,6 +271,23 @@ func migrate(db *sql.DB) error {
 	// Idempotent column additions for existing databases
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN default_model TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mcp_servers ADD COLUMN note TEXT NOT NULL DEFAULT ''`)
+	// desc_hash drives the settings UI's "description changed" badge (design
+	// doc §5.2.1) — it must NEVER be added to any invalidation gate. See
+	// mcp_approvals.go's Put doc comment for why.
+	_, _ = db.Exec(`ALTER TABLE mcp_tool_approvals ADD COLUMN desc_hash TEXT NOT NULL DEFAULT ''`)
+
+	// Startup sweep: clear any MCP runtime row still showing probe_state='probing'.
+	// nimoos-ai is the only process that ever probes MCP servers (Go is the sole
+	// writer of MCP runtime state), so a 'probing' row observed at process startup
+	// can only be left over from a previous process that died mid-probe (a routine
+	// `systemctl restart nimoos-ai`, a panic, or a crash) — it can never be a
+	// concurrent probe actually in flight, because this migration runs before
+	// anything in this process starts probing. Without this sweep, MarkProbing's
+	// single-flight lock (probe_state='probing') would wedge that server forever:
+	// every later probe attempt would see the lock as held and refuse to run, and
+	// recovering would mean hand-editing ai.db.
+	_, _ = db.Exec(`UPDATE mcp_server_runtime SET probe_state='' WHERE probe_state='probing'`)
 
 	// One-time backfill: classify rows whose provider_type is still empty.
 	rows, err = db.Query(`SELECT id, base_url, protocol FROM providers WHERE provider_type=''`)

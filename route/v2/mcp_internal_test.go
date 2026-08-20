@@ -14,7 +14,7 @@ import (
 
 func TestRegisterInternal_CreatesForUser(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/register",
 		strings.NewReader(`{"user_id":"7","command_line":"npx -y @upstash/context7-mcp"}`))
@@ -47,7 +47,7 @@ func TestRegisterInternal_CreatesForUser(t *testing.T) {
 
 func TestRegisterInternal_RequiresUserID(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/register",
 		strings.NewReader(`{"command_line":"npx x"}`))
@@ -61,7 +61,7 @@ func TestRegisterInternal_RequiresUserID(t *testing.T) {
 
 func TestParseInternal_OK(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/parse",
 		strings.NewReader(`{"command_line":"uvx mcp-server-time"}`))
@@ -81,7 +81,7 @@ func TestParseInternal_OK(t *testing.T) {
 
 func TestListInternal_RequiresUserID(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/v1/ai/_internal/mcp/list", nil)
 	rec := httptest.NewRecorder()
@@ -93,7 +93,7 @@ func TestListInternal_RequiresUserID(t *testing.T) {
 
 func TestListInternal_ReturnsDTOs(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	// seed one server for user 7 via the register endpoint
 	regReq := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/register",
@@ -123,7 +123,7 @@ func TestListInternal_ReturnsDTOs(t *testing.T) {
 
 func TestRemoveInternal_RequiresUserID(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/remove",
 		strings.NewReader(`{"id":3}`))
@@ -137,7 +137,7 @@ func TestRemoveInternal_RequiresUserID(t *testing.T) {
 
 func TestRemoveInternal_Deletes(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	// seed
 	regReq := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/register",
@@ -171,7 +171,7 @@ func TestRemoveInternal_Deletes(t *testing.T) {
 
 func TestRegisterInternal_RequiresCommandLine(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/register",
 		strings.NewReader(`{"user_id":"7"}`))
@@ -185,7 +185,7 @@ func TestRegisterInternal_RequiresCommandLine(t *testing.T) {
 
 func TestRemoveInternal_RequiresID(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/_internal/mcp/remove",
 		strings.NewReader(`{"user_id":"7"}`))

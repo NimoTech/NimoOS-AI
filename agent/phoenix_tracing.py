@@ -134,22 +134,63 @@ def refresh_enabled_flag(conn) -> None:
     _set_flag(tracing_globally_enabled(conn))
 
 
+def _tool_error_formatter(args):
+    """RunConfig.tool_error_formatter: rewrite "tool not found" for `mcp__*`
+    names into instructions the model can act on. Returning None (any other
+    error kind, any non-MCP tool, or any failure in here) keeps the SDK's own
+    default message."""
+    try:
+        if getattr(args, "kind", "") != "tool_not_found":
+            return None
+        from skills import mcp_gating as _mcp
+        return _mcp.tool_not_found_message(getattr(args, "tool_name", "") or "")
+    except Exception:
+        return None
+
+
+def _tool_error_kwargs() -> dict:
+    """Turn a call to a tool that isn't in the tool list from a run-killing
+    ModelBehaviorError (the SDK default, run_config.py's
+    tool_not_found_behavior="raise_error") into a tool result the model can
+    recover from. Split out so an SDK version that lacks either parameter
+    degrades to the old behaviour instead of failing every run — see
+    build_trace_run_config's retry."""
+    return {
+        "tool_not_found_behavior": "return_error_to_model",
+        "tool_error_formatter": _tool_error_formatter,
+    }
+
+
 def build_trace_run_config(enabled: bool, session_id, user_id, model_name, kind):
-    """Always return a RunConfig. enabled=False → tracing_disabled=True."""
+    """Always return a RunConfig. enabled=False → tracing_disabled=True.
+
+    Also the single place this repo configures tool-error handling: there is
+    exactly one RunConfig factory, and every run goes through it whether
+    tracing is on or off.
+    """
     from agents import RunConfig
-    if not enabled:
+    base = {"tracing_disabled": True} if not enabled else {
+        "workflow_name": "nimoos-agent",
+        "group_id": str(session_id),
+        "trace_metadata": {
+            "user_id": str(user_id),
+            "model": str(model_name),
+            "agent_type": str(kind),
+        },
+        "tracing_disabled": False,
+    }
+    try:
+        return RunConfig(**base, **_tool_error_kwargs())
+    except TypeError:
+        # SDK too old for these parameters: keep the run working.
+        _LOG.warning("SDK RunConfig rejected tool-error parameters; "
+                     "falling back without them", exc_info=True)
+    except Exception:
+        _LOG.warning("build_trace_run_config failed; disabling trace for this run",
+                     exc_info=True)
         return RunConfig(tracing_disabled=True)
     try:
-        return RunConfig(
-            workflow_name="nimoos-agent",
-            group_id=str(session_id),
-            trace_metadata={
-                "user_id": str(user_id),
-                "model": str(model_name),
-                "agent_type": str(kind),
-            },
-            tracing_disabled=False,
-        )
+        return RunConfig(**base)
     except Exception:
         _LOG.warning("build_trace_run_config failed; disabling trace for this run",
                      exc_info=True)

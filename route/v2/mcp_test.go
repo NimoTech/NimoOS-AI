@@ -31,7 +31,7 @@ func mcpTestSvc(t *testing.T) service.Services {
 func TestMcpHandler_CreateListDTOHidesSecrets(t *testing.T) {
 	svc := mcpTestSvc(t)
 	ts := NewTicketStore(time.Minute)
-	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, ts, NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 
 	body := `{"name":"github","transport":"http","url":"https://x","headers":{"Authorization":"Bearer SECRET"}}`
@@ -63,14 +63,26 @@ func TestMcpHandler_CreateListDTOHidesSecrets(t *testing.T) {
 func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 	svc := mcpTestSvc(t)
 	ts := NewTicketStore(time.Minute)
-	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, ts, NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 
 	enc, _ := svc.MasterKey().Encrypt(`{"Authorization":"Bearer SECRET"}`)
-	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+	m := &service.McpServer{
 		UserID: "u1", Name: "github", Transport: "http", URL: "https://x",
 		Args: "[]", Env: "{}", Headers: enc, Enabled: true,
-	})
+	}
+	_ = svc.MCP().CreateMcpServer(m)
+	// Task 8's TTL self-check treats a server with no runtime row as
+	// trivially expired and fires a background probe against agentURL
+	// ("http://127.0.0.1:1" above, deliberately unreachable). Seed a fresh,
+	// long-TTL runtime row so that pre-filter skips this server: this test
+	// is about decryption, not the self-check, and an unwanted goroutine
+	// would otherwise call SaveFailure after t.Cleanup has closed the DB —
+	// harmless in production but noisy/racy here.
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{ServerID: m.ID, TTLSec: 3600},
+		[]service.ToolMeta{{Name: "noop", SchemaHash: "h", DescHash: "d"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
 
 	tok := ts.Mint("u1")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -107,15 +119,26 @@ func TestMcpHandler_RuntimeReturnsDecryptedForTicket(t *testing.T) {
 func TestMcpHandler_RuntimeMarksUndecryptableConfig(t *testing.T) {
 	svc := mcpTestSvc(t)
 	ts := NewTicketStore(time.Minute)
-	h := NewMCPHandler(svc, ts, "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, ts, NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 
 	// Headers is non-empty but NOT ciphertext produced by this master key, so
 	// decryption fails — the defect-1 silent point 3 scenario.
-	_ = svc.MCP().CreateMcpServer(&service.McpServer{
+	m := &service.McpServer{
 		UserID: "u1", Name: "broken", Transport: "http", URL: "https://x",
 		Args: "[]", Env: "{}", Headers: "garbage-not-ciphertext", Enabled: true,
-	})
+	}
+	_ = svc.MCP().CreateMcpServer(m)
+	// A decrypt failure already makes Task 8's TTL self-check skip this
+	// server (probing with known-broken credentials would just fail
+	// predictably), but seed a fresh, long-TTL runtime row anyway so this
+	// test's cleanliness does not depend on that guard remaining in place —
+	// see TestMcpHandler_RuntimeReturnsDecryptedForTicket's identical comment
+	// for what goes wrong otherwise.
+	if err := svc.MCPRuntime().SaveSuccess(&service.McpServerRuntime{ServerID: m.ID, TTLSec: 3600},
+		[]service.ToolMeta{{Name: "noop", SchemaHash: "h", DescHash: "d"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
 
 	tok := ts.Mint("u1")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -145,7 +168,7 @@ func TestMcpHandler_RuntimeMarksUndecryptableConfig(t *testing.T) {
 
 func TestMcpHandler_CreateStdioAcceptedAndCleansURL(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	body := `{"name":"fs","transport":"stdio","command":"npx","args":["-y","x"],"url":"https://stray"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -168,7 +191,7 @@ func TestMcpHandler_CreateStdioAcceptedAndCleansURL(t *testing.T) {
 }
 
 func TestMcpHandler_CreateStdioRequiresCommand(t *testing.T) {
-	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	body := `{"name":"x","transport":"stdio"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -183,7 +206,7 @@ func TestMcpHandler_CreateStdioRequiresCommand(t *testing.T) {
 }
 
 func TestMcpHandler_CreateUnknownTransport(t *testing.T) {
-	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	body := `{"name":"x","transport":"ws","url":"https://x"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -198,7 +221,7 @@ func TestMcpHandler_CreateUnknownTransport(t *testing.T) {
 }
 
 func TestMcpHandler_CreateHTTPRequiresURL(t *testing.T) {
-	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	body := `{"name":"x","transport":"http"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -231,7 +254,7 @@ func TestMcpHandler_TestProxiesToAgent(t *testing.T) {
 	}))
 	defer agent.Close()
 
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), agent.URL)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), agent.URL)
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("X-NimoOS-User-ID", "u1")
@@ -269,7 +292,7 @@ func TestMcpHandler_TestProxiesToAgent(t *testing.T) {
 }
 
 func TestMcpHandler_TestNotFound(t *testing.T) {
-	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(mcpTestSvc(t), NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.Header.Set("X-NimoOS-User-ID", "u1")

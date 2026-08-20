@@ -1,0 +1,376 @@
+package service
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// staleWindowSec is the "gone dark" gate: a tool not seen in a listing for
+// this long must be re-approved, because a same-named tool that reappears
+// after a long absence may not be the same tool.
+const staleWindowSec = 7 * 24 * 60 * 60
+
+// hygieneWindowSec is pure cleanup, not a security boundary: rows unseen for
+// this long are deleted outright rather than merely gated.
+const hygieneWindowSec = 90 * 24 * 60 * 60
+
+// ApprovalRow is one row of the tool-approval store, as read back by either
+// the gated view (EffectiveApprovals) or the raw view (ListForServer).
+// StaleReason is populated only by ListForServer, for the settings UI to
+// explain to the user why a listed approval is currently void; it is
+// display/diagnostic only and never feeds any pass/fail decision.
+// StaleReasonKey is the machine-readable counterpart of StaleReason, one of
+// the StaleReasonXxx constants below, set alongside it in the exact same
+// switch arms in ListForServer -- added so the settings UI can map it to a
+// localized string (mcpErrorKey.ts's existing error_key pattern) instead of
+// rendering StaleReason's English prose directly. StaleReason itself is kept
+// unchanged: nothing that reads it today should break.
+// LastSeenAt and DescHash are likewise populated only by ListForServer, for
+// the public GET .../tools endpoint (route/v2/mcp_approvals.go) to compute
+// per-tool last_seen_at and the "description changed" badge. Like
+// StaleReason, neither ever feeds a gate decision.
+type ApprovalRow struct {
+	ServerID       int64
+	ToolName       string
+	StaleReason    string
+	StaleReasonKey string
+	LastSeenAt     int64
+	DescHash       string
+}
+
+// StaleReasonXxx are the machine-readable codes for ListForServer's reason
+// switch, one per existing arm (config gate / tool-removed / interface gate
+// / stale gate). Adding a code here must be paired with adding an arm to
+// that switch -- see TestListForServerStaleReasonKeyMatchesEachArm, which
+// pins all four.
+const (
+	StaleReasonConfigChanged = "config_changed"
+	StaleReasonToolRemoved   = "tool_removed"
+	StaleReasonSchemaChanged = "schema_changed"
+	StaleReasonStale         = "stale"
+)
+
+type mcpApprovalService struct{ db *sql.DB }
+
+// PutServerLevel records (or refreshes) the server-level '*' approval — the
+// user's blanket "always allow every tool on this server" consent. It is
+// the ONLY way to write the '*' row; Put itself rejects tool_name=="*" (see
+// its doc comment for why). Since it never takes a schema_hash, this call
+// hardcodes it to "" — '*' is not a real tool and never has one.
+func (s *mcpApprovalService) PutServerLevel(serverID int64, identityFP string) error {
+	return s.put(serverID, "*", identityFP, "", "")
+}
+
+// Put records (or refreshes) one ordinary tool's approval, including the
+// desc_hash the user saw at approval time (design doc §5.2.1 — drives the
+// settings UI's "description changed" badge; participates in NO gate, see
+// EffectiveApprovals'/ListForServer's doc comments). toolName must not be
+// "*" — use PutServerLevel for the server-level approval instead, and this
+// rejects the call otherwise.
+//
+// This is the ONLY writer for ordinary tool approvals — both call sites
+// (ApprovalsInternal's confirm-card path in route/v2/mcp.go, and the public
+// PUT .../approvals/:tool endpoint in route/v2/mcp_approvals.go) look up
+// identity_fp/schema_hash/desc_hash from the server's current runtime row
+// and pass all three here; neither ever passes a value from a caller. A
+// single writer means there is no silent "" path for desc_hash: every
+// approval write stamps whatever the runtime row currently has for that
+// tool, so re-approving after a gate voids an approval never blanks a
+// previously recorded desc_hash back to "".
+//
+// The tool_name=="*" rejection exists because tool_name is otherwise a
+// namespace populated by names the MCP server itself declares, which this
+// code must treat as untrusted. Without it, a malicious server could publish
+// one ordinary, innocuous-looking tool literally named "*"; a future caller
+// that forwards a server-declared tool name into Put — believing it is
+// recording consent for that one tool — would silently write the
+// server-level sentinel row instead, converting a single-tool approval into
+// a blanket approval for every tool the server ever offers. Put refusing
+// tool_name=="*" outright closes that hole at the point where approvals are
+// written, regardless of where the name originated.
+func (s *mcpApprovalService) Put(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
+	if toolName == "*" {
+		return fmt.Errorf(`mcp_approvals: tool_name "*" is reserved for the server-level approval; call PutServerLevel instead`)
+	}
+	return s.put(serverID, toolName, identityFP, schemaHash, descHash)
+}
+
+// put is the shared writer behind Put and PutServerLevel. approved_at and
+// last_seen_at are both set to now: approved_at marks when the user
+// consented, last_seen_at is reset here so a freshly (re-)approved tool
+// doesn't immediately fail the stale gate. descHash is stored verbatim and
+// never inspected here — see Put's doc comment for why it must never enter
+// a gate.
+func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHash, descHash string) error {
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`
+		INSERT INTO mcp_tool_approvals (server_id, tool_name, identity_fp, schema_hash, desc_hash, approved_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(server_id, tool_name) DO UPDATE SET
+			identity_fp=excluded.identity_fp, schema_hash=excluded.schema_hash, desc_hash=excluded.desc_hash,
+			approved_at=excluded.approved_at, last_seen_at=excluded.last_seen_at`,
+		serverID, toolName, identityFP, schemaHash, descHash, now, now)
+	return err
+}
+
+// AckDescription records that the user has SEEN this tool's current
+// description, clearing the settings UI's "description changed" badge without
+// touching anything else on the row. Deliberately not routed through put():
+// that UPSERT also rewrites approved_at (when the user consented -- audit
+// information a mere "I've read it" must not overwrite) and resets
+// last_seen_at, which would restart the 7-day stale window and so extend an
+// approval's life without the user having re-read what they were consenting
+// to.
+//
+// descHash comes from the caller, which must read it out of the server's
+// CURRENT runtime row -- never from a request body. Same rule as PutApproval:
+// a caller able to supply it directly could store a hash that always matches
+// itself and permanently silence the badge.
+func (s *mcpApprovalService) AckDescription(serverID int64, toolName, descHash string) error {
+	// An empty descHash means the tool is not in the server's current listing,
+	// so there is no description to acknowledge. Storing it would be actively
+	// harmful, not merely useless: desc_changed is reported as
+	// `stored != "" && stored != current`, so an empty stored value silences
+	// the badge for this tool PERMANENTLY -- including after it comes back
+	// with different prose. Refusing here (rather than only in the handler)
+	// keeps that invariant with the column instead of with one caller.
+	if descHash == "" {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`UPDATE mcp_tool_approvals SET desc_hash=? WHERE server_id=? AND tool_name=?`,
+		descHash, serverID, toolName)
+	return err
+}
+
+// Delete revokes one tool's approval.
+func (s *mcpApprovalService) Delete(serverID int64, toolName string) error {
+	_, err := s.db.Exec(`DELETE FROM mcp_tool_approvals WHERE server_id=? AND tool_name=?`, serverID, toolName)
+	return err
+}
+
+// DeleteAll revokes every approval (including the server-level '*' row) for
+// one server, e.g. when the user removes the server or resets its consent.
+func (s *mcpApprovalService) DeleteAll(serverID int64) error {
+	_, err := s.db.Exec(`DELETE FROM mcp_tool_approvals WHERE server_id=?`, serverID)
+	return err
+}
+
+// EffectiveApprovals returns the set of approvals that have passed all four
+// invalidation gates. The gates run in Go, after a single JOIN query (design
+// doc §5.2): all four gates' inputs are gathered here in one pass, so the
+// Python side receives a ready-to-use set and _ensure_confirmed degrades to
+// a single in-memory lookup.
+//
+// The four gates:
+//
+//	Config    — void if identity_fp no longer matches. The judgement is
+//	            identity_fp, NOT mcp_servers.updated_at: UpdateMcpServer
+//	            bumps updated_at unconditionally, so keying on it would void
+//	            every approval whenever the user disables/re-enables a
+//	            server, renames it, or edits its note — none of which change
+//	            what the server actually is.
+//	Interface — void if schema_hash differs from the one currently in the
+//	            server's tools_json for that tool. The tool's arguments
+//	            changed, so what the user consented to is not what would run.
+//	Stale     — void if last_seen_at is older than 7 days. A tool that
+//	            vanished for a week and came back under the same name may not
+//	            be the same tool.
+//	Hygiene   — rows unseen for 90 days are deleted outright. This is
+//	            cleanup, not a security mechanism.
+//
+// tool_name='*' is the server-level approval. It is not a real tool — it
+// never appears in tools_json, so it has no schema_hash of its own, and its
+// last_seen_at is advanced by any successful non-empty probe rather than by
+// its own presence in a listing — so it skips the interface and stale gates.
+//
+// A server with no runtime row at all (never successfully probed) has no
+// entry in the runtime map below, so its runtime identity_fp reads back as
+// "". The config gate requires both sides to be a non-empty match, so every
+// approval for such a server — wildcard included — fails closed rather than
+// being treated as trusted just because "" happens to equal "".
+func (s *mcpApprovalService) EffectiveApprovals(userID string) ([]ApprovalRow, error) {
+	// Gate 4 (hygiene) runs first and unconditionally: delete rows that
+	// haven't been seen in 90 days. last_seen_at > 0 excludes rows that have
+	// never been heartbeated at all (freshly approved, probe pending) —
+	// without that guard a brand-new approval with last_seen_at=0 would be
+	// deleted immediately.
+	now := time.Now().Unix()
+	if _, err := s.db.Exec(
+		`DELETE FROM mcp_tool_approvals WHERE last_seen_at > 0 AND last_seen_at < ?`,
+		now-hygieneWindowSec); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`
+		SELECT a.server_id, a.tool_name, a.identity_fp, a.schema_hash, a.last_seen_at,
+			r.identity_fp, r.tools_json
+		FROM mcp_tool_approvals a
+		JOIN mcp_servers s ON s.id = a.server_id
+		LEFT JOIN mcp_server_runtime r ON r.server_id = a.server_id
+		WHERE s.user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type toolSet map[string]ToolMeta
+	toolSetCache := map[int64]toolSet{}
+
+	var out []ApprovalRow
+	for rows.Next() {
+		var serverID int64
+		var toolName, approvalFP, approvalSchema string
+		var lastSeenAt int64
+		var runtimeFP sql.NullString
+		var toolsJSON sql.NullString
+		if err := rows.Scan(&serverID, &toolName, &approvalFP, &approvalSchema, &lastSeenAt,
+			&runtimeFP, &toolsJSON); err != nil {
+			return nil, err
+		}
+
+		// Config gate: identity_fp must still match the current runtime
+		// observation, AND neither side may be empty. A server with no
+		// runtime row at all (or a runtime row that exists but was never
+		// populated with a real fingerprint — MarkProbing's bare INSERT and
+		// SaveSuccess's empty-listing branch both leave identity_fp at its
+		// column default of '') yields runtimeFP as NULL/"" here. Comparing
+		// that directly against approvalFP would treat "no fingerprint on
+		// either side" as a match — a fail-open hole: a caller that writes
+		// an approval with an empty identity_fp before the server has ever
+		// probed successfully would pass this gate forever. Requiring both
+		// sides to be non-empty (in addition to equal) closes it.
+		//
+		// This check MUST run before the tool_name=="*" branch below: the
+		// wildcard only skips the interface and stale gates, never this one
+		// (see TestWildcardConfigGateVoidsOnIdentityChange).
+		if approvalFP == "" || !runtimeFP.Valid || runtimeFP.String == "" || approvalFP != runtimeFP.String {
+			continue
+		}
+
+		if toolName == "*" {
+			// Server-level approval: skips the interface and stale gates,
+			// since '*' never appears in tools_json and its last_seen_at is
+			// driven by probe success, not by its own listing membership.
+			out = append(out, ApprovalRow{ServerID: serverID, ToolName: toolName})
+			continue
+		}
+
+		// Interface gate: schema_hash must match the tool's current entry
+		// in tools_json. Parse tools_json into a map once per server and
+		// reuse it across rows, rather than re-parsing per row.
+		tools, ok := toolSetCache[serverID]
+		if !ok {
+			tools = toolSet{}
+			if toolsJSON.Valid && toolsJSON.String != "" {
+				var metas []ToolMeta
+				if err := json.Unmarshal([]byte(toolsJSON.String), &metas); err == nil {
+					for _, m := range metas {
+						tools[m.Name] = m
+					}
+				}
+			}
+			toolSetCache[serverID] = tools
+		}
+		// Both approvalSchema and meta.SchemaHash default to "" (an approval
+		// row with no recorded hash, or a tools_json entry with no
+		// schema_hash key). Comparing only for equality would let those two
+		// empty defaults match each other — the tool's arguments could then
+		// change freely without ever voiding the approval. Require both
+		// sides non-empty as well. This still only compares stored hashes;
+		// it never computes or normalizes one (schema_hash is Python-only).
+		meta, present := tools[toolName]
+		if !present || approvalSchema == "" || meta.SchemaHash == "" || meta.SchemaHash != approvalSchema {
+			continue
+		}
+
+		// Stale gate: last_seen_at must be within the last 7 days.
+		if now-lastSeenAt > staleWindowSec {
+			continue
+		}
+
+		out = append(out, ApprovalRow{ServerID: serverID, ToolName: toolName})
+	}
+	return out, rows.Err()
+}
+
+// ListForServer returns every approval row for a server WITHOUT running the
+// gates, for the settings UI: it must show the user everything they
+// approved, even approvals that are currently void, with StaleReason
+// explaining why. StaleReason is display/diagnostic only; it never feeds a
+// pass/fail decision — EffectiveApprovals owns that.
+func (s *mcpApprovalService) ListForServer(serverID int64) ([]ApprovalRow, error) {
+	rows, err := s.db.Query(`
+		SELECT a.tool_name, a.identity_fp, a.schema_hash, a.desc_hash, a.last_seen_at,
+			r.identity_fp, r.tools_json
+		FROM mcp_tool_approvals a
+		LEFT JOIN mcp_server_runtime r ON r.server_id = a.server_id
+		WHERE a.server_id = ?`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	now := time.Now().Unix()
+	var tools map[string]ToolMeta
+	var toolsLoaded bool
+
+	var out []ApprovalRow
+	for rows.Next() {
+		var toolName, approvalFP, approvalSchema, approvalDesc string
+		var lastSeenAt int64
+		var runtimeFP sql.NullString
+		var toolsJSON sql.NullString
+		if err := rows.Scan(&toolName, &approvalFP, &approvalSchema, &approvalDesc, &lastSeenAt,
+			&runtimeFP, &toolsJSON); err != nil {
+			return nil, err
+		}
+
+		reason := ""
+		reasonKey := ""
+		switch {
+		case approvalFP == "" || !runtimeFP.Valid || runtimeFP.String == "" || approvalFP != runtimeFP.String:
+			reason = "config changed: server identity no longer matches the approved one"
+			reasonKey = StaleReasonConfigChanged
+		case toolName == "*":
+			// Server-level approval: no interface/stale reasons apply.
+		default:
+			if !toolsLoaded {
+				tools = map[string]ToolMeta{}
+				if toolsJSON.Valid && toolsJSON.String != "" {
+					var metas []ToolMeta
+					if err := json.Unmarshal([]byte(toolsJSON.String), &metas); err == nil {
+						for _, m := range metas {
+							tools[m.Name] = m
+						}
+					}
+				}
+				toolsLoaded = true
+			}
+			meta, present := tools[toolName]
+			switch {
+			case !present:
+				reason = "tool no longer offered by the server"
+				reasonKey = StaleReasonToolRemoved
+			case approvalSchema == "" || meta.SchemaHash == "" || meta.SchemaHash != approvalSchema:
+				reason = "interface changed: tool's schema no longer matches the approved one"
+				reasonKey = StaleReasonSchemaChanged
+			case now-lastSeenAt > staleWindowSec:
+				reason = "stale: tool not seen in the last 7 days"
+				reasonKey = StaleReasonStale
+			}
+		}
+
+		// LastSeenAt and DescHash are exposed here purely for the settings UI
+		// (route/v2/mcp_approvals.go's GET .../tools) — they are read back
+		// as-is, same as StaleReason/StaleReasonKey above, and play no part
+		// in the reason switch above them.
+		out = append(out, ApprovalRow{
+			ServerID: serverID, ToolName: toolName, StaleReason: reason, StaleReasonKey: reasonKey,
+			LastSeenAt: lastSeenAt, DescHash: approvalDesc,
+		})
+	}
+	return out, rows.Err()
+}

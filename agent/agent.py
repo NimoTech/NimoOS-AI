@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextvars import ContextVar
 from typing import AsyncIterator
 
 from agents import Agent, Runner
@@ -42,12 +43,29 @@ import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
 from mcp_client import status as mcp_status
-from mcp_client.runtime import ConfigUnavailable
+from mcp_client.runtime import ConfigUnavailable, RuntimePayload
+import skills.mcp_gating as mcp_gating
 from profiles import get_profile
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
 _LOG = logging.getLogger("nimoos-agent")
+
+# Set at run start (see AgentRunner.run, right after Agent construction) to
+# this run's live Agent object. skills/tool_gating.py's L2 loading replaces
+# .tools on this object mid-run (see expand_categories / _load_l2_tools). The
+# SDK re-reads agent.tools on every step (pinned by
+# tests/test_mcp_zero_network_start.py::test_sdk_still_reresolves_tools_each_turn),
+# so swapping this Agent's tools list takes effect starting the model's next
+# step — that property is the entire foundation L2 rests on. Default None
+# means "no run in progress" (tests/error paths).
+#
+# Re-exported from mcp_client.client (NOT constructed here): some test
+# helpers reload "agent" out of sys.modules (see mcp_client.client's comment
+# on this same ContextVar for why that matters), so the single stable object
+# lives in a module nobody reloads that way, and this name is just an alias
+# to it for readability and for tests that do `agent.RUN_AGENT_VAR`.
+RUN_AGENT_VAR = mcp_client.RUN_AGENT_VAR
 
 # Each run persists the FULL history as a new snapshot row; keep a bounded
 # undo window per session instead of letting the table grow O(turns^2).
@@ -379,14 +397,6 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
     return tools
 
 
-def gate_runtime_tools(tools, category: str):
-    """Wrap runtime tools (e.g. MCP) with a gated is_enabled copy for a category."""
-    import dataclasses
-    from skills import tool_gating as _gat
-    return [dataclasses.replace(t, is_enabled=_gat.make_is_enabled(category))
-            for t in tools]
-
-
 def attachment_system_block(attachment_ids, *, session_id: str) -> str:
     """System-prompt suffix listing non-image attachments. Empty string when
     there are no non-image attachments."""
@@ -425,11 +435,41 @@ def format_context_lines(context_photo=None, context_album=None) -> str:
     return out
 
 
+# Go's probe_state (route/v2/mcp.go's Runtime response, Task 8) mapped onto
+# this process's own ServerStatus vocabulary. "probing" and any unrecognized/
+# empty value (a server Go has never successfully probed) both fall back to
+# WARMING: neither means "known broken", just "no confirmed-good tool list to
+# show yet".
+_MCP_PROBE_STATE_TO_STATUS = {
+    "ok": mcp_status.OK,
+    "failed": mcp_status.FAILED,
+}
+
+
 async def _build_mcp_for_run(mcp_servers):
-    """Build cache-backed, confirm-gated MCP tools for this run. Never raises —
-    MCP is additive. Returns (FunctionTool list, McpStatusSnapshot | None);
-    a None snapshot means MCP is not in play (or the pipeline errored), which
-    renders as no prompt line + the fallback expand_tools wording."""
+    """Build the per-run MCP status snapshot PURELY from the server dicts Go
+    already probed and handed down at run start. Opens ZERO third-party
+    connections and always returns an EMPTY tool list — run start must never
+    pay a connect/list round trip, no matter how many MCP servers exist or
+    how sick they are (a legacy-protocol server that silently swallows
+    server/discover used to cost a 10s wait before the first token).
+
+    This is the L0/L1 half of progressive disclosure: the system-prompt line
+    (render_prompt_line) and expand_tools(["mcp"])'s catalogue
+    (render_expand_section) are rendered entirely from this snapshot. L2 — a
+    single server's real FunctionTools — is loaded only for servers whose gate
+    is open: mid-run by skills.tool_gating.expand_tools(["mcp:<handle>"]) the
+    first time the model asks for one, and at run start by
+    skills.tool_gating.rehydrate_unlocked_mcp_tools for gates this session
+    opened in an earlier run. Neither dials a third party (both read the
+    cross-run schema cache, else ask Go over loopback), so the zero-connection
+    contract above covers the whole of run start, not just this function.
+
+    Never raises — MCP is additive. Returns (empty tool list,
+    McpStatusSnapshot | None); a None snapshot means MCP is not in play (or
+    this construction step itself errored), which renders as no prompt line
+    plus the fallback expand_tools wording.
+    """
     if isinstance(mcp_servers, ConfigUnavailable):
         return [], mcp_status.McpStatusSnapshot(config_error=mcp_servers.reason)
     if mcp_servers is None:
@@ -437,10 +477,53 @@ async def _build_mcp_for_run(mcp_servers):
     if not mcp_servers:
         return [], mcp_status.McpStatusSnapshot()
     try:
-        tools, statuses = await mcp_client.build_mcp_tools(mcp_servers)
-        return tools, mcp_status.McpStatusSnapshot(servers=statuses)
+        slugs = mcp_client.assign_slugs(mcp_servers)
+        statuses = []
+        for s in mcp_servers:
+            name = s.get("name", "mcp")
+            if s.get("config_error"):
+                # Go flagged this server's stored credentials as
+                # undecryptable; never advertise it as connectable.
+                statuses.append(mcp_status.ServerStatus(
+                    name=name, status=mcp_status.CONFIG_ERROR,
+                    detail=str(s["config_error"]),
+                    handle=s.get("handle", "") or "",
+                    slug=slugs.get(s.get("id"), "")))
+                continue
+            slug = slugs.get(s["id"], "")
+            tool_names = [f"mcp__{slug}__{t['name']}" for t in (s.get("tools") or [])
+                          if isinstance(t, dict) and t.get("name")]
+            status = _MCP_PROBE_STATE_TO_STATUS.get(s.get("probe_state", ""), mcp_status.WARMING)
+            statuses.append(mcp_status.ServerStatus(
+                name=name, status=status,
+                detail=(s.get("last_error", "") or "") if status != mcp_status.OK else "",
+                tool_names=tool_names,
+                handle=s.get("handle", "") or "", slug=slug,
+                summary=s.get("summary", "") or "",
+                instructions=s.get("instructions", "") or "",
+                # A non-OK status with tool names on hand means those names
+                # came from a probe before the current failure/warmup, not a
+                # live connection right now — see status.py's stale rules.
+                stale=(status != mcp_status.OK and bool(tool_names))))
+        return [], mcp_status.McpStatusSnapshot(servers=statuses)
     except Exception:
         return [], None
+
+
+def _mark_mcp_loaded(snapshot, loaded_slugs) -> None:
+    """Flag the servers whose tools this run's rehydration actually put in the
+    tool list, so render_prompt_line/render_expand_section can say "already in
+    your tool list" for them and "load with expand_tools" for the rest.
+
+    Must run BEFORE _apply_mcp_status (which both publishes the snapshot for
+    expand_tools and renders the prompt line from it). Never raises — a wording
+    detail must not be able to stop a run."""
+    try:
+        for s in getattr(snapshot, "servers", None) or []:
+            if s.slug and s.slug in loaded_slugs:
+                s.loaded = True
+    except Exception:
+        pass
 
 
 def _apply_mcp_status(full_prompt: str, snapshot) -> str:
@@ -573,7 +656,7 @@ class AgentRunner:
         context_album=None,
         auth_header: str = "",
         user_lang: str = "",
-        mcp_servers: "list | ConfigUnavailable | None" = None,
+        mcp_servers: "list | ConfigUnavailable | RuntimePayload | None" = None,
         channel_send_file=None,
     ) -> None:
         lock = _get_lock(session_id)
@@ -596,9 +679,55 @@ class AgentRunner:
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             mcp_client.USER_PATTERNS_VAR.set(user_patterns or [])
-            mcp_client._CONFIRMED_TOOLS_VAR.set(set())
             mcp_client._RUN_CONNS_VAR.set({})
             mcp_client._RUN_CONN_LOCKS_VAR.set({})
+            # main.py's /run endpoint fetches the FULL Runtime payload
+            # (mcp_client.runtime.fetch_runtime -> parse_runtime), which
+            # carries Go's pre-filtered per-user approval set and a
+            # run-scoped write token alongside the server list. Channel runs
+            # (and any older caller) still pass a plain server list/
+            # ConfigUnavailable/None, so both shapes are accepted here —
+            # unwrap a RuntimePayload's fields once, up front; every later
+            # use of `mcp_servers` in this method (the _build_mcp_for_run
+            # call below) then sees the plain server-list shape it always
+            # expected.
+            if isinstance(mcp_servers, RuntimePayload):
+                _mcp_payload = mcp_servers
+                mcp_servers = mcp_servers.servers
+            else:
+                _mcp_payload = None
+            _mcp_write_token = _mcp_payload.write_token if _mcp_payload else ""
+            # CONTRACT (see client.py's _CONFIRMED_TOOLS_VAR comment): Go's
+            # pre-filtered "passed all four gates" approval set for the
+            # CURRENT user. Empty when the caller didn't supply a
+            # RuntimePayload (channel runs, or an older Go build whose
+            # response parse_runtime already tolerates missing approvals for)
+            # — degrading to "ask every time" rather than failing the run.
+            # A COPY, never the payload's own set: _ensure_confirmed (Task 17)
+            # mutates this ContextVar's set in place when the user picks
+            # "don't ask again" this run, to avoid re-asking later in the
+            # SAME run. Handing it the payload's own `approvals` set directly
+            # would let that in-place mutation write through to
+            # RuntimePayload.approvals itself, making the payload object
+            # non-reusable (phase-3 review defect ②).
+            mcp_client._CONFIRMED_TOOLS_VAR.set(
+                set(_mcp_payload.approvals) if _mcp_payload else set())
+            _mcp_server_list = mcp_servers if isinstance(mcp_servers, list) else []
+            # Guard against a malformed server dict (missing "id"): assign_slugs
+            # indexes by s["id"] internally and would raise KeyError, killing the
+            # whole run over an add-on capability that must never prevent one
+            # from starting. Reuses the exact same guard the next line already
+            # applied to _RUN_SERVERS_VAR, so both are built from one filtered list.
+            _mcp_valid_servers = [s for s in _mcp_server_list if isinstance(s, dict) and "id" in s]
+            _mcp_slugs_by_id = mcp_client.assign_slugs(_mcp_valid_servers)
+            mcp_client._RUN_SERVERS_VAR.set({s["id"]: s for s in _mcp_valid_servers})
+            # Run-scoped write token (Task 9): "" (same degraded path as
+            # above) when no RuntimePayload was supplied.
+            mcp_client.WRITE_TOKEN_VAR.set(_mcp_write_token)
+            # slug -> server_id, the inverse of assign_slugs's id -> slug —
+            # skills/mcp_gating.py resolves "mcp:<slug>" tokens through this.
+            mcp_gating.MCP_HANDLES_VAR.set(
+                {slug: sid for sid, slug in _mcp_slugs_by_id.items()})
             mb_skills.SESSION_ID_VAR.set(session_id)
             mb_skills.EVENT_QUEUE_VAR.set(sink)
             mb_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
@@ -816,12 +945,43 @@ class AgentRunner:
             # MCP connection cost.
             _mcp_allowed = profile is None or profile.tools is None
             mcp_tools, mcp_snapshot = await _build_mcp_for_run(mcp_servers if _mcp_allowed else None)
+            # Rebuild the tools of every server whose gate this session already
+            # opened. The gate is session-scoped (reloaded into UNLOCKED_VAR
+            # above from sessions.unlocked_tool_categories) but mid-run
+            # expand_tools only ever put the tools on the run's Agent object, so
+            # before this the second message in a conversation had an open gate,
+            # a prompt line saying "N tools ready", and no such tools in the
+            # request — the model called one and the SDK raised "Tool
+            # mcp__<slug>__<tool> not found in agent". Placed here, ahead of the
+            # _overhead estimate below, so these tokens are counted against the
+            # compaction budget; splicing them in after Agent construction (the
+            # mid-run path) would hide ~14k tokens from compact_for_run.
+            # Opens zero third-party connections — see
+            # rehydrate_unlocked_mcp_tools.
+            if _mcp_allowed:
+                _mcp_l2_tools, _mcp_loaded_slugs = await _gat.rehydrate_unlocked_mcp_tools()
+            else:
+                _mcp_l2_tools, _mcp_loaded_slugs = [], set()
+            _mark_mcp_loaded(mcp_snapshot, _mcp_loaded_slugs)
             full_prompt = _apply_mcp_status(full_prompt, mcp_snapshot)
-            run_tools = (select_tools_for_run(attachment_ids,
-                                              session_id=session_id, profile=profile)
-                         + (gate_runtime_tools(mcp_tools, "mcp")
-                            if (profile is None or profile.tools is None)
-                            else mcp_tools))
+            # mcp_tools is always [] here: Task 16's contract is that run start
+            # opens zero THIRD-PARTY connections, and _build_mcp_for_run honours
+            # it by building nothing at all. `+ mcp_tools` is kept (rather than
+            # dropped) purely so this stays correct if that is ever revisited.
+            # _mcp_l2_tools is the other half of L2 and does not weaken that
+            # contract — it only rebuilds servers whose gate is ALREADY open,
+            # from the cross-run schema cache or Go over loopback, never by
+            # dialling a third party. A gate the model opens for the FIRST time
+            # is still served mid-run by skills/tool_gating.py splicing straight
+            # onto the live Agent object (see RUN_AGENT_VAR); both paths share
+            # _fetch_and_build. There is no per-category gating to apply here
+            # (the old gate_runtime_tools wrapper was deleted as dead code —
+            # nothing ever reached it non-empty), and MCP tools deliberately
+            # carry no is_enabled callback: which ones exist is decided at build
+            # time, because estimate_tools_tokens below counts every tool in the
+            # list whether is_enabled would hide it or not.
+            run_tools = select_tools_for_run(
+                attachment_ids, session_id=session_id, profile=profile) + mcp_tools + _mcp_l2_tools
             try:
                 _overhead = (context_compaction.estimate_tokens(full_prompt)
                              + context_compaction.estimate_tools_tokens(run_tools))
@@ -874,6 +1034,10 @@ class AgentRunner:
                 model=model,
                 model_settings=model_settings,
             )
+            # L2's injection target: skills/tool_gating.py's expand_categories
+            # replaces .tools on THIS object mid-run once the model opens a
+            # specific MCP server (see RUN_AGENT_VAR's module-level comment).
+            RUN_AGENT_VAR.set(agent)
 
             if continue_run:
                 input_messages = send_history
@@ -1027,6 +1191,13 @@ class AgentRunner:
                 # egress routing table.
                 self._active_sinks.pop(session_id, None)
                 await mcp_client.close_run_conns()
+                if _mcp_write_token:
+                    # Shrink the token's replay window back down to this run's
+                    # actual duration instead of leaving it valid for Go's 24h
+                    # backstop (RunTokenStore). Best-effort/never-raises — see
+                    # release_token's own docstring.
+                    from mcp_client import runtime as _mcp_runtime_mod
+                    await _mcp_runtime_mod.release_token(_mcp_write_token)
                 await sink.put({"type": "done"})
 
 

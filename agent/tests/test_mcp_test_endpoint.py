@@ -18,17 +18,20 @@ def _clear():
 
 
 @pytest.mark.asyncio
-async def test_test_server_ok_and_warms_cache(monkeypatch):
-    async def fake_connect(s, connect_timeout=None): return GoodConn()
+async def test_test_server_ok_and_does_not_warm_the_schema_cache(monkeypatch):
+    """test_server is a pure probe now: Go is the sole writer of probe results
+    (it persists the identity card / tool metas / schemas this call returns),
+    so Python must not also keep its own parallel in-memory copy."""
+    async def fake_connect(s, connect_timeout=None, mode=None): return GoodConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["ok"] is True and out["tool_count"] == 1 and out["tools"] == ["search"]
-    assert mc._cache_get(1) is not None        # warmed
+    assert 1 not in mc._SCHEMA_CACHE           # not warmed
 
 
 @pytest.mark.asyncio
 async def test_test_server_connect_failure(monkeypatch):
-    async def boom(s, connect_timeout=None): raise RuntimeError("refused")
+    async def boom(s, connect_timeout=None, mode=None): raise RuntimeError("refused")
     monkeypatch.setattr(mc, "_connect", boom)
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
     assert out["ok"] is False
@@ -40,7 +43,7 @@ async def test_test_server_connect_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_test_server_overall_timeout(monkeypatch):
     monkeypatch.setattr(mc, "TEST_TIMEOUT", 0.05)
-    async def slow_connect(s, connect_timeout=None):
+    async def slow_connect(s, connect_timeout=None, mode=None):
         import asyncio
         await asyncio.sleep(1)
     monkeypatch.setattr(mc, "_connect", slow_connect)
@@ -74,7 +77,7 @@ async def test_test_server_overall_timeout_still_closes_conn(monkeypatch):
         async def aclose(self):
             closed.append(True)
 
-    async def fake_connect(s, connect_timeout=None):
+    async def fake_connect(s, connect_timeout=None, mode=None):
         return SlowListConn()
 
     monkeypatch.setattr(mc, "_connect", fake_connect)
@@ -95,7 +98,7 @@ async def test_test_server_list_tools_timeout(monkeypatch):
             await asyncio.sleep(1)
         async def aclose(self): pass
 
-    async def fake_connect(s, connect_timeout=None):
+    async def fake_connect(s, connect_timeout=None, mode=None):
         return SlowListSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "PROBE_LIST_TIMEOUT", 0.05)
@@ -111,7 +114,7 @@ async def test_test_server_list_tools_failure(monkeypatch):
         async def list_tools(self): raise RuntimeError("bad response")
         async def aclose(self): pass
 
-    async def fake_connect(s, connect_timeout=None):
+    async def fake_connect(s, connect_timeout=None, mode=None):
         return BoomListSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     out = await mc._test_server_inner({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
@@ -173,7 +176,7 @@ async def test_connect_phase_has_its_own_timeout(monkeypatch):
     """
     monkeypatch.setattr(mc, "PROBE_CONNECT_TIMEOUT", 0.05)
 
-    async def slow_connect(s, connect_timeout=None):
+    async def slow_connect(s, connect_timeout=None, mode=None):
         await asyncio.sleep(5)
     monkeypatch.setattr(mc, "_connect", slow_connect)
 
@@ -195,7 +198,7 @@ async def test_list_phase_budget_is_independent_of_the_connect_budget(monkeypatc
             await asyncio.sleep(5)
         async def aclose(self): pass
 
-    async def fake_connect(s, connect_timeout=None): return SlowList()
+    async def fake_connect(s, connect_timeout=None, mode=None): return SlowList()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
     out = await mc._test_server_inner({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
@@ -215,7 +218,7 @@ async def test_connect_still_receives_the_stdio_enforced_budget(monkeypatch):
         async def aclose(self): pass
         def protocol_info(self): return {}
 
-    async def fake_connect(s, connect_timeout=None):
+    async def fake_connect(s, connect_timeout=None, mode=None):
         seen["ct"] = connect_timeout
         return OK()
     monkeypatch.setattr(mc, "_connect", fake_connect)
@@ -280,7 +283,7 @@ async def test_test_server_surfaces_the_protocol_fields(monkeypatch):
             return {"protocol_era": "modern", "protocol_version": "2026-07-28",
                     "supported_versions": ["2026-07-28", "2025-11-25"]}
 
-    async def fake_connect(s, connect_timeout=None): return ModernConn()
+    async def fake_connect(s, connect_timeout=None, mode=None): return ModernConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
@@ -299,7 +302,7 @@ async def test_a_broken_version_readout_never_fails_the_probe(monkeypatch):
         async def aclose(self): pass
         def protocol_info(self): raise RuntimeError("sdk moved the attribute")
 
-    async def fake_connect(s, connect_timeout=None): return WeirdConn()
+    async def fake_connect(s, connect_timeout=None, mode=None): return WeirdConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
     out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
@@ -322,7 +325,7 @@ async def test_protocol_fields_are_read_before_the_connection_closes(monkeypatch
             return {"protocol_era": "legacy", "protocol_version": "2025-11-25",
                     "supported_versions": ["2025-11-25"]}
 
-    async def fake_connect(s, connect_timeout=None): return OrderConn()
+    async def fake_connect(s, connect_timeout=None, mode=None): return OrderConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
     await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
@@ -330,9 +333,13 @@ async def test_protocol_fields_are_read_before_the_connection_closes(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_version_fields_do_not_enter_the_schema_cache(monkeypatch):
-    """The cache holds the tool manifest, not protocol metadata. Storing the latter
-    would blur what _fingerprint-based invalidation actually means."""
+async def test_test_server_result_carries_no_cache_entry_shape(monkeypatch):
+    """test_server's return value mixes protocol metadata (protocol_era, ...) with
+    the tool manifest (tool_metas, schemas, ...) in one dict -- that is fine for a
+    JSON response, but it must never be mistaken for (or fed into) a _CacheEntry.
+    test_server no longer touches _SCHEMA_CACHE at all; the schema cache is only
+    ever warmed by the run-start cold path (_cold_fetch/_revalidate), which stores
+    metas alone, never protocol fields."""
     class ModernConn:
         async def list_tools(self): return [{"name": "t", "description": "", "input_schema": {}}], mc.SCHEMA_TTL
         async def aclose(self): pass
@@ -340,11 +347,10 @@ async def test_version_fields_do_not_enter_the_schema_cache(monkeypatch):
             return {"protocol_era": "modern", "protocol_version": "2026-07-28",
                     "supported_versions": ["2026-07-28"]}
 
-    async def fake_connect(s, connect_timeout=None): return ModernConn()
+    async def fake_connect(s, connect_timeout=None, mode=None): return ModernConn()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 
-    await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
-    entry = mc._cache_get(1)
-    assert entry is not None
-    assert not hasattr(entry, "protocol_era")
-    assert entry.metas == [{"name": "t", "description": "", "input_schema": {}}]
+    out = await mc.test_server({"id": 1, "name": "x", "transport": "http", "url": "https://x"})
+    assert out["protocol_era"] == "modern"
+    assert out["tool_metas"][0]["name"] == "t"
+    assert 1 not in mc._SCHEMA_CACHE

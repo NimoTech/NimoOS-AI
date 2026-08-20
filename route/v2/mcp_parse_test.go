@@ -13,7 +13,7 @@ import (
 
 func TestParseHandler_Stdio(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/mcp/servers/parse",
 		strings.NewReader(`{"command_line":"npx -y @upstash/context7-mcp"}`))
@@ -39,7 +39,7 @@ func TestParseHandler_Stdio(t *testing.T) {
 
 func TestParseHandler_BadInput(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/mcp/servers/parse",
 		strings.NewReader(`{"command_line":"  "}`))
@@ -53,7 +53,7 @@ func TestParseHandler_BadInput(t *testing.T) {
 
 func TestCreate_FromCommandLine(t *testing.T) {
 	svc := mcpTestSvc(t)
-	h := NewMCPHandler(svc, NewTicketStore(time.Minute), "http://127.0.0.1:1")
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/mcp/servers",
 		strings.NewReader(`{"command_line":"npx -y @upstash/context7-mcp","name":"ctx"}`))

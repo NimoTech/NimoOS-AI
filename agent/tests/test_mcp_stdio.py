@@ -79,14 +79,14 @@ async def test_connect_stdio_branch(monkeypatch):
 def test_connect_timeout_per_transport():
     # NOTE: this only pins the _connect_timeout() lookup table, not enforcement.
     # MCP_CONNECT_TIMEOUT is actually ENFORCED only on the stdio branch (passed
-    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse in
-    # _get_run_conn and _revalidate, _connect() is not wrapped in asyncio.wait_for
-    # — the handshake is bounded only by the generous httpx2 AsyncClient(timeout=
-    # session_to) built in _build_transport (~60s), not this constant. For the
-    # run-start cold path, _metas_for_server wraps _cold_fetch in asyncio.wait_for
-    # with MCP_COLD_TOTAL_TIMEOUT, capping both connect and list together. Reading
-    # "http/sse connects are capped at MCP_CONNECT_TIMEOUT today" would be wrong
-    # outside the cold-path context.
+    # straight through to netns start_mcp_stdio's connect_timeout=). For http/sse
+    # in _get_run_conn, _connect() is not wrapped in asyncio.wait_for — the
+    # handshake is bounded only by the generous httpx2 AsyncClient(timeout=
+    # session_to) built in _build_transport (~60s), not this constant. As of
+    # Task 17, building a run's live tool list (_metas_for_server) no longer
+    # connects at all — it asks Go for schemas over loopback instead — so
+    # MCP_CONNECT_TIMEOUT now only governs the stdio branch of an actual
+    # per-tool-call connect and of the /test probe.
     assert mc._connect_timeout({"transport": "stdio"}) == mc.STDIO_CONNECT_TIMEOUT
     assert mc._connect_timeout({"transport": "http"}) == mc.MCP_CONNECT_TIMEOUT
     assert mc._connect_timeout({}) == mc.MCP_CONNECT_TIMEOUT
@@ -138,54 +138,47 @@ async def test_connect_http_uses_session_timeout_not_connect_cap(monkeypatch):
 
 @pytest.fixture
 def _clear_cache():
-    mc._SCHEMA_CACHE.clear(); mc._REVALIDATING.clear(); mc._BACKGROUND_TASKS.clear()
+    mc._SCHEMA_CACHE.clear()
     mc.EVENT_QUEUE_VAR.set(None)
     yield
     mc._SCHEMA_CACHE.clear()
 
 
 @pytest.mark.asyncio
-async def test_cold_stdio_self_heals_not_inline(monkeypatch, _clear_cache):
-    scheduled = {"n": 0}
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.__setitem__("n", scheduled["n"] + 1))
-    warns = []
-    async def fake_emit(name, err): warns.append((name, str(err)))
-    monkeypatch.setattr(mc, "_emit_warning", fake_emit)
-    async def boom(s): raise AssertionError("stdio cold must NOT connect inline")
+async def test_metas_for_server_never_connects_stdio_or_http(monkeypatch, _clear_cache):
+    """Task 17: building a run's live tool list never dials the MCP server
+    itself, for ANY transport (stdio included) — Go is the sole party that
+    connects to produce a schema list. A cache miss goes through
+    mcp_client.runtime.fetch_schemas over loopback instead."""
+    async def boom(s, connect_timeout=None, mode=None): raise AssertionError("must NOT connect to build a tool list")
     monkeypatch.setattr(mc, "_connect", boom)
+    calls = []
+    async def fake_fetch(token, server_id):
+        calls.append(server_id)
+        return 9, [{"name": "t", "description": "", "input_schema": {"type": "object", "properties": {}}}]
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
 
-    metas, status, detail = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
-    assert metas == [] and status == mc.WARMING
-    assert scheduled["n"] == 1
-    assert warns and ("initializing" in warns[-1][1] or "background" in warns[-1][1])
-
-
-@pytest.mark.asyncio
-async def test_cold_http_still_inline(monkeypatch, _clear_cache):
-    called = {"n": 0}
-    async def fake_cold(s):
-        called["n"] += 1
-        return [{"name": "t", "description": "", "input_schema": {"type": "object", "properties": {}}}]
-    monkeypatch.setattr(mc, "_cold_fetch", fake_cold)
+    metas, status, _ = await mc._metas_for_server({"id": 1, "name": "fs", "transport": "stdio"})
+    assert len(metas) == 1 and status == mc.OK
     metas, status, _ = await mc._metas_for_server({"id": 2, "name": "h", "transport": "http", "url": "https://x"})
-    assert called["n"] == 1 and len(metas) == 1 and status == mc.OK
+    assert len(metas) == 1 and status == mc.OK
+    assert calls == [1, 2]
 
 
 @pytest.mark.asyncio
-async def test_cold_http_failure_schedules_self_heal(monkeypatch, _clear_cache):
-    # A slow remote whose inline cold-fetch times out must NOT just give up: it
-    # schedules a background revalidate (generous timeouts) so the next run gets tools.
-    scheduled = {"n": 0}
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.__setitem__("n", scheduled["n"] + 1))
+async def test_schema_fetch_failure_reports_failed_and_warns(monkeypatch, _clear_cache):
     warns = []
     async def fake_emit(name, err): warns.append((name, str(err)))
     monkeypatch.setattr(mc, "_emit_warning", fake_emit)
-    async def boom_cold(s): raise TimeoutError()
-    monkeypatch.setattr(mc, "_cold_fetch", boom_cold)
-    metas, status, detail = await mc._metas_for_server({"id": 7, "name": "h", "transport": "http", "url": "https://x"})
+    async def fake_fetch(token, server_id):
+        return 0, []   # mcp_client.runtime.fetch_schemas's documented degrade shape
+    monkeypatch.setattr("mcp_client.runtime.fetch_schemas", fake_fetch)
+    metas, status, detail = await mc._metas_for_server(
+        {"id": 7, "name": "h", "transport": "http", "url": "https://x"})
     assert metas == [] and status == mc.FAILED
-    assert detail == "TimeoutError"     # str(TimeoutError()) is empty -> falls back to the class name
-    assert scheduled["n"] == 1          # background self-heal scheduled
+    # Pin the exact fixed string (client.py's _metas_for_server), not just
+    # truthiness.
+    assert detail == "could not fetch tool schemas from nimoos-ai"
     assert warns                        # user warned
 
 
@@ -210,7 +203,7 @@ async def test_test_server_list_tools_timeout_message(monkeypatch, _clear_cache)
             import asyncio
             await asyncio.sleep(10)
         async def aclose(self): pass
-    async def fake_connect(s, connect_timeout=None): return SlowSrv()
+    async def fake_connect(s, connect_timeout=None, mode=None): return SlowSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
     monkeypatch.setattr(mc, "PROBE_LIST_TIMEOUT", 0.05)   # only the list phase is squeezed
     out = await mc.test_server({"id": 1, "name": "h", "transport": "http", "url": "https://x"})
@@ -231,7 +224,7 @@ async def test_stdio_conn_cleanup_called_on_close(monkeypatch):
     class FakeStdioSrv:
         async def aclose(self): cleaned["n"] += 1   # stack unwind happens here
 
-    async def fake_connect(server, connect_timeout=None):
+    async def fake_connect(server, connect_timeout=None, mode=None):
         return FakeStdioSrv()
     monkeypatch.setattr(mc, "_connect", fake_connect)
 

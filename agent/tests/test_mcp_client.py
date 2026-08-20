@@ -44,7 +44,7 @@ def _setup(conn=None):
 
 
 def test_wrap_tool_name_and_schema():
-    tool = mc._wrap_tool({"id": 1, "name": "My Git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "My Git"}, META, slug="my_git")
     assert tool.name == "mcp__my_git__search"
     assert tool.params_json_schema["properties"]["q"]["type"] == "string"
     assert tool.strict_json_schema is False
@@ -54,7 +54,7 @@ def test_wrap_tool_name_and_schema():
 async def test_invoke_confirm_then_call():
     fconn = FakeConn()
     mgr, q = _setup(conn=fconn)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve():
         for _ in range(50):
@@ -73,7 +73,7 @@ async def test_invoke_confirm_then_call():
 @pytest.mark.asyncio
 async def test_invoke_rejected_returns_text():
     mgr, q = _setup(conn=FakeConn())
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def reject():
         for _ in range(50):
@@ -88,10 +88,22 @@ async def test_invoke_rejected_returns_text():
 
 
 @pytest.mark.asyncio
-async def test_remember_skips_second_confirm():
+async def test_remember_skips_second_confirm(monkeypatch):
+    # remember=True below reaches _ensure_confirmed's persist branch, which
+    # calls mcp_client.runtime.put_approval. Must be patched: unpatched, this
+    # would open a real loopback socket to nimoos-ai whenever
+    # /var/run/nimoos/ai.url happens to exist on the machine running the
+    # suite — making the code under test take a different branch depending
+    # on machine state, exactly the class of test this task was careful to
+    # avoid elsewhere. The outcome is irrelevant to this test either way (a
+    # write failure must not block the call — see
+    # test_mcp_persistent_approval.py), so a no-op stub is enough.
+    async def noop_put_approval(*a, **kw): return True
+    monkeypatch.setattr("mcp_client.runtime.put_approval", noop_put_approval)
+
     fconn = FakeConn()
     mgr, q = _setup(conn=fconn)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve_remember():
         for _ in range(50):
@@ -113,7 +125,8 @@ async def test_blacklist_blocks_path_arg():
     mc.USER_PATTERNS_VAR.set(["/etc/"])
     tool = mc._wrap_tool({"id": 1, "name": "fs"},
                          {"name": "read", "description": "",
-                          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}})
+                          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                         slug="fs")
     out = await tool.on_invoke_tool(None, '{"path":"/etc/shadow"}')
     assert out.startswith("[MCP error]")
     assert "blacklist" in out.lower()
@@ -124,7 +137,7 @@ async def test_connect_failure_message_distinct(monkeypatch):
     mgr, q = _setup()                       # no pre-seeded conn
     async def boom(s): raise RuntimeError("net down")
     monkeypatch.setattr(mc, "_connect", boom)
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     async def approve():
         for _ in range(50):
@@ -169,7 +182,11 @@ def _approve_first(mgr, q):
 
 
 @pytest.mark.asyncio
-async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
+async def test_unknown_tool_keeps_stale_cache_no_refresh(monkeypatch):
+    """As of Task 17, Go is the sole writer of MCP runtime state: an
+    unknown-tool error no longer drops the schema cache or schedules any
+    Python-side refresh (both mechanisms are deleted). The stale entry is
+    left exactly as it was; only the model-facing message changes."""
     class UnknownToolConn:
         async def call_tool(self, name, args):
             raise MCPError(code=METHOD_NOT_FOUND, message="Unknown tool: search")
@@ -177,17 +194,13 @@ async def test_unknown_tool_drops_cache_and_schedules_refresh(monkeypatch):
 
     mgr, q = _setup(conn=UnknownToolConn())
     mc._SCHEMA_CACHE.clear()
-    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
-    scheduled = []
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    mc._cache_put(1, [META], listed_at=1)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert "no longer recognizes" in out and "do NOT" in out
-    assert "next message" in out                # the run's tool set is immutable (SDK decision) — the message states that honestly
-    assert mc._cache_get(1) is None             # stale entry dropped
-    assert scheduled == [1]                     # refresh scheduled for the next run
+    assert 1 in mc._SCHEMA_CACHE                # stale entry is left in place — no Python-side drop
 
 
 @pytest.mark.asyncio
@@ -201,13 +214,10 @@ async def test_ordinary_mcp_error_keeps_cache(monkeypatch):
 
     mgr, q = _setup(conn=ArgErrorConn())
     mc._SCHEMA_CACHE.clear()
-    mc._cache_put(1, [META], mc._fingerprint({"id": 1, "name": "git"}), mc.SCHEMA_TTL)
-    scheduled = []
-    monkeypatch.setattr(mc, "_schedule_revalidate", lambda s: scheduled.append(s["id"]))
-    tool = mc._wrap_tool({"id": 1, "name": "git"}, META)
+    mc._cache_put(1, [META], listed_at=1)
+    tool = mc._wrap_tool({"id": 1, "name": "git"}, META, slug="git")
 
     asyncio.create_task(_approve_first(mgr, q)())
     out = await tool.on_invoke_tool(None, '{"q":"hi"}')
     assert out.startswith("[MCP error] MCP tool search failed")
-    assert mc._cache_get(1) is not None        # cache untouched
-    assert scheduled == []
+    assert 1 in mc._SCHEMA_CACHE                # cache untouched

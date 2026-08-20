@@ -25,7 +25,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	models := v2.NewModelsHandler(svc, config.Cfg.DataPath+"/models")
 	sessions := v2.NewSessionsHandler(svc)
 	mcpTickets := v2.NewTicketStore(30 * time.Second)
-	mcp := v2.NewMCPHandler(svc, mcpTickets, agentURL)
+	runTokens := v2.NewRunTokenStore(24 * time.Hour)
+	mcp := v2.NewMCPHandler(svc, mcpTickets, runTokens, agentURL)
+	// Task 22: backfill identity cards for MCP servers that existed before
+	// this progressive-disclosure feature shipped. Belt-and-braces on top of
+	// the TTL self-check in mcp.go's Runtime handler (see
+	// StartMigrationBackfill's doc comment) — runs once, in the background,
+	// and never blocks startup.
+	mcp.StartMigrationBackfill()
 	agent := v2.NewAgentHandler(svc, agentURL, 60, mcpTickets)
 	agent.StartHealthMonitor()
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
@@ -98,6 +105,9 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.POST("/mcp/register", mcp.RegisterInternal)
 	internal.GET("/mcp/list", mcp.ListInternal)
 	internal.POST("/mcp/remove", mcp.RemoveInternal)
+	internal.POST("/mcp/approvals", mcp.ApprovalsInternal)
+	internal.GET("/mcp/servers/:id/schemas", mcp.SchemasInternal)
+	internal.POST("/mcp/token/release", mcp.ReleaseTokenInternal)
 	internal.GET("/agent/provider-credentials", v2.ProviderCredentials(svc, runtimePath))
 
 	// LLM inference endpoints
@@ -120,6 +130,15 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.PUT("/mcp/servers/:id", mcp.Update)
 	g.DELETE("/mcp/servers/:id", mcp.Delete)
 	g.POST("/mcp/servers/:id/test", mcp.Test)
+
+	// MCP tool approvals (design doc §8.1) — the settings UI's window into
+	// the approval store Task 10 built. Public/browser-facing, authenticated
+	// like the routes above; see route/v2/mcp_approvals.go.
+	g.GET("/mcp/servers/:id/tools", mcp.Tools)
+	g.PUT("/mcp/servers/:id/approvals/:tool", mcp.PutApproval)
+	g.POST("/mcp/servers/:id/approvals/:tool/ack-description", mcp.AckDescription)
+	g.DELETE("/mcp/servers/:id/approvals", mcp.DeleteApprovals)
+	g.GET("/mcp/approvals", mcp.ListApprovals)
 
 	// Privacy policy
 	g.GET("/policy", policy.Get)

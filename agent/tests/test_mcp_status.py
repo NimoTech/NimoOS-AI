@@ -29,10 +29,57 @@ def test_prompt_line_mixed_statuses():
         st.ServerStatus(name="old", status=st.CONFIG_ERROR, detail="decrypt failed"),
     ))
     assert line.startswith("[MCP servers: ") and line.endswith("]")
-    assert "Mygithub: 32 tools ready" in line
+    # No slug and no fq tool names to recover one from -> no expand token to
+    # advertise, but still never a bare "ready" (see the two tests below).
+    assert "Mygithub: 32 tools, not loaded yet" in line
     assert "supabase: failed to load (timeout)" in line
-    assert "fs: starting up" in line
+    assert "fs: still connecting, not loadable yet" in line
     assert "old: configuration error (decrypt failed)" in line
+
+
+def test_prompt_line_unloaded_server_names_the_gate_instead_of_claiming_ready():
+    # Regression, the whole point of this branch's fix: a server whose gate is
+    # NOT open this run has no tools in the request's tool array. The old
+    # wording ("N tools ready") read as callable, so the model called
+    # mcp__<slug>__<tool> directly and the SDK raised "Tool ... not found in
+    # agent", killing the turn. The line must instead name the exact token
+    # that loads them.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github",
+                        tool_names=["mcp__github__get_me"] * 44)))
+    assert 'github: 44 tools, load with expand_tools(["mcp:github"])' in line
+    assert "ready" not in line
+
+
+def test_prompt_line_loaded_server_says_the_tools_are_callable_now():
+    # After run-start rehydration (skills.tool_gating.rehydrate_unlocked_mcp_tools)
+    # the tools ARE in the tool array, so the line must not send the model
+    # through expand_tools for them again.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github", loaded=True,
+                        tool_names=["mcp__github__get_me"] * 44)))
+    assert "github: 44 tools, already in your tool list" in line
+    assert "expand_tools" not in line
+
+
+def test_expand_section_loaded_server_does_not_advertise_its_gate():
+    lines = st.render_expand_section(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github", loaded=True,
+                        tool_names=["mcp__github__get_me"])))
+    joined = "\n".join(lines)
+    assert "already in your tool list — call them directly;" in joined
+    assert "expand as:" not in joined
+
+
+def test_prompt_line_ok_server_with_zero_tools_is_not_misrepresented_as_ready():
+    # A server that probes ok but publishes zero tools (e.g. a real remote
+    # server that requires auth this repo does not try to detect) must not
+    # read as "0 tools ready" -- that phrasing implies a working, expandable
+    # server, which this one is not.
+    line = st.render_prompt_line(_snap(
+        st.ServerStatus(name="needsauth", status=st.OK, tool_names=[])))
+    assert "0 tools ready" not in line
+    assert "needsauth: connected, published no tools" in line
 
 
 def test_prompt_line_config_unavailable():
@@ -84,6 +131,23 @@ def test_expand_long_tool_list_not_truncated():
     assert "(40 tools)" in joined and joined.rstrip().endswith(";")
 
 
+def test_expand_ok_server_with_zero_tools_has_no_dangling_punctuation_or_expand_hint():
+    # Before this fix, an OK status with tool_names == [] fell into the
+    # generic OK branch and produced a malformed 'MCP server "x" (0 tools): ;'
+    # line PLUS an "expand as:" hint -- inviting the model to open a gate
+    # with nothing behind it. Opening it used to report "no tool schemas
+    # could be loaded right now -- try again shortly", which is untrue: there
+    # is nothing to load, and retrying will not help. Both real enabled
+    # servers on the live machine are in exactly this state.
+    joined = "\n".join(st.render_expand_section(_snap(
+        st.ServerStatus(name="needsauth", status=st.OK, tool_names=[],
+                        summary="a remote server"))))
+    assert ": ;" not in joined
+    assert "expand as:" not in joined
+    assert '"needsauth": connected, but published no tools' in joined
+    assert "a remote server" in joined
+
+
 def test_expand_failed_server_discloses_and_warns():
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="supabase", status=st.FAILED, detail="timeout"))))
@@ -91,13 +155,39 @@ def test_expand_failed_server_discloses_and_warns():
     assert "Do not register replacement" in joined   # guards against duplicate-registration behavior in field
 
 
-def test_expand_warming_server():
+def test_expand_warming_server_forbids_retrying_in_this_turn():
+    """Regression for run debe6e65: the old text ("its tools should appear on a
+    later message") read as "a later step in this turn", so the model called
+    expand_tools(["mcp"]) three times against an identical answer and burned the
+    whole turn. Go's probe is a background goroutine kicked off by the Runtime
+    GET at run start and cannot finish mid-turn, so the model must be told to
+    stop, not to wait."""
     joined = "\n".join(st.render_expand_section(_snap(
         st.ServerStatus(name="fs", status=st.WARMING))))
-    assert '"fs"' in joined and "later message" in joined
+    assert '"fs"' in joined
+    assert "cannot be loaded yet" in joined
+    assert "THIS turn cannot change that" in joined
+    assert "ask again in a moment" in joined
+    assert "later message" not in joined, "must not read as 'a later step in this turn'"
 
 
 def test_expand_config_unavailable():
     joined = "\n".join(st.render_expand_section(_snap(config_error="no ticket")))
     assert "could not be fetched" in joined and "no ticket" in joined
     assert "registering" in joined      # also discourages registering new servers
+
+
+def test_l1_names_are_marked_not_callable_until_the_server_is_expanded():
+    """L1 publishes tool NAMES only — no FunctionTool reaches the tool array
+    until expand_tools(["mcp:<slug>"]) builds them (tool_gating._fetch_and_build).
+    The old hint ("expand as: mcp:github for full tool schemas") read as an
+    optional detail upgrade, so the model treated the names printed right above
+    it as callable and called one, which is the same "not found in agent" wall
+    the cross-run gap produced. The precondition has to be stated, not hinted."""
+    lines = st.render_expand_section(_snap(
+        st.ServerStatus(name="Mygithub", status=st.OK, slug="github",
+                        tool_names=["mcp__github__get_me", "mcp__github__list_issues"])))
+    joined = "\n".join(lines)
+    assert "mcp__github__get_me" in joined                    # names still published
+    assert 'NOT callable yet — expand_tools(["mcp:github"]) loads them' in joined
+    assert "for full tool schemas" not in joined
