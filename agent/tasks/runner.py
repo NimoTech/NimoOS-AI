@@ -107,6 +107,87 @@ def format_preauth_note(auto_approved) -> str:
     return note
 
 
+# Extension → the interpreter the run gate will accept for it. Only entries
+# that are in `skills/shell.py::_SCRIPT_INTERPRETERS`, or the briefing would
+# teach a command that gets refused.
+_SCRIPT_INTERPRETER_BY_EXT = {
+    ".py": "python3", ".sh": "bash", ".bash": "bash", ".zsh": "zsh",
+    ".js": "node", ".mjs": "node", ".rb": "ruby", ".pl": "perl",
+    ".lua": "lua", ".php": "php",
+}
+
+BRIEFING_MAX_CHARS = 1200
+
+# How many scripts to name. A task with fifty pre-authorized scripts is not a
+# real shape, and the briefing must not crowd out the author's own prompt.
+_BRIEFING_MAX_SCRIPTS = 8
+
+
+def _briefing_command(path: str) -> str:
+    ext = path[path.rfind("."):].lower() if "." in path.rsplit("/", 1)[-1] else ""
+    interpreter = _SCRIPT_INTERPRETER_BY_EXT.get(ext)
+    # No recognized extension: `bash` is the one interpreter that can run an
+    # arbitrary executable text file, and it is on the accepted list, so the
+    # line we print stays a command the gate would honour.
+    return f"{interpreter or 'bash'} {path}"
+
+
+def format_run_briefing(doc) -> str:
+    """Tell the model which scripts it may run, and in exactly what form.
+
+    Found on the live box: with a perfectly good `scripts` grant the model wrote
+    ``cd /DATA/AppData/radar && python3 radar.py`` and was refused, because
+    chaining is refused whatever the rules say. The grant was right — the model
+    simply had no way to learn the required shape. Nothing told it:
+    `format_preauth_note` is after-the-fact provenance appended to the summary,
+    which the model never sees.
+
+    So this is not a convenience. Without it every author has to discover the
+    exact invocation by trial and denial, and the natural first guess (`cd` into
+    the directory) is one of the refused shapes.
+
+    Only `scripts` gets a briefing. The other buckets need no shape hint — the
+    driver answers their confirmation cards whatever form the request took.
+    Returns `""` when there is nothing to say, so a task without a scripts grant
+    keeps a byte-identical prompt.
+    """
+    scripts = []
+    if isinstance(doc, dict):
+        scripts = [s for s in (doc.get("scripts") or []) if isinstance(s, str) and s]
+    if not scripts:
+        return ""
+    lines = [
+        "[This run is pre-authorized to execute the following script(s). "
+        "Use the command EXACTLY as written:",
+    ]
+    for path in scripts[:_BRIEFING_MAX_SCRIPTS]:
+        lines.append(f"  {_briefing_command(path)}")
+    remaining = len(scripts) - _BRIEFING_MAX_SCRIPTS
+    if remaining > 0:
+        lines.append(f"  …and {remaining} more (see the task's preauth)")
+    lines.append(
+        "Any variation is refused: do not prepend `cd`, do not chain with `&&`, "
+        "`||`, `;` or a pipe, do not add an argument or a flag, and do not "
+        "redirect the output. Read the script's own output from the command "
+        "result instead.]")
+    note = "\n".join(lines)
+    if len(note) > BRIEFING_MAX_CHARS:
+        note = note[:BRIEFING_MAX_CHARS - 2] + "…]"
+    return note
+
+
+def compose_prompt(prompt: str, doc) -> str:
+    """The author's prompt, plus the run briefing when there is one.
+
+    The author's text stays FIRST and unmodified: it is the instruction, and the
+    briefing is a constraint on how to carry it out.
+    """
+    briefing = format_run_briefing(doc)
+    if not briefing:
+        return prompt
+    return f"{prompt}\n\n{briefing}" if prompt else briefing
+
+
 def _redact(msg: str, creds) -> str:
     key = (creds or {}).get("api_key") if isinstance(creds, dict) else None
     if key:
@@ -350,7 +431,10 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                            run_id, exc_info=True)
 
         sink = start_run(
-            session_id, user_id, task["prompt"], creds,
+            # The briefing rides the PROMPT rather than a new parameter: it is
+            # an instruction to the model, and every start_run seam (including
+            # the test double) already carries the prompt.
+            session_id, user_id, compose_prompt(task["prompt"], doc), creds,
             max_turns=resolve_max_turns(task, conn, max_turns_reader),
             pre_confirmed_tools=set(doc["mcp_tools"]),
             run_shell_allowlist=doc["shell"],

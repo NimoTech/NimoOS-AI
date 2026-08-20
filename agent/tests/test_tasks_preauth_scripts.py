@@ -268,3 +268,81 @@ def test_script_run_target_rejects_every_shape_the_gate_rejects():
                     f"systemd-run {SCRIPT}", "python3 relative.py",
                     f"python3 {SCRIPT} > /tmp/out"):
         assert shell.script_run_target(command) == "", command
+
+
+# ── telling the model the shape it must use ───────────────────────────────────
+#
+# Found on the live box, not in a unit test: with a correct `scripts` grant the
+# model wrote `cd /DATA/AppData/radar && python3 radar.py` and was refused —
+# chaining is refused whatever the rules say. The grant was right; the model had
+# no way to know the required shape. Nothing in the run path told it: the
+# existing `format_preauth_note` is after-the-fact provenance appended to the
+# summary, which the model never sees.
+
+def test_a_scripts_grant_briefs_the_model_with_the_exact_command():
+    from tasks import runner
+    text = runner.format_run_briefing({"scripts": [SCRIPT], "egress_domains": [],
+                                       "mcp_tools": [], "fs_write": [], "shell": []})
+    assert f"python3 {SCRIPT}" in text
+
+
+def test_the_briefing_names_the_shapes_that_will_be_refused():
+    from tasks import runner
+    text = runner.format_run_briefing({"scripts": [SCRIPT]})
+    # The three the model actually reached for, in order of likelihood.
+    for forbidden in ("cd", "&&", "argument"):
+        assert forbidden in text, forbidden
+
+
+def test_the_interpreter_follows_the_file_extension():
+    from tasks import runner
+    cases = {"/x/a.py": "python3", "/x/a.sh": "bash", "/x/a.js": "node",
+             "/x/a.rb": "ruby", "/x/a.pl": "perl", "/x/a.lua": "lua"}
+    for path, interpreter in cases.items():
+        text = runner.format_run_briefing({"scripts": [path]})
+        assert f"{interpreter} {path}" in text, path
+
+
+def test_an_unknown_extension_still_produces_a_usable_line():
+    from tasks import runner
+    text = runner.format_run_briefing({"scripts": ["/x/collector"]})
+    assert "/x/collector" in text
+
+
+def test_every_briefed_command_is_one_the_gate_would_actually_honour():
+    """The briefing must not teach a command that gets refused.
+
+    A briefing that names an invocation the gate rejects is worse than none: the
+    model follows it, gets denied, and the author sees a rule that "does not
+    work" while the real fault is our own instruction.
+    """
+    from tasks import runner
+    for path in ("/x/a.py", "/x/a.sh", "/x/a.js", "/x/a.rb"):
+        text = runner.format_run_briefing({"scripts": [path]})
+        line = next(l.strip() for l in text.splitlines() if path in l and " " in l.strip())
+        assert shell.run_scripts_would_cover(line, [path]), line
+
+
+def test_no_scripts_means_no_briefing():
+    # A task without a scripts grant must read exactly as it did before.
+    from tasks import runner
+    assert runner.format_run_briefing({"scripts": [], "egress_domains": ["a.com"]}) == ""
+    assert runner.format_run_briefing({}) == ""
+
+
+def test_the_briefing_is_bounded():
+    from tasks import runner
+    text = runner.format_run_briefing({"scripts": [f"/x/s{i}.py" for i in range(200)]})
+    assert len(text) <= runner.BRIEFING_MAX_CHARS
+
+
+def test_the_prompt_carries_the_briefing_but_keeps_the_authors_text_first():
+    from tasks import runner
+    composed = runner.compose_prompt("collect and report", {"scripts": [SCRIPT]})
+    assert composed.startswith("collect and report")
+    assert f"python3 {SCRIPT}" in composed
+
+
+def test_a_prompt_without_a_scripts_grant_is_untouched():
+    from tasks import runner
+    assert runner.compose_prompt("just say hi", {"scripts": []}) == "just say hi"
