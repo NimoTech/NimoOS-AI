@@ -1,0 +1,69 @@
+name: agent image
+
+# Publishes the agent container image to GHCR on every release tag, so an
+# install can `docker pull ghcr.io/nimotech/nimoos-agent:<tag>` and upgrades
+# fetch only the changed layers, instead of downloading the ~1GB docker-save
+# tarball every time.
+#
+# Deliberately a second channel, not a replacement: the S3 tarball
+# (script/package-agent.sh → release.sh) is unchanged and remains the path for
+# networks where ghcr.io is unreachable — which includes most of mainland
+# China, this project's largest install base. Nothing on the install side
+# consumes GHCR yet; flipping installs over is a separate, later change.
+on:
+  push:
+    tags: ['v*']
+  # For exercising the pipeline without a release: builds and pushes a
+  # dev-<sha> tag from whatever ref it is dispatched on.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: agent-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.23'
+
+      # The Dockerfile COPYs a prebuilt static egress-proxy binary rather than
+      # using a multi-stage golang image (that base image may not exist on an
+      # offline build machine). package-agent.sh builds it on the host; this
+      # step is the CI equivalent, and must stay in sync with it.
+      - name: Build the egress-proxy static binary
+        run: |
+          cd deploy/agent/egress-proxy
+          CGO_ENABLED=0 go build -o egress-proxy .
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+
+      # amd64 only, matching the artifacts that actually ship (the installer
+      # refuses other architectures). The image name must be lowercase —
+      # ghcr.io/nimotech, not the org's display casing.
+      - name: Build and push
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          case "$ref" in
+            v*) tag="$ref" ;;
+            *)  tag="dev-${GITHUB_SHA::8}" ;;   # dispatch on a branch
+          esac
+          image="ghcr.io/nimotech/nimoos-agent:${tag}"
+          echo "building ${image}"
+          docker build -f deploy/agent/Dockerfile -t "${image}" .
+          docker push "${image}"
+          echo "pushed ${image}"

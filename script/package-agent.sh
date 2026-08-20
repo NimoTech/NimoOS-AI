@@ -54,5 +54,14 @@ TARBALL="${OUT_DIR}/nimoos-agent-${VERSION}.tar.gz"
 echo "==> Packaging ${TARBALL} ..."
 tar -czf "${TARBALL}" -C "${STAGE}" agent-image.tar docker-compose.yml install.sh
 
+# The same compose + install.sh WITHOUT the image, a few KB: the GHCR install
+# path (install-ai.sh) pulls the image from ghcr.io and only needs these two
+# files. Same staged copies as the full bundle, so the two can never drift.
+COMPOSE_TARBALL="${OUT_DIR}/nimoos-agent-compose-${VERSION}.tar.gz"
+echo "==> Packaging ${COMPOSE_TARBALL} ..."
+tar -czf "${COMPOSE_TARBALL}" -C "${STAGE}" docker-compose.yml install.sh
+
 echo "✓ Output: ${TARBALL}"
+echo "         ${COMPOSE_TARBALL}"
 echo "  Upload: <bucket>/nimoos/NimoOS-AI/releases/download/agent-${VERSION}/$(basename "${TARBALL}")"
+echo "          <bucket>/nimoos/NimoOS-AI/releases/download/agent-${VERSION}/$(basename "${COMPOSE_TARBALL}")"

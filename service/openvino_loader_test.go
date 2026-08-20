@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -210,5 +211,26 @@ func TestReconcileFromOVMSEmptyOnFreshBoot(t *testing.T) {
 
 	if len(a.loaded) != 0 {
 		t.Fatalf("fresh boot loaded = %d, want 0 (must never resurrect old models)", len(a.loaded))
+	}
+}
+
+// The graph template must request dynamic KV cache allocation (cache_size 0:
+// GenAI grows the cache on demand from actual free VRAM, verified on both
+// OVMS 2026.2.1 and 2026.4.0) and 8-bit KV quantization via the GPU plugin
+// property KV_CACHE_PRECISION (a top-level kv_cache_precision graph field
+// does not exist in LLMCalculatorOptions and fails graph parsing).
+func TestOvmsGraphPbtxtDynamicU8KVCache(t *testing.T) {
+	g := ovmsGraphPbtxt("GPU.1")
+	if !strings.Contains(g, "cache_size: 0,") {
+		t.Errorf("graph must set cache_size: 0 (dynamic), got:\n%s", g)
+	}
+	if !strings.Contains(g, `"KV_CACHE_PRECISION":"u8"`) {
+		t.Errorf("plugin_config must set KV_CACHE_PRECISION u8, got:\n%s", g)
+	}
+	if strings.Contains(g, "kv_cache_precision") {
+		t.Errorf("kv_cache_precision must not appear as a graph field (unsupported by LLMCalculatorOptions)")
+	}
+	if !strings.Contains(g, `device: "GPU.1"`) {
+		t.Errorf("device must still be templated, got:\n%s", g)
 	}
 }
