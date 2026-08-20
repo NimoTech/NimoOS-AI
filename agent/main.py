@@ -904,6 +904,12 @@ async def _egress_shutdown():
 # Internal egress-confirm callback (called by egress-proxy, not by users)
 # ---------------------------------------------------------------------------
 
+# The proxy's reason code for "first connection to a host nobody has confirmed
+# yet" — the domain gate. Its sibling, "upload_over_threshold", is the upload
+# DLP gate; see egress_confirm for why only the former can be auto-approved.
+TOFU_UNKNOWN_HOST_REASON = "tofu_unknown_host"
+
+
 class _EgressConfirmRequest(BaseModel):
     host: str
     bytes: int = 0
@@ -925,6 +931,38 @@ async def egress_confirm(req: _EgressConfirmRequest):
     Fail-closed: any condition that prevents us from finding an active session
     or registering a confirmation returns {"allow": false}.
     """
+    # A configured search backend must not raise a card on every TOFU miss:
+    # the TTL is an hour, so an interactive user would be asked all day for a
+    # host an administrator already chose. Checked BEFORE the session lookup
+    # so an unattended run gets the same answer as an interactive one.
+    #
+    # Scoped to reason == "tofu_unknown_host" ON PURPOSE. The proxy calls this
+    # one endpoint for two different controls, and the design authorises the
+    # exemption for the domain gate only:
+    #   * "tofu_unknown_host"     — first connection to an unknown host
+    #   * "upload_over_threshold" — this connection pushed >64 KB outward
+    # The second is the DLP control. Matching on host alone would silently
+    # remove the upload confirmation for the configured provider — an injected
+    # page could then have the agent call web_search with a local file's
+    # contents as the query and exfiltrate it with no card raised — and the
+    # proxy would additionally register a byte grant for later connections.
+    #
+    # This is not a gate bypass primitive: the sandbox can POST here (the
+    # proxy's internal-target branch reaches container loopback), but the
+    # response only carries a verdict — markConfirmed happens inside the Go
+    # proxy after it receives `true`, so there is no state here to write.
+    try:
+        from web import settings as _web_settings  # noqa: PLC0415
+        _preapproved = _web_settings.preapproved_hosts(
+            _web_settings.load(_db()))
+    except Exception:  # noqa: BLE001 — a config read must never gate egress open
+        _preapproved = set()
+    if req.reason == TOFU_UNKNOWN_HOST_REASON and req.host.lower() in _preapproved:
+        from audit import audit as _audit  # noqa: PLC0415
+        _audit("egress_grant", host=req.host, bytes=req.bytes,
+               reason=req.reason, decision="auto_approved_search_backend")
+        return {"allow": True}
+
     # Find an active session — P0 uses last-active heuristic
     session_id: str | None = _runner._last_active_session
     if session_id is not None and session_id not in _runner._active_sinks:
@@ -3766,6 +3804,47 @@ async def archive_note_api(note_id: str, request: Request):
 async def note_backlinks_api(note_id: str, request: Request):
     uid = _notes_uid(request)
     return {"backlinks": notes_store.get_backlinks(_db(), uid, note_id)}
+
+
+# ---------------------------------------------------------------------------
+# Web tools settings. One global row: the box shares one search backend
+# because the owner pays for the key.
+#
+# Admin gating lives in the Go layer as an explicit per-route pair in
+# route/v2.go — `g.Any("/agent/web-settings", agent.Proxy,
+# v2.AdminOnly(runtimePath))`, registered ahead of the /agent/* wildcard,
+# same shape as /agent/notes/settings. Until that line exists this endpoint
+# is reachable by any authenticated user, so it must not ship without it.
+# ---------------------------------------------------------------------------
+from web import settings as web_settings_mod
+
+
+class WebSettingsPayload(BaseModel):
+    backend: str = ""
+    api_key: str | None = None      # None = keep whatever is stored
+    base_url: str = ""
+    enabled: bool = False
+
+
+@app.get("/agent/web-settings")
+async def get_web_settings():
+    return web_settings_mod.public_view(web_settings_mod.load(_db()))
+
+
+@app.put("/agent/web-settings")
+async def put_web_settings(body: WebSettingsPayload):
+    if body.backend and body.backend not in web_settings_mod.VALID_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {web_settings_mod.VALID_BACKENDS}")
+    conn = _db()
+    current = web_settings_mod.load(conn)
+    # The UI never receives the key, so it cannot echo one back: an omitted
+    # api_key means "unchanged", not "clear it". Sending "" clears it.
+    api_key = current["api_key"] if body.api_key is None else body.api_key
+    web_settings_mod.save(conn, backend=body.backend, api_key=api_key,
+                          base_url=body.base_url, enabled=body.enabled)
+    return web_settings_mod.public_view(web_settings_mod.load(conn))
 
 
 if __name__ == "__main__":

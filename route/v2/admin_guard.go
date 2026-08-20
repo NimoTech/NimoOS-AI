@@ -39,6 +39,9 @@ var AdminScopedAgentPaths = []string{
 	"/agent/notes/dir-info",
 	"/agent/toolbox",
 	"/agent/tasks",
+	// Box-wide search provider and its API key, which every user's web_search
+	// then spends — same scope as notes/settings, not per-user data.
+	"/agent/web-settings",
 }
 
 // adminCheckedContextKey marks a request whose admin role AdminPathGuard has

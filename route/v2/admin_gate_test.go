@@ -389,3 +389,18 @@ func TestTasksGateAdminPassthrough(t *testing.T) {
 			"%s %s admin must pass through", c.method, c.path)
 	}
 }
+
+// TestWebSettingsIsAdminScoped pins /agent/web-settings into the admin-scoped
+// list. List membership is behavioural here rather than cosmetic: AdminPathGuard
+// reads AdminScopedAgentPaths at request time and enforces the admin check on the
+// DECODED path, and route/v2.go registers the same list with AdminOnly. Dropping
+// the entry would open the endpoint that writes the box-wide search provider, its
+// API key, and the egress auto-approve host set to any authenticated user.
+func TestWebSettingsIsAdminScoped(t *testing.T) {
+	for _, p := range AdminScopedAgentPaths {
+		if p == "/agent/web-settings" {
+			return
+		}
+	}
+	t.Fatal("/agent/web-settings must be in AdminScopedAgentPaths")
+}
