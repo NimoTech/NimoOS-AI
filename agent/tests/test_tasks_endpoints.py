@@ -81,7 +81,7 @@ def test_create_list_get_update_delete(client):
     tasks = r.json()["tasks"]
     assert [t["id"] for t in tasks] == [tid]
     assert tasks[0]["preauth"] == {"shell": [], "egress_domains": [],
-                                   "mcp_tools": [], "fs_write": []}
+                              "mcp_tools": [], "fs_write": [], "scripts": []}
     assert "preauth_json" not in tasks[0]
     assert tasks[0]["enabled"] is True
 

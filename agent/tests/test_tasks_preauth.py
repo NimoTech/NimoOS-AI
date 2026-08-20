@@ -44,7 +44,7 @@ def test_parse_tolerates_none_and_wrong_shapes():
     for junk in (None, [], 7, {"shell": "lark-cli "}, {"egress_domains": "abc"}):
         p = preauth.parse(junk)
         assert p == {"shell": [], "egress_domains": [],
-                     "mcp_tools": [], "fs_write": []}
+                     "mcp_tools": [], "fs_write": [], "scripts": []}
 
 
 def test_shell_match_prefix():
@@ -514,10 +514,11 @@ def test_parse_with_report_is_empty_for_a_clean_document():
 
 
 def test_parse_delegates_to_parse_with_report():
-    """parse() keeps its exact four-key shape — no report keys leak into it."""
+    """parse() keeps its exact key shape — no report keys leak into it."""
     from tasks import preauth
     p = preauth.parse({"shell": [{"kind": "prefix", "value": "x "}]})
-    assert set(p) == {"shell", "egress_domains", "mcp_tools", "fs_write"}
+    assert set(p) == {"shell", "egress_domains", "mcp_tools", "fs_write",
+                      "scripts"}
 
 
 def test_shell_match_caps_rules_even_if_not_parsed():

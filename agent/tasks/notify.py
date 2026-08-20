@@ -44,9 +44,88 @@ import logging
 
 logger = logging.getLogger("nimoos-agent.tasks")
 
-# "summary 前 800 字" — a hard character cut, no ellipsis; the run history
-# itself still has the full text, this is only the chat-side digest.
-_SUMMARY_MAX_CHARS = 800
+# The formatter's own ceiling, kept only as a runaway guard. It used to be
+# `_SUMMARY_MAX_CHARS = 800`, a hard slice with no ellipsis, and that number was
+# OURS rather than any channel's — Feishu accepts far more. Every real report
+# (a daily digest of eight items, a log tail, a migration summary) is thousands
+# of characters, so the notification simply stopped mid-sentence with nothing
+# saying it had been cut. Splitting to fit the channel is now `split_message`'s
+# job; this only stops a runaway run from pushing a megabyte into a chat.
+SUMMARY_MAX_CHARS = 20_000
+
+# Per-channel hard caps. Telegram and Discord REJECT an over-long send outright
+# (it is not truncated for us), so these are correctness limits, not taste.
+# Lark's real ceiling is much higher; 10k keeps a comfortable margin under it
+# while still fitting any digest we have seen.
+_CHANNEL_LIMITS = {
+    "telegram": 4096,
+    "discord": 2000,
+    "lark": 10_000,
+}
+
+# What an unknown channel gets. Deliberately the SMALLEST known cap, not the
+# largest: a newly added adapter that nobody remembered to list here must fail
+# by sending too little, never by having its sends rejected.
+_FALLBACK_LIMIT = min(_CHANNEL_LIMITS.values())
+
+TRUNCATION_NOTE = "\n\n[输出过长，已截断]"
+
+# Bound on how many chat messages one notification may become. A 40-part
+# notification is indistinguishable from spam, and the reader stops reading long
+# before part 12.
+DEFAULT_MAX_PARTS = 4
+
+
+def channel_limit(channel_type: str) -> int:
+    """Max characters one message may carry on `channel_type`."""
+    return _CHANNEL_LIMITS.get(str(channel_type or "").strip().lower(),
+                               _FALLBACK_LIMIT)
+
+
+def split_message(text: str, limit: int,
+                  max_parts: int = DEFAULT_MAX_PARTS) -> list:
+    """Split `text` into at most `max_parts` chunks of at most `limit` chars.
+
+    Splits on line boundaries where it can: a report is a list of entries, and
+    cutting mid-line makes it unreadable. A single line longer than `limit` is
+    hard-split rather than emitted over-limit — an over-limit part would be
+    rejected by Telegram/Discord outright.
+
+    If the text does not fit in `max_parts`, the last part ends with
+    :data:`TRUNCATION_NOTE`. That note is the point: a digest that silently
+    loses its tail leaves the reader unable to tell "nothing more happened"
+    from "the rest was dropped".
+    """
+    text = text or ""
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    parts: list = []
+    remaining = text
+    while remaining and len(parts) < max_parts:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            remaining = ""
+            break
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        # Only honour a line boundary that keeps a reasonable amount of content;
+        # a newline in the first few characters would emit near-empty parts and
+        # burn the part budget.
+        if cut < limit // 4:
+            cut = limit
+        parts.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+
+    if remaining:
+        # Out of parts with text left over. Make room for the note inside the
+        # last part rather than appending past the limit.
+        room = limit - len(TRUNCATION_NOTE)
+        last = parts[-1][:room] if room > 0 else ""
+        parts[-1] = last + TRUNCATION_NOTE
+    return parts
 
 # "denied_actions 摘要(最多 5 条)" — same reasoning as runner.format_preauth_note:
 # an unattended run that hammered a confirmation gate must not be able to
@@ -129,7 +208,7 @@ def format_message(task_row, run_row) -> str:
     name = task_row["name"] or "(unnamed task)"
     status = run_row["status"]
     if status == "succeeded":
-        summary = _truncate(str(run_row["summary"] or ""), _SUMMARY_MAX_CHARS)
+        summary = _truncate(str(run_row["summary"] or ""), SUMMARY_MAX_CHARS)
         parts = [f"✅ {name}{_duration(run_row)}"]
         if summary:
             parts.append(summary)
@@ -177,6 +256,30 @@ def _should_notify(policy: str, status: str) -> bool:
     if policy == "failure":
         return status in _FAILURE_STATUSES
     return False  # 'never', or anything unrecognized — degrade to silent
+
+
+def _channel_type_of(conn, instance_id: str) -> str:
+    """`channel_instances.channel_type` for one instance, `""` if unknown.
+
+    The length limit is a property of the PLATFORM, and `notify_channel` only
+    carries the instance id — two instances of different platforms are both
+    valid targets, so the type has to be looked up rather than assumed. An
+    unknown instance degrades to `""`, which `channel_limit` maps to the
+    tightest cap: a target we cannot identify gets the most conservative
+    treatment, never the most permissive.
+    """
+    try:
+        row = conn.execute(
+            "SELECT channel_type FROM channel_instances WHERE id=?",
+            (instance_id,)).fetchone()
+    except Exception:                       # noqa: BLE001 — never break a send
+        return ""
+    if row is None:
+        return ""
+    try:
+        return str(row["channel_type"] or "")
+    except (KeyError, IndexError, TypeError):
+        return str(row[0] or "")
 
 
 def _resolve_target(conn, task_row, raw_channel: str):
@@ -310,12 +413,22 @@ async def send_result(conn, task_row, run_row, *, sender=None) -> bool:
 
     text = format_message(task_row, run_row)
     send = sender or _default_send
-    try:
-        ok = await send(instance_id, chat_id, text)
-    except Exception:                       # noqa: BLE001 — a task run's result
-        # must never depend on a channel adapter behaving; log and move on.
-        logger.warning("tasks notify: send failed for task %s",
-                       task_row["id"] if "id" in task_row.keys() else "?",
-                       exc_info=True)
-        return False
-    return bool(ok)
+    limit = channel_limit(_channel_type_of(conn, instance_id))
+    parts = split_message(text, limit)
+
+    # Delivered if ANY part landed. A later part failing does not un-send the
+    # earlier ones: the reader already has part 1 in their chat, and reporting
+    # False would leave the run log claiming nothing was sent while the chat
+    # shows otherwise.
+    delivered = False
+    for index, part in enumerate(parts):
+        try:
+            ok = await send(instance_id, chat_id, part)
+        except Exception:                   # noqa: BLE001 — a task run's result
+            # must never depend on a channel adapter behaving; log and move on.
+            logger.warning("tasks notify: send failed for task %s (part %d/%d)",
+                           task_row["id"] if "id" in task_row.keys() else "?",
+                           index + 1, len(parts), exc_info=True)
+            continue
+        delivered = delivered or bool(ok)
+    return delivered

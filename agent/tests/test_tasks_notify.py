@@ -1,7 +1,7 @@
 """notify — result/failure notifications for scheduled tasks (M2 task 6).
 
 Covers the policy matrix (never/failure/always x succeeded/non-succeeded),
-message formatting (success/failure templates, 800-char summary cut, 5-item
+message formatting (success/failure templates, the runaway summary guard, 5-item
 denied-actions cap), `notify_channel` resolution against the REAL channel
 tables (`channel_instances` / `channel_bindings` / `channel_chats` — see
 `tasks/notify.py`'s module docstring for why the format is
@@ -146,14 +146,29 @@ def test_denied_summary_caps_at_five_and_notes_the_remainder():
     assert "…and 2 more" in text
 
 
-def test_summary_is_cut_to_800_chars():
+def test_a_summary_longer_than_the_old_800_ceiling_survives_intact():
+    """The 800-char cut is GONE, deliberately.
+
+    It was our number, not any channel's, and it silently amputated every real
+    report (a daily digest, a log tail) mid-sentence. Fitting the channel is
+    now `split_message`'s job — see test_tasks_notify_length.py. The formatter
+    keeps only a runaway guard at `SUMMARY_MAX_CHARS`.
+    """
     task = {"name": "t"}
     run = {"status": "succeeded", "summary": "x" * 950, "error": "",
           "denied_actions": "[]"}
     text = notify.format_message(task, run)
     body = text.split("\n\n", 1)[1]
-    assert len(body) == 800
-    assert body == "x" * 800
+    assert body == "x" * 950
+
+
+def test_the_runaway_guard_still_caps_the_formatter():
+    task = {"name": "t"}
+    run = {"status": "succeeded",
+           "summary": "x" * (notify.SUMMARY_MAX_CHARS + 1000),
+           "error": "", "denied_actions": "[]"}
+    body = notify.format_message(task, run).split("\n\n", 1)[1]
+    assert len(body) == notify.SUMMARY_MAX_CHARS
 
 
 # -- policy matrix ---------------------------------------------------------

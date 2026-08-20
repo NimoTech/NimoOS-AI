@@ -577,6 +577,7 @@ class AgentRunner:
         channel_send_file=None,
         pre_confirmed_tools: "set[str] | None" = None,
         run_shell_allowlist: "list | None" = None,
+        run_scripts: "list | None" = None,
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -641,6 +642,11 @@ class AgentRunner:
             # the context dies with the task and the next run re-sets the var.
             _run_allow_token = shell_skills.RUN_ALLOWLIST_VAR.set(
                 list(run_shell_allowlist or []))
+            # Same lifetime, same reasoning as the allowlist var above: set
+            # unconditionally so a run without a scripts grant cannot inherit
+            # one from whatever ran before it in this context.
+            _run_scripts_token = shell_skills.RUN_SCRIPTS_VAR.set(
+                list(run_scripts or []))
 
             from skills import tool_gating as _gat
             import db as _db
@@ -1049,6 +1055,10 @@ class AgentRunner:
                     shell_skills.RUN_ALLOWLIST_VAR.reset(_run_allow_token)
                 except Exception:  # noqa: BLE001 — token from another context
                     shell_skills.RUN_ALLOWLIST_VAR.set(())
+                try:
+                    shell_skills.RUN_SCRIPTS_VAR.reset(_run_scripts_token)
+                except Exception:  # noqa: BLE001 — token from another context
+                    shell_skills.RUN_SCRIPTS_VAR.set(())
                 await mcp_client.close_run_conns()
                 await sink.put({"type": "done"})
 

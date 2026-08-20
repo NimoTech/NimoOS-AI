@@ -232,7 +232,8 @@ async def _default_creds_resolver(user_id: str, model: str):
 
 
 def _default_start_run(session_id, user_id, message, creds, *, max_turns,
-                       pre_confirmed_tools, run_shell_allowlist):
+                       pre_confirmed_tools, run_shell_allowlist,
+                       run_scripts=None):
     """Bridge into `main._start_run`, mirroring `main._channel_start_run`."""
     import main  # noqa: PLC0415
     return main._start_run(
@@ -242,6 +243,7 @@ def _default_start_run(session_id, user_id, message, creds, *, max_turns,
         max_turns=max_turns,
         pre_confirmed_tools=pre_confirmed_tools,
         run_shell_allowlist=run_shell_allowlist,
+        run_scripts=run_scripts,
     )
 
 
@@ -352,6 +354,7 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             max_turns=resolve_max_turns(task, conn, max_turns_reader),
             pre_confirmed_tools=set(doc["mcp_tools"]),
             run_shell_allowlist=doc["shell"],
+            run_scripts=doc["scripts"],
         )
 
         timeout_seconds = int(task["timeout_seconds"] or 0)

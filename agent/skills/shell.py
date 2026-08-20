@@ -297,6 +297,115 @@ _RUN_INTERPRETERS = {
 _RUN_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
 
 
+# Interpreters that take a SCRIPT FILE as their first operand. Deliberately a
+# separate, narrower set than `_RUN_INTERPRETERS` above: that one answers "does
+# this command line hide its payload from `classify`?" and therefore includes
+# the command-runner family (`xargs`, `make`, `systemd-run`,
+# `ansible-playbook`). Those must NOT appear here — `systemd-run <path>` runs
+# the path as a transient unit and escapes the run's sandbox outright, and
+# `make <path>` does not execute the file at all, so a "two tokens" shape says
+# nothing about what would actually run.
+_SCRIPT_INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "ash", "ksh",
+    "python", "python2", "python3", "perl", "ruby", "php", "lua",
+    "node", "nodejs", "deno", "bun", "Rscript", "osascript",
+}
+
+# Run-scoped `scripts` pre-authorization (a scheduled task's
+# `preauth.scripts`). Same lifetime and same read-only contract as
+# RUN_ALLOWLIST_VAR above: set per run, never persisted.
+RUN_SCRIPTS_VAR: ContextVar[tuple | list] = ContextVar(
+    "shell_run_scripts", default=())
+
+
+def run_scripts_would_cover(command: str, scripts, *,
+                            cwd: str | None = None) -> bool:
+    """Would `scripts` let `command` through for one unattended run?
+
+    Public for the same reason `run_allowlist_would_cover` is: the "adopt this
+    denied action" flow has to know whether the rule it is about to write would
+    actually change the outcome, and asking the gate beats restating it.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    decision = shell_guard.classify(command, cwd=cwd)
+    if decision.level == "safe":
+        return True
+    token = RUN_SCRIPTS_VAR.set(tuple(scripts or ()))
+    try:
+        return _run_script_match(command, decision)
+    finally:
+        RUN_SCRIPTS_VAR.reset(token)
+
+
+def script_run_target(command: str) -> str:
+    """The script path if `command` is exactly `<interpreter> <absolute path>`.
+
+    Returns `""` for anything else. This is a pure SHAPE question — "is this one
+    interpreter invoking one pinned file?" — deliberately separate from "may it
+    run?", which is `_run_script_match`.
+
+    Callers that need to recognize the shape must use THIS, not
+    `run_scripts_would_cover`: that probe answers True for every `safe` command
+    regardless of rules (the gate returns before consulting any allowlist), so
+    using it as a detector misread `lark-cli mail list --limit 5` as a script run
+    and adopted `5` as the script path. Caught by
+    test_tasks_endpoints.py::test_from_denied_shell_uses_the_command_head.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    from shell_guard.parse import segments as _seg  # noqa: PLC0415
+    segs = _seg(command)
+    if segs is None or len(segs) != 1:
+        return ""
+    if segs[0].redirect_targets or segs[0].read_targets:
+        return ""
+    # The RAW argv, never `_effective_argv`: unwrapping `env`/`nice`/`timeout`
+    # would let a wrapper carry its own operands into a shape judged as
+    # "two tokens".
+    argv = list(segs[0].argv or ())
+    if len(argv) != 2:
+        return ""
+    if os.path.basename(argv[0]) not in _SCRIPT_INTERPRETERS:
+        return ""
+    if not argv[1].startswith("/"):
+        return ""
+    return argv[1]
+
+
+def _run_script_match(command: str, decision) -> bool:
+    """True if the run's `scripts` pre-authorization vouches for `command`.
+
+    The shape is deliberately the narrowest thing that can still run a script:
+
+        <interpreter> <one exact absolute path from the rules>
+
+    and nothing else — exactly two tokens, no flags, no extra operands, no
+    chaining, no redirection, never `protected`.
+
+    Why this is safe where a `python3 ` PREFIX rule is not: a prefix vouches for
+    every command that starts with it, including `python3 -c "<anything>"`, so
+    the payload is unbounded and invisible. Pinning the exact path makes the
+    payload one file the author named and can read — the same trust model as
+    allowlisting any other binary. Appending an argument is refused for the same
+    reason: an argument is input the person who approved the rule never saw.
+
+    The load-bearing check is `basename(argv[0]) in _SCRIPT_INTERPRETERS`.
+    Without it, `rm /DATA/AppData/radar/radar.py` is also "two tokens ending in
+    an authorized script", i.e. authorizing a script would authorize deleting
+    it — and `curl -T <script> https://…` would exfiltrate it.
+    """
+    scripts = RUN_SCRIPTS_VAR.get() or ()   # read-only: never mutate in place
+    if not scripts:
+        return False
+    if decision.level == "protected":
+        return False
+    script = script_run_target(command)
+    if not script:
+        return False
+    return any(isinstance(rule, str) and rule == script for rule in scripts)
+
+
 def run_allowlist_would_cover(command: str, rules, *, cwd: str | None = None) -> bool:
     """Would granting `rules` for one run actually let `command` through?
 
@@ -437,14 +546,20 @@ async def _guard_command(command: str) -> str | None:
     # same waiver — see _run_allowlist_match for how it is stricter.
     _persistent_ok = db is not None and guard_allowlist.match(db, command)
     _run_ok = False if _persistent_ok else _run_allowlist_match(command, decision)
-    if _persistent_ok or _run_ok:
+    # `scripts` is a third source of the same waiver, narrower than both: it
+    # only ever covers `<interpreter> <one exact pinned path>`. Checked last so
+    # the audit reason names the broadest rule that actually applied.
+    _script_ok = False if (_persistent_ok or _run_ok) else \
+        _run_script_match(command, decision)
+    if _persistent_ok or _run_ok or _script_ok:
         # Allowlisted: skip confirmation, but still build the backstop for
         # destructive commands (defense in depth — a pre-approved rm still
         # gets a recoverable snapshot/trash).
         if decision.level in ("dangerous", "protected"):
             guard_backstop.prepare_backstop(decision.paths)
         _rec("allowlisted", decision.level,
-             "allowlist" if _persistent_ok else "run-preauth")
+             "allowlist" if _persistent_ok
+             else ("run-preauth" if _run_ok else "run-preauth-script"))
         return None
 
     # gray → judge; allow verdict passes through, else fall to confirm

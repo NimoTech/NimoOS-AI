@@ -2219,7 +2219,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                mcp_servers: "list | ConfigUnavailable | None" = None,
                channel_send_file=None,
                pre_confirmed_tools: "set[str] | None" = None,
-               run_shell_allowlist: "list | None" = None) -> RunSink:
+               run_shell_allowlist: "list | None" = None,
+               run_scripts: "list | None" = None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -2259,6 +2260,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 # every interactive path, which keeps the gates unchanged.
                 pre_confirmed_tools=pre_confirmed_tools,
                 run_shell_allowlist=run_shell_allowlist,
+                run_scripts=run_scripts,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -3199,6 +3201,25 @@ def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:
         entry, bucket = detail, "mcp_tools"          # already "server::tool"
     elif kind == "shell":
         parts = detail.split()
+        # A denied `<interpreter> <absolute script>` becomes a `scripts` entry,
+        # not a prefix rule. Without this branch the button is a dead end for
+        # the whole "run my collector every morning" case: the prefix generated
+        # below would be `python3 `, which the run gate refuses outright
+        # (interpreter), so `run_allowlist_would_cover` correctly rejects it and
+        # the user sees `shell_rule_would_not_apply` with nothing to do about it
+        # — the feature would exist but be unreachable from the one place a user
+        # actually meets it.
+        # `script_run_target`, NOT `run_scripts_would_cover`: the latter answers
+        # True for every `safe` command whatever the rules, so using it as a
+        # detector read `lark-cli mail list --limit 5` as a script run and
+        # adopted `5` as the script path.
+        from skills import shell as _shell
+        _script = _shell.script_run_target(raw_detail)
+        if _script:
+            bucket, entry = "scripts", _script
+            if entry not in out[bucket]:
+                out[bucket].append(entry)
+            return out, bucket, entry
         # `preauth.shell_match` is `command.startswith(value)` on the RAW
         # command — deliberately not stripped there, since leading whitespace
         # is part of what the author would have had to authorize. So the rule
@@ -3218,7 +3239,7 @@ def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:
         # written here would be inert, and the user would walk away believing
         # the next run is authorized. Ask the gate itself rather than
         # re-deriving its conditions, and refuse instead of writing a no-op.
-        from skills import shell as _shell
+        # (`_shell` is already imported by the scripts branch above.)
         if not _shell.run_allowlist_would_cover(raw_detail, [entry]):
             raise HTTPException(400, "shell_rule_would_not_apply")
     else:

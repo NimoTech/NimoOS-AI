@@ -47,7 +47,14 @@ _SHELL_KINDS = ("prefix",)
 _REJECTED_SHELL_KINDS = ("regex",)
 
 # The normalized document's keys; anything else in the input is dropped.
-_STRING_LIST_FIELDS = ("egress_domains", "mcp_tools", "fs_write")
+_STRING_LIST_FIELDS = ("egress_domains", "mcp_tools", "fs_write", "scripts")
+
+# `scripts` entries must be ABSOLUTE paths, and unlike the other string buckets
+# a bad entry is reported rather than silently kept: the whole safety argument
+# for this bucket is "the payload is exactly this file", and a relative path
+# resolves against whatever CWD the run happens to have — never what the author
+# meant. Same rule (and same reasoning) as `fs_write`'s check in `main.py`.
+_ABSOLUTE_PATH_FIELDS = ("scripts",)
 
 # A preauth document is author-supplied data. Prefix matching is linear in the
 # command length, so the only cost left to bound is the rule count: one command
@@ -87,7 +94,8 @@ def parse_with_report(preauth_json) -> tuple[dict, dict]:
     if not isinstance(raw, dict):
         raw = {}
 
-    out: dict = {"shell": [], "egress_domains": [], "mcp_tools": [], "fs_write": []}
+    out: dict = {"shell": [], "egress_domains": [], "mcp_tools": [],
+                 "fs_write": [], "scripts": []}
     report: dict = {"truncated": {}, "rejected_rules": []}
 
     shell_rules = raw.get("shell")
@@ -115,7 +123,20 @@ def parse_with_report(preauth_json) -> tuple[dict, dict]:
         # A bare string must NOT be iterated (it would decompose into chars).
         if not isinstance(values, (list, tuple)):
             continue
-        out[field] = [v for v in values if isinstance(v, str) and v]
+        kept = []
+        for value in values:
+            if not isinstance(value, str) or not value:
+                continue
+            if field in _ABSOLUTE_PATH_FIELDS and not value.startswith("/"):
+                logger.warning(
+                    "preauth: dropping relative %s entry %r (absolute paths only)",
+                    field, value)
+                report["rejected_rules"].append({
+                    "field": field, "value": value,
+                    "reason": "path_must_be_absolute"})
+                continue
+            kept.append(value)
+        out[field] = kept
 
     for field, items in out.items():
         if len(items) > MAX_RULES:
