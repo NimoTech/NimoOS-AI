@@ -197,3 +197,48 @@ def test_the_briefing_stays_bounded_with_both(monkeypatch):
         {"scripts": [f"/DATA/s{i}.py" for i in range(200)],
          "workspace": "/DATA/AppData/nimoos-tasks/" + "x" * 300})
     assert len(text) <= runner.BRIEFING_MAX_CHARS
+
+
+# ── granting a folder must also hand over the tool to use it ──────────────────
+
+@pytest.mark.asyncio
+async def test_a_run_with_a_workspace_starts_with_the_files_tools_unlocked():
+    """The failure this fixes, observed on the live box.
+
+    `read_file` and `list_dir` are in CORE_TOOL_NAMES, so a run could READ its
+    folder — and it did, correctly reporting "first run, no history". But
+    `write_file` lives in the gated `files` category, so the tool to write the
+    state back was not even visible to the model, and the run finished having
+    saved nothing. `denied_actions` was empty: nothing was refused, because
+    nothing was attempted.
+
+    Granting a folder and briefing it while withholding the only tool that can
+    write to it is a half-built feature. Discovering `expand_tools` is friction
+    that produced exactly this miss at the end of a long run.
+    """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import db as dbmod
+    from tasks import runner as task_runner
+    from skills import tool_registry
+
+    assert "write_file" not in tool_registry.CORE_TOOL_NAMES, \
+        "if write_file became core this fix is obsolete — delete it"
+    assert any(getattr(t, "name", "") == "write_file"
+               for t in tool_registry.CATEGORY_TOOLS["files"])
+
+    unlocked = task_runner.unlocked_for_workspace([])
+    assert "files" in unlocked
+
+
+def test_the_categories_a_task_already_had_are_kept():
+    from tasks import runner as task_runner
+    got = task_runner.unlocked_for_workspace(["web", "notes"])
+    assert set(got) >= {"web", "notes", "files"}
+
+
+def test_no_workspace_means_no_extra_unlocking(tmp_path, monkeypatch):
+    # A task without a folder must keep the gate exactly as it was; this feature
+    # is not an excuse to widen the default tool surface for every task.
+    from tasks import runner as task_runner
+    assert task_runner.unlocked_for_workspace(["web"], workspace="") == ["web"]

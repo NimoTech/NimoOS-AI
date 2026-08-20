@@ -146,6 +146,33 @@ def _briefing_command(path: str) -> str:
     return f"{interpreter or 'bash'} {path}"
 
 
+# The category holding `write_file` and friends. `read_file` / `list_dir` are
+# already CORE, so a run can always READ its folder; writing is gated.
+_FILES_CATEGORY = "files"
+
+
+def unlocked_for_workspace(current, workspace: str = "x") -> list:
+    """The session's unlocked tool categories, plus `files` when there is a folder.
+
+    Observed on the live box: a run read its workspace correctly (`read_file` is
+    CORE), reported "first run, no history", and then saved nothing — because
+    `write_file` lives in the gated `files` category and was never visible to the
+    model. `denied_actions` was empty: nothing was refused, because nothing was
+    attempted.
+
+    Granting a folder, briefing it, and withholding the only tool that can write
+    to it is a half-built feature. Unlocking is not a widening of the default
+    tool surface either — it happens only for a run that actually has a folder,
+    and only for the category that folder is useless without.
+    """
+    have = [c for c in (current or []) if isinstance(c, str) and c]
+    if not workspace:
+        return have
+    if _FILES_CATEGORY not in have:
+        have.append(_FILES_CATEGORY)
+    return have
+
+
 def _workspace_lines(doc) -> list:
     """The working-folder paragraph, or `[]` when the run has no folder.
 
@@ -392,6 +419,16 @@ def _default_driver_factory(*, session_id, preauth, run_timeout):
                          preauth=preauth, run_timeout=run_timeout)
 
 
+def _default_read_unlocked(session_id: str) -> list:
+    import db as _db  # noqa: PLC0415 — same lazy-import discipline as the rest
+    return _db.get_unlocked_categories(session_id)
+
+
+def _default_unlock(session_id: str, categories) -> None:
+    import db as _db  # noqa: PLC0415
+    _db.set_unlocked_categories(session_id, list(categories))
+
+
 def _default_max_turns_reader(conn, user_id: str) -> int:
     import main  # noqa: PLC0415
     return main._read_max_turns_setting(conn, user_id)
@@ -411,6 +448,8 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
                        notify=notify.send_result,
                        notify_start=notify.send_start,
                        workspace_ensure=workspace.ensure,
+                       read_unlocked=_default_read_unlocked,
+                       unlock=_default_unlock,
                        keep_runs: int = KEEP_RUNS) -> bool:
     """Claim and execute at most one run. False only when there was nothing
     to do — the caller uses that to decide whether to sleep.
@@ -475,6 +514,18 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
 
         session_id = session_factory(conn, user_id, task["agent_type"])
         store.attach_session(conn, run_id, session_id)
+
+        # Hand over the tool that makes the folder usable. Must happen BEFORE
+        # start_run: agent.py seeds UNLOCKED_VAR from the session row at the top
+        # of the run, so anything written afterwards is read too late.
+        if doc.get("workspace"):
+            try:
+                unlock(session_id,
+                       unlocked_for_workspace(read_unlocked(session_id),
+                                              doc["workspace"]))
+            except Exception:               # noqa: BLE001 — never sink a run
+                logger.warning("tasks runner: could not unlock file tools for "
+                               "session %s", session_id, exc_info=True)
 
         try:
             granted = grant_fs(conn, session_id, doc["fs_write"])

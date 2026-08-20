@@ -1339,3 +1339,52 @@ async def test_a_run_without_a_workspace_keeps_the_prompt_verbatim(conn):
 
     assert await h.run(conn) is True
     assert h.start_run_calls[0]["message"] == "write the report"
+
+
+@pytest.mark.asyncio
+async def test_the_file_tools_are_unlocked_before_the_run_starts(conn):
+    """Ordering, not just presence.
+
+    `agent.py` seeds UNLOCKED_VAR from the session row at the top of the run, so
+    an unlock written after start_run is read too late and the tool stays
+    invisible — the exact symptom this feature had before the fix, with nothing
+    in the logs to explain it.
+    """
+    h = Harness()
+    h.workspace_path = "/tmp/ws/t-1"
+    order = []
+    unlocked = {}
+
+    def read_unlocked(session_id):
+        return ["web"]
+
+    def unlock(session_id, categories):
+        order.append("unlock")
+        unlocked[session_id] = list(categories)
+
+    real_start = h.start_run
+
+    def start_run(*a, **kw):
+        order.append("start_run")
+        return real_start(*a, **kw)
+
+    tid = _mk(conn)
+    _queue(conn, tid)
+    assert await h.run(conn, read_unlocked=read_unlocked, unlock=unlock,
+                       start_run=start_run) is True
+
+    assert order == ["unlock", "start_run"], order
+    assert set(next(iter(unlocked.values()))) == {"web", "files"}
+
+
+@pytest.mark.asyncio
+async def test_a_task_without_a_workspace_does_not_touch_the_tool_gate(conn):
+    # This feature must not quietly widen the tool surface for every task.
+    h = Harness()
+    h.workspace_path = ""
+    calls = []
+    tid = _mk(conn)
+    _queue(conn, tid)
+
+    assert await h.run(conn, unlock=lambda s, c: calls.append(c)) is True
+    assert calls == []

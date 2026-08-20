@@ -96,9 +96,13 @@ def _write_marker(path: str, task_id: str, name: str) -> None:
             fh.write(f"{name or '(unnamed task)'}\n"
                      f"task id: {task_id}\n\n"
                      "This folder belongs to a NimoOS scheduled task. The task "
-                     "may read and write files here — it is where it keeps state "
-                     "between runs. You can edit or delete anything in it; this "
-                     "file is written once and never overwritten.\n")
+                     "may read and write files here — it is where it keeps "
+                     "state between runs.\n\n"
+                     "You can browse, edit and clear it from the NimoOS file "
+                     "manager. Note that the agent runs as root, so files here "
+                     "are root-owned: over SSH as another user you can read "
+                     "them but not change them.\n\n"
+                     "This file is written once and never overwritten.\n")
     except OSError as exc:
         # A missing marker costs readability, nothing else.
         logger.warning("tasks workspace: cannot write marker in %s: %s",
