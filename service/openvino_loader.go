@@ -210,8 +210,16 @@ type ovmsConfig struct {
 // Without prefix caching, every round has to prefill a several-thousand-token
 // prefix from scratch (measured ~3s/round); with it enabled, prefill on the
 // repeated prefix drops to ~0.2s (measured 15x speedup), and it hits across
-// requests too. cache_size is in GB — 2GB leaves headroom on a B60 with 19GB
-// of weights + 24GB of VRAM.
+// requests too.
+//
+// cache_size: 0 selects GenAI's dynamic KV cache allocation ("Cache type:
+// dynamic" in llm_executor logs): the cache starts tiny and grows on demand
+// from whatever VRAM is actually free after weights, instead of a fixed
+// pre-allocation that must be guessed per model/device. KV_CACHE_PRECISION
+// u8 halves per-token KV cost vs f16 (this model family: 128KB/token @ u8).
+// Both verified working on OVMS 2026.2.1 and 2026.4.0 on GPU.1 (B60).
+// Note: kv_cache_precision is NOT a graph field — LLMCalculatorOptions has
+// no such member and graph parsing fails; it must ride in plugin_config.
 func ovmsGraphPbtxt(device string) string {
 	return `input_stream: "HTTP_REQUEST_PAYLOAD:input"
 output_stream: "HTTP_RESPONSE_PAYLOAD:output"
@@ -231,10 +239,10 @@ node: {
     [type.googleapis.com/mediapipe.LLMCalculatorOptions]: {
       models_path: "./1",
       device: "` + device + `",
-      plugin_config: '{"PERFORMANCE_HINT":"LATENCY"}',
+      plugin_config: '{"PERFORMANCE_HINT":"LATENCY","KV_CACHE_PRECISION":"u8"}',
       enable_prefix_caching: true,
       dynamic_split_fuse: true,
-      cache_size: 2,
+      cache_size: 0,
       reasoning_parser: "qwen3",
       tool_parser: "qwen3coder"
     }
