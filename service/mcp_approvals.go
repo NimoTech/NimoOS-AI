@@ -115,6 +115,36 @@ func (s *mcpApprovalService) put(serverID int64, toolName, identityFP, schemaHas
 	return err
 }
 
+// AckDescription records that the user has SEEN this tool's current
+// description, clearing the settings UI's "description changed" badge without
+// touching anything else on the row. Deliberately not routed through put():
+// that UPSERT also rewrites approved_at (when the user consented -- audit
+// information a mere "I've read it" must not overwrite) and resets
+// last_seen_at, which would restart the 7-day stale window and so extend an
+// approval's life without the user having re-read what they were consenting
+// to.
+//
+// descHash comes from the caller, which must read it out of the server's
+// CURRENT runtime row -- never from a request body. Same rule as PutApproval:
+// a caller able to supply it directly could store a hash that always matches
+// itself and permanently silence the badge.
+func (s *mcpApprovalService) AckDescription(serverID int64, toolName, descHash string) error {
+	// An empty descHash means the tool is not in the server's current listing,
+	// so there is no description to acknowledge. Storing it would be actively
+	// harmful, not merely useless: desc_changed is reported as
+	// `stored != "" && stored != current`, so an empty stored value silences
+	// the badge for this tool PERMANENTLY -- including after it comes back
+	// with different prose. Refusing here (rather than only in the handler)
+	// keeps that invariant with the column instead of with one caller.
+	if descHash == "" {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`UPDATE mcp_tool_approvals SET desc_hash=? WHERE server_id=? AND tool_name=?`,
+		descHash, serverID, toolName)
+	return err
+}
+
 // Delete revokes one tool's approval.
 func (s *mcpApprovalService) Delete(serverID int64, toolName string) error {
 	_, err := s.db.Exec(`DELETE FROM mcp_tool_approvals WHERE server_id=? AND tool_name=?`, serverID, toolName)

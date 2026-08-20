@@ -41,6 +41,7 @@ import (
 // StaleReason is kept as-is alongside it: nothing that reads it today breaks.
 type toolStateDTO struct {
 	Name           string `json:"name"`
+	Description    string `json:"description,omitempty"`
 	Approved       bool   `json:"approved"`
 	LastSeenAt     int64  `json:"last_seen_at"`
 	DescChanged    bool   `json:"desc_changed"`
@@ -76,7 +77,31 @@ type toolsResponseDTO struct {
 	ServerLevelStaleReason    string         `json:"server_level_stale_reason,omitempty"`
 	ServerLevelStaleReasonKey string         `json:"server_level_stale_reason_key,omitempty"`
 	TotalStoredApprovals      int            `json:"total_stored_approvals"`
+	ListingStale              bool           `json:"listing_stale"`
+	LastOkAt                  int64          `json:"last_ok_at"`
 }
+
+// ListingStale / LastOkAt are the SERVER-level freshness pair. They exist
+// because per-tool last_seen_at cannot answer "is this listing still live":
+// that column lives on the approval row, so a tool the user never approved
+// has no timestamp at all (pinned by
+// TestToolsEndpointReturnsToolsWithApprovalStateAndLastSeenAt) and a client
+// reading its zero as "last seen at the epoch" greys out every unapproved
+// tool forever.
+//
+// ListingStale keys on fail_streak, NOT probe_state: MarkProbing writes
+// probe_state='probing' at the start of every refresh but never touches
+// fail_streak, so fail_streak still reports the last COMPLETED probe's
+// outcome. Keying on probe_state would flash "may be out of date" during
+// each routine re-probe -- near-continuously for a server whose declared
+// ttlMs lands on the SCHEMA_TTL_MIN floor of 60s.
+//
+// The judgement is also deliberately server-level rather than per-tool: a
+// successful probe replaces tools_json wholesale, so a tool that really was
+// removed simply stops appearing in this response (its orphaned approval
+// surfaces through stale_reason_key='tool_removed' instead). "This one tool
+// vanished" is therefore not a state this list can ever represent; "the
+// whole listing is a leftover from before the current failure" is.
 
 // approvalSummaryDTO is one element of GET /mcp/approvals' cross-server
 // summary. ServerHandle is required — Task 21 groups the summary page by
@@ -167,6 +192,20 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 	var metas []service.ToolMeta
 	_ = json.Unmarshal([]byte(rt.ToolsJSON), &metas)
 
+	// Tool descriptions live in the sibling mcp_server_schemas row, not in
+	// tools_json (which carries names and hashes only). Same probe persists
+	// both, so reading it here keeps this handler zero-network. Best-effort
+	// on purpose: a tool list that renders without prose beats no list.
+	descByName := map[string]string{}
+	if _, schemasJSON, serr := h.svc.MCPRuntime().GetSchemas(id); serr == nil {
+		var schemas []ProbeSchema
+		if json.Unmarshal([]byte(schemasJSON), &schemas) == nil {
+			for _, sc := range schemas {
+				descByName[sc.Name] = sc.Description
+			}
+		}
+	}
+
 	approvals, err := h.svc.MCPApprovals().ListForServer(id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -179,7 +218,7 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 
 	out := make([]toolStateDTO, 0, len(metas))
 	for _, m := range metas {
-		dto := toolStateDTO{Name: m.Name}
+		dto := toolStateDTO{Name: m.Name, Description: descByName[m.Name]}
 		switch row, ok := byName[m.Name]; {
 		case ok:
 			// An explicit per-tool approval is the more specific record;
@@ -206,7 +245,12 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		out = append(out, dto)
 	}
 
-	resp := toolsResponseDTO{Tools: out, TotalStoredApprovals: len(approvals)}
+	resp := toolsResponseDTO{
+		Tools:                out,
+		TotalStoredApprovals: len(approvals),
+		ListingStale:         rt.FailStreak > 0,
+		LastOkAt:             rt.LastOkAt,
+	}
 	if hasWildcard {
 		// True even if void (see toolsResponseDTO's doc comment) — mirrors
 		// each toolStateDTO row's own Approved semantics above.
@@ -215,6 +259,54 @@ func (h *MCPHandler) Tools(c echo.Context) error {
 		resp.ServerLevelStaleReasonKey = wildcard.StaleReasonKey
 	}
 	return c.JSON(http.StatusOK, resp)
+}
+
+// AckDescription handles POST /v1/ai/mcp/servers/:id/approvals/:tool/ack-description
+// -- the user telling the settings UI "I have read this tool's new
+// description", which clears its desc_changed badge.
+//
+// Before this existed the ONLY way to clear the badge was to re-grant the
+// approval (PutApproval's UPSERT re-stamps desc_hash as a side effect of
+// re-consenting), which also rewrote approved_at and reset the 7-day stale
+// window. See the service method for why that is the wrong price for an
+// acknowledgement.
+//
+// A subsequent, DIFFERENT description lights the badge again -- that falls out
+// of the desc_hash comparison and is the intended behaviour: acknowledging is
+// "I've seen this change", not "never tell me about this tool again".
+func (h *MCPHandler) AckDescription(c echo.Context) error {
+	_, id, err := h.ownerOrForbidden(c)
+	if err != nil {
+		return err
+	}
+	toolName, err := url.PathUnescape(c.Param("tool"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid tool encoding")
+	}
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "tool name required")
+	}
+	// '*' is the server-level grant, not a tool: it has no description of its
+	// own and so never lights the badge (see PutServerLevel). Rejected rather
+	// than silently no-op'd, so a caller that meant a real tool hears about it.
+	if toolName == "*" {
+		return echo.NewHTTPError(http.StatusBadRequest,
+			`tool name "*" is the server-level grant and has no description to acknowledge`)
+	}
+
+	rt, err := h.svc.MCPRuntime().Get(id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	var descHash string
+	if rt != nil {
+		_, descHash = lookupToolMeta(rt.ToolsJSON, toolName)
+	}
+	if err := h.svc.MCPApprovals().AckDescription(id, toolName, descHash); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
 }
 
 // PutApproval handles PUT /v1/ai/mcp/servers/:id/approvals/:tool. It is the

@@ -853,3 +853,411 @@ func TestPutApprovalPercentDecodesWildcard(t *testing.T) {
 		t.Fatalf("expected a server-level '*' approval, got %+v", rows)
 	}
 }
+
+// TestToolsEndpointReportsListingStaleAfterFailedProbe pins the server-level
+// freshness signal the settings UI needs to tell a hot listing from a cold
+// one. The per-tool last_seen_at cannot answer this: it lives on the approval
+// row, so an unapproved tool has no timestamp at all (pinned by
+// TestToolsEndpointReturnsToolsWithApprovalStateAndLastSeenAt above), and the
+// UI used to read that zero as "this tool is gone from the server".
+func TestToolsEndpointReportsListingStaleAfterFailedProbe(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh1"}},
+		"[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	// The listing above is still the newest thing we know, but the most
+	// recent probe attempt failed -- what the client is about to render is a
+	// leftover, not a live observation.
+	if err := svc.MCPRuntime().SaveFailure(m.ID, "connect_failed", "all connection attempts failed"); err != nil {
+		t.Fatalf("seed failure: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+
+	var out struct {
+		ListingStale bool  `json:"listing_stale"`
+		LastOkAt     int64 `json:"last_ok_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if !out.ListingStale {
+		t.Fatalf("expected listing_stale=true after a failed probe, got %s", rec.Body.String())
+	}
+	if out.LastOkAt == 0 {
+		t.Fatalf("expected last_ok_at to carry the earlier success so the UI can say how long it has been cold, got %s", rec.Body.String())
+	}
+}
+
+// TestToolsEndpointListingNotStaleWhileHealthyServerReprobes guards the
+// freshness signal against the transient probe_state='probing' that
+// MarkProbing writes at the START of every refresh. Keying listing_stale on
+// probe_state alone would flash "this listing may be out of date" at the user
+// during each routine re-probe -- constantly for a server whose declared TTL
+// sits at the SCHEMA_TTL_MIN floor of 60s. fail_streak is the honest input:
+// MarkProbing never touches it, so it still reports the last COMPLETED
+// probe's outcome.
+func TestToolsEndpointListingNotStaleWhileHealthyServerReprobes(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh1"}},
+		"[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	claimed, err := svc.MCPRuntime().MarkProbing(m.ID)
+	if err != nil || !claimed {
+		t.Fatalf("MarkProbing: claimed=%v err=%v", claimed, err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+
+	var out struct {
+		ListingStale bool `json:"listing_stale"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if out.ListingStale {
+		t.Fatalf("expected listing_stale=false while a healthy server is mid-reprobe, got %s", rec.Body.String())
+	}
+}
+
+// TestToolsEndpointCarriesToolDescriptions pins the settings UI's ability to
+// show WHAT a tool does, and -- next to the existing desc_changed badge --
+// what its description changed TO. tools_json holds only name + hashes, so
+// the prose has to come from the sibling mcp_server_schemas row. Still zero
+// network: both are persisted by the same probe.
+func TestToolsEndpointCarriesToolDescriptions(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	e := echo.New()
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	schemas := `[{"name":"create_issue","description":"Open a new issue on a repository.","input_schema":{"type":"object"}},
+	             {"name":"close_issue","description":"Close an existing issue.","input_schema":{"type":"object"}}]`
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{
+			{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh1"},
+			{Name: "close_issue", SchemaHash: "sh2", DescHash: "dh2"},
+		}, schemas); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(m.ID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+
+	var out struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	got := map[string]string{}
+	for _, tl := range out.Tools {
+		got[tl.Name] = tl.Description
+	}
+	if got["create_issue"] != "Open a new issue on a repository." {
+		t.Fatalf("expected create_issue's description, got %+v", got)
+	}
+	if got["close_issue"] != "Close an existing issue." {
+		t.Fatalf("expected close_issue's description, got %+v", got)
+	}
+}
+
+// seedDescChanged creates one server, approves `tool` against description
+// hash `oldDesc`, then re-lists it with `newDesc` — the exact state that
+// lights the settings UI's "description changed" badge.
+func seedDescChanged(t *testing.T, svc service.Services, tool, oldDesc, newDesc string) *service.McpServer {
+	t.Helper()
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: tool, SchemaHash: "sh1", DescHash: oldDesc}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, tool, "fp", "sh1", oldDesc); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Same tool, same schema, new description — desc_hash is the only change.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: tool, SchemaHash: "sh1", DescHash: newDesc}}, "[]"); err != nil {
+		t.Fatalf("re-list: %v", err)
+	}
+	return m
+}
+
+// descChangedOf reads one tool's desc_changed straight off the Tools endpoint,
+// so these tests assert on what the settings UI actually receives.
+func descChangedOf(t *testing.T, h *MCPHandler, serverID int64, tool string) bool {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id"}, []string{fmt.Sprint(serverID)})
+	if err := h.Tools(c); err != nil {
+		t.Fatalf("Tools: %v", err)
+	}
+	var out struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			DescChanged bool   `json:"desc_changed"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	for _, tl := range out.Tools {
+		if tl.Name == tool {
+			return tl.DescChanged
+		}
+	}
+	t.Fatalf("tool %q not in response %s", tool, rec.Body.String())
+	return false
+}
+
+// ackDescription drives the endpoint under test.
+func ackDescription(t *testing.T, h *MCPHandler, serverID int64, tool string) *httptest.ResponseRecorder {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "u1")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id", "tool"}, []string{fmt.Sprint(serverID), tool})
+	if err := h.AckDescription(c); err != nil {
+		if he, ok := err.(*echo.HTTPError); ok {
+			rec.Code = he.Code
+			return rec
+		}
+		t.Fatalf("AckDescription: %v", err)
+	}
+	return rec
+}
+
+// TestAckDescriptionClearsTheBadge is the whole point of the endpoint: let the
+// user say "I've read it" without re-granting the approval, which is the only
+// thing that could clear this badge before (PutApproval's UPSERT re-stamps
+// desc_hash as a side effect of re-consenting).
+func TestAckDescriptionClearsTheBadge(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	m := seedDescChanged(t, svc, "create_issue", "dh-old", "dh-new")
+
+	if !descChangedOf(t, h, m.ID, "create_issue") {
+		t.Fatal("fixture is wrong: desc_changed should be true before the ack")
+	}
+	if rec := ackDescription(t, h, m.ID, "create_issue"); rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if descChangedOf(t, h, m.ID, "create_issue") {
+		t.Fatal("expected desc_changed=false after acknowledging the change")
+	}
+}
+
+// TestAckDescriptionOnAbsentToolStoresNothing guards the one way this endpoint
+// could permanently break the badge. lookupToolMeta returns "" for a tool that
+// is not in the CURRENT listing, and desc_changed is reported as
+// `stored != "" && stored != current` — so writing that "" would silence the
+// badge for this tool forever, even after it comes back with different prose.
+// Acking something the server no longer offers must be a no-op.
+func TestAckDescriptionOnAbsentToolStoresNothing(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh-old"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "fp", "sh1", "dh-old"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// The server drops create_issue and keeps offering something else (a
+	// wholly empty listing would be ignored by SaveSuccess's blip guard).
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "close_issue", SchemaHash: "sh2", DescHash: "dh2"}}, "[]"); err != nil {
+		t.Fatalf("re-list: %v", err)
+	}
+
+	ackDescription(t, h, m.ID, "create_issue")
+
+	// create_issue returns, with prose that differs from what was approved.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh-new"}}, "[]"); err != nil {
+		t.Fatalf("re-list 2: %v", err)
+	}
+	if !descChangedOf(t, h, m.ID, "create_issue") {
+		t.Fatal("acking an absent tool must not store an empty desc_hash: the badge is now dead for this tool")
+	}
+}
+
+// TestAckDescriptionRejectsWildcard: '*' is the server-level grant, not a real
+// tool, and carries no description of its own (see PutServerLevel). There is
+// nothing to acknowledge, and letting it through would write to a row whose
+// desc_hash is load-bearing for nothing.
+func TestAckDescriptionRejectsWildcard(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	m := seedDescChanged(t, svc, "create_issue", "dh-old", "dh-new")
+
+	if rec := ackDescription(t, h, m.ID, "*"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for the wildcard, got %d", rec.Code)
+	}
+}
+
+// TestAckDescriptionRelightsBadgeOnTheNextChange pins the agreed semantics:
+// acknowledging means "I have seen THIS change", not "never mention this tool
+// again". Falls out of the desc_hash comparison, which is exactly why it is
+// worth pinning -- it is a property of the mechanism, easy to lose in a
+// refactor that starts remembering acknowledgements separately.
+func TestAckDescriptionRelightsBadgeOnTheNextChange(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	m := seedDescChanged(t, svc, "create_issue", "dh-old", "dh-new")
+
+	ackDescription(t, h, m.ID, "create_issue")
+	if descChangedOf(t, h, m.ID, "create_issue") {
+		t.Fatal("badge should be clear right after the ack")
+	}
+
+	// The server edits the description a second time.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh1", DescHash: "dh-newer"}}, "[]"); err != nil {
+		t.Fatalf("re-list: %v", err)
+	}
+	if !descChangedOf(t, h, m.ID, "create_issue") {
+		t.Fatal("a second, different description must light the badge again")
+	}
+}
+
+// TestAckDescriptionDoesNotReconsentToAChangedSchema is the security-relevant
+// half of "acknowledging is not re-approving". PutApproval's UPSERT re-stamps
+// identity_fp AND schema_hash from the current runtime row, so routing an
+// acknowledgement through it would silently satisfy the interface gate -- the
+// user would have re-consented to a tool whose ARGUMENTS changed by clicking a
+// button about its prose. The narrow UPDATE must leave that gate failing.
+func TestAckDescriptionDoesNotReconsentToAChangedSchema(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+
+	m := &service.McpServer{UserID: "u1", Name: "github", Transport: "http", URL: "https://x", Args: "[]", Env: "{}", Enabled: true}
+	if err := svc.MCP().CreateMcpServer(m); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh-old", DescHash: "dh-old"}}, "[]"); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := svc.MCPApprovals().Put(m.ID, "create_issue", "fp", "sh-old", "dh-old"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Both the arguments and the prose changed.
+	if err := svc.MCPRuntime().SaveSuccess(
+		&service.McpServerRuntime{ServerID: m.ID, IdentityFP: "fp", TTLSec: 3600},
+		[]service.ToolMeta{{Name: "create_issue", SchemaHash: "sh-new", DescHash: "dh-new"}}, "[]"); err != nil {
+		t.Fatalf("re-list: %v", err)
+	}
+
+	ackDescription(t, h, m.ID, "create_issue")
+
+	rows, err := svc.MCPApprovals().ListForServer(m.ID)
+	if err != nil {
+		t.Fatalf("ListForServer: %v", err)
+	}
+	var found bool
+	for _, r := range rows {
+		if r.ToolName != "create_issue" {
+			continue
+		}
+		found = true
+		if r.StaleReasonKey != service.StaleReasonSchemaChanged {
+			t.Fatalf("acking the description must leave the interface gate failing, got stale_reason_key=%q", r.StaleReasonKey)
+		}
+	}
+	if !found {
+		t.Fatalf("approval row vanished: %+v", rows)
+	}
+}
+
+// TestAckDescriptionRejectsForeignServer: same indistinguishable-403 rule as
+// every other handler here -- a server that belongs to someone else and one
+// that does not exist must not be tellable apart.
+func TestAckDescriptionRejectsForeignServer(t *testing.T) {
+	svc := mcpTestSvc(t)
+	h := NewMCPHandler(svc, NewTicketStore(time.Minute), NewRunTokenStore(time.Minute), "http://127.0.0.1:1")
+	m := seedDescChanged(t, svc, "create_issue", "dh-old", "dh-new")
+
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set("X-NimoOS-User-ID", "someone-else")
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	setParams(c, []string{"id", "tool"}, []string{fmt.Sprint(m.ID), "create_issue"})
+	err := h.AckDescription(c)
+	he, ok := err.(*echo.HTTPError)
+	if !ok || he.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %v", err)
+	}
+	if descChangedOf(t, h, m.ID, "create_issue") != true {
+		t.Fatal("a rejected ack must not have cleared the owner's badge")
+	}
+}

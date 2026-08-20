@@ -136,6 +136,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	// like the routes above; see route/v2/mcp_approvals.go.
 	g.GET("/mcp/servers/:id/tools", mcp.Tools)
 	g.PUT("/mcp/servers/:id/approvals/:tool", mcp.PutApproval)
+	g.POST("/mcp/servers/:id/approvals/:tool/ack-description", mcp.AckDescription)
 	g.DELETE("/mcp/servers/:id/approvals", mcp.DeleteApprovals)
 	g.GET("/mcp/approvals", mcp.ListApprovals)
 
