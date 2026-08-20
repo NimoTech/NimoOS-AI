@@ -184,7 +184,7 @@ async def test_same_host_redirect_upgrades_scheme_back_to_https():
 
 
 @pytest.mark.asyncio
-async def test_error_responses_are_not_cached():
+async def test_error_responses_are_not_cached(monkeypatch):
     calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -192,12 +192,23 @@ async def test_error_responses_are_not_cached():
         calls += 1
         return httpx.Response(500)
 
+    # 500 is now a retryable status (see fetch.FETCH_ATTEMPTS): stub the backoff
+    # so this test does not spend its runtime asleep.
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(fetch, "_retry_sleep", no_sleep)
+
     async with _client(handler) as c:
         a = await fetch.fetch_page("https://x.test/err", client=c)
         b = await fetch.fetch_page("https://x.test/err", client=c)
 
     assert "error" in a and "error" in b
-    assert calls == 2
+    # The claim is "the second call really went out again", not a raw request
+    # count: each fetch_page now retries a 5xx, so the expected total is one
+    # full attempt budget per call. Hardcoding 2 would break every time the
+    # retry policy changes while telling us nothing about caching.
+    assert calls == 2 * fetch.FETCH_ATTEMPTS
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ just granted for a different host.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -129,8 +130,65 @@ async def _read_capped(resp: httpx.Response) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+# Retry policy for a throttled or briefly broken host.
+#
+# Found on the live box: a task fetched four Reddit search feeds in quick
+# succession and three came back 429 — Reddit throttles a datacenter IP hard.
+# The pacing in web/backends.py covers SEARCH only, so a throttled feed became
+# "0 items" in the report, indistinguishable from "that source had nothing".
+#
+# Retry, not global pacing: ten YouTube channel feeds fetched back to back all
+# succeeded, so serializing every host behind one interval would slow the common
+# case to fix the uncommon one.
+FETCH_ATTEMPTS = 3
+FETCH_BACKOFF_SEC = 2.0          # doubled per retry
+FETCH_MAX_BACKOFF_SEC = 30.0     # ceiling, incl. a server's own Retry-After
+_FETCH_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Injection seam for tests (real sleeps would make this the slowest file here).
+_retry_sleep = asyncio.sleep
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """How long to wait before the next attempt.
+
+    `Retry-After` wins when the server sends a usable one — a server that names
+    its own cooldown knows better than our curve — but it is capped: a hostile
+    or broken value ("99999") must not park the run for an hour. Anything
+    unparseable falls back to the curve rather than to zero, which would spin.
+    """
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if raw:
+        try:
+            return min(float(int(raw)), FETCH_MAX_BACKOFF_SEC)
+        except (TypeError, ValueError):
+            pass                    # a date form, or junk — use the curve
+    return min(FETCH_BACKOFF_SEC * (2 ** attempt), FETCH_MAX_BACKOFF_SEC)
+
+
 async def _fetch_once(client: httpx.AsyncClient, url: str) -> dict:
-    """One request, no redirect following. Returns a raw dict or an error dict."""
+    """One logical fetch: no redirect following, but retried when throttled.
+
+    Returns a raw dict or an error dict. A retried status that never clears is
+    still reported with its code — a throttled source must never look like an
+    empty one.
+    """
+    for attempt in range(FETCH_ATTEMPTS):
+        result = await _fetch_attempt(client, url, attempt)
+        retry_after = result.pop("_retry_after", None)
+        if retry_after is None or attempt == FETCH_ATTEMPTS - 1:
+            return result
+        await _retry_sleep(retry_after)
+    return result       # unreachable; the loop always returns
+
+
+async def _fetch_attempt(client: httpx.AsyncClient, url: str,
+                         attempt: int = 0) -> dict:
+    """One HTTP request. A retryable status carries `_retry_after` back up.
+
+    `attempt` only feeds the backoff curve, so a host that keeps throttling gets
+    progressively more room instead of the same short pause three times.
+    """
     try:
         req = client.build_request(
             "GET", url,
@@ -156,6 +214,10 @@ async def _fetch_once(client: httpx.AsyncClient, url: str) -> dict:
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get("Location", "")
             return {"_redirect": urljoin(url, loc) if loc else ""}
+        if resp.status_code in _FETCH_RETRY_STATUSES:
+            # Hand the delay up to _fetch_once, which owns the attempt budget.
+            return {"error": f"HTTP {resp.status_code} from {url}",
+                    "_retry_after": _retry_delay(resp, attempt)}
         if resp.status_code >= 400:
             return {"error": f"HTTP {resp.status_code} from {url}"}
         ctype = resp.headers.get("Content-Type", "")
