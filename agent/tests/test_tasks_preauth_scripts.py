@@ -346,3 +346,20 @@ def test_the_prompt_carries_the_briefing_but_keeps_the_authors_text_first():
 def test_a_prompt_without_a_scripts_grant_is_untouched():
     from tasks import runner
     assert runner.compose_prompt("just say hi", {"scripts": []}) == "just say hi"
+
+
+def test_the_briefing_tells_the_model_to_allow_a_generous_timeout():
+    """Second live finding: the shell tool's own timeout killed the script.
+
+    The task's `timeout_seconds` is the RUN budget, not the per-command one.
+    `run_command` defaults to 30s and the model picked 60 — the collector was
+    still fetching at 60s and got killed mid-run, so the report was a partial
+    log instead of a digest. A script worth pre-authorizing is usually a script
+    that does real work, so the briefing has to say so.
+    """
+    from tasks import runner
+    from skills import shell as shell_skill
+    text = runner.format_run_briefing({"scripts": [SCRIPT]})
+    assert "timeout" in text.lower()
+    # And it must not advise a value the tool would clamp away silently.
+    assert str(shell_skill.MAX_TIMEOUT_SEC) in text

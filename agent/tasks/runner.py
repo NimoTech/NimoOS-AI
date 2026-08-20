@@ -123,6 +123,20 @@ BRIEFING_MAX_CHARS = 1200
 _BRIEFING_MAX_SCRIPTS = 8
 
 
+def _shell_max_timeout() -> int:
+    """`skills.shell.MAX_TIMEOUT_SEC`, read lazily.
+
+    Lazily because importing the shell skill at module scope would pull the
+    whole sandbox stack into every consumer of `tasks.runner`. Read rather than
+    duplicated so the briefing can never advise a value the tool would clamp.
+    """
+    try:
+        from skills import shell as _shell  # noqa: PLC0415
+        return int(_shell.MAX_TIMEOUT_SEC)
+    except Exception:                       # noqa: BLE001 — never break a run
+        return 300
+
+
 def _briefing_command(path: str) -> str:
     ext = path[path.rfind("."):].lower() if "." in path.rsplit("/", 1)[-1] else ""
     interpreter = _SCRIPT_INTERPRETER_BY_EXT.get(ext)
@@ -169,7 +183,19 @@ def format_run_briefing(doc) -> str:
         "Any variation is refused: do not prepend `cd`, do not chain with `&&`, "
         "`||`, `;` or a pipe, do not add an argument or a flag, and do not "
         "redirect the output. Read the script's own output from the command "
-        "result instead.]")
+        "result instead.")
+    # Second live finding. The task's `timeout_seconds` is the RUN budget; the
+    # shell tool has its OWN per-command timeout that defaults to 30s. The model
+    # picked 60 and the collector was killed mid-fetch, so the report came back
+    # as a partial log rather than a digest — and nothing in the output said the
+    # cause was a per-command timeout. A script worth pre-authorizing usually
+    # does real work, so say so, and name the ceiling rather than let the tool
+    # clamp a larger value away silently.
+    lines.append(
+        f"These scripts can take minutes: pass a generous `timeout` on the "
+        f"command (up to {_shell_max_timeout()} seconds, the maximum). If the "
+        f"output looks cut off mid-way, it was the per-command timeout, not the "
+        f"script finishing.]")
     note = "\n".join(lines)
     if len(note) > BRIEFING_MAX_CHARS:
         note = note[:BRIEFING_MAX_CHARS - 2] + "…]"
