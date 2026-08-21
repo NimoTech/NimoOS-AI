@@ -549,3 +549,120 @@ async def test_cleanup_runs_even_if_the_sink_raises():
     with pytest.raises(RuntimeError):
         await _driver(mgr).drive(ExplodingSink(past=[{"type": "done"}]))
     assert mgr.cancelled == [SID]
+
+
+# --------------------------------------------------------------------------
+# Contract: escalation hook (spec §6 — out-of-scope cards go to a channel)
+# --------------------------------------------------------------------------
+
+class _EscalateRecorder:
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, ev, on_outcome):
+        self.calls.append((ev, on_outcome))
+
+
+def _esc_driver(mgr, escalate, preauth=None):
+    return TaskRunDriver(confirm_mgr=mgr, session_id=SID,
+                         preauth=preauth or {}, run_timeout=60,
+                         escalate=escalate)
+
+
+def _egress_ev(cid="c1", host="x.com"):
+    # `reason` is required: gate_of_event maps a reason-less egress card to
+    # gate None, which is the non-escalatable (immediate-deny) bucket.
+    return {"type": "confirmation_required", "confirm_id": cid,
+            "action": "egress_confirm", "reason": "tofu_unknown_host",
+            "host": host}
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_card_escalates_instead_of_denying():
+    mgr = FakeConfirmManager()
+    esc = _EscalateRecorder()
+    d = _esc_driver(mgr, esc)
+    d._handle_confirm(_egress_ev())
+    await asyncio.sleep(0)          # escalation is scheduled via create_task
+    assert len(esc.calls) == 1
+    assert mgr.calls == []          # NOT resolved yet — a human owns it now
+    assert d._denied == [] and d._auto_approved == []
+    # the human pressed "allow & persist"
+    _, on_outcome = esc.calls[0]
+    on_outcome(True, True)
+    assert d._auto_approved == [{"kind": "egress", "detail": "x.com",
+                                 "via": "channel", "persisted": True}]
+    assert d._denied == []
+
+
+@pytest.mark.asyncio
+async def test_escalated_deny_recorded_with_via():
+    mgr = FakeConfirmManager()
+    esc = _EscalateRecorder()
+    d = _esc_driver(mgr, esc)
+    d._handle_confirm(_egress_ev())
+    await asyncio.sleep(0)
+    esc.calls[0][1](False, False)
+    assert d._denied == [{"kind": "egress", "detail": "x.com",
+                          "via": "channel"}]
+    assert d._auto_approved == []
+
+
+@pytest.mark.asyncio
+async def test_preauthorized_card_never_escalates():
+    mgr = FakeConfirmManager()
+    esc = _EscalateRecorder()
+    d = _esc_driver(mgr, esc, preauth={"egress_domains": ["x.com"]})
+    d._handle_confirm(_egress_ev())
+    await asyncio.sleep(0)
+    assert esc.calls == []
+    assert mgr.calls == [("c1", True, SID)]
+
+
+@pytest.mark.asyncio
+async def test_non_gateable_card_denies_without_escalation():
+    mgr = FakeConfirmManager()
+    esc = _EscalateRecorder()
+    d = _esc_driver(mgr, esc)
+    d._handle_confirm({"type": "confirmation_required", "confirm_id": "c1",
+                       "kind": "mcp_elicit_form"})
+    await asyncio.sleep(0)
+    assert esc.calls == []
+    assert mgr.calls == [("c1", False, SID)]
+
+
+@pytest.mark.asyncio
+async def test_no_escalate_keeps_immediate_deny():
+    mgr = FakeConfirmManager()
+    d = _esc_driver(mgr, None)
+    d._handle_confirm(_egress_ev())
+    assert mgr.calls == [("c1", False, SID)]
+    assert d._denied == [{"kind": "egress", "detail": "x.com"}]
+
+
+@pytest.mark.asyncio
+async def test_idless_card_denies_without_escalation():
+    mgr = FakeConfirmManager()
+    esc = _EscalateRecorder()
+    d = _esc_driver(mgr, esc)
+    d._handle_confirm({"type": "confirmation_required",
+                       "action": "egress_confirm",
+                       "reason": "tofu_unknown_host", "host": "x.com"})
+    await asyncio.sleep(0)
+    assert esc.calls == []
+    assert d._denied == [{"kind": "egress", "detail": "x.com"}]
+
+
+@pytest.mark.asyncio
+async def test_escalate_exception_falls_back_to_deny():
+    mgr = FakeConfirmManager()
+
+    async def boom(ev, on_outcome):
+        raise RuntimeError("x")
+
+    d = _esc_driver(mgr, boom)
+    d._handle_confirm(_egress_ev())
+    await asyncio.sleep(0.01)
+    assert mgr.calls == [("c1", False, SID)]
+    assert d._denied == [{"kind": "egress", "detail": "x.com",
+                          "via": "channel"}]

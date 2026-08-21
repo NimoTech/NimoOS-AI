@@ -325,11 +325,68 @@ class ChannelRouter:
             "chat_id": chat_id, "message_id": mid, "session_id": session_id,
             "timer": timer}
 
+    async def surface_external_confirm(self, adapter, chat_id: str,
+                                       session_id: str, confirm_id: str,
+                                       text: str, *,
+                                       timeout: float | None = None,
+                                       persist_label: str | None = None,
+                                       on_resolved=None) -> bool:
+        """Render a confirmation card on behalf of an EXTERNAL driver (a
+        scheduled task's escalation).  Unlike `_surface_confirm` this does not
+        consult the permission policy — the caller already decided the card
+        needs a human — and it may carry a third button whose click means
+        "allow AND persist this into the task's preauth".
+
+        `on_resolved(allow, persist)` fires exactly once, on click or on
+        timeout.  Returns False when the card could not be delivered, in
+        which case NOTHING was registered and the caller must deny by itself.
+        """
+        if not confirm_id:
+            return False
+        buttons = [("✅ Allow once", f"cf:{confirm_id}:a"),
+                   ("❌ Deny", f"cf:{confirm_id}:d")]
+        if persist_label:
+            buttons.append((persist_label, f"cf:{confirm_id}:p"))
+        try:
+            mid = await adapter.send_buttons(chat_id, text, buttons)
+        except Exception:
+            _LOG.exception("send_buttons failed for external confirm %s",
+                           confirm_id)
+            return False
+        if mid is None:
+            return False
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(
+            timeout if timeout is not None else self._confirm_timeout,
+            lambda: asyncio.create_task(self._on_confirm_timeout(confirm_id)))
+        self._confirms[confirm_id] = {
+            "adapter": adapter, "instance_id": adapter.instance_id,
+            "chat_id": chat_id, "message_id": mid, "session_id": session_id,
+            "timer": timer, "on_resolved": on_resolved}
+        return True
+
+    def _fire_on_resolved(self, entry: dict, allow: bool, persist: bool) -> None:
+        """Invoke an external card's outcome callback, exactly once.
+
+        Pop-before-call so a re-entrant resolution (a timeout racing a click)
+        cannot fire it twice; swallow everything — the outcome callback is
+        bookkeeping, and a broken one must not lose the click that was
+        already resolved above.
+        """
+        cb = entry.pop("on_resolved", None)
+        if cb is None:
+            return
+        try:
+            cb(allow, persist)
+        except Exception:
+            _LOG.exception("external confirm on_resolved callback failed")
+
     async def _on_confirm_timeout(self, confirm_id: str) -> None:
         entry = self._confirms.pop(confirm_id, None)
         if entry is None:
             return
         self._deny(confirm_id, entry["session_id"])
+        self._fire_on_resolved(entry, False, False)
         try:
             await entry["adapter"].edit_to_resolved(
                 entry["chat_id"], entry["message_id"], "⏱ Timed out → denied")
@@ -343,6 +400,8 @@ class ChannelRouter:
             if len(parts) != 3 or parts[0] != "cf":
                 return
             confirm_id, suffix = parts[1], parts[2]
+            if suffix not in ("a", "d", "p"):
+                return
             entry = self._confirms.get(confirm_id)
             if entry is None:
                 return
@@ -350,7 +409,10 @@ class ChannelRouter:
                     or entry["instance_id"] != adapter.instance_id):
                 _LOG.warning("confirm ownership mismatch for %s", confirm_id)
                 return
-            allow = suffix == "a"
+            # "p" (persist) is an allow whose extra meaning — fold the action
+            # into the task's preauth — is carried to the registrant via
+            # on_resolved; the router itself never touches preauth.
+            allow = suffix in ("a", "p")
             self._confirms.pop(confirm_id, None)
             entry["timer"].cancel()
             if self._resolve_confirm is not None:
@@ -359,10 +421,12 @@ class ChannelRouter:
                                           expected_session_id=entry["session_id"])
                 except KeyError:
                     pass
+            self._fire_on_resolved(entry, allow, suffix == "p")
             try:
                 await adapter.edit_to_resolved(
                     chat_id, entry["message_id"],
-                    "✅ Allowed" if allow else "❌ Denied")
+                    "✅ Allowed & added to pre-authorization" if suffix == "p"
+                    else ("✅ Allowed" if allow else "❌ Denied"))
             except Exception:
                 _LOG.exception("edit_to_resolved failed")
         except Exception:
@@ -380,3 +444,4 @@ class ChannelRouter:
             # it deterministically here too (idempotent: _deny swallows
             # KeyError if already resolved).
             self._deny(cid, entry["session_id"])
+            self._fire_on_resolved(entry, False, False)

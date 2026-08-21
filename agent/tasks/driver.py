@@ -209,7 +209,7 @@ def _detail_of(ev: dict) -> str:
 class TaskRunDriver:
     def __init__(self, *, confirm_mgr, session_id: str, preauth: dict,
                  run_timeout: float, sleep=asyncio.sleep, now=None,
-                 policy: dict | None = None):
+                 policy: dict | None = None, escalate=None):
         self._mgr = confirm_mgr
         self._session_id = session_id
         self._preauth = preauth or {}
@@ -219,6 +219,13 @@ class TaskRunDriver:
         # author-reviewed grant and its answer is recorded as such. None (the
         # default, and every pre-existing caller) keeps today's deny behavior.
         self._policy = policy
+        # Escalation callable (tasks/escalate.py's `build` product) — None
+        # keeps the immediate-deny behavior every pre-existing caller
+        # expects. Signature: async (ev, on_outcome) -> None.
+        self._escalate = escalate
+        # Strong refs to in-flight escalation tasks (create_task keeps a
+        # weak one; a collected task would silently drop the card).
+        self._escalations: set = set()
         # `sleep` is accepted for ctor symmetry with ChannelRunDriver (and so a
         # future pacing need has a seam); nothing on this path sleeps — an
         # unattended run has no rate-limited chat to pace against, and its only
@@ -320,6 +327,16 @@ class TaskRunDriver:
             approve, detail = False, ""
         record = {"kind": kind, "detail": detail}
         cid = ev.get("confirm_id")
+        if not approve and cid and self._escalate is not None \
+                and self._gateable(ev):
+            # Out of scope, but a human CAN be asked: hand the card to the
+            # paired channel instead of denying (spec §6). The tool coroutine
+            # stays parked on ConfirmManager.wait(); the escalation (its
+            # click, its timeout, or drive()'s final cancel_session) resolves
+            # it. A run-deadline cancel_session racing a late click is fine:
+            # the click's resolve raises KeyError, which the router swallows.
+            self._spawn_escalation(ev, record)
+            return
         if not cid:
             # Nothing is waiting on an id-less card (elicitation cards get their
             # id added by the caller); record it so the run still reports what
@@ -342,6 +359,47 @@ class TaskRunDriver:
             self._denied.append(record)
             return
         (self._auto_approved if approve else self._denied).append(record)
+
+    def _gateable(self, ev: dict) -> bool:
+        """Only cards the permission system can classify are escalatable.
+
+        Elicitation and unknown card types map to gate None — a chat button
+        cannot answer a form, so those keep the immediate deny."""
+        try:
+            import permissions as _perm  # noqa: PLC0415
+            gate, _level = _perm.gate_of_event(ev)
+            return gate is not None
+        except Exception:  # noqa: BLE001 — classification failure = deny path
+            return False
+
+    def _spawn_escalation(self, ev: dict, record: dict) -> None:
+        cid = ev.get("confirm_id")
+
+        def on_outcome(allow: bool, persist: bool) -> None:
+            rec = dict(record)
+            rec["via"] = "channel"
+            if persist:
+                rec["persisted"] = True
+            (self._auto_approved if allow else self._denied).append(rec)
+
+        async def _run():
+            try:
+                await self._escalate(ev, on_outcome)
+            except Exception:  # noqa: BLE001 — a broken escalator must not
+                # strand the tool coroutine on wait()'s 24h default.
+                logger.warning("task driver: escalation crashed; denying",
+                               exc_info=True)
+                try:
+                    self._mgr.resolve(cid, False,
+                                      expected_session_id=self._session_id,
+                                      source="task-driver")
+                except Exception:  # noqa: BLE001
+                    pass
+                on_outcome(False, False)
+
+        t = asyncio.create_task(_run())
+        self._escalations.add(t)
+        t.add_done_callback(self._escalations.discard)
 
     # -- event stream -----------------------------------------------------
 
