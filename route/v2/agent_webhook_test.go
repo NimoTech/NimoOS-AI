@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/labstack/echo/v4"
@@ -75,18 +76,52 @@ func TestProxyAnonymousStripsIdentityHeaders(t *testing.T) {
 	}
 }
 
-func TestProxyAnonymousRefusesWhenAgentUnavailable(t *testing.T) {
-	h := &AgentHandler{}
-	h.available.Store(false)
+// The request path no longer consults the sampled health bit (it went stale
+// for up to 30s and bounced real confirmation clicks — see Proxy's comment);
+// a genuinely unreachable agent now yields the same 503 body from the reverse
+// proxy's ErrorHandler, per request, with no stale window.
+func TestProxyAnonymousAnswers503WhenAgentUnreachable(t *testing.T) {
+	h := NewAgentHandler(nil, "http://127.0.0.1:19999", 10, nil) // dead port
+	h.available.Store(false) // the sampled bit must not matter either way
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ai/agent/task-webhook/abc", nil)
 	rec := httptest.NewRecorder()
 
-	err := h.ProxyAnonymous(e.NewContext(req, rec))
+	if err := h.ProxyAnonymous(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("ProxyAnonymous returned %v; the proxy should answer instead", err)
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 from the proxy ErrorHandler, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "nimoos-agent is not available") {
+		t.Fatalf("expected the legacy 503 body, got %q", rec.Body.String())
+	}
+}
 
-	he, ok := err.(*echo.HTTPError)
-	if !ok || he.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when the agent is down, got %v (rec %d)", err, rec.Code)
+// The stale-bit scenario this change exists for: the sampled health bit says
+// "down" while the agent is in fact serving — the request must go through.
+func TestProxyForwardsEvenWhenSampledBitSaysUnavailable(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+	defer backend.Close()
+
+	h := NewAgentHandler(nil, backend.URL, 10, nil)
+	h.available.Store(false) // stale verdict from the 30s monitor
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1/ai/agent/sessions/s1/confirm", strings.NewReader("{}"))
+	req.Header.Set("X-NimoOS-User-ID", "1")
+	rec := httptest.NewRecorder()
+
+	if err := h.Proxy(e.NewContext(req, rec)); err != nil {
+		t.Fatalf("Proxy returned %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the confirm click to reach the agent (200), got %d",
+			rec.Code)
 	}
 }
 

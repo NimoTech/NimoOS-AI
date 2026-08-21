@@ -617,7 +617,26 @@ async def _guard_command(command: str) -> str | None:
         if db is not None and not permissions.judge_enabled(db, "shell"):
             verdict = "ask"
         else:
+            # Surface the wait: the judge can take up to ~20s on a busy local
+            # model, and without these events the user just sees the agent
+            # stall. `judging` starts the indicator, `judged` ends it and says
+            # what happened (allow → ran without a click; ask → the card that
+            # follows explains itself). Best-effort: a UI event must never
+            # block or fail the gate.
+            _jsink = EVENT_QUEUE_VAR.get()
+            if _jsink is not None:
+                try:
+                    await _jsink.put({"type": "judging", "kind": "shell",
+                                      "command": command})
+                except Exception:  # noqa: BLE001
+                    pass
             verdict = await judge_command(command)
+            if _jsink is not None:
+                try:
+                    await _jsink.put({"type": "judged", "kind": "shell",
+                                      "command": command, "verdict": verdict})
+                except Exception:  # noqa: BLE001
+                    pass
         if verdict == "allow":
             # A judge-allowed gray command that writes to real paths still gets a
             # cheap backstop — a small-model false-negative must not mean silent,
@@ -732,7 +751,26 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                     if _pdb is not None and not permissions.judge_enabled(_pdb, "egress"):
                         verdict = "ask"
                     else:
+                        # Same visible-wait contract as the shell judge above.
+                        _jsink = EVENT_QUEUE_VAR.get()
+                        if _jsink is not None:
+                            try:
+                                await _jsink.put({"type": "judging",
+                                                  "kind": "upload",
+                                                  "host": intent.host,
+                                                  "command": command})
+                            except Exception:  # noqa: BLE001
+                                pass
                         verdict = await _ej.judge(content, intent.host)
+                        if _jsink is not None:
+                            try:
+                                await _jsink.put({"type": "judged",
+                                                  "kind": "upload",
+                                                  "host": intent.host,
+                                                  "command": command,
+                                                  "verdict": verdict})
+                            except Exception:  # noqa: BLE001
+                                pass
 
                     if verdict == "block":
                         _audit("egress_block", session_id=session_id,
