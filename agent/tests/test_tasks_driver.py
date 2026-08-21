@@ -41,7 +41,8 @@ class FakeConfirmManager:
         self._raise_on = set(raise_on)
 
     def resolve(self, confirm_id, confirmed, remember=False,
-                expected_session_id=None, *, action=None, content=None):
+                expected_session_id=None, *, action=None, content=None,
+                source="user"):
         self.calls.append((confirm_id, confirmed, expected_session_id))
         if confirm_id in self._raise_on:
             raise KeyError("confirm_expired")

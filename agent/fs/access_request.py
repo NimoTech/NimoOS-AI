@@ -12,6 +12,10 @@ import asyncio
 import json
 import os
 import time
+import uuid
+
+import permissions
+from audit import audit as _audit
 
 # op category -> human reason shown on the card (English fallback; the UI
 # localizes via reason_key, see NimoOS-UI PermissionRequestCard.vue).
@@ -77,6 +81,38 @@ def _record_decision(ctx, confirm_id: str, decision: str) -> None:
     ctx["conn"].commit()
 
 
+def _policy_auto_grants(ctx, abs_paths: list[str]) -> bool:
+    """True if the global permission policy waives the access card for EVERY
+    path. Belt-and-braces: even under an auto policy a path that resolves into
+    a system location (FS_DENY_ROOTS, "/") still gets a card — the blacklist
+    upstream should have caught it, but an auto-grant must never be the thing
+    that widens what a human click would have been asked about. The floor
+    itself lives in permissions.paths_policy_grantable (shared with the task
+    driver and the channel router)."""
+    try:
+        return permissions.auto_approve(ctx["conn"], "grant_access") \
+            and permissions.paths_policy_grantable(list(abs_paths))
+    except Exception:  # noqa: BLE001 — fail toward asking
+        return False
+
+
+def _auto_grant(ctx, abs_paths: list[str], kind_hint: str, reason: str,
+                reason_key: str) -> None:
+    """Persist grants + a resolved access_requests row (so rebuilt history
+    still shows what was opened) + an audit record. No card is emitted."""
+    confirm_id = str(uuid.uuid4())
+    path_field = abs_paths[0] if len(abs_paths) == 1 else json.dumps(abs_paths)
+    _record_request(ctx, confirm_id, path_field, kind_hint, reason, reason_key)
+    _record_decision(ctx, confirm_id, "granted")
+    for p in abs_paths:
+        _insert_visible_resource(ctx, p, _infer_kind(p))
+    try:
+        _audit("grant_access", session_id=ctx.get("session_id"),
+               paths=abs_paths, decision="auto_approved_by_policy")
+    except Exception:  # noqa: BLE001 — auditing must never break the grant
+        pass
+
+
 async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
     """Ask the user to authorize abs_path for this session. Returns True if
     granted (and writes visible_resources), False otherwise. The request and
@@ -90,9 +126,13 @@ async def request_access(ctx, abs_path: str, kind: str, op: str) -> bool:
     if cache_key in _pending_requests:
         return await _pending_requests[cache_key]
 
-    mgr = ctx["confirm_mgr"]
     reason = _REASON.get(op, _DEFAULT_REASON)
     reason_key = op if op in _REASON else "default"
+    if _policy_auto_grants(ctx, [abs_path]):
+        _auto_grant(ctx, [abs_path], kind, reason, reason_key)
+        return True
+
+    mgr = ctx["confirm_mgr"]
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     _pending_requests[cache_key] = fut
     confirm_id = None
@@ -156,6 +196,9 @@ async def request_access_batch(ctx, abs_paths: list[str], op: str) -> bool:
     session_id = ctx["session_id"]
     reason = _REASON.get(op, _DEFAULT_REASON)
     reason_key = op if op in _REASON else "default"
+    if _policy_auto_grants(ctx, list(abs_paths)):
+        _auto_grant(ctx, list(abs_paths), "folder", reason, reason_key)
+        return True
     confirm_id = None
     try:
         confirm_id = mgr.register(session_id, "grant_access", abs_paths[0], "")

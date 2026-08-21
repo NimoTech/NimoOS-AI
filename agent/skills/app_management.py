@@ -22,6 +22,13 @@ def _session_id():
     return SESSION_ID_VAR.get()
 
 
+def _policy_auto(action: str, command: str, session_id: str) -> bool:
+    """Global permission policy waiver for this write op (audited).
+    Fails toward asking on any error."""
+    import permissions as _perm  # noqa: PLC0415
+    return _perm.policy_waives(action, session_id=session_id, command=command)
+
+
 @function_tool
 async def list_apps() -> str:
     """List all installed applications on this NimoOS NAS."""
@@ -61,6 +68,8 @@ async def show_app(app_id: str) -> str:
 async def _write_op(action: str, description: str, command_preview: str, cli_cmd: list[str]) -> str:
     """Common pattern for write operations: emit confirm event, wait, execute."""
     session_id = _session_id()
+    if _policy_auto(action, command_preview, session_id):
+        return await run_cli(cli_cmd)
     confirm_id = _mgr().register(session_id, action, description, command_preview)
     await _queue().put({
         "type": "confirmation_required",
@@ -81,6 +90,8 @@ async def install_app(yaml_content: str) -> str:
     session_id = _session_id()
     description = "Install a new application from YAML definition. Confirm to proceed."
     command = "nimoos-cli app-management install <yaml>"
+    if _policy_auto("install_app", command, session_id):
+        return await run_cli_with_yaml([CLI_BIN, "app-management", "install"], yaml_content)
     confirm_id = _mgr().register(session_id, "install_app", description, command)
     await _queue().put({
         "type": "confirmation_required",

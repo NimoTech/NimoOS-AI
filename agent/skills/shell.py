@@ -29,6 +29,7 @@ from pathlib import Path
 from agents import function_tool
 
 import db as dbmod
+import permissions
 from audit import audit as _audit
 from fs.sandbox_view import SandboxView, build_view, to_bwrap_args
 
@@ -219,6 +220,11 @@ async def _maybe_grant_network(session_id: str, command: str) -> bool:
     """Return True if the sandbox may use the network for this command."""
     db = DB_VAR.get()
     if db is not None and dbmod.is_network_granted(db, session_id):
+        return True
+    if db is not None and permissions.auto_approve(db, "shell_network"):
+        _audit("shell_network", session_id=session_id, command=command,
+               decision="auto_approved_by_policy")
+        dbmod.grant_network(db, session_id)
         return True
     mgr = CONFIRM_MGR_VAR.get()
     sink = EVENT_QUEUE_VAR.get()
@@ -562,6 +568,18 @@ async def _guard_command(command: str) -> str | None:
              else ("run-preauth" if _run_ok else "run-preauth-script"))
         return None
 
+    # Global permission policy (admin-configured): auto_gray waives the card
+    # for gray commands, auto_all also for dangerous. `protected` is never
+    # waived, and non-interactive contexts (tasks/channels) cap this at gray —
+    # both enforced inside permissions.auto_approve. A waived destructive
+    # command still gets the backstop, same as an allowlisted one.
+    if db is not None and permissions.auto_approve(
+            db, "shell_command", level=decision.level):
+        if decision.paths:
+            guard_backstop.prepare_backstop(decision.paths)
+        _rec("auto_approved", decision.level, "policy")
+        return None
+
     # gray → judge; allow verdict passes through, else fall to confirm
     if decision.level == "gray":
         # Outbound uploads are owned by the egress A-path (content-aware DLP,
@@ -593,7 +611,13 @@ async def _guard_command(command: str) -> str | None:
                         return None
                 except Exception:  # noqa: BLE001 — parse failure must not block; fall through to judge
                     pass
-        verdict = await judge_command(command)
+        # The judge can be disabled by policy: a gray command then goes
+        # straight to the card (or straight through when the policy check
+        # above already waived it) instead of waiting on Ollama.
+        if db is not None and not permissions.judge_enabled(db, "shell"):
+            verdict = "ask"
+        else:
+            verdict = await judge_command(command)
         if verdict == "allow":
             # A judge-allowed gray command that writes to real paths still gets a
             # cheap backstop — a small-model false-negative must not mean silent,
@@ -700,7 +724,15 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                         except OSError:
                             content = b""
 
-                    verdict = await _ej.judge(content, intent.host)
+                    # Content judge can be disabled by policy: a suspect
+                    # upload then falls to the card (or through, if the upload
+                    # gate itself is auto). Hard `block` rules above already
+                    # ran and are not affected by this toggle.
+                    _pdb = DB_VAR.get()
+                    if _pdb is not None and not permissions.judge_enabled(_pdb, "egress"):
+                        verdict = "ask"
+                    else:
+                        verdict = await _ej.judge(content, intent.host)
 
                     if verdict == "block":
                         _audit("egress_block", session_id=session_id,
@@ -711,6 +743,13 @@ async def _run_command_impl(command: str, timeout_sec: int, network: bool) -> st
                             "The upload content was judged to contain sensitive/private data. "
                             "If it truly must be sent out, handle it manually."
                         )
+                    elif verdict == "ask" and _pdb is not None and \
+                            permissions.auto_approve(_pdb, "egress_upload"):
+                        # Policy waives the upload card; the grant below still
+                        # bounds the byte budget and the audit records it.
+                        _audit("egress_grant", session_id=session_id,
+                               host=intent.host, files=intent.files,
+                               decision="auto_approved_by_policy")
                     elif verdict == "ask":
                         mgr = CONFIRM_MGR_VAR.get()
                         sink = EVENT_QUEUE_VAR.get()

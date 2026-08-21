@@ -163,6 +163,9 @@ async def _request_confirm(action: str, description: str, command: str) -> bool:
     if mgr is None or sink is None or not session_id:
         # Misconfigured runtime — refuse write rather than silently bypass.
         return False
+    import permissions as _perm  # noqa: PLC0415
+    if _perm.policy_waives(action, session_id=session_id, command=command):
+        return True
     confirm_id = mgr.register(session_id, action, description, command)
     await sink.put({
         "type": "confirmation_required",

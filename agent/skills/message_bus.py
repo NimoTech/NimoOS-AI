@@ -42,6 +42,12 @@ async def trigger_action(action_type: str, data: str = "{}") -> str:
     description = f"Trigger MessageBus action '{action_type}' with data: {data}"
     command = f"nimoos-cli message-bus trigger action --type {action_type} --data {data}"
 
+    import permissions as _perm  # noqa: PLC0415
+    if _perm.policy_waives("trigger_action", session_id=session_id,
+                           command=command):
+        return await run_cli([CLI_BIN, "message-bus", "trigger", "action",
+                              "--type", action_type, "--data", data])
+
     confirm_id = mgr.register(session_id, "trigger_action", description, command)
     await queue.put({
         "type": "confirmation_required",

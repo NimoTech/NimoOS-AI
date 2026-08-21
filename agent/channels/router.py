@@ -260,10 +260,45 @@ class ChannelRouter:
         except KeyError:
             pass
 
+    def _policy_auto_approves(self, ev: dict) -> bool:
+        """Global permission policy: should this card resolve itself instead
+        of rendering buttons? Covers the cards that never went through an
+        in-line gate (the proxy's egress cards land here raw). In-line gates
+        already ran with the channel context, so anything else reaching this
+        point was a deliberate "ask" — the check is cheap and idempotent
+        either way. Shell above gray and elicitation are never waived, and an
+        fs card must pass the deny-roots floor — all enforced by the shared
+        permissions helpers, never restated here. Fails toward buttons."""
+        try:
+            import permissions as _perm  # noqa: PLC0415
+            gate, level = _perm.gate_of_event(ev)
+            if gate == "fs_access":
+                paths = ev.get("paths")
+                if not isinstance(paths, (list, tuple)) or not paths:
+                    paths = [ev.get("path") or ""]
+                if not _perm.paths_policy_grantable(list(paths)):
+                    return False
+            return _perm.decide(_perm.load(self._conn), gate, level=level,
+                                 context="channel")
+        except Exception:  # noqa: BLE001 — a policy failure must ask
+            _LOG.exception("channel policy auto-approve check failed")
+            return False
+
     async def _surface_confirm(self, adapter, chat_id: str, session_id: str,
                                ev: dict) -> None:
         confirm_id = ev.get("confirm_id")
         if not confirm_id:
+            return
+        if self._policy_auto_approves(ev):
+            if self._resolve_confirm is not None:
+                try:
+                    # source="policy": the audit trail must never claim a
+                    # human pressed Allow when the policy answered.
+                    self._resolve_confirm(confirm_id, True,
+                                          expected_session_id=session_id,
+                                          source="policy")
+                except KeyError:
+                    pass
             return
         if not getattr(adapter.capabilities, "supports_buttons", False):
             self._deny(confirm_id, session_id)

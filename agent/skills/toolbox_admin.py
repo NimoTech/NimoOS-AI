@@ -31,13 +31,18 @@ async def install_component(component_id: str) -> str:
     mgr = CONFIRM_MGR_VAR.get(); queue = EVENT_QUEUE_VAR.get(); sid = SESSION_ID_VAR.get()
     if not (mgr and queue and sid):
         return "Cannot install without a confirmation channel."
-    confirm_id = mgr.register(sid, f"toolbox_install:{component_id}",
-                              f"Install {comp['name']} v{comp['version']}", component_id)
-    await queue.put({"type": "confirmation_required", "confirm_id": confirm_id,
-                     "kind": "toolbox_install", "title": f"Install {comp['name']} v{comp['version']}",
-                     "detail": comp["description"]})
-    if not await mgr.wait(confirm_id):
-        return "The user denied the toolbox install."
+    import permissions as _perm  # noqa: PLC0415
+    _auto = _perm.policy_waives(f"toolbox_install:{component_id}",
+                                audit_event="toolbox_install",
+                                session_id=sid, component=component_id)
+    if not _auto:
+        confirm_id = mgr.register(sid, f"toolbox_install:{component_id}",
+                                  f"Install {comp['name']} v{comp['version']}", component_id)
+        await queue.put({"type": "confirmation_required", "confirm_id": confirm_id,
+                         "kind": "toolbox_install", "title": f"Install {comp['name']} v{comp['version']}",
+                         "detail": comp["description"]})
+        if not await mgr.wait(confirm_id):
+            return "The user denied the toolbox install."
     try:
         await _do_install(_db.get_connection(), component_id)
     except Exception as e:

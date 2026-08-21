@@ -208,11 +208,17 @@ def _detail_of(ev: dict) -> str:
 
 class TaskRunDriver:
     def __init__(self, *, confirm_mgr, session_id: str, preauth: dict,
-                 run_timeout: float, sleep=asyncio.sleep, now=None):
+                 run_timeout: float, sleep=asyncio.sleep, now=None,
+                 policy: dict | None = None):
         self._mgr = confirm_mgr
         self._session_id = session_id
         self._preauth = preauth or {}
         self._run_timeout = run_timeout
+        # Global permission policy snapshot (permissions.load). Consulted only
+        # AFTER the task's own preauth says no — preauth is the narrower,
+        # author-reviewed grant and its answer is recorded as such. None (the
+        # default, and every pre-existing caller) keeps today's deny behavior.
+        self._policy = policy
         # `sleep` is accepted for ctor symmetry with ChannelRunDriver (and so a
         # future pacing need has a seam); nothing on this path sleeps — an
         # unattended run has no rate-limited chat to pace against, and its only
@@ -241,8 +247,10 @@ class TaskRunDriver:
         """
         kind = _kind_of(ev)
         if kind == _KIND_EGRESS:
-            return egress_allowed(ev.get("host") or "",
-                                  self._preauth.get("egress_domains") or []), ""
+            if egress_allowed(ev.get("host") or "",
+                              self._preauth.get("egress_domains") or []):
+                return True, ""
+            return self._policy_allows(ev, kind), ""
         if kind == _KIND_FS:
             roots = self._preauth.get("fs_write") or []
             # A batch card (`request_access_batch`) carries every path in
@@ -251,14 +259,50 @@ class TaskRunDriver:
             paths = ev.get("paths")
             if not isinstance(paths, (list, tuple)) or not paths:
                 paths = [ev.get("path") or ""]
+            offending = ""
             for p in paths:
                 if not fs_allowed(p, roots):
-                    return False, (p if isinstance(p, str) else "")
-            return True, ""
+                    offending = p if isinstance(p, str) else ""
+                    break
+            else:
+                return True, ""
+            allowed = self._policy_allows(ev, kind)
+            return allowed, ("" if allowed else offending)
         # shell / mcp_tool / mcp_install / toolbox_install / elicitation …
         # Their pre-authorization is injected before the tool runs, so a card
         # here means "not preauthorized".
-        return False, ""
+        return self._policy_allows(ev, kind), ""
+
+    def _policy_allows(self, ev: dict, kind: str) -> bool:
+        """Does the global policy's `contexts.tasks` mode waive this card?
+
+        All rules live in the shared permissions helpers, never restated
+        here: gate_of_event maps the raw event (kind/action/reason) to its
+        gate — elicitation and unknown card types map to None and are NEVER
+        waived, whatever the context mode says; decide() applies the
+        strict/follow/auto ladder with the non-interactive shell cap; and an
+        fs card must additionally pass the deny-roots floor
+        (paths_policy_grantable), so an "auto" policy can never authorize a
+        system location.
+        """
+        del kind  # classification is derived from the event itself
+        pol = self._policy
+        if not isinstance(pol, dict):
+            return False
+        try:
+            import permissions as _perm  # noqa: PLC0415
+            gate, level = _perm.gate_of_event(ev)
+            if gate == "fs_access":
+                paths = ev.get("paths")
+                if not isinstance(paths, (list, tuple)) or not paths:
+                    paths = [ev.get("path") or ""]
+                if not _perm.paths_policy_grantable(list(paths)):
+                    return False
+            return _perm.decide(pol, gate, level=level, context="task")
+        except Exception:  # noqa: BLE001 — a policy failure must deny
+            logger.warning("task driver: policy check failed; denying",
+                           exc_info=True)
+            return False
 
     def _handle_confirm(self, ev: dict) -> None:
         # Classification and matching run INSIDE the try: a malformed event
@@ -285,7 +329,11 @@ class TaskRunDriver:
             self._denied.append(record)
             return
         try:
-            self._mgr.resolve(cid, approve, expected_session_id=self._session_id)
+            # source: never "user" — nobody pressed anything in an unattended
+            # run, and the audit trail must say so.
+            self._mgr.resolve(cid, approve,
+                              expected_session_id=self._session_id,
+                              source="task-driver")
         except Exception as exc:            # noqa: BLE001 — KeyError for expired /
             # session-mismatched confirms, and anything else: a raise here would
             # abandon the rest of the stream, so it is swallowed and recorded.
