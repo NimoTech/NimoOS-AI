@@ -150,6 +150,119 @@ def parse_with_report(preauth_json) -> tuple[dict, dict]:
     return out, report
 
 
+class FoldError(ValueError):
+    """A denied action cannot be folded into a preauth document.
+
+    ``.reason`` is the machine key the API layer maps to its 400 body —
+    the vocabulary is shared with ``main._check_fs_write`` and the
+    endpoint-local implementation this was extracted from.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def fold_denied(doc: dict, action: dict) -> tuple:
+    """Fold one denied action into a preauth document.
+
+    Returns ``(new document, bucket, adopted entry)`` — a copy, never a
+    mutation of ``doc``.  The vocabulary is ``tasks/driver.py``'s normalized
+    kinds; ``detail`` is what that driver recorded — for ``fs`` the FIRST
+    path that was not covered, not the card's first path, so the rule
+    generated here actually changes the outcome next time.
+
+    Shared by the from-denied API endpoint and the channel escalation's
+    "allow & add to preauth" button, so both paths enforce the same gates:
+    a folded fs root passes the same deny-roots floor as a hand-typed one,
+    and a shell rule the run gate would never honor is refused rather than
+    written as a no-op.
+    """
+    import os
+
+    kind = str(action.get("kind") or "")
+    raw_detail = str(action.get("detail") or "")
+    detail = raw_detail.strip()
+    if not detail:
+        raise FoldError("empty_detail")
+
+    out = {k: list(v) for k, v in doc.items()}
+    if kind == "egress":
+        from .driver import _strip_port
+        # Bare host, no port: that is what the egress gate matches on.
+        entry, bucket = _strip_port(detail), "egress_domains"
+    elif kind == "fs":
+        # A denied file grants its directory — `fs_write` entries are roots
+        # and a bare file path would authorize nothing else in that folder.
+        entry = os.path.dirname(detail) if os.path.isfile(detail) else detail
+        bucket = "fs_write"
+        # Same gate as create/update (`main._check_fs_write`): adopting a
+        # denial must not become the back door that puts "/" (or /etc) into
+        # a preauth document.
+        from .driver import fs_root_denied
+        if not entry.startswith("/"):
+            raise FoldError("bad_fs_write")
+        try:
+            real = os.path.realpath(entry)
+        except (OSError, ValueError):
+            # An embedded NUL raises ValueError; unjudgeable = unstorable.
+            raise FoldError("bad_fs_write")
+        if fs_root_denied(real):
+            raise FoldError("bad_fs_write")
+    elif kind == "mcp_tool":
+        entry, bucket = detail, "mcp_tools"          # already "server::tool"
+    elif kind == "shell":
+        parts = detail.split()
+        # A denied `<interpreter> <absolute script>` becomes a `scripts` entry,
+        # not a prefix rule. Without this branch the fold is a dead end for
+        # the whole "run my collector every morning" case: the prefix
+        # generated below would be `python3 `, which the run gate refuses
+        # outright (interpreter), so `run_allowlist_would_cover` correctly
+        # rejects it and the user sees `shell_rule_would_not_apply` with
+        # nothing to do about it.
+        # `script_run_target`, NOT `run_scripts_would_cover`: the latter
+        # answers True for every `safe` command whatever the rules, so using
+        # it as a detector read `lark-cli mail list --limit 5` as a script
+        # run and adopted `5` as the script path.
+        from skills import shell as _shell
+        _script = _shell.script_run_target(raw_detail)
+        if _script:
+            bucket, entry = "scripts", _script
+            if entry not in out[bucket]:
+                out[bucket].append(entry)
+            return out, bucket, entry
+        # `shell_match` is `command.startswith(value)` on the RAW command —
+        # deliberately not stripped, since leading whitespace is part of what
+        # the author would have had to authorize. So the rule has to carry
+        # the same leading whitespace the denied command had, or adopting
+        # `"  rm -rf x"` would generate `"rm "`, which can never match it
+        # and leaves the fold a silent no-op.
+        lead = raw_detail[:len(raw_detail) - len(raw_detail.lstrip())]
+        # Head + a space, so `git ` can never also authorize `github-cli`.
+        # A command that WAS just its head ("date") is the exception: `"date "`
+        # could never prefix-match it either, so the bare token is stored.
+        entry = {"kind": "prefix",
+                 "value": lead + parts[0] + ("" if len(parts) == 1 else " ")}
+        bucket = "shell"
+        # A head-derived prefix cannot authorize every command it came from.
+        # The run gate refuses chaining, redirection, interpreters and
+        # `protected` outright — whatever the rules say — so for those the
+        # rule written here would be inert, and the user would walk away
+        # believing the next run is authorized. Ask the gate itself rather
+        # than re-deriving its conditions, and refuse instead of writing a
+        # no-op.
+        if not _shell.run_allowlist_would_cover(raw_detail, [entry]):
+            raise FoldError("shell_rule_would_not_apply")
+    else:
+        raise FoldError("unsupported_kind")
+
+    if not entry:
+        raise FoldError("empty_detail")
+    if entry not in out[bucket]:
+        out[bucket].append(entry)
+    return out, bucket, entry
+
+
 def shell_match(rules, command: str) -> bool:
     """True if `command` starts with one of the rules' prefixes.
 
