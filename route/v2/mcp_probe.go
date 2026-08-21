@@ -522,6 +522,12 @@ func (h *MCPHandler) StartMigrationBackfill() {
 // goroutine, keeps the blast radius to one child process no matter how many
 // servers need backfilling.
 func (h *MCPHandler) migrateBackfillIdentityCards() error {
+	// Same nil-svc contract as every other handler in this package (see
+	// agent.go): routing tests build the router without a service layer, and
+	// this sweep runs unconditionally from InitV2Router's startup path.
+	if h.svc == nil {
+		return nil
+	}
 	rows, err := h.svc.DB().Query(`
 		SELECT s.id, s.user_id, s.name, s.transport, s.url, s.command, s.args,
 		       s.env, s.headers, s.enabled, s.created_at, s.updated_at
