@@ -16,7 +16,8 @@ def test_core_names_exact():
 def test_categories_exact_keys():
     assert set(tr.CATEGORY_TOOLS.keys()) == {
         "apps", "files", "photos", "wiki",
-        "documents", "system", "events", "mcp", "notes", "toolbox", "web"}
+        "documents", "system", "events", "mcp", "notes", "toolbox", "web",
+        "tasks"}
     assert set(tr.CATEGORY_DESCRIPTIONS.keys()) == set(tr.CATEGORY_TOOLS.keys())
 
 
