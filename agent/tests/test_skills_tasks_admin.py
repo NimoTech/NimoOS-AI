@@ -17,6 +17,13 @@ from skills.skills_registry import USER_ID_VAR
 def conn(tmp_path, monkeypatch):
     conn = db_module.init_db(str(tmp_path / "t.db"))
     monkeypatch.setattr(db_module, "get_connection", lambda: conn)
+    # Some earlier test may have done `sys.modules.pop("db")` and re-imported
+    # (test_main_agent_type.py's client fixture does), leaving a DIFFERENT
+    # `db` module object in sys.modules than the one this file imported at
+    # collection time. tasks_admin resolves `import db` lazily at call time,
+    # so pin OUR (patched) module object back, or the patch above is invisible
+    # to the code under test whenever that fixture ran first.
+    monkeypatch.setitem(sys.modules, "db", db_module)
     return conn
 
 
