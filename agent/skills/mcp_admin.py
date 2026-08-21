@@ -75,19 +75,32 @@ async def add_mcp_server(command_line: str, name: str = "") -> str:
         return ("System error: the confirmation channel is unavailable; cannot register. "
                 "Tell the user to add it manually on the settings page.")
 
-    confirm_id = mgr.register(
-        session_id, f"mcp_install:{display_name}",
-        f'Register MCP server "{display_name}" ({transport})',
-        command_line)
-    await queue.put({
-        "type": "confirmation_required", "confirm_id": confirm_id,
-        "kind": "mcp_install", "name": display_name, "transport": transport,
-        "command": parsed.get("command", ""), "args": parsed.get("args", []),
-        "url": parsed.get("url", ""),
-    })
-    confirmed = await mgr.wait(confirm_id)
-    if not confirmed:
-        return "The user declined to install this MCP server."
+    _auto = False
+    try:  # global permission policy waiver (audited); fail toward asking
+        import db as _dbmod  # noqa: PLC0415
+        import permissions as _perm  # noqa: PLC0415
+        from audit import audit as _audit  # noqa: PLC0415
+        if _perm.auto_approve(_dbmod.get_connection(),
+                              f"mcp_install:{display_name}"):
+            _audit("mcp_install", session_id=session_id, name=display_name,
+                   command=command_line, decision="auto_approved_by_policy")
+            _auto = True
+    except Exception:  # noqa: BLE001
+        _auto = False
+    if not _auto:
+        confirm_id = mgr.register(
+            session_id, f"mcp_install:{display_name}",
+            f'Register MCP server "{display_name}" ({transport})',
+            command_line)
+        await queue.put({
+            "type": "confirmation_required", "confirm_id": confirm_id,
+            "kind": "mcp_install", "name": display_name, "transport": transport,
+            "command": parsed.get("command", ""), "args": parsed.get("args", []),
+            "url": parsed.get("url", ""),
+        })
+        confirmed = await mgr.wait(confirm_id)
+        if not confirmed:
+            return "The user declined to install this MCP server."
 
     user_id = skills_registry.USER_ID_VAR.get()
     try:

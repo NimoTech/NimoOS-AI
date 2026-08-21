@@ -17,6 +17,7 @@ import phoenix_tracing
 from openai import AsyncOpenAI
 
 import agent_md
+import permissions
 from fences import fence_untrusted
 import db as db_module
 from provider_adapters import (
@@ -677,6 +678,7 @@ class AgentRunner:
         pre_confirmed_tools: "set[str] | None" = None,
         run_shell_allowlist: "list | None" = None,
         run_scripts: "list | None" = None,
+        run_context: str = "interactive",
     ) -> None:
         lock = _get_lock(session_id)
         if lock.locked():
@@ -694,6 +696,12 @@ class AgentRunner:
             APP_SESSION_VAR.set(session_id)
             APP_EVENT_VAR.set(sink)
             APP_CONFIRM_VAR.set(self._confirm_mgr)
+            # Who is driving this run (interactive / task / channel). Every
+            # permission gate resolves its policy through this — set it
+            # unconditionally so a run can never inherit a stale context.
+            permissions.RUN_CONTEXT_VAR.set(
+                run_context if run_context in ("interactive", "task", "channel")
+                else "interactive")
             mcp_client.SESSION_ID_VAR.set(session_id)
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)

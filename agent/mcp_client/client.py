@@ -379,6 +379,24 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
                server=sid, tool=tool_name,
                reason="run-preauth-wildcard", outcome="allowlisted")
         return True
+    # Global permission policy: mcp_tools=auto (or an auto task/channel
+    # context) skips the card. Same audit shape as the wildcard above so the
+    # call still leaves a trace. Fail toward asking on any error.
+    try:
+        import db as _dbmod  # noqa: PLC0415 — lazy, mirrors skills' pattern
+        import permissions as _perm  # noqa: PLC0415
+        if _perm.auto_approve(_dbmod.get_connection(), f"mcp_call:{key}"):
+            try:
+                from skills.skills_registry import USER_ID_VAR  # noqa: PLC0415
+                _uid = USER_ID_VAR.get() or None
+            except Exception:  # noqa: BLE001
+                _uid = None
+            _audit("mcp_call", user_id=_uid, session_id=SESSION_ID_VAR.get(),
+                   server=sid, tool=tool_name,
+                   reason="policy-auto", outcome="allowlisted")
+            return True
+    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
+        pass
     mgr = CONFIRM_MGR_VAR.get()
     queue = EVENT_QUEUE_VAR.get()
     session_id = SESSION_ID_VAR.get()

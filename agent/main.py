@@ -381,6 +381,7 @@ def _channel_start_run(session_id: str, user_id: str, message: str,
         chat_username=chat_username,
         attachment_ids=attachment_ids,
         channel_send_file=channel_send_file,
+        run_context="channel",
     )
 
 
@@ -709,6 +710,8 @@ def _build_proxy_argv(
     confirm_url: str = "http://127.0.0.1:8282/internal/egress-confirm",
     grant_listen: str = "127.0.0.1:8889",
     confirm_timeout: int = EGRESS_CONFIRM_TIMEOUT,
+    tofu_ttl_hours: int | None = None,
+    upload_threshold_kb: int | None = None,
 ) -> list[str]:
     """Return the argv list for starting the egress-proxy.
 
@@ -727,7 +730,7 @@ def _build_proxy_argv(
     confirmation card, and must stay a bit above the 110s the egress_confirm
     route below passes to ConfirmManager.wait().
     """
-    return [
+    argv = [
         proxy_bin,
         "-listen", listen,
         "-dns", dns,
@@ -735,6 +738,15 @@ def _build_proxy_argv(
         "-grant-listen", grant_listen,
         "-confirm-timeout", f"{confirm_timeout}s",
     ]
+    # Permission-policy overrides (permissions.proxy_settings). Passed only
+    # when they differ from the proxy's own flag defaults, so a default policy
+    # keeps the argv — and every test pinning it — byte-identical. Applied at
+    # spawn: a change takes effect after the AI service restarts.
+    if tofu_ttl_hours is not None and tofu_ttl_hours != 1:
+        argv += ["-tofu-ttl", f"{tofu_ttl_hours}h"]
+    if upload_threshold_kb is not None and upload_threshold_kb != 64:
+        argv += ["-upload-threshold", str(upload_threshold_kb * 1024)]
+    return argv
 
 
 def _wait_for_pid_file(pid_file: str, timeout: float = 5.0, interval: float = 0.1) -> int:
@@ -870,7 +882,15 @@ async def _egress_startup():
         _LOG.info("egress startup: netns veth configured")
 
         # 4. Start egress-proxy
-        proxy_argv = _build_proxy_argv(EGRESS_PROXY_BIN)
+        try:
+            import permissions as _perm
+            _proxy_cfg = _perm.proxy_settings(_db())
+        except Exception:  # noqa: BLE001 — policy read must not block startup
+            _proxy_cfg = {}
+        proxy_argv = _build_proxy_argv(
+            EGRESS_PROXY_BIN,
+            tofu_ttl_hours=_proxy_cfg.get("tofu_ttl_hours"),
+            upload_threshold_kb=_proxy_cfg.get("upload_threshold_kb"))
         _proxy_proc = subprocess.Popen(proxy_argv)
         _LOG.info("egress startup: proxy spawned pid=%d argv=%s",
                   _proxy_proc.pid, proxy_argv)
@@ -962,6 +982,25 @@ async def egress_confirm(req: _EgressConfirmRequest):
         _audit("egress_grant", host=req.host, bytes=req.bytes,
                reason=req.reason, decision="auto_approved_search_backend")
         return {"allow": True}
+
+    # Global permission policy: the domain gate follows gates.network, the
+    # upload-threshold gate follows gates.upload. Matched on the proxy's exact
+    # reason string — any other/unknown reason keeps the card. Checked before
+    # the session lookup so unattended runs get the same answer.
+    try:
+        import permissions as _perm  # noqa: PLC0415
+        _gate_action = None
+        if req.reason == TOFU_UNKNOWN_HOST_REASON:
+            _gate_action = "egress"          # → gates.network
+        elif req.reason == "upload_over_threshold":
+            _gate_action = "egress_upload"   # → gates.upload
+        if _gate_action is not None and _perm.auto_approve(_db(), _gate_action):
+            from audit import audit as _audit  # noqa: PLC0415
+            _audit("egress_grant", host=req.host, bytes=req.bytes,
+                   reason=req.reason, decision="auto_approved_by_policy")
+            return {"allow": True}
+    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
+        pass
 
     # Find an active session — P0 uses last-active heuristic
     session_id: str | None = _runner._last_active_session
@@ -2258,7 +2297,8 @@ def _start_run(session_id: str, user_id: str, message: str,
                channel_send_file=None,
                pre_confirmed_tools: "set[str] | None" = None,
                run_shell_allowlist: "list | None" = None,
-               run_scripts: "list | None" = None) -> RunSink:
+               run_scripts: "list | None" = None,
+               run_context: str = "interactive") -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -2299,6 +2339,7 @@ def _start_run(session_id: str, user_id: str, message: str,
                 pre_confirmed_tools=pre_confirmed_tools,
                 run_shell_allowlist=run_shell_allowlist,
                 run_scripts=run_scripts,
+                run_context=run_context,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -2634,6 +2675,33 @@ async def confirm_session(
         # confirm_session_mismatch (id belongs to another session). Both are 409.
         raise HTTPException(status_code=409, detail=str(e.args[0]) if e.args else "confirm_expired")
     return {"ok": True}
+
+
+@app.get("/agent/permission-settings")
+async def permission_settings_get(x_user_id: str = Header(..., alias="X-User-Id")):
+    """The box-wide permission policy. Admin-scoped at the gateway
+    (AdminScopedAgentPaths) — same authority as the shell allowlist below."""
+    import permissions as _perm
+    return _perm.load(_db())
+
+
+@app.put("/agent/permission-settings")
+async def permission_settings_put(
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    import permissions as _perm
+    import json as _json
+    try:
+        data = _json.loads(await request.body() or b"{}")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="invalid_json")
+    # save() normalizes: unknown keys are dropped, invalid values fall back to
+    # their (ask/strict) defaults. Echo the normalized truth so the UI renders
+    # what will actually be enforced, not what it sent.
+    return _perm.save(_db(), data)
 
 
 @app.get("/agent/shell-allowlist")

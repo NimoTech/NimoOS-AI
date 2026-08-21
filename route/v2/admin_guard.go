@@ -35,6 +35,9 @@ var AdminScopedAgentPaths = []string{
 	"/agent/channels/instances",
 	"/agent/channels/lark",
 	"/agent/shell-allowlist",
+	// Box-wide permission policy: which confirmation gates auto-approve —
+	// the same authority shell-allowlist hands out, generalized.
+	"/agent/permission-settings",
 	"/agent/notes/settings",
 	"/agent/notes/dir-info",
 	"/agent/toolbox",

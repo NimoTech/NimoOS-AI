@@ -208,11 +208,17 @@ def _detail_of(ev: dict) -> str:
 
 class TaskRunDriver:
     def __init__(self, *, confirm_mgr, session_id: str, preauth: dict,
-                 run_timeout: float, sleep=asyncio.sleep, now=None):
+                 run_timeout: float, sleep=asyncio.sleep, now=None,
+                 policy: dict | None = None):
         self._mgr = confirm_mgr
         self._session_id = session_id
         self._preauth = preauth or {}
         self._run_timeout = run_timeout
+        # Global permission policy snapshot (permissions.load). Consulted only
+        # AFTER the task's own preauth says no — preauth is the narrower,
+        # author-reviewed grant and its answer is recorded as such. None (the
+        # default, and every pre-existing caller) keeps today's deny behavior.
+        self._policy = policy
         # `sleep` is accepted for ctor symmetry with ChannelRunDriver (and so a
         # future pacing need has a seam); nothing on this path sleeps — an
         # unattended run has no rate-limited chat to pace against, and its only
@@ -241,8 +247,10 @@ class TaskRunDriver:
         """
         kind = _kind_of(ev)
         if kind == _KIND_EGRESS:
-            return egress_allowed(ev.get("host") or "",
-                                  self._preauth.get("egress_domains") or []), ""
+            if egress_allowed(ev.get("host") or "",
+                              self._preauth.get("egress_domains") or []):
+                return True, ""
+            return self._policy_allows(ev, kind), ""
         if kind == _KIND_FS:
             roots = self._preauth.get("fs_write") or []
             # A batch card (`request_access_batch`) carries every path in
@@ -251,14 +259,67 @@ class TaskRunDriver:
             paths = ev.get("paths")
             if not isinstance(paths, (list, tuple)) or not paths:
                 paths = [ev.get("path") or ""]
+            offending = ""
             for p in paths:
                 if not fs_allowed(p, roots):
-                    return False, (p if isinstance(p, str) else "")
-            return True, ""
+                    offending = p if isinstance(p, str) else ""
+                    break
+            else:
+                return True, ""
+            allowed = self._policy_allows(ev, kind)
+            return allowed, ("" if allowed else offending)
         # shell / mcp_tool / mcp_install / toolbox_install / elicitation …
         # Their pre-authorization is injected before the tool runs, so a card
         # here means "not preauthorized".
-        return False, ""
+        return self._policy_allows(ev, kind), ""
+
+    def _policy_allows(self, ev: dict, kind: str) -> bool:
+        """Does the global policy's `contexts.tasks` mode waive this card?
+
+        Shell is NEVER waived here: the in-line gate (shell.py) already applied
+        the policy with the task context — gray was auto-approved there, so a
+        shell card reaching this driver is dangerous/protected, which an
+        unattended run must not run. Same hard floor for anything unmapped
+        (elicitation, unknown kinds). fs approvals re-check fs_root_denied so
+        an "auto" policy can never authorize a system location.
+        """
+        pol = self._policy
+        if not isinstance(pol, dict):
+            return False
+        try:
+            mode = (pol.get("contexts") or {}).get("tasks", "strict")
+            if mode not in ("follow", "auto"):
+                return False
+            gates = pol.get("gates") or {}
+            if kind == _KIND_SHELL:
+                return False
+            if kind == _KIND_FS:
+                if mode != "auto" and gates.get("fs_access") != "auto":
+                    return False
+                paths = ev.get("paths")
+                if not isinstance(paths, (list, tuple)) or not paths:
+                    paths = [ev.get("path") or ""]
+                for p in paths:
+                    real = _real(p) if isinstance(p, str) and p else None
+                    if real is None or fs_root_denied(real):
+                        return False
+                return True
+            if kind == _KIND_EGRESS:
+                gate = ("upload" if ev.get("reason") == "upload_over_threshold"
+                        else "network")
+                return mode == "auto" or gates.get(gate) == "auto"
+            if mode == "auto":
+                return True
+            # "follow": map the card's action back to its gate. Unmapped
+            # actions (elicitation, unknown) are never waived.
+            import permissions as _perm  # noqa: PLC0415
+            gate = _perm.gate_of(ev.get("action") or "")
+            return gate is not None and gate != "shell" \
+                and gates.get(gate) == "auto"
+        except Exception:  # noqa: BLE001 — a policy failure must deny
+            logger.warning("task driver: policy check failed; denying",
+                           exc_info=True)
+            return False
 
     def _handle_confirm(self, ev: dict) -> None:
         # Classification and matching run INSIDE the try: a malformed event

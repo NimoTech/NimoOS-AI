@@ -408,15 +408,22 @@ def _default_start_run(session_id, user_id, message, creds, *, max_turns,
         pre_confirmed_tools=pre_confirmed_tools,
         run_shell_allowlist=run_shell_allowlist,
         run_scripts=run_scripts,
+        run_context="task",
     )
 
 
 def _default_driver_factory(*, session_id, preauth, run_timeout):
     import main  # noqa: PLC0415
+    import permissions  # noqa: PLC0415
 
     from .driver import TaskRunDriver  # noqa: PLC0415
+    try:
+        policy = permissions.load(main._db())
+    except Exception:  # noqa: BLE001 — a policy failure means strict (deny)
+        policy = None
     return TaskRunDriver(confirm_mgr=main._confirm_mgr, session_id=session_id,
-                         preauth=preauth, run_timeout=run_timeout)
+                         preauth=preauth, run_timeout=run_timeout,
+                         policy=policy)
 
 
 def _default_read_unlocked(session_id: str) -> list:

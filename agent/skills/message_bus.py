@@ -42,6 +42,18 @@ async def trigger_action(action_type: str, data: str = "{}") -> str:
     description = f"Trigger MessageBus action '{action_type}' with data: {data}"
     command = f"nimoos-cli message-bus trigger action --type {action_type} --data {data}"
 
+    try:  # global permission policy waiver (audited); fail toward asking
+        import db as _dbmod  # noqa: PLC0415
+        import permissions as _perm  # noqa: PLC0415
+        from audit import audit as _audit  # noqa: PLC0415
+        if _perm.auto_approve(_dbmod.get_connection(), "trigger_action"):
+            _audit("trigger_action", session_id=session_id, command=command,
+                   decision="auto_approved_by_policy")
+            return await run_cli([CLI_BIN, "message-bus", "trigger", "action",
+                                  "--type", action_type, "--data", data])
+    except Exception:  # noqa: BLE001
+        pass
+
     confirm_id = mgr.register(session_id, "trigger_action", description, command)
     await queue.put({
         "type": "confirmation_required",
