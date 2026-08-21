@@ -154,6 +154,12 @@ def test_build_proxy_argv_defaults(tmp_path, monkeypatch):
     confirm_idx = argv.index("-confirm-url")
     assert "egress-confirm" in argv[confirm_idx + 1]
     assert "-grant-listen" in argv
+    # 2026-08-16 fix: proxy's confirm-callback timeout must be human-scale
+    # (default 120s), not the old hardcoded 5s that made confirmation cards
+    # unusable — see egress-proxy/main.go's confirmClient doc comment.
+    assert "-confirm-timeout" in argv
+    timeout_idx = argv.index("-confirm-timeout")
+    assert argv[timeout_idx + 1] == "120s"
 
 
 def test_build_proxy_argv_custom(tmp_path, monkeypatch):
@@ -164,10 +170,24 @@ def test_build_proxy_argv_custom(tmp_path, monkeypatch):
         "/custom/proxy",
         listen="0.0.0.0:9999",
         confirm_url="http://localhost:1234/cb",
+        confirm_timeout=45,
     )
     assert argv[0] == "/custom/proxy"
     listen_idx = argv.index("-listen")
     assert argv[listen_idx + 1] == "0.0.0.0:9999"
+    timeout_idx = argv.index("-confirm-timeout")
+    assert argv[timeout_idx + 1] == "45s"
+
+
+def test_build_proxy_argv_confirm_timeout_env_override(tmp_path, monkeypatch):
+    """NIMOOS_EGRESS_CONFIRM_TIMEOUT overrides the default passed to the proxy."""
+    monkeypatch.setenv("NIMOOS_EGRESS_CONFIRM_TIMEOUT", "45")
+    m, _ = _reload_main(tmp_path, monkeypatch)
+
+    assert m.EGRESS_CONFIRM_TIMEOUT == 45
+    argv = m._build_proxy_argv("/usr/local/bin/egress-proxy")
+    timeout_idx = argv.index("-confirm-timeout")
+    assert argv[timeout_idx + 1] == "45s"
 
 
 def test_wait_for_pid_file_success(tmp_path, monkeypatch):

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "toolbox-helper",
+  "name": "toolbox-helper",
+  "title": "Toolbox helper",
+  "description": "Install CLI tools (gh, lark-cli, ...) into the persistent NimoOS toolbox when the user asks to install a CLI or component. Never install CLIs with raw npm/pip in the sandbox - those land in the container layer and vanish on rebuild.",
+  "color": "blue",
+  "icon": "grid",
+  "trigger": "auto",
+  "examples": ["帮我安装飞书 CLI", "install the GitHub CLI", "npx @larksuite/cli install"],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}

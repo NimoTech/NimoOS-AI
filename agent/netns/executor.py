@@ -48,15 +48,20 @@ Response schema:
   }
 
 Constants:
-  MEM_BYTES         = 512 MiB address-space limit passed to prlimit
+  MEM_BYTES         = 2 GiB address-space limit passed to prlimit (default;
+                      overridable via NIMOOS_SANDBOX_AS_BYTES — see below)
   MAX_TIMEOUT_SEC   = 300 s
   DEFAULT_TIMEOUT_SEC = 30 s
   MAX_OUTPUT_BYTES  = 16 KiB
   NPROC             = 1024
 
 Environment overrides (for testing / deployment):
-  NIMOOS_EXEC_SOCK      — Unix socket path (default /var/run/nimoos/agent-exec.sock)
-  NIMOOS_EXEC_PID_FILE  — PID file path   (default /var/run/nimoos/agent-exec.pid)
+  NIMOOS_EXEC_SOCK        — Unix socket path (default /var/run/nimoos/agent-exec.sock)
+  NIMOOS_EXEC_PID_FILE    — PID file path   (default /var/run/nimoos/agent-exec.pid)
+  NIMOOS_SANDBOX_AS_BYTES — prlimit --as (RLIMIT_AS) cap for sandboxed shell
+                            commands, in bytes (default 2 GiB). Invalid values
+                            (non-numeric or <= 0) log a warning and fall back
+                            to the default rather than raising at import time.
 """
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ import json
 import logging
 import os
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -81,7 +87,47 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 CLONE_NEWNET = 0x40000000
 
-MEM_BYTES = 512 * 1024 * 1024
+# prlimit --as (RLIMIT_AS / virtual address space) cap for sandboxed shell
+# commands — defense in depth on top of the container's `mem_limit: 2g` cgroup,
+# which is the real backstop on physical memory. 512 MiB was too tight: Go
+# 1.21+'s runtime reserves a large virtual-address region up front in
+# runtime.mallocinit() (before any user code runs), and that reservation
+# itself fails outright under a restrictive RLIMIT_AS — crashing every
+# Go-compiled toolbox binary (e.g. `gh`) with "failed to reserve page summary
+# memory", regardless of how little memory the program actually uses.
+# Empirically (2026-08-15, gh 2.62.0 amd64 on 118): 1G/2G/4G --as all let `gh
+# --version` run; 512M does not. Default picked as min(smallest-working-tier
+# x2, 4G) = min(1G*2, 4G) = 2G, overridable via NIMOOS_SANDBOX_AS_BYTES for
+# boxes that need to go higher for some other Go-runtime toolbox component.
+_DEFAULT_MEM_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _parse_mem_bytes(raw: str | None) -> int:
+    """Parse NIMOOS_SANDBOX_AS_BYTES into a positive int, falling back to
+    _DEFAULT_MEM_BYTES (with a warning) on any invalid value — missing,
+    non-numeric, or <= 0 — so a bad deployment env var can never raise at
+    module-import time and take the whole executor daemon down with it.
+    """
+    if raw is None:
+        return _DEFAULT_MEM_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid NIMOOS_SANDBOX_AS_BYTES=%r (not an integer); "
+            "falling back to default %d bytes", raw, _DEFAULT_MEM_BYTES,
+        )
+        return _DEFAULT_MEM_BYTES
+    if value <= 0:
+        logger.warning(
+            "invalid NIMOOS_SANDBOX_AS_BYTES=%r (must be > 0); "
+            "falling back to default %d bytes", raw, _DEFAULT_MEM_BYTES,
+        )
+        return _DEFAULT_MEM_BYTES
+    return value
+
+
+MEM_BYTES = _parse_mem_bytes(os.environ.get("NIMOOS_SANDBOX_AS_BYTES"))
 MAX_TIMEOUT_SEC = 300
 DEFAULT_TIMEOUT_SEC = 30
 MAX_OUTPUT_BYTES = 16 * 1024
@@ -90,6 +136,15 @@ NPROC = 1024  # per-user process limit inside the sandbox
 DEFAULT_SOCK_PATH = "/var/run/nimoos/agent-exec.sock"
 DEFAULT_PID_FILE = "/var/run/nimoos/agent-exec.pid"
 MCP_SOCK_DIR = os.environ.get("NIMOOS_MCP_SOCK_DIR", "/var/run/nimoos")
+
+TOOLBOX_BIN = os.environ.get("NIMOOS_TOOLBOX_BIN", "/opt/toolbox/bin")
+_BASE_PATH = "/usr/bin:/usr/sbin:/bin:/sbin"
+
+
+def _sandbox_path() -> str:
+    if os.path.isdir(TOOLBOX_BIN):
+        return f"{TOOLBOX_BIN}:{_BASE_PATH}"
+    return _BASE_PATH
 
 PROXY_BASE_URL = f"http://{bootstrap.PROXY_IP}:8888"
 
@@ -178,7 +233,7 @@ def _build_proxy_env(extra_env: dict) -> dict:
     """
     base_env = {
         "HOME": "/work",
-        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "PATH": _sandbox_path(),
         "TERM": "dumb",
     }
     # Layer 2: runtime vars from the executor's own environment.
@@ -400,6 +455,33 @@ def _execute_mcp_stdio(req: dict) -> dict:
 # Command execution
 # ---------------------------------------------------------------------------
 
+def _shell_argv(cmd: str) -> list[str]:
+    """Build the prlimit-wrapped bash argv for a shell *cmd*.
+
+    The command runs as ``/bin/bash -lc``, i.e. a *login* shell — that's
+    required so things like `.bashrc`/`.profile`-driven tool setups (uv, nvm,
+    etc.) still work. But a login shell also sources `/etc/profile`, which on
+    Debian unconditionally re-exports PATH (root: "/usr/local/sbin:...",
+    non-root: "/usr/local/bin:..."), silently stomping the sandbox PATH
+    (including TOOLBOX_BIN) that _execute's base_env just set. Prepending an
+    explicit `export PATH=...;` to the command string itself re-asserts the
+    sandbox PATH *after* /etc/profile has already run, since it executes as
+    part of the command bash was told to run, not as an env var bash can
+    discard on login. base_env's "PATH" is left in place too as defense in
+    depth (e.g. for the exec() call itself before bash sources anything).
+    """
+    path_export = f"export PATH={shlex.quote(_sandbox_path())}; "
+    return [
+        PRLIMIT_BIN,
+        f"--as={MEM_BYTES}",
+        f"--cpu={MAX_TIMEOUT_SEC}",
+        f"--nofile={NOFILE_LIMIT}",
+        f"--nproc={NPROC}",
+        "--",
+        "/bin/bash", "-lc", path_export + cmd,
+    ]
+
+
 def _execute(req: dict) -> dict:
     """Dispatch *req* to the appropriate handler and return a response dict."""
     req_id = req.get("id", "")
@@ -423,7 +505,7 @@ def _execute(req: dict) -> dict:
     # by passing env={"HTTP_PROXY": "http://evil"}.
     base_env = {
         "HOME": "/work",
-        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "PATH": _sandbox_path(),
         "TERM": "dumb",
     }
     base_env.update(extra_env)
@@ -436,15 +518,7 @@ def _execute(req: dict) -> dict:
     base_env["no_proxy"] = ""
 
     # Build prlimit-wrapped command
-    argv = [
-        PRLIMIT_BIN,
-        f"--as={MEM_BYTES}",
-        f"--cpu={MAX_TIMEOUT_SEC}",
-        f"--nofile={NOFILE_LIMIT}",
-        f"--nproc={NPROC}",
-        "--",
-        "/bin/bash", "-lc", cmd,
-    ]
+    argv = _shell_argv(cmd)
 
     try:
         proc = subprocess.Popen(

@@ -50,6 +50,15 @@ DB_VAR: ContextVar = ContextVar("shell_db", default=None)
 USER_PATTERNS_VAR: ContextVar[list] = ContextVar("shell_user_patterns", default=[])
 CONFIRM_MGR_VAR: ContextVar = ContextVar("shell_confirm_mgr", default=None)
 EVENT_QUEUE_VAR: ContextVar = ContextVar("shell_event_queue", default=None)
+# Run-scoped shell allowlist (scheduled tasks' `preauth.shell`).  Unlike the
+# persistent `shell_allowlist` table this lives only for the duration of one
+# agent run and is NEVER written to the DB.  Set by agent.py::run() from the
+# run's pre-authorization; the empty default means "no run-scoped grant" and
+# keeps the gate bit-identical to its pre-preauth behavior.  The default is an
+# immutable tuple on purpose — a mutable default object is shared by every
+# context that never set the var.  Readers must treat it as read-only.
+RUN_ALLOWLIST_VAR: ContextVar[tuple | list] = ContextVar(
+    "shell_run_allowlist", default=())
 
 EXEC_MODE = os.environ.get("NIMOOS_AGENT_EXEC_MODE", "netns")
 
@@ -66,6 +75,22 @@ WORK_ROOT = Path(os.environ.get(
     "NIMOOS_AGENT_SHELL_ROOT",
     str(Path.home() / ".nimoos" / "agent"),
 ))
+
+HOMES_ROOT = Path(os.environ.get("NIMOOS_HOMES_ROOT", "/var/lib/nimoos/ai/homes"))
+
+
+def _user_home_env() -> dict:
+    from skills.skills_registry import USER_ID_VAR
+    uid = (USER_ID_VAR.get() or "").strip()
+    if not uid or not HOMES_ROOT.is_dir():
+        return {}
+    home = HOMES_ROOT / uid
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}
+    return {"HOME": str(home)}
+
 
 _NETWORK_HINT = ("\n(System hint: the command may have failed because the sandbox is offline by default. "
                  "If network access is genuinely needed, retry with network=true — the user will be asked to confirm.)")
@@ -136,7 +161,7 @@ async def _run(command: str, timeout_sec: int, network: bool,
         # Lazy import: keeps bwrap mode loadable even if netns package is absent.
         from netns import client as netns_client  # noqa: PLC0415
         exit_code, output = await netns_client.run_command(
-            command, timeout_sec, env={}, cwd=str(work)
+            command, timeout_sec, env=_user_home_env(), cwd=str(work)
         )
         return f"[exit {exit_code}]\n{output}"
 
@@ -228,6 +253,265 @@ def _argv_is_atomic(seg) -> bool:
     )
 
 
+# Commands whose real work lives in a STRING ARGUMENT the classifier never sees.
+# `sh -c 'cat /etc/shadow'` classifies as GRAY (argv is just `sh`, `-c`, and an
+# opaque string), so the `protected` exclusion below would not fire and a run
+# rule like prefix "sh -c " would wave the payload through unattended. The
+# persistent allowlist has the same hole, but that is a human-maintained,
+# per-machine decision and is out of scope here (tracked follow-up); a
+# run-scoped grant must never be usable as an interpreter escape hatch.
+_RUN_INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "busybox",
+    "python", "python2", "python3", "perl", "ruby", "php", "lua",
+    "node", "nodejs", "deno", "bun", "awk", "gawk", "mawk",
+    "pwsh", "powershell", "tclsh", "expect", "Rscript", "osascript",
+    # Not interpreters in the language sense, but they all take a command (or a
+    # recipe/playbook naming one) and run it, so the argv the classifier sees is
+    # never the work that happens.  `xargs` also takes its arguments from stdin,
+    # which no static check here can see.
+    "xargs", "make", "systemd-run", "ansible-playbook",
+    # NOT listed: `env` / `nohup` / `nice` / `timeout` / `sudo` / `ionice` — plain
+    # exec wrappers.  Listing them would refuse honest invocations
+    # (`env LC_ALL=C sort -c f.txt`, `nice -n 10 rsync …`), and what they wrap is
+    # caught anyway by the full-argv scan in _run_allowlist_match.  Note this is
+    # NOT because unwrapping reveals it: `_effective_argv` stops at a flag's
+    # value, so `nice -n 10 sh -c …` never unwraps to `sh` at all (see the scan's
+    # comment).  A stale version of this comment claimed otherwise.
+}
+# find-family flags that hand a command to another process.  Unambiguous (no
+# other common tool spells them), so they are checked on every command.
+#
+# `-c` / `-e` are NOT checked (review round 2, M2): as everyday flags on
+# ordinary tools — `curl -e`, `sed -e`, `sort -c`, `cut -c`, `tar -cf`,
+# `git commit -c`, `gcc -c`, `docker run -e`, `jq -e`, `ssh -e`,
+# `openssl enc -e` — refusing them broke the only use case this feature has.
+#
+# That trade is NOT free, and the earlier "no security gain" claim was wrong.
+# It gives up coverage of launchers whose argv[0] is not itself an interpreter
+# but that still run an arbitrary command through a `-c`-ish option, e.g.
+# `git -c core.pager='rm -rf /DATA' log` or `uv run python -c …`.  Mitigation
+# today is authoring discipline: a rule should name the whole invocation
+# (prefix `git log`), not just the binary (prefix `git `).  FOLLOW-UP: an
+# option-aware per-tool deny list (git -c/-C/--exec-path, uv/uvx/npx/pipx run,
+# find -printf %h, …) rather than a blanket flag scan.
+_RUN_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+
+# Interpreters that take a SCRIPT FILE as their first operand. Deliberately a
+# separate, narrower set than `_RUN_INTERPRETERS` above: that one answers "does
+# this command line hide its payload from `classify`?" and therefore includes
+# the command-runner family (`xargs`, `make`, `systemd-run`,
+# `ansible-playbook`). Those must NOT appear here — `systemd-run <path>` runs
+# the path as a transient unit and escapes the run's sandbox outright, and
+# `make <path>` does not execute the file at all, so a "two tokens" shape says
+# nothing about what would actually run.
+_SCRIPT_INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "ash", "ksh",
+    "python", "python2", "python3", "perl", "ruby", "php", "lua",
+    "node", "nodejs", "deno", "bun", "Rscript", "osascript",
+}
+
+# Run-scoped `scripts` pre-authorization (a scheduled task's
+# `preauth.scripts`). Same lifetime and same read-only contract as
+# RUN_ALLOWLIST_VAR above: set per run, never persisted.
+RUN_SCRIPTS_VAR: ContextVar[tuple | list] = ContextVar(
+    "shell_run_scripts", default=())
+
+
+def run_scripts_would_cover(command: str, scripts, *,
+                            cwd: str | None = None) -> bool:
+    """Would `scripts` let `command` through for one unattended run?
+
+    Public for the same reason `run_allowlist_would_cover` is: the "adopt this
+    denied action" flow has to know whether the rule it is about to write would
+    actually change the outcome, and asking the gate beats restating it.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    decision = shell_guard.classify(command, cwd=cwd)
+    if decision.level == "safe":
+        return True
+    token = RUN_SCRIPTS_VAR.set(tuple(scripts or ()))
+    try:
+        return _run_script_match(command, decision)
+    finally:
+        RUN_SCRIPTS_VAR.reset(token)
+
+
+def script_run_target(command: str) -> str:
+    """The script path if `command` is exactly `<interpreter> <absolute path>`.
+
+    Returns `""` for anything else. This is a pure SHAPE question — "is this one
+    interpreter invoking one pinned file?" — deliberately separate from "may it
+    run?", which is `_run_script_match`.
+
+    Callers that need to recognize the shape must use THIS, not
+    `run_scripts_would_cover`: that probe answers True for every `safe` command
+    regardless of rules (the gate returns before consulting any allowlist), so
+    using it as a detector misread `lark-cli mail list --limit 5` as a script run
+    and adopted `5` as the script path. Caught by
+    test_tasks_endpoints.py::test_from_denied_shell_uses_the_command_head.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    from shell_guard.parse import segments as _seg  # noqa: PLC0415
+    segs = _seg(command)
+    if segs is None or len(segs) != 1:
+        return ""
+    if segs[0].redirect_targets or segs[0].read_targets:
+        return ""
+    # The RAW argv, never `_effective_argv`: unwrapping `env`/`nice`/`timeout`
+    # would let a wrapper carry its own operands into a shape judged as
+    # "two tokens".
+    argv = list(segs[0].argv or ())
+    if len(argv) != 2:
+        return ""
+    if os.path.basename(argv[0]) not in _SCRIPT_INTERPRETERS:
+        return ""
+    if not argv[1].startswith("/"):
+        return ""
+    return argv[1]
+
+
+def _run_script_match(command: str, decision) -> bool:
+    """True if the run's `scripts` pre-authorization vouches for `command`.
+
+    The shape is deliberately the narrowest thing that can still run a script:
+
+        <interpreter> <one exact absolute path from the rules>
+
+    and nothing else — exactly two tokens, no flags, no extra operands, no
+    chaining, no redirection, never `protected`.
+
+    Why this is safe where a `python3 ` PREFIX rule is not: a prefix vouches for
+    every command that starts with it, including `python3 -c "<anything>"`, so
+    the payload is unbounded and invisible. Pinning the exact path makes the
+    payload one file the author named and can read — the same trust model as
+    allowlisting any other binary. Appending an argument is refused for the same
+    reason: an argument is input the person who approved the rule never saw.
+
+    The load-bearing check is `basename(argv[0]) in _SCRIPT_INTERPRETERS`.
+    Without it, `rm /DATA/AppData/radar/radar.py` is also "two tokens ending in
+    an authorized script", i.e. authorizing a script would authorize deleting
+    it — and `curl -T <script> https://…` would exfiltrate it.
+    """
+    scripts = RUN_SCRIPTS_VAR.get() or ()   # read-only: never mutate in place
+    if not scripts:
+        return False
+    if decision.level == "protected":
+        return False
+    script = script_run_target(command)
+    if not script:
+        return False
+    return any(isinstance(rule, str) and rule == script for rule in scripts)
+
+
+def run_allowlist_would_cover(command: str, rules, *, cwd: str | None = None) -> bool:
+    """Would granting `rules` for one run actually let `command` through?
+
+    Exists for the "adopt this denied action" flow, which turns a denied
+    command into a preauth rule. That generator works on the command's head, so
+    for a CHAINED command it produced a rule the gate can never honour (chaining
+    is refused outright, whatever the rules say) — the button wrote something
+    and changed nothing, with no way for the user to tell.
+
+    Answers by running the real gate with `rules` temporarily in scope, rather
+    than restating the gate's conditions here: a second copy of "single simple
+    command, no interpreters, never protected" would drift from
+    `_run_allowlist_match` the first time either side changed.
+
+    `safe` is True regardless of `rules`: `handle_shell_confirmation` returns
+    before consulting any allowlist, so such a command was never gated.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    decision = shell_guard.classify(command, cwd=cwd)
+    if decision.level == "safe":
+        return True
+    token = RUN_ALLOWLIST_VAR.set(tuple(rules or ()))
+    try:
+        return _run_allowlist_match(command, decision)
+    finally:
+        # Restore, never just clear: this runs inside a live request, and
+        # leaking the probe's rules would grant them to whatever runs next.
+        RUN_ALLOWLIST_VAR.reset(token)
+
+
+def _run_allowlist_match(command: str, decision) -> bool:
+    """True if the run-scoped pre-authorization vouches for `command`.
+
+    Deliberately STRICTER than the persistent allowlist:
+
+    * ``protected`` is never covered.  The persistent allowlist *does* pass some
+      protected commands (a `path_scope` entry, or a `prefix` entry on a mass
+      delete under /DATA, whose paths aren't "protected paths" individually) —
+      that is a human-maintained, per-machine decision.  A run-scoped grant
+      comes from a scheduled task's stored document and runs with nobody
+      watching, so protected always falls through to the refusal path.
+    * Interpreters and find-style exec flags are never covered (see
+      _RUN_INTERPRETERS): their payload is invisible to `classify`, so the
+      protected exclusion above would be trivially bypassable.  Ordinary tools'
+      flags are NOT inspected — that only over-refused honest commands.
+    * Same anti-smuggling shape as `shell_guard.allowlist.match`: a SINGLE
+      simple command, no chaining (`;`/`&&`/`|`/subshells) and no redirection,
+      so a benign matched prefix can't vouch for a destructive tail.
+    """
+    rules = RUN_ALLOWLIST_VAR.get() or ()   # read-only: never mutate in place
+    if not rules:
+        return False
+    if decision.level == "protected":
+        return False
+    from shell_guard.parse import segments as _seg  # noqa: PLC0415
+    segs = _seg(command)
+    if segs is None or len(segs) != 1:
+        return False
+    if segs[0].redirect_targets or segs[0].read_targets:
+        return False
+    # An interpreter anywhere in the command line disqualifies it — the scan is
+    # over EVERY token of the segment as written, not just the command name.
+    #
+    # Narrower checks were tried and both leaked, because `_effective_argv` only
+    # skips tokens starting with `-` (plus one operand for timeout/chroot) and
+    # therefore stops unwrapping at a flag's VALUE: `nice -n 10 sh -c …` halts on
+    # `10`, so neither the peeled prefix nor the unwrapped argv[0] is ever `sh`.
+    # Same for `timeout -s KILL 5 bash -c`, `sudo -u root python3 -c`,
+    # `ionice -c 2 python3 -c`, `env -u FOO python3 -c`, and
+    # `nice -n 10 xargs rm -rf …`.  Scanning all tokens costs nothing and closes
+    # the whole family; the price is refusing a command that merely *mentions* an
+    # interpreter name as an argument (`apt install make`), which is a
+    # pre-authorization the author can simply phrase differently.
+    #
+    # STILL NOT COVERED (deliberately, and out of scope here): the same early
+    # stop also degrades `classify` itself.  `nice -n 10 rm -rf /DATA` is GRAY
+    # while `rm -rf /DATA` is PROTECTED, so the protected exclusion above does
+    # not fire and a rule naming it grants it — and `rm` is not an interpreter,
+    # so this scan does not catch it either.  The defect is in
+    # shell_guard._effective_argv and equally affects the persistent allowlist
+    # and the judge path; fixing it there is a separate follow-up.
+    from shell_guard.rules import _effective_argv  # noqa: PLC0415
+    raw_argv = segs[0].argv
+    argv = _effective_argv(raw_argv)
+    if not argv:
+        return False
+    # URL-looking ARGUMENTS are exempt: `basename()` of a URL is just its last
+    # path segment, so `curl -s https://open.feishu.cn/node` read as an
+    # interpreter named `node` — a silent refusal on the most typical
+    # scheduled-task command there is.
+    #
+    # argv[0] is NEVER exempt, however: it is the thing that actually executes,
+    # and POSIX collapses `//` in a path, so `foo://bash` resolves to `foo:/bash`
+    # — an attacker with a writable work dir can `mkdir 'foo:'` and symlink
+    # `foo:/bash` to the real shell, then pass the whole thing off as a URL.
+    # Exempting the command name would hand that straight through.
+    scan = [raw_argv[0]] + [tok for tok in raw_argv[1:] if "://" not in tok]
+    if any(os.path.basename(tok) in _RUN_INTERPRETERS for tok in scan):
+        return False
+    if any(tok in _RUN_EXEC_FLAGS for tok in argv[1:]):
+        return False
+    from tasks import preauth as _preauth  # noqa: PLC0415
+    return _preauth.shell_match(rules, command)
+
+
 async def _guard_command(command: str) -> str | None:
     """Classify `command`; return a refusal string to block, or None to allow.
 
@@ -257,14 +541,25 @@ async def _guard_command(command: str) -> str | None:
     if decision.level == "safe":
         return None
 
-    # user-maintained allowlist wins (runs even unattended)
-    if db is not None and guard_allowlist.match(db, command):
+    # user-maintained allowlist wins (runs even unattended); a run-scoped
+    # pre-authorization (scheduled tasks) is a second, narrower source of the
+    # same waiver — see _run_allowlist_match for how it is stricter.
+    _persistent_ok = db is not None and guard_allowlist.match(db, command)
+    _run_ok = False if _persistent_ok else _run_allowlist_match(command, decision)
+    # `scripts` is a third source of the same waiver, narrower than both: it
+    # only ever covers `<interpreter> <one exact pinned path>`. Checked last so
+    # the audit reason names the broadest rule that actually applied.
+    _script_ok = False if (_persistent_ok or _run_ok) else \
+        _run_script_match(command, decision)
+    if _persistent_ok or _run_ok or _script_ok:
         # Allowlisted: skip confirmation, but still build the backstop for
         # destructive commands (defense in depth — a pre-approved rm still
         # gets a recoverable snapshot/trash).
         if decision.level in ("dangerous", "protected"):
             guard_backstop.prepare_backstop(decision.paths)
-        _rec("allowlisted", decision.level, "allowlist")
+        _rec("allowlisted", decision.level,
+             "allowlist" if _persistent_ok
+             else ("run-preauth" if _run_ok else "run-preauth-script"))
         return None
 
     # gray → judge; allow verdict passes through, else fall to confirm

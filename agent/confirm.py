@@ -66,13 +66,24 @@ class ConfirmManager:
         self._db.commit()
         return confirm_id
 
-    async def wait(self, confirm_id: str) -> bool:
-        """Block until /confirm or /cancel resolves this id, or timeout fires."""
+    async def wait(self, confirm_id: str, *, timeout: float | None = None) -> bool:
+        """Block until /confirm or /cancel resolves this id, or timeout fires.
+
+        `timeout` overrides the manager-wide DEFAULT_TIMEOUT for THIS wait only
+        (same shape as `wait_elicit`'s per-call override). Existing callers that
+        omit it keep the current 24h default unchanged. A caller whose own
+        upstream request has a shorter deadline than 24h (e.g. an HTTP callback
+        with its own client-side timeout) should pass a `timeout` a bit shorter
+        than that deadline, so THIS call resolves — and can log/attribute a
+        clean "timed out" outcome — before the caller's own timeout fires.
+        """
         pending = self._pending.get(confirm_id)
         if pending is None:
             return False
         try:
-            await asyncio.wait_for(pending.event.wait(), timeout=self._timeout)
+            await asyncio.wait_for(
+                pending.event.wait(),
+                timeout=self._timeout if timeout is None else timeout)
         except asyncio.TimeoutError:
             return False
         except asyncio.CancelledError:

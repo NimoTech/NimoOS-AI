@@ -4,7 +4,17 @@ import re
 # Set AGENT_DB_PATH before any test module is imported, so that main.py's
 # module-level db init uses an in-memory SQLite rather than the on-disk path.
 # This is needed for tests that import `main` at module level (e.g. TestClient).
-os.environ.setdefault("AGENT_DB_PATH", ":memory:")
+#
+# UNCONDITIONAL, never setdefault. The agent's own container image sets
+# AGENT_DB_PATH=/var/lib/nimoos/ai/agent/agent.db (deploy/agent/Dockerfile),
+# so `setdefault` was a no-op whenever the suite ran inside the container:
+# `main._conn` then pointed at the LIVE database and every test that writes
+# through it wrote production. That is not hypothetical — it destroyed a
+# user's real channel bindings once (see the M2 scheduled-tasks task 7
+# report). Tests that want their own on-disk DB still get one: they
+# `monkeypatch.setenv`/`monkeypatch.setattr` at run time, long after this
+# line, and are unaffected by it.
+os.environ["AGENT_DB_PATH"] = ":memory:"
 
 
 _FENCE_RE = re.compile(

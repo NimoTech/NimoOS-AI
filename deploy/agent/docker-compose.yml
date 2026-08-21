@@ -30,6 +30,22 @@ services:
       NIMOOS_EXEC_SOCK: /var/lib/nimoos/ai/agent/agent-exec.sock
       NIMOOS_EXEC_PID_FILE: /var/lib/nimoos/ai/agent/agent-exec.pid
       NIMOOS_MCP_SOCK_DIR: /var/lib/nimoos/ai/agent
+      # Host timezone, so `tasks/cron.py` resolves a schedule in the same zone
+      # the user reads their clock in: it uses datetime.fromtimestamp, i.e. the
+      # container's local zone, and a UTC container turned `0 9 * * *` into
+      # 05:00 on an America/New_York box.
+      #
+      # The colon form is a glibc tzfile PATH, and the path is deliberately NOT
+      # /etc/localtime: that is a symlink to /usr/share/zoneinfo/Etc/UTC in the
+      # image, and docker resolves a bind mount's target through symlinks — so
+      # mounting the host file at /etc/localtime overwrote the container's
+      # Etc/UTC (and /usr/share/zoneinfo/UTC, which links to it), leaving
+      # `TZ=UTC date` and ZoneInfo("UTC") reporting EDT. The agent runs the
+      # user's shell commands in this container, so that would silently corrupt
+      # any command that asks for UTC. Mounting at a neutral path keeps the
+      # zoneinfo database intact and still lets an explicit TZ=<zone> override
+      # win. Not an empty TZ — glibc reads that as UTC and would undo this.
+      TZ: ":/etc/nimoos-localtime"
       # Phoenix (OTLP) tracing endpoint/project. Enabling is a runtime setting
       # (AI Settings "Agent monitoring" toggle → user_settings): instrumentation
       # installs at startup and exports only while enabled; net=host makes
@@ -39,6 +55,10 @@ services:
       PHOENIX_OTLP_ENDPOINT: "${PHOENIX_OTLP_ENDPOINT:-http://127.0.0.1:6006/v1/traces}"
       PHOENIX_PROJECT: "${PHOENIX_PROJECT:-nimoos-agent}"
     volumes:
+      # The host tzfile the TZ variable above points at. Neutral target on
+      # purpose — see that comment for why /etc/localtime is the wrong one.
+      # Picked up on container (re)create, not on a host timezone change.
+      - { type: bind, source: /etc/localtime, target: /etc/nimoos-localtime, read_only: true }
       # rslave: lets the container see new host mounts made after the container starts
       # (USB→/media, array→/DATA); one-directional, nothing leaks back.
       - { type: bind, source: /DATA,  target: /DATA,  bind: { propagation: rslave } }
@@ -49,6 +69,8 @@ services:
       # skills root: Go (host) seeds builtin/ here and builds the .runtime/<user>/ symlink
       # view; the container's Python list_skills/read_skill_file only scans read-only, hence read_only.
       - { type: bind, source: /var/lib/nimoos/ai/skills, target: /var/lib/nimoos/ai/skills, read_only: true }
+      - { type: bind, source: /var/lib/nimoos/ai/toolbox, target: /opt/toolbox, bind: { create_host_path: true } }
+      - { type: bind, source: /var/lib/nimoos/ai/homes, target: /var/lib/nimoos/ai/homes, bind: { create_host_path: true } }
       # NOTE: /etc/nimoos is no longer mounted (P2c). Agent config goes entirely through
       # NIMOOS_* env vars and never reads /etc/nimoos; this mount used to expose
       # ai_master.key/service config to root commands. Mount masking is hard-blocked by

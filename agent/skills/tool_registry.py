@@ -14,9 +14,11 @@ from skills.message_bus import ALL_TOOLS as MESSAGEBUS_TOOLS
 from skills.filesystem import ALL_TOOLS as FS_TOOLS
 from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
+from skills.toolbox_admin import ALL_TOOLS as TOOLBOX_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills import WIKI_TOOLS
 from skills.notes import NOTES_TOOLS
+from skills.web import WEB_TOOLS
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "run_command", "read_file", "list_dir",
@@ -47,7 +49,9 @@ CATEGORY_TOOLS: dict[str, list] = {
     "system": _SYSTEM,                     # 5
     "events": list(MESSAGEBUS_TOOLS),      # 3
     "notes": list(NOTES_TOOLS),
+    "web": list(WEB_TOOLS),                # 2
     "mcp": list(MCP_ADMIN_TOOLS),          # 1 (+ dynamic runtime MCP tools)
+    "toolbox": list(TOOLBOX_TOOLS),         # 1
 }
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -59,7 +63,9 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "system": "service/port health, system logs, disks and mounts",
     "events": "message-bus event types, action types, trigger actions",
     "notes": "knowledge notes: save/update/consult long-term conclusions and summaries (writes require user confirmation)",
+    "web": "search the public web and fetch web pages (needs a configured search provider)",
     "mcp": "register and use tools from connected MCP servers",
+    "toolbox": "Install/manage persistent CLI components (toolbox)",
 }
 
 # tool name → category name (returns None for always-on/unknown)
