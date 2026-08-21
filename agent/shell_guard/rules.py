@@ -21,6 +21,10 @@ _SAFE_CMDS = {
 # git subcommands that are read-only
 _SAFE_GIT_SUB = {"status", "log", "diff", "show"}
 
+# Write-redirect targets that are sinks, not files: redirecting into them
+# neither persists data nor damages a device.
+_HARMLESS_DEVS = ("/dev/null", "/dev/stdout", "/dev/stderr")
+
 # ── DANGEROUS verb/flag patterns ──────────────────────────────────────────────
 _SHELL_CMDS = {"sh", "bash", "zsh", "dash"}
 _DISK_CMDS = {"dd", "mkfs", "wipefs", "fdisk", "parted", "sgdisk", "shred"}
@@ -149,20 +153,80 @@ def _is_dangerous_seg(seg: Segment, all_segs: list[Segment], idx: int) -> str | 
     # fork bomb heuristic
     if ":(){" in "".join(seg.argv):
         return "fork bomb pattern"
-    # redirect to a device node
+    # redirect to a device node. /dev/null (and the std streams, which are
+    # pipe-equivalent) is exempt: `2>/dev/null` is everyday noise-silencing,
+    # and flagging it DANGEROUS produced pure false alarms (`ls 2>/dev/null`
+    # was a confirmation card before 2026-08-21).
     for tgt in seg.redirect_targets:
-        if tgt.startswith("/dev/"):
+        if tgt.startswith("/dev/") and tgt not in _HARMLESS_DEVS:
             return f"redirect to device: {tgt}"
     return None
 
 
 # ── PROTECTED path prefixes ───────────────────────────────────────────────────
-_PROTECTED_PREFIXES = (
-    "/etc", "/boot", "/usr", "/var/lib/nimoos", "/opt/nimoos",
+# Two classes, one behavioral split (2026-08-21, user-requested read/write
+# distinction):
+#
+# * SECRET paths — the harm is READING them (confidentiality): credential
+#   files, key material, the agent's own database (MCP tokens, channel
+#   credentials), /etc (shadow, ssl private keys, service configs) and
+#   /var/lib/nimoos (service databases: user.db password hashes, JWT state).
+#   Any access, read or write, stays PROTECTED.
+# * INTEGRITY paths — the harm is WRITING them: system/application code that
+#   is world-readable anyway (/usr, /boot, /opt/nimoos). A read-only trusted
+#   command touching them downgrades to GRAY (see _classify_seg) — never
+#   SAFE, so the touch still lands in the audit trail and still meets the
+#   judge/card under a strict policy.
+_SECRET_PREFIXES = (
+    "/etc", "/var/lib/nimoos",
 )
+_INTEGRITY_PREFIXES = (
+    "/boot", "/usr", "/opt/nimoos",
+)
+_PROTECTED_PREFIXES = _SECRET_PREFIXES + _INTEGRITY_PREFIXES
 _PROTECTED_SUFFIXES = (".key", ".pem")
 _PROTECTED_SUBSTR = ("/.ssh/", "agent.db")
 _DATA_ROOT = "/DATA"
+
+# Commands whose normal operation only READS its path operands. Deliberately
+# a hand-picked list, not "everything that seems harmless": each entry must
+# not be able to modify or execute its operands through ordinary argv usage.
+# Interpreters, editors, and copy/移动 verbs never belong here. sed and find
+# are conditional — see _seg_reads_only.
+_READONLY_CMDS = _SAFE_CMDS | {
+    "less", "more", "strings", "od", "xxd", "hexdump", "diff", "cmp",
+    "sort", "uniq", "cut", "tr", "nl", "tac", "readlink", "rg", "jq",
+    "column", "find", "sed",
+}
+
+# find operands that make it write/execute instead of just walking.
+_FIND_MUTATING = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+
+
+def _seg_reads_only(eff: Segment) -> bool:
+    """True if this (effective) segment can only READ its path operands.
+
+    Fail toward False: anything not positively known read-only keeps the
+    stricter classification.
+    """
+    if not eff.argv:
+        return False
+    name = _cmd_name(eff)
+    if name not in _READONLY_CMDS or not _is_trusted_argv0(eff.argv[0]):
+        return False
+    if name == "sed":
+        # -i / --in-place edits the file; every other common sed flag (-n, -e,
+        # -E, -r, -s, -z, -u) is read-side. A combined bundle like -ni still
+        # carries the i, so scan flag tokens for it.
+        for a in eff.argv[1:]:
+            if a == "--in-place" or a.startswith("--in-place="):
+                return False
+            if a.startswith("-") and not a.startswith("--") and "i" in a[1:]:
+                return False
+    if name == "find":
+        if any(a in _FIND_MUTATING or a.startswith("-fprint") for a in eff.argv[1:]):
+            return False
+    return True
 
 
 def _resolve(p: str, cwd: str | None = None) -> str:
@@ -186,6 +250,17 @@ def _is_protected_path(raw: str, cwd: str | None = None) -> bool:
     if any(s in rp for s in _PROTECTED_SUBSTR):
         return True
     return False
+
+
+def _is_secret_path(raw: str, cwd: str | None = None) -> bool:
+    """Confidentiality-class protected path: READING it is already the harm,
+    so no read-only downgrade ever applies (agent.db, keys, /etc, ...)."""
+    rp = _resolve(raw, cwd)
+    if any(rp == pre or rp.startswith(pre + "/") for pre in _SECRET_PREFIXES):
+        return True
+    if rp.endswith(_PROTECTED_SUFFIXES):
+        return True
+    return any(s in rp for s in _PROTECTED_SUBSTR)
 
 
 def _is_data_mass(raw: str, cwd: str | None = None) -> bool:
@@ -226,12 +301,26 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int,
     name = _cmd_name(eff)
     paths = extract_paths(eff)
 
-    # sensitive prefixes/suffixes: reading OR writing always escalates
+    danger = _is_dangerous_seg(eff, all_segs, idx)
+
     sensitive = [p for p in paths if _is_protected_path(p, cwd)]
     if sensitive:
-        return Decision("protected", f"touches protected path(s): {sensitive}", sensitive)
-
-    danger = _is_dangerous_seg(eff, all_segs, idx)
+        # Read/write split (2026-08-21): only INTEGRITY-class paths touched by
+        # a positively read-only trusted command downgrade. Anything else —
+        # a secret-class path (reading is the harm), a redirect INTO any
+        # protected path (a write, whatever the verb), a dangerous pattern,
+        # or a command we can't prove read-only — stays PROTECTED.
+        secret = [p for p in sensitive if _is_secret_path(p, cwd)]
+        redirected = [t for t in seg.redirect_targets
+                      if _is_protected_path(t, cwd)]
+        if secret or redirected or danger or not _seg_reads_only(eff):
+            return Decision("protected",
+                            f"touches protected path(s): {sensitive}", sensitive)
+        # GRAY, never SAFE: the touch stays in the audit trail and, under a
+        # strict policy, still meets the judge/confirmation card.
+        return Decision("gray",
+                        f"read-only access to protected path(s): {sensitive}",
+                        sensitive)
 
     # /DATA mass op: escalate only for destructive commands (avoid over-blocking reads)
     if _is_destructive(eff):
@@ -242,7 +331,9 @@ def _classify_seg(seg: Segment, all_segs: list[Segment], idx: int,
     if danger:
         return Decision("dangerous", danger, paths)
 
-    has_write_redirect = bool(seg.redirect_targets)
+    # /dev/null-family sinks don't make a reader a writer (`ls 2>/dev/null`).
+    has_write_redirect = any(t not in _HARMLESS_DEVS
+                             for t in seg.redirect_targets)
     arg0 = eff.argv[0] if eff.argv else ""
     if name in _SAFE_CMDS and not has_write_redirect and _is_trusted_argv0(arg0):
         return Decision("safe")

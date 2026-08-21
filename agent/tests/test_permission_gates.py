@@ -130,6 +130,47 @@ def test_shell_judge_disabled_goes_straight_to_card(monkeypatch):
     assert mgr.registered and mgr.registered[0][0] == "shell_command"
 
 
+def test_shell_judge_emits_judging_and_judged_events(monkeypatch):
+    """The user must SEE the judge working: `judging` starts the wait
+    indicator, `judged` ends it with the verdict."""
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup_shell(monkeypatch, mgr, sink)
+
+    async def _judge(_cmd):
+        return "allow"
+    monkeypatch.setattr(shell, "judge_command", _judge)
+    assert asyncio.run(shell._guard_command("cryptsetup status foo")) is None
+    types = [(e.get("type"), e.get("kind"), e.get("verdict")) for e in sink.events]
+    assert ("judging", "shell", None) in types
+    assert ("judged", "shell", "allow") in types
+    assert mgr.registered == []          # allow verdict → no card, no click
+
+
+def test_shell_judge_events_precede_the_card_on_ask(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    _setup_shell(monkeypatch, mgr, sink)
+
+    async def _judge(_cmd):
+        return "ask"
+    monkeypatch.setattr(shell, "judge_command", _judge)
+    asyncio.run(shell._guard_command("cryptsetup status foo"))
+    types = [e.get("type") for e in sink.events]
+    assert types.index("judging") < types.index("judged") \
+        < types.index("confirmation_required")
+
+
+def test_shell_judge_disabled_emits_no_judging_events(monkeypatch):
+    mgr, sink = _Mgr(grant=True), _Sink()
+    conn = _setup_shell(monkeypatch, mgr, sink)
+    permissions.save(conn, {"judges": {"shell": False}})
+
+    async def _boom(_cmd):
+        raise AssertionError("judge must not run")
+    monkeypatch.setattr(shell, "judge_command", _boom)
+    asyncio.run(shell._guard_command("cryptsetup status foo"))
+    assert all(e.get("type") != "judging" for e in sink.events)
+
+
 def test_shell_default_policy_unchanged(monkeypatch):
     """No policy stored → the pre-existing judge path runs."""
     mgr, sink = _Mgr(grant=True), _Sink()
