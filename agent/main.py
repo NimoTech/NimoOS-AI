@@ -14,13 +14,34 @@ from typing import AsyncGenerator
 
 _LOG = logging.getLogger("nimoos-agent")
 
+# The container starts this file with `python main.py`, so it executes as
+# `__main__`. Anything that reaches back into it by name — `tasks/runner.py`,
+# `tasks/notify.py` — does `import main`, which would otherwise execute this
+# file a SECOND time and hand out a DIFFERENT module object: a second
+# AgentRunner, a second sqlite connection, a second ConfirmManager.
+#
+# That split silently broke every scheduled task that needed the network
+# (found on 118, 2026-08-17): a task run registered its sink on
+# `main._runner._active_sinks`, while `/internal/egress-confirm` — served by
+# the app in `__main__` — looked in `__main__._runner._active_sinks`, found
+# nothing, and fail-closed. The egress-proxy then answered 403 "blocked by
+# policy" for every outbound connection an unattended run made, no matter what
+# `preauth.egress_domains` allowed. Interactive chats and channels were
+# unaffected because they never import this module by name.
+#
+# Aliasing the two names makes `import main` return this very module. Safe
+# because every `import main` in the codebase is deferred inside a function
+# (never at module import time), so nobody observes a half-initialized module.
+if __name__ == "__main__":
+    sys.modules.setdefault("main", sys.modules["__main__"])
+
 _SKILL_ID_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _MAX_SKILL_MD_BYTES = 50 * 1024
 
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import agent_md
@@ -151,6 +172,14 @@ EGRESS_PROXY_BIN    = _env_str("NIMOOS_EGRESS_PROXY_BIN",   "/usr/local/bin/egre
 EGRESS_TOFU         = _env_bool("NIMOOS_EGRESS_TOFU",       True)
 # Upload byte threshold above which egress is flagged for confirmation
 EGRESS_UPLOAD_BYTES = _env_int("NIMOOS_EGRESS_UPLOAD_BYTES", 65_536)
+# Timeout (seconds) for the egress-proxy's own -confirm-timeout, i.e. how long
+# the Go proxy's HTTP client will wait on this route before it fail-closes the
+# CONNECT (see egress-proxy/main.go's confirmClient doc for the 2026-08-16
+# incident this fixes: proxy defaulted to 5s, Python defaulted to 24h, so no
+# human could ever click the card in time). Keep EGRESS_CONFIRM_TIMEOUT a bit
+# ABOVE the 110s passed to mgr.wait() below, so Python resolves (and can log a
+# clean "timed out, denied") before the proxy's own HTTP call times out.
+EGRESS_CONFIRM_TIMEOUT = _env_int("NIMOOS_EGRESS_CONFIRM_TIMEOUT", 120)
 
 # Subprocess handles for orchestrated children (executor + proxy).
 # Populated by the startup handler; used by the shutdown handler.
@@ -306,6 +335,36 @@ async def _notes_distill_scanner_startup():
     notes_distill_scan.start_scanner(_db())
 
 
+# Kept alive for the process's lifetime: an asyncio.Task with no strong
+# reference anywhere can be garbage-collected mid-await.
+_tasks_workers = {}
+
+
+@app.on_event("startup")
+async def _tasks_runner_startup():
+    """Scheduled-task run worker.
+
+    Registered BEFORE the scheduler on purpose: start_worker() reconciles runs
+    left 'queued'/'running' by the previous process (marking them failed, never
+    replaying them), and doing that after the scheduler's first tick would
+    kill runs it had just legitimately enqueued.
+    """
+    try:
+        from tasks import runner as tasks_runner
+        _tasks_workers["runner"] = tasks_runner.start_worker(_db())
+    except Exception:
+        _LOG.exception("tasks runner startup failed; scheduled tasks will not run")
+
+
+@app.on_event("startup")
+async def _tasks_scheduler_startup():
+    try:
+        from tasks import scheduler as tasks_scheduler
+        _tasks_workers["scheduler"] = tasks_scheduler.start_worker(_db())
+    except Exception:
+        _LOG.exception("tasks scheduler startup failed; scheduled tasks will not fire")
+
+
 _channel_manager = None
 
 
@@ -427,13 +486,22 @@ async def channel_instance_create(
         x_user_id: str = Header(..., alias="X-User-Id")):
     from channels import store as channel_store
     from channels.manager import ADAPTERS
-    if body.channel_type not in ADAPTERS:
+    adapter_cls = ADAPTERS.get(body.channel_type)
+    # This endpoint creates an instance out of a bot token, so it only accepts
+    # adapters that can vet one. Membership in ADAPTERS is NOT the right gate:
+    # ADAPTERS is the manager's runtime registry, and "lark" lives there so the
+    # manager can run the instance even though its credentials come from
+    # lark-cli, not from a token — it is created through /agent/channels/lark.
+    # Gating on the capability (rather than on the string "lark") means the
+    # next credential-less adapter is rejected with a 422 here instead of
+    # 500-ing on a missing `validate_token` attribute.
+    if adapter_cls is None or not hasattr(adapter_cls, "validate_token"):
         raise HTTPException(status_code=422, detail="unsupported channel_type")
     config = dict(body.config)
     token = (config.get("bot_token") or "").strip()
     if not token:
         raise HTTPException(status_code=422, detail="bot_token required")
-    info = await ADAPTERS[body.channel_type].validate_token(token)
+    info = await adapter_cls.validate_token(token)
     if info is None:
         raise HTTPException(status_code=422, detail="bot token rejected")
     config["bot_token"] = token
@@ -465,6 +533,11 @@ async def channel_pairable_instances(
     out = []
     for r in channel_store.list_instances(_conn):
         if not r["enabled"]:
+            continue
+        if r["channel_type"] == "lark":
+            # No inbound path ever redeems a pairing code against Lark: this
+            # milestone consumes only card clicks, never messages. Offering
+            # it here would advertise a pairing flow that can never complete.
             continue
         cfg = json.loads(r["config_json"])
         item = {"id": r["id"], "channel_type": r["channel_type"],
@@ -568,6 +641,63 @@ async def channel_binding_download_dir(
     return {"ok": True}
 
 
+def _lark_buttons_ready(instance_id: str) -> bool:
+    """Runtime truth for the settings page: is the click consumer up?"""
+    mgr = globals().get("_channel_manager")
+    if mgr is None or not instance_id:
+        return False
+    entry = (getattr(mgr, "_running", None) or {}).get(instance_id)
+    if entry is None:
+        return False
+    return bool(getattr(entry[0], "buttons_available", False))
+
+
+async def _reload_channels() -> None:
+    """Apply an instance change to the running adapters. Never fatal."""
+    mgr = globals().get("_channel_manager")
+    if mgr is None:
+        return
+    try:
+        await mgr.reload()
+    except Exception:
+        _LOG.exception("lark channel: manager reload failed")
+
+
+@app.get("/agent/channels/lark")
+async def lark_channel_status(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    st = lark_setup.status(_db(), x_user_id)
+    st["buttons_ready"] = _lark_buttons_ready(st.get("instance_id") or "")
+    return st
+
+
+@app.post("/agent/channels/lark")
+async def lark_channel_enable(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    try:
+        await lark_setup.enable(_db(), x_user_id, now_ms=int(time.time() * 1000))
+    except lark_setup.LarkSetupError:
+        # Not a 500: "lark-cli is not installed or not logged in" is the
+        # DEFAULT state of a fresh box and the first thing the settings page
+        # asks about. (The same 409 also covers a CLI that IS logged in but
+        # only holds the bot identity — resolve_bot_identity cannot tell the
+        # two apart without a Task 3 change, so the user-facing string names
+        # both possibilities; see channelsLarkEnableFailed.)
+        raise HTTPException(409, "lark_unavailable")
+    await _reload_channels()
+    st = lark_setup.status(_db(), x_user_id)
+    st["buttons_ready"] = _lark_buttons_ready(st.get("instance_id") or "")
+    return st
+
+
+@app.delete("/agent/channels/lark", status_code=204)
+async def lark_channel_disable(x_user_id: str = Header(..., alias="X-User-Id")):
+    from channels import lark_setup
+    lark_setup.disable(_db(), x_user_id)
+    await _reload_channels()
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # Startup orchestration helpers (netns + egress-proxy + executor)
 # ---------------------------------------------------------------------------
@@ -578,6 +708,7 @@ def _build_proxy_argv(
     dns: str = "169.254.7.1:53",
     confirm_url: str = "http://127.0.0.1:8282/internal/egress-confirm",
     grant_listen: str = "127.0.0.1:8889",
+    confirm_timeout: int = EGRESS_CONFIRM_TIMEOUT,
 ) -> list[str]:
     """Return the argv list for starting the egress-proxy.
 
@@ -588,6 +719,13 @@ def _build_proxy_argv(
     inspection allow-listing) but main.py does not call it in this phase — there
     is no content judge, so the grant channel has no caller.  Proxy grant support
     is wired at the process level; P1 will add the judge that calls it.
+
+    `confirm_timeout` defaults to EGRESS_CONFIRM_TIMEOUT (env-overridable via
+    NIMOOS_EGRESS_CONFIRM_TIMEOUT, default 120s) and is passed through as the
+    proxy's `-confirm-timeout` flag — see egress-proxy/main.go's confirmClient
+    doc comment for why this must give a human real time to answer a
+    confirmation card, and must stay a bit above the 110s the egress_confirm
+    route below passes to ConfirmManager.wait().
     """
     return [
         proxy_bin,
@@ -595,6 +733,7 @@ def _build_proxy_argv(
         "-dns", dns,
         "-confirm-url", confirm_url,
         "-grant-listen", grant_listen,
+        "-confirm-timeout", f"{confirm_timeout}s",
     ]
 
 
@@ -765,6 +904,12 @@ async def _egress_shutdown():
 # Internal egress-confirm callback (called by egress-proxy, not by users)
 # ---------------------------------------------------------------------------
 
+# The proxy's reason code for "first connection to a host nobody has confirmed
+# yet" — the domain gate. Its sibling, "upload_over_threshold", is the upload
+# DLP gate; see egress_confirm for why only the former can be auto-approved.
+TOFU_UNKNOWN_HOST_REASON = "tofu_unknown_host"
+
+
 class _EgressConfirmRequest(BaseModel):
     host: str
     bytes: int = 0
@@ -786,6 +931,38 @@ async def egress_confirm(req: _EgressConfirmRequest):
     Fail-closed: any condition that prevents us from finding an active session
     or registering a confirmation returns {"allow": false}.
     """
+    # A configured search backend must not raise a card on every TOFU miss:
+    # the TTL is an hour, so an interactive user would be asked all day for a
+    # host an administrator already chose. Checked BEFORE the session lookup
+    # so an unattended run gets the same answer as an interactive one.
+    #
+    # Scoped to reason == "tofu_unknown_host" ON PURPOSE. The proxy calls this
+    # one endpoint for two different controls, and the design authorises the
+    # exemption for the domain gate only:
+    #   * "tofu_unknown_host"     — first connection to an unknown host
+    #   * "upload_over_threshold" — this connection pushed >64 KB outward
+    # The second is the DLP control. Matching on host alone would silently
+    # remove the upload confirmation for the configured provider — an injected
+    # page could then have the agent call web_search with a local file's
+    # contents as the query and exfiltrate it with no card raised — and the
+    # proxy would additionally register a byte grant for later connections.
+    #
+    # This is not a gate bypass primitive: the sandbox can POST here (the
+    # proxy's internal-target branch reaches container loopback), but the
+    # response only carries a verdict — markConfirmed happens inside the Go
+    # proxy after it receives `true`, so there is no state here to write.
+    try:
+        from web import settings as _web_settings  # noqa: PLC0415
+        _preapproved = _web_settings.preapproved_hosts(
+            _web_settings.load(_db()))
+    except Exception:  # noqa: BLE001 — a config read must never gate egress open
+        _preapproved = set()
+    if req.reason == TOFU_UNKNOWN_HOST_REASON and req.host.lower() in _preapproved:
+        from audit import audit as _audit  # noqa: PLC0415
+        _audit("egress_grant", host=req.host, bytes=req.bytes,
+               reason=req.reason, decision="auto_approved_search_backend")
+        return {"allow": True}
+
     # Find an active session — P0 uses last-active heuristic
     session_id: str | None = _runner._last_active_session
     if session_id is not None and session_id not in _runner._active_sinks:
@@ -819,7 +996,14 @@ async def egress_confirm(req: _EgressConfirmRequest):
             "reason": req.reason,
             "description": description,
         })
-        granted = await _confirm_mgr.wait(cid)
+        # 110s, NOT the ConfirmManager 24h default: this call is answering a
+        # synchronous HTTP POST from the Go egress-proxy, which itself gives up
+        # after -confirm-timeout (default 120s — see EGRESS_CONFIRM_TIMEOUT /
+        # egress-proxy/main.go's confirmClient doc for the incident this fixes).
+        # 110 < 120 so THIS wait times out first and we can log/attribute a
+        # clean "timed out, denied" instead of the proxy just seeing its own
+        # HTTP client deadline expire with no explanation.
+        granted = await _confirm_mgr.wait(cid, timeout=110)
         from audit import audit as _audit  # noqa: PLC0415
         _audit("egress_grant", session_id=session_id, host=req.host,
                bytes=req.bytes, reason=req.reason,
@@ -1297,9 +1481,16 @@ def _session_agent_type(session_id: str) -> str:
 
 @app.get("/agent/sessions")
 async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
+    # source != 'task': every scheduled run opens its own session with a NULL
+    # title, and they sort by updated_at like any other — so a task firing
+    # every 5 minutes would push the user's real conversations off the top of
+    # the chat list. Task sessions are reachable through the run history,
+    # which is where they belong. `source` is NOT NULL DEFAULT 'web', so the
+    # comparison never drops a legacy row to a NULL result.
     rows = _db().execute(
         "SELECT id, title, created_at, updated_at, agent_type "
-        "FROM sessions WHERE user_id=? ORDER BY updated_at DESC",
+        "FROM sessions WHERE user_id=? AND source != 'task' "
+        "ORDER BY updated_at DESC",
         (x_user_id,)
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1307,22 +1498,14 @@ async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
 
 @app.delete("/agent/sessions/{session_id}")
 async def delete_session(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
-    # Best-effort vector cleanup BEFORE dropping rows: a deleted session must
-    # not stay recallable. Soft-fail — deletion never depends on Parser being
-    # online; a missed cleanup only leaves orphan vectors (logged).
-    try:
-        import recall_index
-        await asyncio.wait_for(
-            recall_index._get_parser_client().agent_memory_delete(
-                x_user_id, session_id),
-            timeout=10)
-    except Exception as e:
-        _LOG.warning("agent-memory vector cleanup failed for %s: %s",
-                     session_id, e)
-    _conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
-    _conn.execute("DELETE FROM sessions WHERE id=? AND user_id=?", (session_id, x_user_id))
-    _conn.commit()
-    shutil.rmtree(os.path.join(_snapshots_root, session_id), ignore_errors=True)
+    # Every step (vector cleanup, the child tables that have no FK cascade,
+    # the snapshot dir) lives in session_purge, shared with the scheduled-task
+    # runner's prune path — see that module for why the order is fixed. This
+    # handler used to carry its own copy, which cleared neither `agent_runs`
+    # nor `event_log`.
+    import session_purge
+    await session_purge.purge_session(_conn, x_user_id, session_id,
+                                      snapshots_root=_snapshots_root)
     return {"ok": True}
 
 
@@ -2072,7 +2255,10 @@ def _start_run(session_id: str, user_id: str, message: str,
                auth_header: str = "",
                user_lang: str = "",
                mcp_servers: "list | ConfigUnavailable | RuntimePayload | None" = None,
-               channel_send_file=None) -> RunSink:
+               channel_send_file=None,
+               pre_confirmed_tools: "set[str] | None" = None,
+               run_shell_allowlist: "list | None" = None,
+               run_scripts: "list | None" = None) -> RunSink:
     """Allocate a run row + sink and spawn the detached agent task. Returns
     the sink so the caller can immediately subscribe."""
     run_id = str(uuid.uuid4())
@@ -2108,6 +2294,11 @@ def _start_run(session_id: str, user_id: str, message: str,
                 user_lang=user_lang,
                 mcp_servers=mcp_servers,
                 channel_send_file=channel_send_file,
+                # Run-scoped pre-authorization (scheduled tasks); None for
+                # every interactive path, which keeps the gates unchanged.
+                pre_confirmed_tools=pre_confirmed_tools,
+                run_shell_allowlist=run_shell_allowlist,
+                run_scripts=run_scripts,
             )
         except asyncio.CancelledError:
             # User clicked stop, or session was cancelled. Surface a clean
@@ -2487,6 +2678,695 @@ async def shell_allowlist_delete(
     from shell_guard import allowlist as _al
     import db as _db
     return {"ok": _al.delete(_db.get_connection(), entry_id)}
+
+
+_TOOLBOX_JOBS: dict[str, "asyncio.Task"] = {}
+
+
+@app.get("/agent/toolbox")
+async def toolbox_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    return {"components": installer.list_components(_db.get_connection())}
+
+
+@app.post("/agent/toolbox/install")
+async def toolbox_install(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    try:
+        body = await request.json()
+        cid = str(body["id"])
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    try:
+        installer._catalog_by_id(cid)
+    except installer.InstallError:
+        raise HTTPException(404, "unknown_component")
+    job = _TOOLBOX_JOBS.get(cid)
+    if job and not job.done():
+        raise HTTPException(409, "already_installing")
+
+    async def _job():
+        try:
+            await installer.install(_db.get_connection(), cid)
+        except Exception:
+            _LOG.exception("toolbox install failed: %s", cid)
+
+    _TOOLBOX_JOBS[cid] = asyncio.create_task(_job())
+    return JSONResponse({"status": "installing"}, status_code=202)
+
+
+@app.post("/agent/toolbox/uninstall")
+async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    try:
+        body = await request.json()
+        cid = str(body["id"])
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    try:
+        installer.uninstall(_db.get_connection(), cid)
+    except installer.InstallError:
+        raise HTTPException(404, "unknown_component")
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Scheduled tasks (M2)
+#
+# Everything below is scoped by X-User-Id. A task that belongs to somebody
+# else must look *absent*, not forbidden: `store.get_task` filters on
+# (id, user_id) and a miss is always 404, so this API cannot be used to probe
+# for other users' task ids. The store's run-level helpers (set_next_run /
+# claim_run / finish_run / list_runs) take no user_id at all — every handler
+# here therefore establishes ownership through `get_task` FIRST and only then
+# touches runs.
+# ---------------------------------------------------------------------------
+
+_TASK_TRIGGERS = ("cron", "interval", "webhook_only")
+_TASK_ENUMS = {
+    "overlap_policy": ("skip", "queue"),
+    "catchup_policy": ("skip", "run_once"),
+    "notify_policy": ("failure", "always", "never"),
+}
+# The scheduler ticks every 15s and a run can outlive its period, so anything
+# under a minute is a foot-gun rather than a feature. The store does not
+# enforce it (it takes whatever it is given); this is the only gate.
+_MIN_INTERVAL_SECONDS = 60
+_MAX_TURNS_RANGE = (1, 100)
+_TIMEOUT_RANGE = (60, 7200)
+_RUNS_LIMIT_RANGE = (1, 200)
+
+# `fs_write` is the one preauth field that can authorize everything in a single
+# string: `tasks/driver.fs_allowed` realpaths the entry and prefix-matches, so
+# "/" pre-approves every write an unattended run could ever request (verified:
+# `fs_allowed("/etc/shadow", ["/"])` is True), and `grants.grant_fs` would then
+# register that root as a visible resource. A system root is the same problem
+# one level down — it hands an unattended run the agent's own code and
+# database, /etc, and the service units that start them. Both are refused at
+# the edge with `bad_fs_write` rather than trimmed silently, so the author
+# finds out their document was not accepted.
+#
+# The deny list itself lives in `tasks/driver.py` (single source of truth) and
+# is re-applied there at run time, because this check can only judge the string
+# as it is today — see `driver.fs_root_denied`.
+def _check_fs_write(paths) -> None:
+    """Reject `/`, system roots and non-absolute entries in `fs_write`."""
+    from tasks.driver import fs_root_denied
+    for raw in paths or []:
+        path = (raw or "").strip()
+        # Relative paths would be resolved against whatever CWD the run
+        # happens to have — never what the author meant.
+        if not path.startswith("/"):
+            raise HTTPException(400, "bad_fs_write")
+        # Judge the same string the gate will: it realpaths before matching,
+        # so a symlink under an innocuous name must not launder a denied root.
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            # An embedded NUL raises ValueError here (and OSError is possible
+            # on some platforms). A path that cannot be resolved cannot be
+            # judged, and an unjudgeable rule must not be stored — without
+            # this the exception escaped as a 500.
+            raise HTTPException(400, "bad_fs_write")
+        if fs_root_denied(real):
+            raise HTTPException(400, "bad_fs_write")
+
+
+def _empty_preauth_report() -> dict:
+    """A fresh copy every time — the report goes into a response body and a
+    shared module-level dict would be one mutation away from leaking between
+    requests."""
+    return {"truncated": {}, "rejected_rules": []}
+
+
+def _task_int(value, detail: str) -> int:
+    # bool is an int subclass; `True` as a timeout is a client bug, not 1.
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise HTTPException(400, detail)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(400, detail)
+
+
+def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
+    """Validate a create/update body; return (store fields, preauth report).
+
+    `existing` is None for a create (required fields enforced) and the current
+    row for an update. Schedule validity is checked against the MERGED state:
+    a PUT that only flips `trigger_type` to `interval` must be rejected when
+    the stored `interval_seconds` is still 0, or the scheduler would disable
+    the task on its next tick instead.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid_json")
+    creating = existing is None
+    out: dict = {}
+
+    for field in ("name", "prompt"):
+        if field in body:
+            value = body[field]
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(400, f"{field}_required")
+            out[field] = value.strip() if field == "name" else value
+        elif creating:
+            raise HTTPException(400, f"{field}_required")
+
+    if "trigger_type" in body:
+        if body["trigger_type"] not in _TASK_TRIGGERS:
+            raise HTTPException(400, "bad_trigger_type")
+        out["trigger_type"] = body["trigger_type"]
+    elif creating:
+        raise HTTPException(400, "bad_trigger_type")
+    trigger = out.get("trigger_type") or (existing["trigger_type"] if existing else "")
+
+    if "cron_expr" in body:
+        if not isinstance(body["cron_expr"], str):
+            raise HTTPException(400, "bad_cron")
+        out["cron_expr"] = body["cron_expr"].strip()
+    cron_expr = out.get("cron_expr", existing["cron_expr"] if existing else "")
+
+    if "interval_seconds" in body:
+        out["interval_seconds"] = _task_int(body["interval_seconds"], "bad_interval")
+        if out["interval_seconds"] < 0:
+            raise HTTPException(400, "bad_interval")
+    interval = out.get("interval_seconds",
+                       existing["interval_seconds"] if existing else 0)
+
+    if trigger == "cron":
+        from tasks import cron as _cron
+        try:
+            _cron.validate(cron_expr)
+            # `validate` only parses the fields; an expression like
+            # `0 0 30 2 *` parses fine and never fires, and `store.create_task`
+            # would raise CronError computing next_run_at -> a 500. Resolve it
+            # here so it comes back as the same 400 the user can act on.
+            _cron.next_after(cron_expr, int(time.time()))
+        except (_cron.CronError, ValueError, TypeError):
+            raise HTTPException(400, "bad_cron")
+    elif trigger == "interval" and interval < _MIN_INTERVAL_SECONDS:
+        raise HTTPException(400, "bad_interval")
+
+    if "max_turns" in body:
+        value = _task_int(body["max_turns"], "bad_max_turns")
+        if not (_MAX_TURNS_RANGE[0] <= value <= _MAX_TURNS_RANGE[1]):
+            raise HTTPException(400, "bad_max_turns")
+        out["max_turns"] = value
+
+    if "timeout_seconds" in body:
+        value = _task_int(body["timeout_seconds"], "bad_timeout")
+        if not (_TIMEOUT_RANGE[0] <= value <= _TIMEOUT_RANGE[1]):
+            raise HTTPException(400, "bad_timeout")
+        out["timeout_seconds"] = value
+
+    for field, allowed in _TASK_ENUMS.items():
+        if field in body:
+            if body[field] not in allowed:
+                raise HTTPException(400, f"bad_{field}")
+            out[field] = body[field]
+
+    for field in ("agent_type", "model", "notify_channel"):
+        if field in body:
+            if not isinstance(body[field], str):
+                raise HTTPException(400, f"bad_{field}")
+            out[field] = body[field].strip()
+
+    if "enabled" in body and not creating:
+        out["enabled"] = 1 if body["enabled"] else 0
+
+    if "notify_on_start" in body:
+        out["notify_on_start"] = 1 if body["notify_on_start"] else 0
+
+    report = _empty_preauth_report()
+    if "preauth" in body:
+        from tasks import preauth as _preauth
+        # `parse` treats a non-dict as an empty document, so a client that
+        # sends a string or a list would get a 201 and an empty report and
+        # believe its rules are live. Reject the shape instead.
+        if not isinstance(body["preauth"], dict):
+            raise HTTPException(400, "bad_preauth")
+        # parse_with_report, never parse: a rule this normalizer drops (a
+        # leftover regex shell rule) would otherwise be accepted silently and
+        # the author would believe their unattended run is pre-authorized.
+        doc, report = _preauth.parse_with_report(body["preauth"])
+        _check_fs_write(doc["fs_write"])
+        out["preauth"] = doc
+    return out, report
+
+
+def _task_out(row) -> dict:
+    from tasks import preauth as _preauth
+    from tasks import workspace as _workspace
+    out = dict(row)
+    out["preauth"] = _preauth.parse(out.pop("preauth_json", "{}"))
+    out["enabled"] = bool(out.get("enabled"))
+    out["notify_on_start"] = bool(out.get("notify_on_start"))
+    # Derived, never stored: the folder is a pure function of the task id, so a
+    # persisted copy could only ever go stale or disagree. `path_for` (not
+    # `ensure`) because reading a task must not create directories — the folder
+    # appears on the first run, and the UI shows where it will be.
+    out["workspace"] = _workspace.path_for(str(out.get("id") or ""))
+    return out
+
+
+def _run_out(row) -> dict:
+    out = dict(row)
+    raw = out.get("denied_actions")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = []
+    out["denied_actions"] = raw if isinstance(raw, list) else []
+    return out
+
+
+async def _task_body(request: Request) -> dict:
+    try:
+        return await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+
+
+def _owned_task(task_id: str, user_id: str):
+    from tasks import store as _store
+    row = _store.get_task(_db(), task_id, user_id)
+    if row is None:
+        raise HTTPException(404, "not_found")
+    return row
+
+
+@app.get("/agent/tasks")
+async def tasks_list(x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    return {"tasks": [_task_out(r) for r in _store.list_tasks(_db(), x_user_id)]}
+
+
+# Registered BEFORE /agent/tasks/{task_id}: FastAPI matches routes in
+# declaration order, so a literal path added after the parameterized one would
+# be swallowed by it and answered with 404 not_found.
+@app.get("/agent/tasks/notify-targets")
+async def tasks_notify_targets(x_user_id: str = Header(..., alias="X-User-Id")):
+    """Chats this user can point `notify_channel` at.
+
+    Sourced from `channel_chats`, which is written the first time a paired
+    account actually messages the bot — a just-paired channel legitimately
+    does not show up here yet.
+    """
+    from channels import store as channel_store
+    return {"targets": channel_store.list_chats_for_user(_db(), x_user_id)}
+
+
+# Registered BEFORE /agent/tasks/{task_id} for the same reason
+# notify-targets is: FastAPI matches in definition order, so a later
+# static path would be swallowed by the {task_id} parameter route.
+@app.post("/agent/tasks/draft-from-session")
+async def tasks_draft_from_session(
+    request: Request,
+    x_user_id: str = Header(..., alias="X-User-Id"),
+    x_agent_provider_key: str = Header("", alias="X-Agent-Provider-Key"),
+    x_agent_provider_url: str = Header("", alias="X-Agent-Provider-Url"),
+    x_agent_mcp_ticket: str = Header("", alias="X-Agent-MCP-Ticket"),
+):
+    """Turn one chat session into a scheduled-task draft.
+
+    READ-ONLY on purpose: it produces a *suggestion*, and the authorization
+    it suggests only becomes real when the user saves it through the normal
+    POST /agent/tasks path, where preauth.parse and _check_fs_write apply.
+    That is why the M5 red line (agent-created tasks must be disabled with an
+    empty preauth) does not apply here — see spec §6 and §13.
+    """
+    from tasks import draft as _draft
+
+    body = await _task_body(request)
+    if not isinstance(body, dict):
+        raise HTTPException(400, "bad_body")
+    session_id = (body.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(400, "bad_session_id")
+
+    conn = _db()
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE id=? AND user_id=?",
+        (session_id, x_user_id),
+    ).fetchone()
+    # Absent, not forbidden — same rule as the rest of this section: the API
+    # must not confirm that somebody else's session id exists.
+    if not row:
+        raise HTTPException(404, "session not found")
+
+    last = conn.execute(
+        "SELECT content FROM messages WHERE session_id=? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    history = []
+    if last:
+        try:
+            history = json.loads(last["content"]) or []
+        except (json.JSONDecodeError, TypeError):
+            history = []
+    if not isinstance(history, list):
+        history = []
+
+    # slug → server id. Without a ticket (or with an unusable config) the map
+    # is simply empty and every MCP call lands in evidence["dropped"]: a
+    # missing suggestion, never a wrong one.
+    mcp_id_by_slug = {}
+    if x_agent_mcp_ticket:
+        try:
+            from mcp_client.runtime import fetch_mcp_servers
+            from mcp_client.client import _slug
+            servers = await fetch_mcp_servers(x_agent_mcp_ticket)
+            if isinstance(servers, list):
+                for s in servers:
+                    if not isinstance(s, dict) or not s.get("id") or not s.get("name"):
+                        continue
+                    try:
+                        mcp_id_by_slug[_slug(s["name"])] = str(s["id"])
+                    except Exception:
+                        # 一条畸形条目不该让其余服务器的建议一起消失
+                        continue
+        except Exception:
+            _LOG.exception("draft-from-session: MCP server list unavailable; "
+                           "MCP tools will not be suggested")
+
+    scanned = _draft.scan_history(history, mcp_id_by_slug=mcp_id_by_slug)
+
+    name = _draft.fallback_name(history)
+    prompt = _draft.fallback_prompt(history)
+    fallback = True
+
+    model = (body.get("model") or "").strip()
+    if model and history:
+        try:
+            # `history` is untrusted JSON out of the DB and
+            # extract_history_excerpt assumes every item is a dict, so it
+            # belongs INSIDE the guard: a malformed history must degrade to
+            # the fallback draft, never to a 500.
+            excerpt = title_gen.extract_history_excerpt(history)
+            if excerpt:
+                client = AsyncOpenAI(base_url=x_agent_provider_url,
+                                     api_key=x_agent_provider_key)
+                resp = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": _draft.DRAFT_SYSTEM_PROMPT},
+                            {"role": "user", "content": excerpt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=1024,
+                    ),
+                    timeout=30.0,
+                )
+                raw = ""
+                if resp.choices:
+                    msg = resp.choices[0].message
+                    raw = (getattr(msg, "content", None)
+                           or getattr(msg, "reasoning_content", None) or "")
+                parsed = _draft.parse_llm_draft(raw)
+                if parsed:
+                    name, prompt = parsed
+                    fallback = False
+        except (asyncio.TimeoutError, Exception):
+            # Never fail the request over the model: a fallback draft the
+            # user edits by hand still beats an error dialog.
+            _LOG.exception("draft-from-session: model unavailable; "
+                           "falling back to raw user messages")
+
+    return {
+        "name": name,
+        "prompt": prompt,
+        "preauth": scanned["preauth"],
+        "suggested_egress": scanned["suggested_egress"],
+        "evidence": scanned["evidence"],
+        "prompt_fallback": fallback,
+    }
+
+
+@app.post("/agent/tasks", status_code=201)
+async def tasks_create(request: Request,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    fields, report = _task_payload(await _task_body(request))
+    task_id = _store.create_task(_db(), x_user_id, **fields)
+    return {"id": task_id, "preauth_report": report}
+
+
+@app.get("/agent/tasks/{task_id}")
+async def tasks_get(task_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    return _task_out(_owned_task(task_id, x_user_id))
+
+
+@app.put("/agent/tasks/{task_id}")
+async def tasks_update(task_id: str, request: Request,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    existing = _owned_task(task_id, x_user_id)
+    fields, report = _task_payload(await _task_body(request), existing)
+    _store.update_task(_db(), task_id, x_user_id, **fields)
+    return {"status": "ok", "preauth_report": report}
+
+
+@app.delete("/agent/tasks/{task_id}", status_code=204)
+async def tasks_delete(task_id: str,
+                       x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    # Awaited: delete_task also reclaims the task's runs and the sessions they
+    # own (see its docstring — without that, deleting a task orphans every row
+    # it ever produced, with nothing left pointing at them).
+    if not await _store.delete_task(_db(), task_id, x_user_id):
+        raise HTTPException(404, "not_found")
+    return Response(status_code=204)
+
+
+@app.post("/agent/tasks/{task_id}/run", status_code=202)
+async def tasks_run_now(task_id: str,
+                        x_user_id: str = Header(..., alias="X-User-Id")):
+    """Queue one run immediately. The runner worker picks it up on its own.
+
+    Allowed on a disabled task on purpose: "run it now" is how a user tests a
+    task before switching the schedule on. overlap_policy is not consulted
+    either — an explicit human request outranks it.
+    """
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    run_id = _store.create_run(_db(), task_id, x_user_id, "manual")
+    return JSONResponse({"run_id": run_id}, status_code=202)
+
+
+@app.post("/agent/tasks/{task_id}/webhook-token/reset")
+async def tasks_reset_webhook_token(task_id: str,
+                                    x_user_id: str = Header(..., alias="X-User-Id")):
+    """Issue a fresh webhook token, invalidating the old one immediately."""
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    token = _store.reset_webhook_token(_db(), task_id, x_user_id)
+    if not token:
+        raise HTTPException(404, "not_found")
+    return {"webhook_token": token}
+
+
+# The webhook trigger. This is the ONE agent endpoint with no JWT: the Go layer
+# skips authentication for its route and strips every identity header, so the
+# task's own token is the entire credential and the owner comes from the task
+# row — never from the request.
+#
+# Deliberately NOT under /agent/tasks/: that whole subtree is admin-scoped
+# (route/v2/admin_guard.go), which would demand an admin JWT and defeat the
+# point. A sibling path needs no exception carved into the admin gate.
+#
+# The request body is not read at all. Phase one accepts no parameters (spec
+# §9): anything a caller could inject would reach the model as instructions.
+@app.post("/agent/task-webhook/{token}")
+async def task_webhook_trigger(token: str):
+    from tasks import store as _store
+    from tasks.webhook import RATE_LIMITER
+
+    task = _store.get_task_by_webhook_token(_db(), token)
+    # Unknown token is absent, not forbidden — the same rule the rest of this
+    # API follows, and here it also avoids confirming that a token was close.
+    if task is None:
+        raise HTTPException(404, "not_found")
+    # `run now` works on a disabled task on purpose (that is how a human tests
+    # one). A webhook fires unattended, so disabled has to mean disabled.
+    if not task["enabled"]:
+        raise HTTPException(409, "task_disabled")
+    if not RATE_LIMITER.allow(task["id"]):
+        raise HTTPException(429, "rate_limited")
+
+    run_id = _store.create_run(_db(), task["id"], task["user_id"], "webhook")
+    return JSONResponse({"run_id": run_id}, status_code=202)
+
+
+@app.get("/agent/tasks/{task_id}/runs")
+async def tasks_runs(task_id: str, limit: int = 50,
+                     x_user_id: str = Header(..., alias="X-User-Id")):
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    limit = max(_RUNS_LIMIT_RANGE[0], min(_RUNS_LIMIT_RANGE[1], limit))
+    return {"runs": [_run_out(r)
+                     for r in _store.list_runs(_db(), task_id, limit)]}
+
+
+def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:
+    """Fold one denied action into a preauth document.
+
+    Returns `(new document, bucket, adopted entry)` — a copy, never a mutation
+    of `doc`. The vocabulary is `tasks/driver.py`'s normalized kinds; `detail`
+    is what that driver recorded — for `fs` the FIRST path that was not
+    covered, not the card's first path, so the rule generated here actually
+    changes the outcome next time.
+    """
+    kind = str(action.get("kind") or "")
+    raw_detail = str(action.get("detail") or "")
+    detail = raw_detail.strip()
+    if not detail:
+        raise HTTPException(400, "empty_detail")
+
+    out = {k: list(v) for k, v in doc.items()}
+    if kind == "egress":
+        from tasks.driver import _strip_port
+        # Bare host, no port: that is what the egress gate matches on.
+        entry, bucket = _strip_port(detail), "egress_domains"
+    elif kind == "fs":
+        # A denied file grants its directory — `fs_write` entries are roots
+        # and a bare file path would authorize nothing else in that folder.
+        entry = os.path.dirname(detail) if os.path.isfile(detail) else detail
+        bucket = "fs_write"
+        # Same gate as create/update: adopting a denial must not become the
+        # back door that puts "/" (or /etc) into a preauth document.
+        _check_fs_write([entry])
+    elif kind == "mcp_tool":
+        entry, bucket = detail, "mcp_tools"          # already "server::tool"
+    elif kind == "shell":
+        parts = detail.split()
+        # A denied `<interpreter> <absolute script>` becomes a `scripts` entry,
+        # not a prefix rule. Without this branch the button is a dead end for
+        # the whole "run my collector every morning" case: the prefix generated
+        # below would be `python3 `, which the run gate refuses outright
+        # (interpreter), so `run_allowlist_would_cover` correctly rejects it and
+        # the user sees `shell_rule_would_not_apply` with nothing to do about it
+        # — the feature would exist but be unreachable from the one place a user
+        # actually meets it.
+        # `script_run_target`, NOT `run_scripts_would_cover`: the latter answers
+        # True for every `safe` command whatever the rules, so using it as a
+        # detector read `lark-cli mail list --limit 5` as a script run and
+        # adopted `5` as the script path.
+        from skills import shell as _shell
+        _script = _shell.script_run_target(raw_detail)
+        if _script:
+            bucket, entry = "scripts", _script
+            if entry not in out[bucket]:
+                out[bucket].append(entry)
+            return out, bucket, entry
+        # `preauth.shell_match` is `command.startswith(value)` on the RAW
+        # command — deliberately not stripped there, since leading whitespace
+        # is part of what the author would have had to authorize. So the rule
+        # has to carry the same leading whitespace the denied command had, or
+        # adopting `"  rm -rf x"` would generate `"rm "`, which can never
+        # match it and leaves the button a silent no-op.
+        lead = raw_detail[:len(raw_detail) - len(raw_detail.lstrip())]
+        # Head + a space, so `git ` can never also authorize `github-cli`.
+        # A command that WAS just its head ("date") is the exception: `"date "`
+        # could never prefix-match it either, so the bare token is stored.
+        entry = {"kind": "prefix",
+                 "value": lead + parts[0] + ("" if len(parts) == 1 else " ")}
+        bucket = "shell"
+        # A head-derived prefix cannot authorize every command it came from.
+        # The run gate refuses chaining, redirection, interpreters and
+        # `protected` outright — whatever the rules say — so for those the rule
+        # written here would be inert, and the user would walk away believing
+        # the next run is authorized. Ask the gate itself rather than
+        # re-deriving its conditions, and refuse instead of writing a no-op.
+        # (`_shell` is already imported by the scripts branch above.)
+        if not _shell.run_allowlist_would_cover(raw_detail, [entry]):
+            raise HTTPException(400, "shell_rule_would_not_apply")
+    else:
+        raise HTTPException(400, "unsupported_kind")
+
+    if not entry:
+        raise HTTPException(400, "empty_detail")
+    if entry not in out[bucket]:
+        out[bucket].append(entry)
+    return out, bucket, entry
+
+
+@app.post("/agent/tasks/{task_id}/preauth/from-denied")
+async def tasks_preauth_from_denied(
+        task_id: str, request: Request,
+        x_user_id: str = Header(..., alias="X-User-Id")):
+    """Adopt one denied action from a past run into the task's preauth."""
+    from tasks import preauth as _preauth
+    from tasks import store as _store
+    task = _owned_task(task_id, x_user_id)
+    body = await _task_body(request)
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid_json")
+    run_id = str(body.get("run_id") or "")
+    index = _task_int(body.get("index", 0), "bad_index")
+
+    # Scoped on task_id AND user_id: `store.list_runs`/`finish_run` take no
+    # user_id, so ownership is established here or not at all.
+    run = _db().execute(
+        "SELECT * FROM task_runs WHERE id=? AND task_id=? AND user_id=?",
+        (run_id, task_id, x_user_id)).fetchone()
+    if run is None:
+        raise HTTPException(404, "not_found")
+    denied = _run_out(run)["denied_actions"]
+    if index < 0 or index >= len(denied) or not isinstance(denied[index], dict):
+        raise HTTPException(404, "denied_action_not_found")
+
+    doc = _preauth.parse(task["preauth_json"])
+    doc, bucket, entry = _preauth_from_denied(doc, denied[index])
+    # Re-normalize: MAX_RULES truncation applies to a grown document too.
+    doc, report = _preauth.parse_with_report(doc)
+    if entry not in doc[bucket]:
+        # The bucket was already at MAX_RULES, so normalization dropped the
+        # very rule this call was supposed to add. Writing the document back
+        # and answering 200 would tell the user their action was adopted when
+        # nothing changed; refuse instead so they know to prune first.
+        raise HTTPException(400, "preauth_full")
+    _store.update_task(_db(), task_id, x_user_id, preauth=doc)
+    return {"preauth": doc, "preauth_report": report,
+            "adopted": {"field": bucket, "value": entry}}
+
+
+def _lark_uid(x_user_id: str) -> str:
+    """Validate the user id before it is used to build a filesystem path.
+
+    `binding.user_home()` joins this onto HOMES_ROOT, so a `../` would escape
+    the per-user home (and DELETE would rmtree outside it). Rejected at the
+    edge, so nothing downstream has to trust it.
+    """
+    from lark import binding as _lark
+    if not _lark.valid_uid(x_user_id):
+        raise HTTPException(400, "invalid_user_id")
+    return x_user_id
+
+
+@app.post("/agent/lark/binding")
+async def lark_binding_start(x_user_id: str = Header(..., alias="X-User-Id")):
+    from lark import binding as _lark
+    return JSONResponse(await _lark.start(_lark_uid(x_user_id)), status_code=202)
+
+
+@app.get("/agent/lark/binding")
+async def lark_binding_status(x_user_id: str = Header(..., alias="X-User-Id")):
+    # Never 404s: a user who has never bound simply reports phase=unbound.
+    from lark import binding as _lark
+    return await _lark.status(_lark_uid(x_user_id))
+
+
+@app.delete("/agent/lark/binding", status_code=204)
+async def lark_binding_delete(x_user_id: str = Header(..., alias="X-User-Id")):
+    from lark import binding as _lark
+    await _lark.unbind(_lark_uid(x_user_id))
+    return Response(status_code=204)
 
 
 @app.post("/agent/sandbox-run")
@@ -2930,6 +3810,47 @@ async def archive_note_api(note_id: str, request: Request):
 async def note_backlinks_api(note_id: str, request: Request):
     uid = _notes_uid(request)
     return {"backlinks": notes_store.get_backlinks(_db(), uid, note_id)}
+
+
+# ---------------------------------------------------------------------------
+# Web tools settings. One global row: the box shares one search backend
+# because the owner pays for the key.
+#
+# Admin gating lives in the Go layer as an explicit per-route pair in
+# route/v2.go — `g.Any("/agent/web-settings", agent.Proxy,
+# v2.AdminOnly(runtimePath))`, registered ahead of the /agent/* wildcard,
+# same shape as /agent/notes/settings. Until that line exists this endpoint
+# is reachable by any authenticated user, so it must not ship without it.
+# ---------------------------------------------------------------------------
+from web import settings as web_settings_mod
+
+
+class WebSettingsPayload(BaseModel):
+    backend: str = ""
+    api_key: str | None = None      # None = keep whatever is stored
+    base_url: str = ""
+    enabled: bool = False
+
+
+@app.get("/agent/web-settings")
+async def get_web_settings():
+    return web_settings_mod.public_view(web_settings_mod.load(_db()))
+
+
+@app.put("/agent/web-settings")
+async def put_web_settings(body: WebSettingsPayload):
+    if body.backend and body.backend not in web_settings_mod.VALID_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {web_settings_mod.VALID_BACKENDS}")
+    conn = _db()
+    current = web_settings_mod.load(conn)
+    # The UI never receives the key, so it cannot echo one back: an omitted
+    # api_key means "unchanged", not "clear it". Sending "" clears it.
+    api_key = current["api_key"] if body.api_key is None else body.api_key
+    web_settings_mod.save(conn, backend=body.backend, api_key=api_key,
+                          base_url=body.base_url, enabled=body.enabled)
+    return web_settings_mod.public_view(web_settings_mod.load(conn))
 
 
 if __name__ == "__main__":

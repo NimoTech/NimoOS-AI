@@ -23,6 +23,11 @@ def test_select_tools_photos_ignores_attachments():
 def test_select_tools_general_unchanged(monkeypatch):
     monkeypatch.setattr(agent_module, "_fetch_attachments",
                         lambda ids, sid: [])
+    # web_search's own on/off gating (dropped when no search provider is
+    # configured) is covered separately in test_web_skills.py; pin it
+    # "available" here so this test keeps checking what it means to check —
+    # that the general profile assembles every tool in ALL_TOOLS.
+    monkeypatch.setattr(agent_module, "_web_search_available", lambda: True)
     tools = agent_module.select_tools_for_run(
         [], session_id="s1", profile=PROFILES["general"])
     names = {t.name for t in tools}
@@ -34,6 +39,7 @@ def test_select_tools_no_profile_kwarg_backward_compat(monkeypatch):
     # Existing call sites without profile= must behave exactly as before.
     monkeypatch.setattr(agent_module, "_fetch_attachments",
                         lambda ids, sid: [])
+    monkeypatch.setattr(agent_module, "_web_search_available", lambda: True)
     tools = agent_module.select_tools_for_run([], session_id="s1")
     names = {t.name for t in tools}
     expected = {t.name for t in ALL_TOOLS} | {"expand_tools"}

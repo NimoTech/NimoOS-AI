@@ -20,6 +20,7 @@ from mcp.types import INVALID_REQUEST, METHOD_NOT_FOUND
 from mcp_types.jsonrpc import MISSING_REQUIRED_CLIENT_CAPABILITY, URL_ELICITATION_REQUIRED
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
+from audit import audit as _audit
 from mcp_client.schema import sanitize_schema, flatten_result
 from mcp_client.elicitation import make_elicitation_callback
 from mcp_client.status import OK, FAILED, CONFIG_ERROR, ServerStatus
@@ -354,12 +355,29 @@ async def _ensure_confirmed(server: dict, tool_name: str, args: dict) -> bool:
     sid = server["id"]
     key = f"{sid}::{tool_name}"
     confirmed_tools = _CONFIRMED_TOOLS_VAR.get(set())
-    # A server-level approval (the "{id}::*" form documented above — see
-    # Go's PutServerLevel/EffectiveApprovals) covers every tool on that
-    # server, so it must be checked ALONGSIDE the exact-tool key, not
-    # instead of it. Checking only the exact key silently ignored a
-    # wildcard grant (phase-3 review defect ①).
-    if f"{sid}::*" in confirmed_tools or key in confirmed_tools:
+    if key in confirmed_tools:
+        return True
+    # A server-level wildcard (`{sid}::*`) covers every tool on that server,
+    # so it must be checked ALONGSIDE the exact-tool key, not instead of it
+    # (phase-3 review defect ①). It comes from two sources sharing one form:
+    # Go's server-level approvals (PutServerLevel/EffectiveApprovals) and a
+    # scheduled task's pre-authorization (agent.py unions pre_confirmed_tools
+    # in). There is deliberately no broader form — a bare "*" matches no key
+    # and vouches for nothing.
+    if f"{sid}::*" in confirmed_tools:
+        # A wildcard grant skips the card entirely, so the confirmation trail
+        # that normally records the decision does not exist — audit it here or
+        # the call leaves no trace at all (mirrors shell.py's "run-preauth").
+        try:
+            # Same per-run identity the skills use; lazy import keeps
+            # mcp_client free of a skills-package import at module load.
+            from skills.skills_registry import USER_ID_VAR  # noqa: PLC0415
+            _uid = USER_ID_VAR.get() or None
+        except Exception:  # noqa: BLE001 — auditing must never break the call
+            _uid = None
+        _audit("mcp_call", user_id=_uid, session_id=SESSION_ID_VAR.get(),
+               server=sid, tool=tool_name,
+               reason="run-preauth-wildcard", outcome="allowlisted")
         return True
     mgr = CONFIRM_MGR_VAR.get()
     queue = EVENT_QUEUE_VAR.get()

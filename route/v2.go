@@ -38,6 +38,7 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	parserClient := service.NewParserClient(runtimePath + "/parser.url")
 	searchClient := service.NewSearchClient(runtimePath + "/search.url")
 	services := v2.NewServicesStatusHandler(agent, ollamaURL, openvinoURL, parserClient, searchClient)
+	skills := v2.NewSkillsHandlerFull(svc, agentURL)
 
 	e := echo.New()
 	e.Use(echo_middleware.CORSWithConfig(echo_middleware.CORSConfig{
@@ -59,6 +60,13 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 				return true
 			}
 			if p == common.V2APIPath+"/version" {
+				return true
+			}
+			// The task webhook: credential is the task's own token, checked in
+			// Python. Keyed on the MATCHED route pattern, so an encoded or
+			// traversed spelling routes to /agent/* instead and still needs a
+			// JWT — the skip cannot be reached by spelling the URL differently.
+			if v2.IsWebhookTriggerPattern(p) {
 				return true
 			}
 			return v2.MCPDataPath(p) // /v1/ai/mcp[, /*] — token-authed in Python
@@ -92,6 +100,14 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 		},
 	}))
 
+	// Admin enforcement on the DECODED path, after the JWT middleware so an
+	// unauthenticated caller still gets 401 rather than 403. Echo routes on the
+	// ENCODED path (url.RawPath) while the agent proxy forwards the decoded
+	// one, so `/v1/ai/agent/ta%73ks` missed every AdminOnly route below, fell
+	// into the /agent/* wildcard and was served by the agent as /agent/tasks.
+	// This guard does not depend on which route matched.
+	e.Use(v2.AdminPathGuard(runtimePath, common.V2APIPath))
+
 	g := e.Group(common.V2APIPath)
 
 	middleware.RegisterVersionRoute(e, common.V2APIPath+"/version", "AI", common.AIVersion)
@@ -109,6 +125,11 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	internal.GET("/mcp/servers/:id/schemas", mcp.SchemasInternal)
 	internal.POST("/mcp/token/release", mcp.ReleaseTokenInternal)
 	internal.GET("/agent/provider-credentials", v2.ProviderCredentials(svc, runtimePath))
+	// user_id here comes from the request body, not a JWT, so LocalhostOnly
+	// alone isn't enough (see ValidInternalToken) — require the shared
+	// internal token too, same as provider-credentials.
+	internal.POST("/skills/install", skills.InstallInternal, v2.InternalTokenOnly(runtimePath))
+	internal.POST("/skills/remove", skills.RemoveInternal, v2.InternalTokenOnly(runtimePath))
 
 	// LLM inference endpoints
 	g.POST("/chat/completions", chat.ChatCompletions)
@@ -197,17 +218,21 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 
 	// Agent proxy
 	g.GET("/agent/health", agent.Health)
-	// Channel instance management is system-scoped (bot config), gate on admin
-	// role before falling through to the general agent proxy wildcard below.
-	g.Any("/agent/channels/instances", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/channels/instances/*", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Shell allowlist governs unattended command execution — admin only.
-	g.Any("/agent/shell-allowlist", agent.Proxy, v2.AdminOnly(runtimePath))
-	g.Any("/agent/shell-allowlist/*", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Notes settings moves the system-wide notes root — admin only.
-	g.Any("/agent/notes/settings", agent.Proxy, v2.AdminOnly(runtimePath))
-	// Dir-info probes candidate notes folders for the settings UI — same gate.
-	g.Any("/agent/notes/dir-info", agent.Proxy, v2.AdminOnly(runtimePath))
+	// Admin-scoped agent endpoints, registered (with their /* subtrees) BEFORE
+	// the general /agent/* wildcard below so the static segment wins. The list
+	// itself lives in v2.AdminScopedAgentPaths, which is also what the
+	// decoded-path guard installed above enforces — one list, both layers, so
+	// a new admin endpoint cannot be gated in one place and open in the other.
+	for _, p := range v2.AdminScopedAgentPaths {
+		g.Any(p, agent.Proxy, v2.AdminOnly(runtimePath))
+		g.Any(p+"/*", agent.Proxy, v2.AdminOnly(runtimePath))
+	}
+	// The task webhook trigger (M3). Registered ahead of the wildcard as its
+	// own POST route so echo's matched pattern — which is what the JWT skipper
+	// keys off — identifies it exactly. Unauthenticated by design: the task's
+	// webhook_token is the whole credential, and ProxyAnonymous strips every
+	// identity header so a caller cannot name the user whose task runs.
+	g.POST(v2.WebhookTriggerRoute, agent.ProxyAnonymous)
 	g.Any("/agent/*", func(c echo.Context) error {
 		return agent.Proxy(c)
 	})
@@ -223,7 +248,6 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.DELETE("/blacklist/:id", blacklist.Delete)
 
 	// Skill management
-	skills := v2.NewSkillsHandlerFull(svc, agentURL)
 	g.GET("/skills", skills.List)
 	g.POST("/skills", skills.Create)
 	g.GET("/skills/:id", skills.Get)

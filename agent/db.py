@@ -300,6 +300,16 @@ CREATE TABLE IF NOT EXISTS shell_allowlist (
     created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS toolbox_components (
+    id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'installed'
+        CHECK(status IN ('installing','installed','failed')),
+    error TEXT NOT NULL DEFAULT '',
+    installed_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 -- Knowledge notes (M1). Files under <notes_root>/<user_id>/ are the CONTENT
 -- authority; these rows are the METADATA authority, joined by the immutable
 -- frontmatter UUID (= notes.id). Soft-delete only: hard deletes would orphan
@@ -374,6 +384,57 @@ CREATE TABLE IF NOT EXISTS mentions (
 );
 CREATE INDEX IF NOT EXISTS idx_mentions_entity ON mentions(entity_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_note ON mentions(note_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    prompt           TEXT NOT NULL,
+    agent_type       TEXT NOT NULL DEFAULT 'general',
+    model            TEXT NOT NULL DEFAULT '',
+    trigger_type     TEXT NOT NULL CHECK(trigger_type IN ('cron','interval','webhook_only')),
+    cron_expr        TEXT NOT NULL DEFAULT '',
+    interval_seconds INTEGER NOT NULL DEFAULT 0,
+    webhook_token    TEXT NOT NULL,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    max_turns        INTEGER NOT NULL DEFAULT 25,
+    timeout_seconds  INTEGER NOT NULL DEFAULT 1800,
+    overlap_policy   TEXT NOT NULL DEFAULT 'skip' CHECK(overlap_policy IN ('skip','queue')),
+    catchup_policy   TEXT NOT NULL DEFAULT 'skip' CHECK(catchup_policy IN ('skip','run_once')),
+    preauth_json     TEXT NOT NULL DEFAULT '{}',
+    notify_policy    TEXT NOT NULL DEFAULT 'failure' CHECK(notify_policy IN ('failure','always','never')),
+    notify_channel   TEXT NOT NULL DEFAULT '',
+    notify_on_start  INTEGER NOT NULL DEFAULT 0,
+    next_run_at      INTEGER NOT NULL DEFAULT 0,
+    last_run_at      INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+    ON scheduled_tasks(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_user ON scheduled_tasks(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_tasks_webhook
+    ON scheduled_tasks(webhook_token);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    id             TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    user_id        TEXT NOT NULL,
+    session_id     TEXT NOT NULL DEFAULT '',
+    trigger        TEXT NOT NULL CHECK(trigger IN ('cron','interval','webhook','manual')),
+    status         TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','running','succeeded','failed','timeout','skipped')),
+    summary        TEXT NOT NULL DEFAULT '',
+    error          TEXT NOT NULL DEFAULT '',
+    denied_actions TEXT NOT NULL DEFAULT '[]',
+    started_at     INTEGER NOT NULL DEFAULT 0,
+    finished_at    INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_runs_claim ON task_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id, created_at DESC);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -484,6 +545,11 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
         conn.execute("ALTER TABLE notes ADD COLUMN extracted_at INTEGER")
     if "content_hash_at_extraction" not in notes_cols:
         conn.execute("ALTER TABLE notes ADD COLUMN content_hash_at_extraction TEXT")
+    # Idempotent ALTER for task databases predating the start-of-run notification.
+    st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(scheduled_tasks)")}
+    if "notify_on_start" not in st_cols:
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "notify_on_start INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

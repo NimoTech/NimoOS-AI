@@ -1,0 +1,434 @@
+"""notify — result/failure notifications for scheduled tasks (M2 task 6).
+
+`send_result` is the whole story: decide (from `notify_policy`) whether this
+run is worth telling a human about, render the text, and hand it to a paired
+channel adapter. Nothing in here may raise past `send_result` — a scheduled
+run has nobody watching, and `tasks/runner.py` calls this from its `finally`
+block specifically so a broken notification can never touch the run result
+that `store.finish_run` already committed.
+
+**`notify_channel`'s real format is `<instance_id>:<external_chat_id>`, not
+`<channel_type>:<chat_id>`.** The brief assumed the latter; the actual channel
+stack (`channels/manager.py`, `channels/store.py`) rules it out on both
+halves:
+
+* Routing needs the *instance*, not just the type. `ChannelManager` keeps one
+  running adapter per `channel_instances.id` (`self._running: instance_id ->
+  (adapter, fingerprint)`), and nothing stops two instances from sharing a
+  `channel_type` (two Telegram bots). `channel_type` alone cannot pick one.
+* The addressable unit is `external_chat_id`, not the bound user's
+  `external_user_id`. For Telegram the two happen to be equal in a private
+  chat, but Discord's `external_chat_id` is `message.channel.id` — the DM
+  channel's own snowflake, distinct from `message.author.id`
+  (`channels/discord.py:63-64`). Only `channel_chats` (keyed on
+  `instance_id, external_chat_id`) ties a chat back to a `binding_id`; that
+  row is written lazily, on the chat's first non-command message
+  (`channels/router.py`'s `_run_serialized`/`_cmd_new`), not at `/pair` time.
+
+So resolution here is: parse `<instance_id>:<external_chat_id>`, require a
+`channel_chats` row for that exact pair (implies the chat has talked to the
+bot at least once — a real precondition for Task 7/8's UI to surface, see the
+report), and require its `channel_bindings` owner to still match the task's
+`user_id` (revoked/repointed bindings must not receive someone else's task
+notifications). Only then is the paired adapter looked up and sent to.
+
+Task 7/8: build the "already paired channel" picker from `channel_chats`
+joined to `channel_bindings` for the current user (there is no ready-made
+store helper for that reverse listing yet — `list_bindings_for_user` alone
+lacks `external_chat_id`), and store the selection as `<instance_id>:<chat>`.
+"""
+from __future__ import annotations
+
+import json
+import logging
+
+logger = logging.getLogger("nimoos-agent.tasks")
+
+# The formatter's own ceiling, kept only as a runaway guard. It used to be
+# `_SUMMARY_MAX_CHARS = 800`, a hard slice with no ellipsis, and that number was
+# OURS rather than any channel's — Feishu accepts far more. Every real report
+# (a daily digest of eight items, a log tail, a migration summary) is thousands
+# of characters, so the notification simply stopped mid-sentence with nothing
+# saying it had been cut. Splitting to fit the channel is now `split_message`'s
+# job; this only stops a runaway run from pushing a megabyte into a chat.
+SUMMARY_MAX_CHARS = 20_000
+
+# Per-channel hard caps. Telegram and Discord REJECT an over-long send outright
+# (it is not truncated for us), so these are correctness limits, not taste.
+# Lark's real ceiling is much higher; 10k keeps a comfortable margin under it
+# while still fitting any digest we have seen.
+_CHANNEL_LIMITS = {
+    "telegram": 4096,
+    "discord": 2000,
+    "lark": 10_000,
+}
+
+# What an unknown channel gets. Deliberately the SMALLEST known cap, not the
+# largest: a newly added adapter that nobody remembered to list here must fail
+# by sending too little, never by having its sends rejected.
+_FALLBACK_LIMIT = min(_CHANNEL_LIMITS.values())
+
+TRUNCATION_NOTE = "\n\n[输出过长，已截断]"
+
+# Bound on how many chat messages one notification may become. A 40-part
+# notification is indistinguishable from spam, and the reader stops reading long
+# before part 12.
+DEFAULT_MAX_PARTS = 4
+
+
+def channel_limit(channel_type: str) -> int:
+    """Max characters one message may carry on `channel_type`."""
+    return _CHANNEL_LIMITS.get(str(channel_type or "").strip().lower(),
+                               _FALLBACK_LIMIT)
+
+
+def split_message(text: str, limit: int,
+                  max_parts: int = DEFAULT_MAX_PARTS) -> list:
+    """Split `text` into at most `max_parts` chunks of at most `limit` chars.
+
+    Splits on line boundaries where it can: a report is a list of entries, and
+    cutting mid-line makes it unreadable. A single line longer than `limit` is
+    hard-split rather than emitted over-limit — an over-limit part would be
+    rejected by Telegram/Discord outright.
+
+    If the text does not fit in `max_parts`, the last part ends with
+    :data:`TRUNCATION_NOTE`. That note is the point: a digest that silently
+    loses its tail leaves the reader unable to tell "nothing more happened"
+    from "the rest was dropped".
+    """
+    text = text or ""
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    parts: list = []
+    remaining = text
+    while remaining and len(parts) < max_parts:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            remaining = ""
+            break
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        # Only honour a line boundary that keeps a reasonable amount of content;
+        # a newline in the first few characters would emit near-empty parts and
+        # burn the part budget.
+        if cut < limit // 4:
+            cut = limit
+        parts.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+
+    if remaining:
+        # Out of parts with text left over. Make room for the note inside the
+        # last part rather than appending past the limit.
+        room = limit - len(TRUNCATION_NOTE)
+        last = parts[-1][:room] if room > 0 else ""
+        parts[-1] = last + TRUNCATION_NOTE
+    return parts
+
+# "denied_actions 摘要(最多 5 条)" — same reasoning as runner.format_preauth_note:
+# an unattended run that hammered a confirmation gate must not be able to
+# blow up the notification text.
+_DENIED_MAX_ITEMS = 5
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    return text[:limit]
+
+
+def _get(row, key, default=None):
+    """Read one column from either a sqlite3.Row or a plain dict.
+
+    Rows carry every column; the dicts that callers and tests hand in carry
+    only the ones they care about. A message must never fail to render because
+    a field it decorates with is absent — sqlite3.Row raises IndexError for an
+    unknown key, dict raises KeyError, and both mean the same thing here.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _duration(run_row) -> str:
+    """`" (42s)"` when the run has a sane elapsed time, `""` otherwise.
+
+    Both timestamps default to 0 in the schema, so a run that never left the
+    queue would otherwise report a duration measured from the epoch.
+    """
+    try:
+        started = int(_get(run_row, "started_at", 0) or 0)
+        finished = int(_get(run_row, "finished_at", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if started <= 0 or finished < started:
+        return ""
+    return f" ({finished - started}s)"
+
+
+def _denied_list(denied_actions) -> list:
+    """`run_row['denied_actions']` is the store's JSON text column; a caller
+    that already has a parsed list (e.g. a test fixture) is accepted too."""
+    if isinstance(denied_actions, str):
+        try:
+            denied_actions = json.loads(denied_actions)
+        except (TypeError, ValueError):
+            return []
+    return denied_actions if isinstance(denied_actions, list) else []
+
+
+def _denied_summary(denied_actions) -> str:
+    items = _denied_list(denied_actions)
+    if not items:
+        return ""
+    lines = []
+    for item in items[:_DENIED_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "unknown")
+        detail = str(item.get("detail") or "").strip()
+        lines.append(f"- {kind}: {detail}" if detail else f"- {kind}")
+    remaining = len(items) - _DENIED_MAX_ITEMS
+    if remaining > 0:
+        lines.append(f"…and {remaining} more")
+    return "\n".join(lines)
+
+
+def format_message(task_row, run_row) -> str:
+    """Render the chat text for one finished run.
+
+    Deliberately English, not the Chinese literal in the brief's `失败`
+    placeholder — every other user-facing channel string in this codebase
+    (`channels/router.py`'s `MSG_*`) is English, and hardcoded Chinese in the
+    agent was a whole cleanup project (see MEMORY: "Agent 硬编码中文清除").
+    Reintroducing one here would undo that.
+    """
+    name = task_row["name"] or "(unnamed task)"
+    status = run_row["status"]
+    if status == "succeeded":
+        summary = _truncate(str(run_row["summary"] or ""), SUMMARY_MAX_CHARS)
+        parts = [f"✅ {name}{_duration(run_row)}"]
+        if summary:
+            parts.append(summary)
+        # Denied actions on a SUCCESSFUL run: a run can finish cleanly having
+        # been refused everything it actually tried, and the summary alone
+        # ("I could not send it") reads like the agent's opinion rather than a
+        # permission problem the author can fix.
+        denied_text = _denied_summary(_get(run_row, "denied_actions", "[]"))
+        if denied_text:
+            parts.append(f"Denied actions:\n{denied_text}")
+        return "\n\n".join(parts)
+
+    # Only reachable under `always` (see `_should_notify`), and it must not
+    # claim the run failed — nothing was attempted.
+    if status == "skipped":
+        header = f"⏭️ {name} skipped"
+        reason = str(run_row["error"] or "").strip()
+        return f"{header}\n\n{reason}" if reason else header
+
+    header = f"⚠️ {name} failed"
+    parts = [header]
+    error = str(run_row["error"] or "").strip()
+    if error:
+        parts.append(error)
+    denied_text = _denied_summary(run_row["denied_actions"])
+    if denied_text:
+        parts.append(f"Denied actions:\n{denied_text}")
+    return "\n\n".join(parts)
+
+
+# What `failure` means: the run was attempted and did not work. Deliberately
+# NOT "anything that is not succeeded" — that also catches `skipped`, which
+# `overlap_policy=skip` writes on EVERY fire while a slow run is still going.
+# A task on a 1-minute schedule that takes 10 minutes then pushes ten "failed"
+# notifications per run, and the useful failure notification drowns in them.
+# A skip is not a failure: nothing was attempted and nothing is broken; the
+# run history still records it. Users who want to see them opt in with
+# `always`, which keeps meaning literally every terminal run.
+_FAILURE_STATUSES = ("failed", "timeout")
+
+
+def _should_notify(policy: str, status: str) -> bool:
+    if policy == "always":
+        return True
+    if policy == "failure":
+        return status in _FAILURE_STATUSES
+    return False  # 'never', or anything unrecognized — degrade to silent
+
+
+def _channel_type_of(conn, instance_id: str) -> str:
+    """`channel_instances.channel_type` for one instance, `""` if unknown.
+
+    The length limit is a property of the PLATFORM, and `notify_channel` only
+    carries the instance id — two instances of different platforms are both
+    valid targets, so the type has to be looked up rather than assumed. An
+    unknown instance degrades to `""`, which `channel_limit` maps to the
+    tightest cap: a target we cannot identify gets the most conservative
+    treatment, never the most permissive.
+    """
+    try:
+        row = conn.execute(
+            "SELECT channel_type FROM channel_instances WHERE id=?",
+            (instance_id,)).fetchone()
+    except Exception:                       # noqa: BLE001 — never break a send
+        return ""
+    if row is None:
+        return ""
+    try:
+        return str(row["channel_type"] or "")
+    except (KeyError, IndexError, TypeError):
+        return str(row[0] or "")
+
+
+def _resolve_target(conn, task_row, raw_channel: str):
+    """`<instance_id>:<external_chat_id>` -> (instance_id, chat_id), or None
+    if the string is malformed, unpaired, or no longer owned by this task's
+    user. See the module docstring for why this is not `<channel_type>:...`.
+    """
+    if not raw_channel or ":" not in raw_channel:
+        return None
+    instance_id, _, chat_id = raw_channel.partition(":")
+    instance_id, chat_id = instance_id.strip(), chat_id.strip()
+    if not instance_id or not chat_id:
+        return None
+
+    from channels import store as channel_store  # noqa: PLC0415
+
+    chat = channel_store.get_chat(conn, instance_id, chat_id)
+    if chat is None:
+        return None
+    binding = conn.execute(
+        "SELECT user_id FROM channel_bindings WHERE id=? AND revoked=0",
+        (chat["binding_id"],),
+    ).fetchone()
+    if binding is None or str(binding["user_id"]) != str(task_row["user_id"]):
+        return None
+    return instance_id, chat_id
+
+
+async def _default_send(instance_id: str, chat_id: str, text: str) -> bool:
+    """Production sender: the running adapter behind `instance_id`, via
+    `main._channel_manager`. `ChannelManager` has no public getter for a
+    single adapter (`reload()`/`start_all()`/`stop_all()` only) so this reaches
+    into `_running` directly rather than adding one — this task's scope is
+    `tasks/notify.py` + `tasks/runner.py` only.
+    """
+    try:
+        import main  # noqa: PLC0415
+    except Exception:                       # noqa: BLE001 — main not importable
+        logger.warning("tasks notify: main not importable; cannot send",
+                       exc_info=True)
+        return False
+
+    mgr = getattr(main, "_channel_manager", None)
+    if mgr is None:
+        return False
+    running = getattr(mgr, "_running", None) or {}
+    entry = running.get(instance_id)
+    if entry is None:
+        return False
+    adapter = entry[0]
+
+    from channels.model import OutboundMessage  # noqa: PLC0415
+
+    try:
+        result = await adapter.send(chat_id, OutboundMessage(text=text))
+    except Exception:                       # noqa: BLE001 — never raise past send_result
+        logger.warning("tasks notify: adapter.send failed (instance %s)",
+                       instance_id, exc_info=True)
+        return False
+    # An adapter may report failure by RETURNING falsey rather than raising —
+    # LarkAdapter's contract is "never raise, return falsey", so the except
+    # clause above catches nothing for it. Note `""` is a SUCCESS (delivered,
+    # id unparsable), so this must test `is None`, never truthiness.
+    if result is None:
+        logger.warning("tasks notify: adapter.send reported failure (instance %s)",
+                       instance_id)
+        return False
+    return True
+
+
+def format_start_message(task_row, run_row) -> str:
+    """Render the chat text for a run that is about to begin.
+
+    English, for the same reason `format_message` is (see its docstring).
+    """
+    name = _get(task_row, "name") or "(unnamed task)"
+    trigger = str(_get(run_row, "trigger", "") or "").strip()
+    return f"▶️ {name} started ({trigger})" if trigger else f"▶️ {name} started"
+
+
+async def send_start(conn, task_row, run_row, *, sender=None) -> bool:
+    """Tell the owner a run has begun, if `notify_on_start` says to.
+
+    Deliberately gated on its OWN flag rather than `notify_policy`: a task that
+    only reports failures may still be one whose start the author wants to see.
+    The single exception is `never`, which is a master mute — a user who asked
+    for silence gets silence, whatever the other switch says.
+
+    Same "never raises" contract as `send_result`: the run is about to start
+    and must not depend on a channel adapter behaving.
+    """
+    if not _get(task_row, "notify_on_start", 0):
+        return False
+    if str(_get(task_row, "notify_policy", "") or "") == "never":
+        return False
+
+    target = _resolve_target(conn, task_row,
+                             str(_get(task_row, "notify_channel", "") or "").strip())
+    if target is None:
+        return False
+    instance_id, chat_id = target
+
+    send = sender or _default_send
+    try:
+        ok = await send(instance_id, chat_id,
+                        format_start_message(task_row, run_row))
+    except Exception:                       # noqa: BLE001 — see docstring
+        logger.warning("tasks notify: start message failed for task %s",
+                       _get(task_row, "id", "?"), exc_info=True)
+        return False
+    return bool(ok)
+
+
+async def send_result(conn, task_row, run_row, *, sender=None) -> bool:
+    """Notify the task owner about one finished run, if `notify_policy` says
+    to. Returns whether a message was actually sent — never raises.
+
+    `sender` is the test seam: `async (instance_id, chat_id, text) -> bool`,
+    defaulting to `_default_send`.
+    """
+    policy = str(task_row["notify_policy"] or "failure")
+    status = str(run_row["status"] or "")
+    if not _should_notify(policy, status):
+        return False
+
+    raw_channel = str(task_row["notify_channel"] or "").strip()
+    target = _resolve_target(conn, task_row, raw_channel)
+    if target is None:
+        return False
+    instance_id, chat_id = target
+
+    text = format_message(task_row, run_row)
+    send = sender or _default_send
+    limit = channel_limit(_channel_type_of(conn, instance_id))
+    parts = split_message(text, limit)
+
+    # Delivered if ANY part landed. A later part failing does not un-send the
+    # earlier ones: the reader already has part 1 in their chat, and reporting
+    # False would leave the run log claiming nothing was sent while the chat
+    # shows otherwise.
+    delivered = False
+    for index, part in enumerate(parts):
+        try:
+            ok = await send(instance_id, chat_id, part)
+        except Exception:                   # noqa: BLE001 — a task run's result
+            # must never depend on a channel adapter behaving; log and move on.
+            logger.warning("tasks notify: send failed for task %s (part %d/%d)",
+                           task_row["id"] if "id" in task_row.keys() else "?",
+                           index + 1, len(parts), exc_info=True)
+            continue
+        delivered = delivered or bool(ok)
+    return delivered
