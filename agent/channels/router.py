@@ -266,33 +266,20 @@ class ChannelRouter:
         in-line gate (the proxy's egress cards land here raw). In-line gates
         already ran with the channel context, so anything else reaching this
         point was a deliberate "ask" — the check is cheap and idempotent
-        either way. Shell above gray and elicitation are never waived
-        (enforced inside permissions.auto_approve). Fails toward buttons."""
+        either way. Shell above gray and elicitation are never waived, and an
+        fs card must pass the deny-roots floor — all enforced by the shared
+        permissions helpers, never restated here. Fails toward buttons."""
         try:
             import permissions as _perm  # noqa: PLC0415
-            if ev.get("type") == "access_request":
-                # Same hard floor as the in-line gate: an auto policy never
-                # authorizes a system location, only a human button does.
-                from tasks.driver import fs_root_denied  # noqa: PLC0415
+            gate, level = _perm.gate_of_event(ev)
+            if gate == "fs_access":
                 paths = ev.get("paths")
                 if not isinstance(paths, (list, tuple)) or not paths:
                     paths = [ev.get("path") or ""]
-                for p in paths:
-                    if not isinstance(p, str) or not p \
-                            or fs_root_denied(os.path.realpath(p)):
-                        return False
-                action = "grant_access"
-            else:
-                action = ev.get("action") or ""
-                if action == "egress_confirm":
-                    # The stored action is "egress" for both proxy reasons;
-                    # the upload-threshold flavor follows the upload gate.
-                    action = ("egress_upload"
-                              if ev.get("reason") == "upload_over_threshold"
-                              else "egress")
-            level = ev.get("risk_level") or ""
-            return _perm.auto_approve(self._conn, action, level=level,
-                                      context="channel")
+                if not _perm.paths_policy_grantable(list(paths)):
+                    return False
+            return _perm.decide(_perm.load(self._conn), gate, level=level,
+                                 context="channel")
         except Exception:  # noqa: BLE001 — a policy failure must ask
             _LOG.exception("channel policy auto-approve check failed")
             return False
@@ -305,8 +292,11 @@ class ChannelRouter:
         if self._policy_auto_approves(ev):
             if self._resolve_confirm is not None:
                 try:
+                    # source="policy": the audit trail must never claim a
+                    # human pressed Allow when the policy answered.
                     self._resolve_confirm(confirm_id, True,
-                                          expected_session_id=session_id)
+                                          expected_session_id=session_id,
+                                          source="policy")
                 except KeyError:
                     pass
             return

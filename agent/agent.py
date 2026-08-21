@@ -578,6 +578,13 @@ class AgentRunner:
         # (concurrent multi-session case); a proper per-connection routing is P1.
         self._active_sinks: dict[str, object] = {}
         self._last_active_session: str | None = None
+        # session_id -> run_context ("interactive"/"task"/"channel") for the
+        # run currently holding that session. Read by main.py's egress-confirm
+        # callback, which runs OUTSIDE the run's asyncio context and therefore
+        # cannot see permissions.RUN_CONTEXT_VAR — without this map it would
+        # judge every proxy card as "interactive" and contexts.tasks/channels
+        # "strict" could never restrain the network/upload gates.
+        self._run_contexts: dict[str, str] = {}
 
     def _wiki_client_for(self, session_id: str, user_id: str) -> WikiClient:
         if session_id not in self._wiki_clients:
@@ -690,18 +697,23 @@ class AgentRunner:
 
             # Register sink for egress-confirm callback routing. Removed in
             # the finally block below regardless of success or failure.
+            # Who is driving this run (interactive / task / channel). Every
+            # permission gate resolves its policy through this — set it
+            # unconditionally so a run can never inherit a stale context. An
+            # UNRECOGNIZED value maps to "unknown", which auto_approve treats
+            # as never-auto: coercing it to "interactive" (the most permissive
+            # context) would invert the module's fail-safe direction.
+            _run_ctx = (run_context
+                        if run_context in ("interactive", "task", "channel")
+                        else "unknown")
             self._active_sinks[session_id] = sink
             self._last_active_session = session_id
+            self._run_contexts[session_id] = _run_ctx
 
             APP_SESSION_VAR.set(session_id)
             APP_EVENT_VAR.set(sink)
             APP_CONFIRM_VAR.set(self._confirm_mgr)
-            # Who is driving this run (interactive / task / channel). Every
-            # permission gate resolves its policy through this — set it
-            # unconditionally so a run can never inherit a stale context.
-            permissions.RUN_CONTEXT_VAR.set(
-                run_context if run_context in ("interactive", "task", "channel")
-                else "interactive")
+            permissions.RUN_CONTEXT_VAR.set(_run_ctx)
             mcp_client.SESSION_ID_VAR.set(session_id)
             mcp_client.EVENT_QUEUE_VAR.set(sink)
             mcp_client.CONFIRM_MGR_VAR.set(self._confirm_mgr)
@@ -1236,8 +1248,11 @@ class AgentRunner:
             finally:
                 # Deregister sink. The sink remains accessible via _active_runs
                 # in main.py for replay; we just remove it from the hot-path
-                # egress routing table.
+                # egress routing table. The run context goes with it — a stale
+                # entry would let a later run's proxy card be judged under the
+                # previous run's context.
                 self._active_sinks.pop(session_id, None)
+                self._run_contexts.pop(session_id, None)
                 # Drop the run-scoped shell grant as soon as the run ends
                 # (best-effort — see the note at the set site above).
                 try:

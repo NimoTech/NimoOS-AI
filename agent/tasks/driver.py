@@ -276,46 +276,29 @@ class TaskRunDriver:
     def _policy_allows(self, ev: dict, kind: str) -> bool:
         """Does the global policy's `contexts.tasks` mode waive this card?
 
-        Shell is NEVER waived here: the in-line gate (shell.py) already applied
-        the policy with the task context — gray was auto-approved there, so a
-        shell card reaching this driver is dangerous/protected, which an
-        unattended run must not run. Same hard floor for anything unmapped
-        (elicitation, unknown kinds). fs approvals re-check fs_root_denied so
-        an "auto" policy can never authorize a system location.
+        All rules live in the shared permissions helpers, never restated
+        here: gate_of_event maps the raw event (kind/action/reason) to its
+        gate — elicitation and unknown card types map to None and are NEVER
+        waived, whatever the context mode says; decide() applies the
+        strict/follow/auto ladder with the non-interactive shell cap; and an
+        fs card must additionally pass the deny-roots floor
+        (paths_policy_grantable), so an "auto" policy can never authorize a
+        system location.
         """
+        del kind  # classification is derived from the event itself
         pol = self._policy
         if not isinstance(pol, dict):
             return False
         try:
-            mode = (pol.get("contexts") or {}).get("tasks", "strict")
-            if mode not in ("follow", "auto"):
-                return False
-            gates = pol.get("gates") or {}
-            if kind == _KIND_SHELL:
-                return False
-            if kind == _KIND_FS:
-                if mode != "auto" and gates.get("fs_access") != "auto":
-                    return False
+            import permissions as _perm  # noqa: PLC0415
+            gate, level = _perm.gate_of_event(ev)
+            if gate == "fs_access":
                 paths = ev.get("paths")
                 if not isinstance(paths, (list, tuple)) or not paths:
                     paths = [ev.get("path") or ""]
-                for p in paths:
-                    real = _real(p) if isinstance(p, str) and p else None
-                    if real is None or fs_root_denied(real):
-                        return False
-                return True
-            if kind == _KIND_EGRESS:
-                gate = ("upload" if ev.get("reason") == "upload_over_threshold"
-                        else "network")
-                return mode == "auto" or gates.get(gate) == "auto"
-            if mode == "auto":
-                return True
-            # "follow": map the card's action back to its gate. Unmapped
-            # actions (elicitation, unknown) are never waived.
-            import permissions as _perm  # noqa: PLC0415
-            gate = _perm.gate_of(ev.get("action") or "")
-            return gate is not None and gate != "shell" \
-                and gates.get(gate) == "auto"
+                if not _perm.paths_policy_grantable(list(paths)):
+                    return False
+            return _perm.decide(pol, gate, level=level, context="task")
         except Exception:  # noqa: BLE001 — a policy failure must deny
             logger.warning("task driver: policy check failed; denying",
                            exc_info=True)
@@ -346,7 +329,11 @@ class TaskRunDriver:
             self._denied.append(record)
             return
         try:
-            self._mgr.resolve(cid, approve, expected_session_id=self._session_id)
+            # source: never "user" — nobody pressed anything in an unattended
+            # run, and the audit trail must say so.
+            self._mgr.resolve(cid, approve,
+                              expected_session_id=self._session_id,
+                              source="task-driver")
         except Exception as exc:            # noqa: BLE001 — KeyError for expired /
             # session-mismatched confirms, and anything else: a raise here would
             # abandon the rest of the stream, so it is swallowed and recorded.

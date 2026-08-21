@@ -983,25 +983,6 @@ async def egress_confirm(req: _EgressConfirmRequest):
                reason=req.reason, decision="auto_approved_search_backend")
         return {"allow": True}
 
-    # Global permission policy: the domain gate follows gates.network, the
-    # upload-threshold gate follows gates.upload. Matched on the proxy's exact
-    # reason string — any other/unknown reason keeps the card. Checked before
-    # the session lookup so unattended runs get the same answer.
-    try:
-        import permissions as _perm  # noqa: PLC0415
-        _gate_action = None
-        if req.reason == TOFU_UNKNOWN_HOST_REASON:
-            _gate_action = "egress"          # → gates.network
-        elif req.reason == "upload_over_threshold":
-            _gate_action = "egress_upload"   # → gates.upload
-        if _gate_action is not None and _perm.auto_approve(_db(), _gate_action):
-            from audit import audit as _audit  # noqa: PLC0415
-            _audit("egress_grant", host=req.host, bytes=req.bytes,
-                   reason=req.reason, decision="auto_approved_by_policy")
-            return {"allow": True}
-    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
-        pass
-
     # Find an active session — P0 uses last-active heuristic
     session_id: str | None = _runner._last_active_session
     if session_id is not None and session_id not in _runner._active_sinks:
@@ -1019,6 +1000,29 @@ async def egress_confirm(req: _EgressConfirmRequest):
     if sink is None:
         _LOG.debug("egress-confirm: sink gone for session %s — fail-closed", session_id)
         return {"allow": False}
+
+    # Global permission policy: the domain gate follows gates.network, the
+    # upload-threshold gate follows gates.upload (any other reason keeps the
+    # card — permissions.egress_gate_action is the single copy of that
+    # mapping). Checked AFTER the session lookup, and with THAT session's run
+    # context: this handler runs outside the run's asyncio context, so
+    # RUN_CONTEXT_VAR would read "interactive" here and contexts.tasks /
+    # contexts.channels "strict" could never restrain these gates. The
+    # no-active-session fail-closed above also stays authoritative — a policy
+    # must never turn "nobody to attribute this to" into an allow.
+    try:
+        import permissions as _perm  # noqa: PLC0415
+        _gate_action = _perm.egress_gate_action(req.reason)
+        _run_ctx = _runner._run_contexts.get(session_id, "interactive")
+        if _gate_action is not None and _perm.auto_approve(
+                _db(), _gate_action, context=_run_ctx):
+            from audit import audit as _audit  # noqa: PLC0415
+            _audit("egress_grant", session_id=session_id, host=req.host,
+                   bytes=req.bytes, reason=req.reason,
+                   decision="auto_approved_by_policy")
+            return {"allow": True}
+    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
+        pass
 
     description = (
         f"Outbound connection to {req.host!r} — "
@@ -1843,16 +1847,31 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
     for gi, group in enumerate(groups):
         turn = assistant_turns[gi] if gi < len(assistant_turns) else assistant_turns[-1]
         bs = turn.setdefault("blocks", [])
-        cards = [{
-            "type": "access_request",
-            "confirmId": r["confirm_id"],
-            "path": r["path"],
-            "kind": r["kind"],
-            "reason": r["reason"],
-            "reasonKey": r["reason_key"] or "",
-            "decided": True,
-            "granted": r["decision"] == "granted",
-        } for r in group]
+        cards = []
+        for r in group:
+            # Batch rows store the whole path list JSON-encoded in `path`
+            # (see fs/access_request.py::request_access_batch); unfold it so
+            # the rebuilt card shows every path the one approval granted.
+            raw_path = r["path"] or ""
+            paths: list = []
+            if raw_path.startswith("["):
+                try:
+                    parsed = json.loads(raw_path)
+                    if isinstance(parsed, list):
+                        paths = [p for p in parsed if isinstance(p, str)]
+                except (ValueError, TypeError):
+                    paths = []
+            cards.append({
+                "type": "access_request",
+                "confirmId": r["confirm_id"],
+                "path": paths[0] if paths else raw_path,
+                "paths": paths,
+                "kind": r["kind"],
+                "reason": r["reason"],
+                "reasonKey": r["reason_key"] or "",
+                "decided": True,
+                "granted": r["decision"] == "granted",
+            })
         # The access request happened right before the file operation it gated,
         # so place the card(s) before the first tool block of the turn (after any
         # leading text/thinking), not dangling at the very end of the turn.

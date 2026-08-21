@@ -17,6 +17,7 @@ IPs, port policy, `/` grants, `protected` shell, MCP elicitation.
 from __future__ import annotations
 
 import json
+import os
 import time
 from contextvars import ContextVar
 
@@ -145,8 +146,24 @@ def _merge(doc: dict) -> dict:
     return out
 
 
+# Single-slot in-process cache, keyed by connection IDENTITY (`is`, never
+# id() — a recycled id from a garbage-collected test connection must not serve
+# a stale policy). The policy only changes through save() in this process, so
+# save() refreshes the slot; a different connection simply misses and reads.
+# load() runs on the event loop for every gate check (shell, MCP, fs, proxy
+# callback), so the hot path must not do SQLite I/O each time — the same
+# reasoning as phoenix_tracing's in-process cache.
+_cache_conn = None
+_cache_doc: dict | None = None
+
+
 def load(conn) -> dict:
-    """The effective policy (defaults merged). Never raises."""
+    """The effective policy (defaults merged). Never raises. Returns a fresh
+    copy every time — callers may mutate their copy without poisoning the
+    cache."""
+    global _cache_conn, _cache_doc
+    if conn is _cache_conn and _cache_doc is not None:
+        return _merge(_cache_doc)
     try:
         row = conn.execute(
             "SELECT value FROM user_settings WHERE user_id=? AND key=?",
@@ -155,16 +172,20 @@ def load(conn) -> dict:
     except Exception:  # noqa: BLE001 — a broken read must degrade to defaults
         return default_policy()
     if not row:
-        return default_policy()
-    try:
-        return _merge(json.loads(row["value"]))
-    except (ValueError, TypeError):
-        return default_policy()
+        doc = default_policy()
+    else:
+        try:
+            doc = _merge(json.loads(row["value"]))
+        except (ValueError, TypeError):
+            doc = default_policy()
+    _cache_conn, _cache_doc = conn, doc
+    return _merge(doc)
 
 
 def save(conn, doc: dict) -> dict:
     """Normalize + persist. Returns the normalized document (what load() will
     now say), so the API can echo the truth rather than the request."""
+    global _cache_conn, _cache_doc
     normalized = _merge(doc)
     conn.execute(
         "INSERT INTO user_settings(user_id, key, value, updated_at) "
@@ -175,7 +196,8 @@ def save(conn, doc: dict) -> dict:
          int(time.time())),
     )
     conn.commit()
-    return normalized
+    _cache_conn, _cache_doc = conn, normalized
+    return _merge(normalized)
 
 
 def _shell_auto(mode: str, level: str) -> bool:
@@ -188,42 +210,146 @@ def _shell_auto(mode: str, level: str) -> bool:
     return False
 
 
+def decide(policy: dict, gate: str | None, *, level: str = "",
+           context: str = "interactive") -> bool:
+    """The pure decision core: does `policy` waive the card for `gate`?
+
+    This is the ONLY place the strict/follow/auto ladder and the shell caps
+    live — auto_approve, TaskRunDriver and the channel router all call it, so
+    the three surfaces cannot drift. `level` is the shell_guard
+    classification, meaningful only for the shell gate. An unrecognized
+    `context` is never-auto (failing toward "interactive" would pick the MOST
+    permissive context). Never raises: any failure means False (ask).
+    """
+    try:
+        if gate is None:
+            return False
+        gates = (policy or {}).get("gates") or {}
+        if context == "interactive":
+            if gate == "shell":
+                return _shell_auto(gates.get("shell", "ask"), level)
+            return gates.get(gate) == "auto"
+        if context in ("task", "channel"):
+            cmode = ((policy or {}).get("contexts") or {}).get(
+                "tasks" if context == "task" else "channels", "strict")
+            if cmode not in ("follow", "auto"):
+                return False
+            # Unattended/remote contexts cap shell at gray in EVERY mode:
+            # nobody is watching a scheduled run, and a channel user gets a
+            # button for anything above gray instead of silence.
+            if gate == "shell":
+                if level != "gray":
+                    return False
+                return cmode == "auto" or _shell_auto(gates.get("shell", "ask"),
+                                                      level)
+            if cmode == "auto":
+                return True
+            return gates.get(gate) == "auto"
+        return False
+    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
+        return False
+
+
 def auto_approve(conn, action: str, *, level: str = "",
                  context: str | None = None) -> bool:
     """Should the gate for `action` skip its card and proceed?
 
-    `level` is the shell_guard classification, meaningful only for shell
-    actions. `context` overrides RUN_CONTEXT_VAR for callers that answer on
-    behalf of a run they do not execute inside (TaskRunDriver, channel
-    router). Never raises: any failure means False (ask).
+    `context` overrides RUN_CONTEXT_VAR for callers that answer on behalf of
+    a run they do not execute inside (TaskRunDriver, channel router). Never
+    raises: any failure means False (ask).
     """
     try:
         gate = gate_of(action)
         if gate is None:
             return False
         ctx = context if context is not None else RUN_CONTEXT_VAR.get()
-        policy = load(conn)
-        gates = policy["gates"]
-        if ctx in ("task", "channel"):
-            cmode = policy["contexts"]["tasks" if ctx == "task" else "channels"]
-            if cmode == "strict":
+        return decide(load(conn), gate, level=level, context=ctx)
+    except Exception:  # noqa: BLE001 — a policy failure must ask, never open
+        return False
+
+
+def egress_gate_action(reason: str) -> str | None:
+    """Map the egress-proxy's confirm reason to the action string whose gate
+    governs it. THE single copy of this mapping — main.py's callback, the
+    channel router and the task driver all use it. Unknown reasons map to
+    None (keep the card / deny): a new proxy reason must never inherit the
+    network gate's waiver by default.
+    """
+    if reason == "tofu_unknown_host":
+        return "egress"          # → gates.network
+    if reason == "upload_over_threshold":
+        return "egress_upload"   # → gates.upload
+    return None
+
+
+def gate_of_event(ev: dict) -> tuple[str | None, str]:
+    """(gate, shell level) for a CONFIRMATION EVENT dict, matching what the
+    emitting gate would have asked. Consumers that answer cards they did not
+    emit (TaskRunDriver, channel router) must use this, not gate_of on
+    `action` alone: MCP tool/install and toolbox events carry only `kind`,
+    egress events need their `reason`, and elicitation events must map to
+    None (never waivable) whatever a context mode says.
+    """
+    if not isinstance(ev, dict):
+        return None, ""
+    if ev.get("type") == "access_request":
+        return "fs_access", ""
+    action = ev.get("action") or ""
+    if action == "egress_confirm":
+        ga = egress_gate_action(str(ev.get("reason") or ""))
+        return (gate_of(ga) if ga else None), ""
+    kind = ev.get("kind") or ""
+    if kind == "mcp_tool":
+        return "mcp_tools", ""
+    if kind in ("mcp_install", "toolbox_install"):
+        return "installs", ""
+    if kind.startswith("mcp_elicit"):
+        return None, ""
+    return gate_of(action), str(ev.get("risk_level") or "")
+
+
+def paths_policy_grantable(paths) -> bool:
+    """Hard floor for POLICY-driven fs auto-grants: every path must be a
+    non-empty string whose realpath is outside FS_DENY_ROOTS (and not `/`).
+    Only a human click may open a system location; an "auto" policy never
+    does. THE single copy — fs/access_request, the channel router and the
+    task driver all call it. Never raises; anything invalid means False.
+    """
+    try:
+        if isinstance(paths, str) or not isinstance(paths, (list, tuple)) \
+                or not paths:
+            return False
+        from tasks.driver import fs_root_denied  # noqa: PLC0415 — avoid cycle
+        for p in paths:
+            if not isinstance(p, str) or not p:
                 return False
-            if cmode == "auto":
-                # Unattended/remote contexts cap shell at gray in EVERY mode:
-                # nobody is watching a scheduled run, and a channel user gets
-                # a button for anything above gray instead of silence.
-                if gate == "shell":
-                    return level == "gray"
-                return True
-            # "follow" falls through to the gate's own mode, with the same
-            # shell cap applied below.
-            if gate == "shell":
-                return level == "gray" and _shell_auto(gates["shell"], level)
-            return gates[gate] == "auto"
-        # interactive
-        if gate == "shell":
-            return _shell_auto(gates["shell"], level)
-        return gates[gate] == "auto"
+            if fs_root_denied(os.path.realpath(p)):
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — fail toward asking
+        return False
+
+
+def policy_waives(action: str, *, level: str = "", audit_event: str | None = None,
+                  **audit_fields) -> bool:
+    """One-stop policy waiver for the simple skill gates (notes, wiki, apps,
+    message-bus, MCP admin/tools, toolbox): consults the policy on the
+    process connection and, when waived, writes the audit record with
+    decision="auto_approved_by_policy". Never raises; any failure means
+    False (raise the card). Gates with special conn/floor semantics (shell,
+    fs, the proxy callback) keep their own wiring.
+    """
+    try:
+        import db as _dbmod  # noqa: PLC0415 — lazy, mirrors the skills' pattern
+        if not auto_approve(_dbmod.get_connection(), action, level=level):
+            return False
+        try:
+            from audit import audit as _audit  # noqa: PLC0415
+            _audit(audit_event or action,
+                   decision="auto_approved_by_policy", **audit_fields)
+        except Exception:  # noqa: BLE001 — auditing must never break the waiver
+            pass
+        return True
     except Exception:  # noqa: BLE001 — a policy failure must ask, never open
         return False
 

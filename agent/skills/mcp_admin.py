@@ -75,18 +75,11 @@ async def add_mcp_server(command_line: str, name: str = "") -> str:
         return ("System error: the confirmation channel is unavailable; cannot register. "
                 "Tell the user to add it manually on the settings page.")
 
-    _auto = False
-    try:  # global permission policy waiver (audited); fail toward asking
-        import db as _dbmod  # noqa: PLC0415
-        import permissions as _perm  # noqa: PLC0415
-        from audit import audit as _audit  # noqa: PLC0415
-        if _perm.auto_approve(_dbmod.get_connection(),
-                              f"mcp_install:{display_name}"):
-            _audit("mcp_install", session_id=session_id, name=display_name,
-                   command=command_line, decision="auto_approved_by_policy")
-            _auto = True
-    except Exception:  # noqa: BLE001
-        _auto = False
+    import permissions as _perm  # noqa: PLC0415
+    _auto = _perm.policy_waives(f"mcp_install:{display_name}",
+                                audit_event="mcp_install",
+                                session_id=session_id, name=display_name,
+                                command=command_line)
     if not _auto:
         confirm_id = mgr.register(
             session_id, f"mcp_install:{display_name}",

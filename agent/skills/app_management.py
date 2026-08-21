@@ -25,17 +25,8 @@ def _session_id():
 def _policy_auto(action: str, command: str, session_id: str) -> bool:
     """Global permission policy waiver for this write op (audited).
     Fails toward asking on any error."""
-    try:
-        import db as _dbmod  # noqa: PLC0415
-        import permissions as _perm  # noqa: PLC0415
-        from audit import audit as _audit  # noqa: PLC0415
-        if _perm.auto_approve(_dbmod.get_connection(), action):
-            _audit(action, session_id=session_id, command=command,
-                   decision="auto_approved_by_policy")
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    return False
+    import permissions as _perm  # noqa: PLC0415
+    return _perm.policy_waives(action, session_id=session_id, command=command)
 
 
 @function_tool

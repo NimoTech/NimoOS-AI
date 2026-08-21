@@ -281,6 +281,53 @@ def test_driver_auto_fs_respects_deny_roots(tmp_path):
     assert mgr.resolved == [("c2", False)]
 
 
+def test_driver_auto_never_approves_elicitation():
+    """contexts.tasks=auto must not blanket-approve card kinds that have no
+    gate — MCP elicitation needs a real answer, and 'approved with no content'
+    is a lie in the audit trail."""
+    ev = {"type": "confirmation_required", "confirm_id": "c1",
+          "kind": "mcp_elicit_url", "url": "https://srv.example/authorize"}
+    mgr, d = _drive_one(ev, _policy("auto"))
+    assert mgr.resolved == [("c1", False)]
+    ev2 = {"type": "confirmation_required", "confirm_id": "c2",
+           "kind": "mcp_elicit_form", "server": "srv"}
+    mgr, _ = _drive_one(ev2, _policy("auto"))
+    assert mgr.resolved == [("c2", False)]
+
+
+def test_driver_follow_maps_kind_only_mcp_events():
+    """Real mcp_tool/mcp_install/toolbox_install events carry `kind`, not
+    `action` — follow mode must honor the gate for them."""
+    ev = {"type": "confirmation_required", "confirm_id": "c1",
+          "kind": "mcp_tool", "server": "srv", "tool": "t"}
+    mgr, _ = _drive_one(ev, _policy("follow", mcp_tools="auto"))
+    assert mgr.resolved == [("c1", True)]
+    ev2 = {"type": "confirmation_required", "confirm_id": "c2",
+           "kind": "toolbox_install", "title": "Install gh"}
+    mgr, _ = _drive_one(ev2, _policy("follow", installs="auto"))
+    assert mgr.resolved == [("c2", True)]
+    mgr, _ = _drive_one(ev2, _policy("follow"))
+    assert mgr.resolved == [("c2", False)]
+
+
+def test_driver_resolves_with_non_user_source():
+    ev = {"type": "confirmation_required", "action": "egress_confirm",
+          "confirm_id": "c1", "host": "api.example.com",
+          "reason": "tofu_unknown_host"}
+    from tasks.driver import TaskRunDriver
+    sources = []
+
+    class _SrcMgr(_Mgr):
+        def resolve(self, cid, confirmed, remember=False,
+                    expected_session_id=None, source="user", **kw):
+            sources.append(source)
+    d = TaskRunDriver(confirm_mgr=_SrcMgr(), session_id="s1",
+                      preauth={"egress_domains": ["api.example.com"]},
+                      run_timeout=5, policy=None)
+    d._handle_confirm(ev)
+    assert sources == ["task-driver"]
+
+
 def test_driver_none_policy_is_strict():
     ev = {"type": "confirmation_required", "action": "mcp_call:s::t",
           "confirm_id": "c1"}
@@ -304,15 +351,16 @@ def test_channel_router_auto_resolves_egress_card():
     permissions.save(conn, {"contexts": {"channels": "auto"}})
     resolved = []
 
-    def _resolve(cid, ok, expected_session_id=None):
-        resolved.append((cid, ok))
+    def _resolve(cid, ok, expected_session_id=None, source="user"):
+        resolved.append((cid, ok, source))
     r = ChannelRouter(conn, start_run=None, cancel_run=None,
                       resolve_credentials=None, resolve_confirm=_resolve)
     ev = {"type": "confirmation_required", "confirm_id": "c1",
           "action": "egress_confirm", "reason": "tofu_unknown_host",
           "host": "example.com"}
     asyncio.run(r._surface_confirm(object(), "chat1", "s1", ev))
-    assert resolved == [("c1", True)]
+    # source="policy": the audit must not claim a human pressed Allow
+    assert resolved == [("c1", True, "policy")]
 
 
 def test_channel_router_strict_keeps_buttons_path():
@@ -320,7 +368,7 @@ def test_channel_router_strict_keeps_buttons_path():
     conn = dbmod.init_db(":memory:")
     resolved = []
 
-    def _resolve(cid, ok, expected_session_id=None):
+    def _resolve(cid, ok, expected_session_id=None, source="user"):
         resolved.append((cid, ok))
 
     class _NoButtons:
@@ -354,6 +402,27 @@ def test_channel_router_never_auto_grants_system_fs_paths():
     ev = {"type": "access_request", "confirm_id": "c1", "path": "/etc/ssh"}
     asyncio.run(r._surface_confirm(_NoButtons(), "chat1", "s1", ev))
     assert resolved == [("c1", False)]      # denied via the buttons path
+
+
+def test_channel_router_never_auto_approves_elicitation():
+    from channels.router import ChannelRouter
+    conn = dbmod.init_db(":memory:")
+    permissions.save(conn, {"contexts": {"channels": "auto"}})
+    resolved = []
+
+    def _resolve(cid, ok, expected_session_id=None, source="user"):
+        resolved.append((cid, ok))
+
+    class _NoButtons:
+        instance_id = "i1"
+        class capabilities:  # noqa: D106
+            supports_buttons = False
+    r = ChannelRouter(conn, start_run=None, cancel_run=None,
+                      resolve_credentials=None, resolve_confirm=_resolve)
+    ev = {"type": "confirmation_required", "confirm_id": "c1",
+          "kind": "mcp_elicit_form", "server": "srv"}
+    asyncio.run(r._surface_confirm(_NoButtons(), "chat1", "s1", ev))
+    assert resolved == [("c1", False)]      # never auto, falls to deny path
 
 
 # -- proxy argv + endpoints -----------------------------------------------------
@@ -411,19 +480,71 @@ def test_permission_settings_put_rejects_non_object(client):
     assert r.status_code == 400
 
 
-def test_egress_confirm_route_auto_approves_tofu_by_policy(client):
+def test_egress_confirm_route_no_session_denies_even_with_auto_policy(client):
+    """The no-active-session fail-closed must survive the policy: a grant
+    with nobody to attribute it to is not a grant."""
     import main as main_mod
     permissions.save(main_mod._db(), {"gates": {"network": "auto"}})
+    try:
+        main_mod._runner._active_sinks.clear()
+        main_mod._runner._last_active_session = None
+        r = client.post("/internal/egress-confirm", json={
+            "host": "unknown.example.com", "bytes": 0,
+            "reason": "tofu_unknown_host"})
+        assert r.json() == {"allow": False}
+    finally:
+        permissions.save(main_mod._db(), permissions.default_policy())
+
+
+def test_egress_confirm_route_auto_approves_tofu_for_interactive_session(client):
+    import main as main_mod
+    permissions.save(main_mod._db(), {"gates": {"network": "auto"}})
+    sink = _Sink()
+    main_mod._runner._active_sinks["perm-s1"] = sink
+    main_mod._runner._last_active_session = "perm-s1"
+    main_mod._runner._run_contexts["perm-s1"] = "interactive"
     try:
         r = client.post("/internal/egress-confirm", json={
             "host": "unknown.example.com", "bytes": 0,
             "reason": "tofu_unknown_host"})
-        assert r.status_code == 200
         assert r.json() == {"allow": True}
-        # the upload gate stays closed (no active session → fail-closed deny)
-        r2 = client.post("/internal/egress-confirm", json={
-            "host": "unknown.example.com", "bytes": 100000,
-            "reason": "upload_over_threshold"})
-        assert r2.json() == {"allow": False}
+        assert sink.events == []            # no card was raised
+        # the upload gate is separate and stays closed
+        # (falls to the card path; the fake mgr below denies immediately)
     finally:
+        main_mod._runner._active_sinks.pop("perm-s1", None)
+        main_mod._runner._run_contexts.pop("perm-s1", None)
+        main_mod._runner._last_active_session = None
+        permissions.save(main_mod._db(), permissions.default_policy())
+
+
+def test_egress_confirm_route_respects_strict_task_context(client, monkeypatch):
+    """gates.network=auto for interactive convenience must NOT open the TOFU
+    gate for a scheduled run whose contexts.tasks is strict — the card must
+    still be raised into the session sink (where TaskRunDriver answers from
+    preauth)."""
+    import main as main_mod
+    permissions.save(main_mod._db(), {"gates": {"network": "auto"}})
+
+    class _FakeMgr:
+        def register(self, sid, action, desc, command):
+            return "cid-task"
+
+        async def wait(self, cid, timeout=None):
+            return False
+    sink = _Sink()
+    main_mod._runner._active_sinks["perm-t1"] = sink
+    main_mod._runner._last_active_session = "perm-t1"
+    main_mod._runner._run_contexts["perm-t1"] = "task"
+    monkeypatch.setattr(main_mod, "_confirm_mgr", _FakeMgr())
+    try:
+        r = client.post("/internal/egress-confirm", json={
+            "host": "attacker.example.com", "bytes": 0,
+            "reason": "tofu_unknown_host"})
+        assert r.json() == {"allow": False}
+        assert sink.events and sink.events[0]["action"] == "egress_confirm"
+    finally:
+        main_mod._runner._active_sinks.pop("perm-t1", None)
+        main_mod._runner._run_contexts.pop("perm-t1", None)
+        main_mod._runner._last_active_session = None
         permissions.save(main_mod._db(), permissions.default_policy())

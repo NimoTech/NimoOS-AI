@@ -195,6 +195,88 @@ def test_auto_approve_fails_closed_on_broken_conn():
     assert permissions.auto_approve(Boom(), "notes_write") is False
 
 
+def test_unknown_context_fails_closed():
+    """A typo'd or future context name must never resolve as interactive —
+    that would be the MOST permissive context."""
+    conn = _conn()
+    permissions.save(conn, {"gates": {"notes": "auto", "shell": "auto_all"}})
+    assert permissions.auto_approve(conn, "notes_write", context="tasks") is False
+    assert permissions.auto_approve(conn, "shell_command", level="dangerous",
+                                    context="scheduled") is False
+    pol = permissions.load(conn)
+    assert permissions.decide(pol, "notes", context="unknown") is False
+
+
+# -- gate_of_event -------------------------------------------------------------
+
+def test_gate_of_event_shapes():
+    goe = permissions.gate_of_event
+    assert goe({"type": "access_request", "path": "/DATA/x"}) == ("fs_access", "")
+    assert goe({"type": "confirmation_required", "action": "egress_confirm",
+                "reason": "tofu_unknown_host"}) == ("network", "")
+    assert goe({"type": "confirmation_required", "action": "egress_confirm",
+                "reason": "upload_over_threshold"}) == ("upload", "")
+    # unknown proxy reason must NOT inherit the network gate
+    assert goe({"type": "confirmation_required", "action": "egress_confirm",
+                "reason": "brand_new_dlp_verdict"}) == (None, "")
+    assert goe({"type": "confirmation_required", "kind": "mcp_tool",
+                "server": "s", "tool": "t"}) == ("mcp_tools", "")
+    assert goe({"type": "confirmation_required",
+                "kind": "mcp_install"}) == ("installs", "")
+    assert goe({"type": "confirmation_required",
+                "kind": "toolbox_install"}) == ("installs", "")
+    assert goe({"type": "confirmation_required",
+                "kind": "mcp_elicit_form"}) == (None, "")
+    assert goe({"type": "confirmation_required",
+                "kind": "mcp_elicit_url"}) == (None, "")
+    assert goe({"type": "confirmation_required", "action": "shell_command",
+                "risk_level": "gray"}) == ("shell", "gray")
+    assert goe({"type": "confirmation_required",
+                "action": "notes_write"}) == ("notes", "")
+    assert goe({}) == (None, "")
+    assert goe(None) == (None, "")
+
+
+def test_egress_gate_action_single_copy():
+    assert permissions.egress_gate_action("tofu_unknown_host") == "egress"
+    assert permissions.egress_gate_action("upload_over_threshold") == "egress_upload"
+    assert permissions.egress_gate_action("anything_else") is None
+    assert permissions.egress_gate_action("") is None
+
+
+def test_paths_policy_grantable_floor(tmp_path):
+    ok = str(tmp_path / "d")
+    import os
+    os.makedirs(ok)
+    assert permissions.paths_policy_grantable([ok]) is True
+    assert permissions.paths_policy_grantable([ok, "/etc/ssh"]) is False
+    assert permissions.paths_policy_grantable(["/usr/share"]) is False
+    assert permissions.paths_policy_grantable([]) is False
+    assert permissions.paths_policy_grantable("/DATA") is False   # bare string
+    assert permissions.paths_policy_grantable([ok, ""]) is False
+    assert permissions.paths_policy_grantable([ok, None]) is False
+
+
+# -- cache ---------------------------------------------------------------------
+
+def test_load_returns_fresh_copies_and_save_refreshes_cache():
+    conn = _conn()
+    permissions.save(conn, {"gates": {"notes": "auto"}})
+    d1 = permissions.load(conn)
+    d1["gates"]["notes"] = "ask"           # caller mutation must not poison
+    assert permissions.load(conn)["gates"]["notes"] == "auto"
+    permissions.save(conn, {"gates": {"notes": "ask"}})
+    assert permissions.load(conn)["gates"]["notes"] == "ask"
+
+
+def test_cache_is_per_connection_identity():
+    conn_a = _conn()
+    permissions.save(conn_a, {"gates": {"wiki": "auto"}})
+    assert permissions.load(conn_a)["gates"]["wiki"] == "auto"
+    conn_b = _conn()                        # fresh empty DB, different object
+    assert permissions.load(conn_b)["gates"]["wiki"] == "ask"
+
+
 # -- judges / helpers ---------------------------------------------------------
 
 def test_judge_enabled_defaults_and_toggle():

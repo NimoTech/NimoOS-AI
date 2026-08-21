@@ -86,15 +86,12 @@ def _policy_auto_grants(ctx, abs_paths: list[str]) -> bool:
     path. Belt-and-braces: even under an auto policy a path that resolves into
     a system location (FS_DENY_ROOTS, "/") still gets a card — the blacklist
     upstream should have caught it, but an auto-grant must never be the thing
-    that widens what a human click would have been asked about."""
+    that widens what a human click would have been asked about. The floor
+    itself lives in permissions.paths_policy_grantable (shared with the task
+    driver and the channel router)."""
     try:
-        if not permissions.auto_approve(ctx["conn"], "grant_access"):
-            return False
-        from tasks.driver import fs_root_denied  # noqa: PLC0415 — avoid cycle
-        for p in abs_paths:
-            if fs_root_denied(os.path.realpath(p)):
-                return False
-        return True
+        return permissions.auto_approve(ctx["conn"], "grant_access") \
+            and permissions.paths_policy_grantable(list(abs_paths))
     except Exception:  # noqa: BLE001 — fail toward asking
         return False
 

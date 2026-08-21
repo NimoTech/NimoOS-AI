@@ -163,12 +163,8 @@ async def _request_confirm(action: str, description: str, command: str) -> bool:
     if mgr is None or sink is None or not session_id:
         # Misconfigured runtime — refuse write rather than silently bypass.
         return False
-    import db as _dbmod  # noqa: PLC0415
     import permissions as _perm  # noqa: PLC0415
-    from audit import audit as _audit  # noqa: PLC0415
-    if _perm.auto_approve(_dbmod.get_connection(), action):
-        _audit(action, session_id=session_id, command=command,
-               decision="auto_approved_by_policy")
+    if _perm.policy_waives(action, session_id=session_id, command=command):
         return True
     confirm_id = mgr.register(session_id, action, description, command)
     await sink.put({

@@ -177,7 +177,8 @@ class ConfirmManager:
 
     def resolve(self, confirm_id: str, confirmed: bool, remember: bool = False,
                 expected_session_id: str | None = None, *,
-                action: str | None = None, content: dict | None = None) -> None:
+                action: str | None = None, content: dict | None = None,
+                source: str = "user") -> None:
         """Unblock the wait() / wait_elicit() corresponding to confirm_id.
 
         expected_session_id, if provided, must match the registered session;
@@ -186,6 +187,12 @@ class ConfirmManager:
         `action` / `content` are the elicitation extension. Existing two-state callers
         pass neither and are completely unaffected. `content` is held in memory only —
         see the _contents comment in __init__.
+
+        `source` names WHO answered, for the audit trail: "user" (the default
+        — a human pressed a button), "policy" (the permission policy resolved
+        it), "task-driver" (an unattended run's driver). Forensics must be
+        able to tell a policy grant from a human click; before this field the
+        two were indistinguishable in the log.
         """
         if action is not None and action not in ELICIT_ACTIONS:
             raise ValueError(f"unknown elicitation action: {action!r}")
@@ -207,7 +214,8 @@ class ConfirmManager:
                    command=(row["command"] if row else None),
                    decision=(action if action is not None
                              else ("approved" if confirmed else "denied")),
-                   remember=bool(remember))
+                   remember=bool(remember),
+                   source=source)
         except Exception:  # noqa: BLE001 — audit must not break resolution
             pass
         self._results[confirm_id] = confirmed

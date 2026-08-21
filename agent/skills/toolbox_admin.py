@@ -31,17 +31,10 @@ async def install_component(component_id: str) -> str:
     mgr = CONFIRM_MGR_VAR.get(); queue = EVENT_QUEUE_VAR.get(); sid = SESSION_ID_VAR.get()
     if not (mgr and queue and sid):
         return "Cannot install without a confirmation channel."
-    _auto = False
-    try:  # global permission policy waiver (audited); fail toward asking
-        import permissions as _perm  # noqa: PLC0415
-        from audit import audit as _audit  # noqa: PLC0415
-        if _perm.auto_approve(_db.get_connection(),
-                              f"toolbox_install:{component_id}"):
-            _audit("toolbox_install", session_id=sid, component=component_id,
-                   decision="auto_approved_by_policy")
-            _auto = True
-    except Exception:  # noqa: BLE001
-        _auto = False
+    import permissions as _perm  # noqa: PLC0415
+    _auto = _perm.policy_waives(f"toolbox_install:{component_id}",
+                                audit_event="toolbox_install",
+                                session_id=sid, component=component_id)
     if not _auto:
         confirm_id = mgr.register(sid, f"toolbox_install:{component_id}",
                                   f"Install {comp['name']} v{comp['version']}", component_id)
