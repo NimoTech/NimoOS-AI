@@ -18,7 +18,9 @@ MAX_TASKS_PER_USER = 50
 
 _UI_HINT = ("It is DISABLED and has no permissions yet. Ask the user to open "
             "AI → Tasks (/ai/tasks) to review the prompt, grant "
-            "pre-authorizations, and enable it.")
+            "pre-authorizations, enable it, and pick a notify channel "
+            "(Feishu/Telegram/…) so the result actually reaches them — the "
+            "runner delivers the task's final answer through that channel.")
 
 
 async def _create_scheduled_task_impl(name: str, prompt: str,
@@ -83,9 +85,21 @@ async def create_scheduled_task(name: str, prompt: str, cron_expr: str = "",
     Tasks page (AI → Tasks). Never claim the task will run — it will not
     until the user enables it.
 
+    DELIVERY RULE (write the prompt accordingly): the task runner delivers
+    the run's FINAL ANSWER to the user through the task's notify channel
+    (Feishu/Telegram/…, configured on the Tasks page). So the prompt must
+    make the final answer BE the content to deliver. NEVER write steps like
+    "send the result via lark-cli" or "message the user" into a task prompt:
+    task runs are non-interactive, message-sending CLIs there run under the
+    USER identity and require an OAuth scope grant that can never be
+    completed inside a finished run — the task would loop asking for
+    authorization forever instead of delivering anything.
+
     Args:
         name: short display name (e.g. "Daily Feishu digest").
         prompt: the full self-contained instruction the task will run with.
+            End it with what the final answer should contain — that answer is
+            what gets delivered.
         cron_expr: optional 5-field cron schedule (e.g. "0 9 * * *").
         interval_seconds: optional fixed interval; >= 60. Pass NEITHER
             schedule field for a task triggered only manually or by webhook.
