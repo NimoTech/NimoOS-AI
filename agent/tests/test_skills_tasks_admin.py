@@ -121,3 +121,18 @@ def test_registered_in_tasks_category():
     assert "create_scheduled_task" in names
     assert "tasks" in tool_registry.CATEGORY_DESCRIPTIONS
     assert tool_registry.category_of("create_scheduled_task") == "tasks"
+
+
+def test_delivery_rule_is_taught_to_the_model():
+    # Regression pin for the 2026-08-24 incident: a chat-created task whose
+    # prompt said "send it to Feishu" dead-ended in an un-completable OAuth
+    # loop (task runs are non-interactive; user-identity sends need a scope
+    # grant nobody can redeem there). The fix is instructional — the tool's
+    # description must tell the model that the runner delivers the FINAL
+    # ANSWER via the notify channel, and the created-task hint must point the
+    # user at picking one.
+    desc = tasks_admin.create_scheduled_task.description
+    assert "FINAL ANSWER" in desc
+    assert "notify channel" in desc
+    assert "lark-cli" in desc  # the concrete anti-pattern is named
+    assert "notify channel" in tasks_admin._UI_HINT
