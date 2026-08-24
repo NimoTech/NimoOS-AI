@@ -412,7 +412,7 @@ def _default_start_run(session_id, user_id, message, creds, *, max_turns,
     )
 
 
-def _default_driver_factory(*, session_id, preauth, run_timeout):
+def _default_driver_factory(*, session_id, preauth, run_timeout, task=None):
     import main  # noqa: PLC0415
     import permissions  # noqa: PLC0415
 
@@ -421,9 +421,19 @@ def _default_driver_factory(*, session_id, preauth, run_timeout):
         policy = permissions.load(main._db())
     except Exception:  # noqa: BLE001 — a policy failure means strict (deny)
         policy = None
+    esc = None
+    if task is not None:
+        try:
+            from . import escalate as _escalate  # noqa: PLC0415
+            esc = _escalate.build(main._db(), task, session_id=session_id,
+                                  confirm_mgr=main._confirm_mgr)
+        except Exception:  # noqa: BLE001 — escalation is an upgrade; its
+            # absence must never sink the run (falls back to immediate deny).
+            logger.warning("tasks runner: escalation unavailable",
+                           exc_info=True)
     return TaskRunDriver(confirm_mgr=main._confirm_mgr, session_id=session_id,
                          preauth=preauth, run_timeout=run_timeout,
-                         policy=policy)
+                         policy=policy, escalate=esc)
 
 
 def _default_read_unlocked(session_id: str) -> list:
@@ -578,7 +588,7 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
         if timeout_seconds <= 0:
             timeout_seconds = DEFAULT_TIMEOUT_SECONDS
         driver = driver_factory(session_id=session_id, preauth=doc,
-                                run_timeout=timeout_seconds)
+                                run_timeout=timeout_seconds, task=task)
         result = await driver.drive(sink) or {}
 
         status = str(result.get("status") or "failed")

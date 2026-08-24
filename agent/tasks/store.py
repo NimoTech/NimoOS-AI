@@ -31,6 +31,10 @@ _CREATE_DEFAULTS = {
     "notify_policy": "failure",
     "notify_channel": "",
     "notify_on_start": 0,
+    # M5's red line lives on this default: a task the AGENT creates must be
+    # disabled until a human enables it in the UI, so the agent tool passes
+    # enabled=0 explicitly; every other caller keeps today's enabled-on-create.
+    "enabled": 1,
 }
 
 # Fields update_task is allowed to touch. preauth maps to the preauth_json
@@ -78,11 +82,12 @@ def create_task(conn, user_id: str, **fields) -> str:
         "overlap_policy, catchup_policy, preauth_json, notify_policy, "
         "notify_channel, notify_on_start, next_run_at, last_run_at, created_at, "
         "updated_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,0,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
         (
             task_id, user_id, fields["name"], fields["prompt"],
             g("agent_type"), g("model"), trigger_type, cron_expr, interval_seconds,
-            webhook_token, g("max_turns"), g("timeout_seconds"),
+            webhook_token, 1 if g("enabled") else 0,
+            g("max_turns"), g("timeout_seconds"),
             g("overlap_policy"), g("catchup_policy"), preauth_json,
             g("notify_policy"), g("notify_channel"),
             1 if g("notify_on_start") else 0, next_run_at, now, now,

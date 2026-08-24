@@ -92,3 +92,15 @@ def test_prune_runs_returns_session_ids(conn):
     dropped = store.prune_runs(conn, tid, keep=2)
     assert len(dropped) == 3 and "sess-0" in dropped
     assert len(store.list_runs(conn, tid)) == 2
+
+
+def test_create_task_enabled_override(conn):
+    from tasks import store
+    tid = _mk(conn, trigger_type="webhook_only", cron_expr="", enabled=0)
+    assert store.get_task(conn, tid, "u1")["enabled"] == 0
+
+
+def test_create_task_enabled_defaults_to_1(conn):
+    from tasks import store
+    tid = _mk(conn, trigger_type="webhook_only", cron_expr="")
+    assert store.get_task(conn, tid, "u1")["enabled"] == 1

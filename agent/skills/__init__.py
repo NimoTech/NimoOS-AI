@@ -11,6 +11,7 @@ from skills.wiki import (
 )
 from skills.skills_registry import ALL_TOOLS as SKILLS_REGISTRY_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
+from skills.tasks_admin import ALL_TOOLS as TASKS_ADMIN_TOOLS
 from skills.toolbox_admin import ALL_TOOLS as TOOLBOX_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills.memory import MEMORY_TOOLS
@@ -26,4 +27,5 @@ WIKI_TOOLS = [
 ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
              + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
              + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS + SEARCH_TOOLS + MCP_ADMIN_TOOLS
-             + TOOLBOX_TOOLS + MEMORY_TOOLS + NOTES_TOOLS + WEB_TOOLS)
+             + TOOLBOX_TOOLS + TASKS_ADMIN_TOOLS + MEMORY_TOOLS + NOTES_TOOLS
+             + WEB_TOOLS)

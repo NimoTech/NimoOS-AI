@@ -14,6 +14,7 @@ from skills.message_bus import ALL_TOOLS as MESSAGEBUS_TOOLS
 from skills.filesystem import ALL_TOOLS as FS_TOOLS
 from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
 from skills.mcp_admin import ALL_TOOLS as MCP_ADMIN_TOOLS
+from skills.tasks_admin import ALL_TOOLS as TASKS_ADMIN_TOOLS
 from skills.toolbox_admin import ALL_TOOLS as TOOLBOX_TOOLS
 from skills.search import SEARCH_TOOLS
 from skills import WIKI_TOOLS
@@ -52,6 +53,7 @@ CATEGORY_TOOLS: dict[str, list] = {
     "web": list(WEB_TOOLS),                # 2
     "mcp": list(MCP_ADMIN_TOOLS),          # 1 (+ dynamic runtime MCP tools)
     "toolbox": list(TOOLBOX_TOOLS),         # 1
+    "tasks": list(TASKS_ADMIN_TOOLS),       # 1
 }
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -66,6 +68,8 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "web": "search the public web and fetch web pages (needs a configured search provider)",
     "mcp": "register and use tools from connected MCP servers",
     "toolbox": "Install/manage persistent CLI components (toolbox)",
+    "tasks": "create scheduled agent tasks (created disabled; the user "
+             "authorizes & enables them on the Tasks page)",
 }
 
 # tool name → category name (returns None for always-on/unknown)

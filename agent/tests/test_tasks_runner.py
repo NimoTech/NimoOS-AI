@@ -38,12 +38,13 @@ class FakeSink:
 
 class FakeDriver:
     def __init__(self, result, *, session_id="", preauth=None, run_timeout=0,
-                 raises=None):
+                 raises=None, task=None):
         self.result = result
         self.session_id = session_id
         self.preauth = preauth
         self.run_timeout = run_timeout
         self.raises = raises
+        self.task = task
         self.driven = None
 
     async def drive(self, sink):
@@ -1388,3 +1389,16 @@ async def test_a_task_without_a_workspace_does_not_touch_the_tool_gate(conn):
 
     assert await h.run(conn, unlock=lambda s, c: calls.append(c)) is True
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_driver_factory_receives_task_row(conn):
+    # The escalation coordinator (tasks/escalate.py) needs the task row —
+    # notify_channel, id, user_id — so the factory contract carries it.
+    h = Harness()
+    task_id = _mk(conn)
+    _queue(conn, task_id)
+    assert await h.run(conn) is True
+    assert h.driver.task is not None
+    assert h.driver.task["id"] == task_id
+    assert h.driver.task["user_id"] == "u1"
