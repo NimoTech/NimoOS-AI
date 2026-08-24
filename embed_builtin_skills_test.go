@@ -68,6 +68,32 @@ func TestDesktopAppBuilderSkillEmbedded(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// The task-scheduler skill is the L1 pointer that teaches the model to use
+// create_scheduled_task at all (expand_tools gating) and repeats the delivery
+// rule born from the lark-cli self-send incident. Pin the load-bearing
+// content so a rewrite can't silently drop it.
+func TestTaskSchedulerSkillEmbedded(t *testing.T) {
+	b, err := builtinSkillsFS.ReadFile("builtin-skills/task-scheduler/manifest.json")
+	require.NoError(t, err)
+	var m service.SkillManifest
+	require.NoError(t, json.Unmarshal(b, &m))
+	require.Equal(t, "task-scheduler", m.ID)
+	require.Equal(t, "auto", m.Trigger)
+	require.LessOrEqual(t, utf8.RuneCountInString(m.Description), 256)
+	require.NotContains(t, m.Description, "\n")
+	require.NotContains(t, m.Description, "<")
+	require.NotContains(t, m.Description, ">")
+
+	md, err := builtinSkillsFS.ReadFile("builtin-skills/task-scheduler/SKILL.md")
+	require.NoError(t, err)
+	s := string(md)
+	require.Contains(t, s, `expand_tools(["tasks"])`)
+	require.Contains(t, s, "create_scheduled_task")
+	require.Contains(t, s, "FINAL ANSWER")
+	require.Contains(t, s, "notify channel")
+	require.Contains(t, s, "lark-cli")
+}
+
 func TestAllBuiltinBundlesPassValidation(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, service.SeedBuiltinSkills(root, builtinSkillsFS))
@@ -80,7 +106,9 @@ func TestAllBuiltinBundlesPassValidation(t *testing.T) {
 	}
 	require.Contains(t, ids, "desktop-app-builder")
 	require.Contains(t, ids, "toolbox-helper")
-	// 7 pre-existing bundles + desktop-app-builder + toolbox-helper. A
-	// silently-skipped (invalid) bundle would make this count drop.
-	require.Len(t, ms, 9)
+	require.Contains(t, ids, "task-scheduler")
+	// 7 pre-existing bundles + desktop-app-builder + toolbox-helper +
+	// task-scheduler. A silently-skipped (invalid) bundle would make this
+	// count drop.
+	require.Len(t, ms, 10)
 }

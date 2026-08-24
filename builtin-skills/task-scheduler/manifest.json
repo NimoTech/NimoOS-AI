@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "task-scheduler",
+  "name": "task-scheduler",
+  "title": "Task scheduler",
+  "description": "Create scheduled/recurring agent tasks when the user asks for anything periodic or timed (daily digest, weekly check, reminders). Unlock with expand_tools tasks, then create_scheduled_task. Read this BEFORE writing any task prompt.",
+  "color": "purple",
+  "icon": "clock",
+  "trigger": "auto",
+  "examples": ["send me an AI news digest every morning at 9", "every Monday check disk health and report", "turn this workflow into a scheduled task"],
+  "permissions": { "network": false, "writable_paths": [] },
+  "version": "0.1.0",
+  "author": "Nimo"
+}
