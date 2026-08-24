@@ -2804,6 +2804,33 @@ async def toolbox_install(request: Request, x_user_id: str = Header(..., alias="
     return JSONResponse({"status": "installing"}, status_code=202)
 
 
+@app.post("/agent/toolbox/upgrade")
+async def toolbox_upgrade(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
+    from toolbox import installer
+    import db as _db
+    try:
+        body = await request.json()
+        cid = str(body["id"])
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    try:
+        installer._catalog_by_id(cid)
+    except installer.InstallError:
+        raise HTTPException(404, "unknown_component")
+    job = _TOOLBOX_JOBS.get(cid)
+    if job and not job.done():
+        raise HTTPException(409, "already_installing")
+
+    async def _job():
+        try:
+            await installer.upgrade(_db.get_connection(), cid)
+        except Exception:
+            _LOG.exception("toolbox upgrade failed: %s", cid)
+
+    _TOOLBOX_JOBS[cid] = asyncio.create_task(_job())
+    return JSONResponse({"status": "upgrading"}, status_code=202)
+
+
 @app.post("/agent/toolbox/uninstall")
 async def toolbox_uninstall(request: Request, x_user_id: str = Header(..., alias="X-User-Id")):
     from toolbox import installer

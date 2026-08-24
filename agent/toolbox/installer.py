@@ -20,6 +20,39 @@ def toolbox_root() -> Path:
     return Path(os.environ.get("NIMOOS_TOOLBOX_ROOT", "/opt/toolbox"))
 
 
+def deps_dir() -> Path:
+    """Local package mirror consulted BEFORE the network (spec §7 离线).
+
+    Defaults to `<toolbox root>/deps`, which on the host is
+    /var/lib/nimoos/ai/toolbox/deps — the directory the build's install.sh
+    populates from the bundle's deps/toolbox/. Same bind mount as the
+    toolbox itself, so no compose change is needed.
+    """
+    override = os.environ.get("NIMOOS_TOOLBOX_DEPS_DIR")
+    return Path(override) if override else toolbox_root() / "deps"
+
+
+def local_package(comp: dict) -> "Path | None":
+    """The local package file for this component+version, or None.
+
+    npm components match any *.tgz in the version directory (npm pack names
+    the file itself); binary components match the artifact URL's basename,
+    so one directory can hold both architectures side by side.
+    """
+    d = deps_dir() / comp["id"] / comp["version"]
+    if not d.is_dir():
+        return None
+    if comp["method"] == "npm":
+        for p in sorted(d.glob("*.tgz")):
+            return p
+        return None
+    art = (comp.get("artifacts") or {}).get(_arch())
+    if not art:
+        return None
+    p = d / art["url"].rsplit("/", 1)[-1]
+    return p if p.is_file() else None
+
+
 def load_catalog() -> list:
     return json.loads(_CATALOG_PATH.read_text("utf-8"))["components"]
 
@@ -75,8 +108,11 @@ def _link_bins(prefix: Path, comp: dict):
 
 async def _install_npm(comp: dict, prefix: Path):
     prefix.mkdir(parents=True, exist_ok=True)
-    argv = ["npm", "install", "-g", f"{comp['npm_package']}@{comp['version']}",
-            "--prefix", str(prefix)]
+    local = local_package(comp)
+    # A local tarball is authoritative for its pinned version; the registry
+    # coordinate is the ONLINE fallback, not the preference (spec §7 离线).
+    source = str(local) if local else f"{comp['npm_package']}@{comp['version']}"
+    argv = ["npm", "install", "-g", source, "--prefix", str(prefix)]
     code, out, err = await _run(argv, timeout=_DL_TIMEOUT)
     if code != 0:
         raise InstallError(f"npm failed: {err or out}")
@@ -89,10 +125,16 @@ async def _install_binary(comp: dict, prefix: Path):
     prefix.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         tarball = Path(td) / "pkg.tar.gz"
-        async with httpx.AsyncClient(timeout=_DL_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(art["url"])
-            resp.raise_for_status()
-            tarball.write_bytes(resp.content)
+        local = local_package(comp)
+        if local:
+            shutil.copy2(local, tarball)
+        else:
+            async with httpx.AsyncClient(timeout=_DL_TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(art["url"])
+                resp.raise_for_status()
+                tarball.write_bytes(resp.content)
+        # sha256 verifies the LOCAL file too: the deps mirror is a cache,
+        # not a trust root — the catalog stays the integrity source.
         digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
         if digest != art["sha256"]:
             raise InstallError(f"sha256 mismatch: got {digest}")
@@ -139,10 +181,36 @@ async def install(conn, component_id: str) -> None:
             raise InstallError(f"unknown method {comp['method']}")
         _link_bins(prefix, comp)
         await _self_check(comp)
+        _prune_stale_versions(comp)
     except Exception as e:
         _set_row(conn, comp["id"], comp["version"], "failed", str(e))
         raise InstallError(str(e)) from e
     _set_row(conn, comp["id"], comp["version"], "installed")
+
+
+def _prune_stale_versions(comp: dict) -> None:
+    """Remove version directories other than the one just installed.
+
+    Only after link+self-check succeed: a failed new install must leave the
+    previous version's files (and its still-pointing symlinks) untouched.
+    Best-effort — a busy file must not fail an install that already works.
+    """
+    base = toolbox_root() / "pkgs" / comp["id"]
+    if not base.is_dir():
+        return
+    for d in base.iterdir():
+        if d.name != comp["version"]:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+async def upgrade(conn, component_id: str) -> None:
+    """Install the catalog's current version and drop older ones.
+
+    Same machinery as install() on purpose: _link_bins already repoints the
+    symlinks and install() prunes stale versions, so "upgrade" is install()
+    with a name the API/UI can speak.
+    """
+    await install(conn, component_id)
 
 
 def uninstall(conn, component_id: str) -> None:
