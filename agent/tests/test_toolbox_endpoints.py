@@ -68,11 +68,16 @@ def test_upgrade_conflicts_with_running_install():
             return False
 
     c = _client()
-    import main as _main
     # Occupy the per-component job slot the way a running install would.
-    _main._TOOLBOX_JOBS["gh"] = RunningJob()
+    # Deliberately the module-level `main` this file imported at collection
+    # time — the same object _client() routes through. A fresh `import main`
+    # here can resolve a DIFFERENT module under the full suite, because
+    # test_main_agent_type.py's fixture pops "main" from sys.modules and
+    # re-imports it; writing the job into that copy leaves the app's own
+    # _TOOLBOX_JOBS empty and the 409 never fires.
+    main._TOOLBOX_JOBS["gh"] = RunningJob()
     try:
         r = c.post("/agent/toolbox/upgrade", headers=H, json={"id": "gh"})
         assert r.status_code == 409
     finally:
-        _main._TOOLBOX_JOBS.pop("gh", None)
+        main._TOOLBOX_JOBS.pop("gh", None)
