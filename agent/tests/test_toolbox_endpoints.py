@@ -41,3 +41,38 @@ def test_install_unknown_404():
     c = _client()
     r = c.post("/agent/toolbox/install", headers=H, json={"id": "nope"})
     assert r.status_code == 404
+
+
+def test_upgrade_dispatches_background(monkeypatch):
+    called = []
+
+    async def fake_upgrade(conn, cid):
+        called.append(cid)
+
+    monkeypatch.setattr(installer, "upgrade", fake_upgrade)
+    c = _client()
+    r = c.post("/agent/toolbox/upgrade", headers=H, json={"id": "gh"})
+    assert r.status_code == 202
+    assert r.json()["status"] == "upgrading"
+
+
+def test_upgrade_unknown_404():
+    c = _client()
+    r = c.post("/agent/toolbox/upgrade", headers=H, json={"id": "nope"})
+    assert r.status_code == 404
+
+
+def test_upgrade_conflicts_with_running_install():
+    class RunningJob:
+        def done(self):
+            return False
+
+    c = _client()
+    import main as _main
+    # Occupy the per-component job slot the way a running install would.
+    _main._TOOLBOX_JOBS["gh"] = RunningJob()
+    try:
+        r = c.post("/agent/toolbox/upgrade", headers=H, json={"id": "gh"})
+        assert r.status_code == 409
+    finally:
+        _main._TOOLBOX_JOBS.pop("gh", None)
