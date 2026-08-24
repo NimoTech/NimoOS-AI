@@ -3067,9 +3067,35 @@ async def tasks_notify_targets(x_user_id: str = Header(..., alias="X-User-Id")):
     return {"targets": channel_store.list_chats_for_user(_db(), x_user_id)}
 
 
-# Registered BEFORE /agent/tasks/{task_id} for the same reason
-# notify-targets is: FastAPI matches in definition order, so a later
-# static path would be swallowed by the {task_id} parameter route.
+# Registered BEFORE /agent/tasks/{task_id} — FastAPI matches in definition
+# order, so a later static path would be swallowed by the {task_id} route.
+_CRON_PREVIEW_MAX = 5
+
+
+@app.get("/agent/tasks/cron-preview")
+async def tasks_cron_preview(expr: str, count: int = 3,
+                             x_user_id: str = Header(..., alias="X-User-Id")):
+    """Next fire times for a cron expression — the editor's live preview.
+
+    Computed by the SAME `tasks.cron` the scheduler uses, so the preview can
+    never drift from what the task will actually do. An expression that
+    parses but never fires (`0 0 30 2 *`) is a 400 like any other bad cron —
+    the editor must be able to tell the author before the task is saved.
+    """
+    from tasks import cron as _cron
+    count = max(1, min(_CRON_PREVIEW_MAX, count))
+    fires: list = []
+    ts = int(time.time())
+    try:
+        _cron.validate(expr)
+        for _ in range(count):
+            ts = _cron.next_after(expr, ts)
+            fires.append(ts)
+    except Exception:  # noqa: BLE001 — CronError/ValueError/TypeError → 400
+        raise HTTPException(400, "bad_cron")
+    return {"next": fires}
+
+
 @app.post("/agent/tasks/draft-from-session")
 async def tasks_draft_from_session(
     request: Request,

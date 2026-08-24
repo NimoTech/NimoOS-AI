@@ -726,3 +726,37 @@ def test_from_denied_egress_is_unaffected_by_the_shell_check(client):
     assert r.status_code == 200, r.text
     assert r.json()["adopted"] == {"field": "egress_domains",
                                    "value": "open.feishu.cn"}
+
+
+# --- cron next-run preview (spec §9 编辑器"下次运行"实时预览) -----------------
+
+def test_cron_preview_returns_next_fires():
+    c = _client()
+    r = c.get("/agent/tasks/cron-preview", headers=H,
+              params={"expr": "0 9 * * *", "count": 3})
+    assert r.status_code == 200
+    fires = r.json()["next"]
+    assert len(fires) == 3
+    import time
+    now = int(time.time())
+    assert all(isinstance(t, int) and t > now for t in fires)
+    assert fires == sorted(fires) and len(set(fires)) == 3
+
+
+def test_cron_preview_bad_expr_400():
+    c = _client()
+    r = c.get("/agent/tasks/cron-preview", headers=H,
+              params={"expr": "not a cron"})
+    assert r.status_code == 400
+    # `0 0 30 2 *` parses but never fires — must be a 400 too, not a hang/500
+    r = c.get("/agent/tasks/cron-preview", headers=H,
+              params={"expr": "0 0 30 2 *"})
+    assert r.status_code == 400
+
+
+def test_cron_preview_count_clamped():
+    c = _client()
+    r = c.get("/agent/tasks/cron-preview", headers=H,
+              params={"expr": "* * * * *", "count": 999})
+    assert r.status_code == 200
+    assert len(r.json()["next"]) <= 5
