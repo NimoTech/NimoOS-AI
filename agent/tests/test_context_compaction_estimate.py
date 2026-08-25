@@ -65,3 +65,40 @@ def test_default_window_is_modern():
     # entered a truncate-every-turn death spiral.
     assert cc.DEFAULT_CONTEXT_WINDOW >= 32768
     assert cc.DEFAULT_CONTEXT_WINDOW == cc.CLOUD_CONTEXT_WINDOW
+
+
+class _FakeTool:
+    def __init__(self, name, is_enabled=True):
+        self.name = name
+        self.description = "d" * 40
+        self.params_json_schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+        if is_enabled is not None:
+            self.is_enabled = is_enabled
+
+
+def test_estimate_tools_skips_disabled():
+    # Locked gated categories are NOT in the request — counting them inflated
+    # a fresh session's overhead by ~8.5k and put local 8k-window sessions
+    # permanently over budget.
+    on = _FakeTool("a")
+    off = _FakeTool("b", is_enabled=False)
+    cb_on = _FakeTool("c", is_enabled=lambda ctx, agent: True)
+    cb_off = _FakeTool("d", is_enabled=lambda ctx, agent: False)
+    base = cc.estimate_tools_tokens([on])
+    assert cc.estimate_tools_tokens([on, off, cb_off]) == base
+    assert cc.estimate_tools_tokens([on, cb_on]) > base
+    # all filtered out → 0, no boilerplate base either
+    assert cc.estimate_tools_tokens([off, cb_off]) == 0
+
+
+def test_estimate_tools_counts_weird_is_enabled_conservatively():
+    # A raising or non-bool callback must count the tool: estimating high is
+    # safe, estimating low breaks the compaction pre-check.
+    def boom(ctx, agent):
+        raise RuntimeError("x")
+    async def coro(ctx, agent):
+        return False
+    t1 = _FakeTool("a", is_enabled=boom)
+    t2 = _FakeTool("b", is_enabled=coro)   # returns a coroutine, not a bool
+    assert cc.estimate_tools_tokens([t1]) > 0
+    assert cc.estimate_tools_tokens([t2]) > 0

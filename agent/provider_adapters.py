@@ -6,6 +6,7 @@ uses extra_body + reasoning_effort, OpenAI uses reasoning_effort, Anthropic
 uses thinking.budget_tokens (handled in the Go service for the Anthropic
 path; this module only covers OpenAI-compatible Chat Completions).
 """
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -63,6 +64,21 @@ def build_model_settings(
     converted in service/cloud_anthropic.go where the budget_tokens is set.
     Returning empty settings for ANTHROPIC just means we won't double-set.
     """
+    settings = _thinking_settings(provider_type, thinking)
+    # Always ask streaming responses to carry real token usage
+    # (stream_options.include_usage). The SDK defaults this on ONLY for
+    # api.openai.com; DeepSeek / Ollama / Qwen etc. support it too, and
+    # without it no response ever reports real input_tokens — the context
+    # indicator would be stuck on the char-ratio estimate forever. Endpoints
+    # that ignore the field simply return no usage (we fall back to the
+    # estimate); OpenAI-compatible servers don't reject it.
+    return dataclasses.replace(settings, include_usage=True)
+
+
+def _thinking_settings(
+    provider_type: ProviderType,
+    thinking: Optional[ThinkingConfig],
+) -> ModelSettings:
     if thinking is None:
         return ModelSettings()
 

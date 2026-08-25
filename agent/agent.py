@@ -1038,9 +1038,13 @@ class AgentRunner:
             # _fetch_and_build. There is no per-category gating to apply here
             # (the old gate_runtime_tools wrapper was deleted as dead code —
             # nothing ever reached it non-empty), and MCP tools deliberately
-            # carry no is_enabled callback: which ones exist is decided at build
-            # time, because estimate_tools_tokens below counts every tool in the
-            # list whether is_enabled would hide it or not.
+            # carry no is_enabled callback: which ones exist is decided at
+            # build time. estimate_tools_tokens below skips is_enabled=False
+            # tools (locked categories are not in the request); MCP L2 tools,
+            # having no is_enabled, are always counted — correct, since they
+            # are only built when their gate is already open. UNLOCKED_VAR is
+            # already set for this run (see the top of this method), so the
+            # estimate sees the session's real unlock state.
             run_tools = select_tools_for_run(
                 attachment_ids, session_id=session_id, profile=profile) + mcp_tools + _mcp_l2_tools
             try:
@@ -1191,10 +1195,31 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+                # Provider-reported usage: the LAST request's input_tokens is
+                # the provider's own count of the current context (the
+                # accumulated context_wrapper.usage sums all turns — wrong
+                # metric here). Present only when the endpoint honours
+                # stream_options.include_usage (see build_model_settings);
+                # 0 keeps the previous measurement rather than erasing it.
+                _real_input = 0
                 try:
-                    self._conn.execute(
-                        "UPDATE sessions SET last_overhead_tokens=? WHERE id=?",
-                        (_overhead, session_id))
+                    for _resp in reversed(getattr(stream, "raw_responses", None) or []):
+                        _u = getattr(_resp, "usage", None)
+                        if _u and getattr(_u, "input_tokens", 0):
+                            _real_input = int(_u.input_tokens)
+                            break
+                except Exception:
+                    _real_input = 0
+                try:
+                    if _real_input > 0:
+                        self._conn.execute(
+                            "UPDATE sessions SET last_overhead_tokens=?, "
+                            "last_real_input_tokens=? WHERE id=?",
+                            (_overhead, _real_input, session_id))
+                    else:
+                        self._conn.execute(
+                            "UPDATE sessions SET last_overhead_tokens=? WHERE id=?",
+                            (_overhead, session_id))
                     self._conn.commit()
                 except Exception:
                     pass

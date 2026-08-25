@@ -107,13 +107,42 @@ def estimate_messages_tokens(messages) -> int:
     return sum(estimate_tokens(_message_text(m)) for m in (messages or []))
 
 
+def _tool_is_sent(t) -> bool:
+    """Whether this tool's schema actually goes into the request. Gated tool
+    copies carry an is_enabled callback (tool_gating.make_is_enabled) that
+    reads the run's UNLOCKED_VAR — a still-locked category's schemas are NOT
+    sent, so counting them once inflated a fresh session's overhead by ~8.5k
+    (and put every local-8k-window session permanently "over budget").
+    is_enabled may be a bool or a sync callback ignoring its (ctx, agent)
+    args; anything unexpected (async, raising) counts the tool — estimating
+    high is safe, estimating low is not."""
+    enabled = getattr(t, "is_enabled", True)
+    if isinstance(enabled, bool):
+        return enabled
+    if callable(enabled):
+        try:
+            res = enabled(None, None)
+        except Exception:
+            return True
+        if isinstance(res, bool):
+            return res
+        if asyncio.iscoroutine(res):
+            res.close()   # async callback: don't await here, just count it
+        return True
+    return True
+
+
 def estimate_tools_tokens(tools) -> int:
     """Estimated tokens of the tool definitions sent to the model each request
     (name + description + JSON-schema params), serialized, plus a fixed base
-    for the framework's tool-array boilerplate. getattr-tolerant; a tool that
-    fails to serialize is skipped, never raises. Empty/None → 0 (no base)."""
+    for the framework's tool-array boilerplate. Tools whose is_enabled
+    resolves False are skipped — the SDK omits them from the request, so
+    they cost nothing (mid-run unlocks grow later requests; the THRESHOLD
+    headroom absorbs that, same as tool-result growth). getattr-tolerant; a
+    tool that fails to serialize is skipped, never raises. Empty/None → 0
+    (no base)."""
     import json as _json
-    items = list(tools or [])
+    items = [t for t in (tools or []) if _tool_is_sent(t)]
     if not items:
         return 0
     total = TOOLS_BASE_OVERHEAD
@@ -327,21 +356,30 @@ def _load_snapshot_history(conn, session_id) -> list:
 
 
 def compute_usage(conn, *, session_id, user_id, model) -> dict:
-    """Read-only current context usage for a session: estimated tokens of
-    (rolling_summary + history snapshot) vs the resolved model window. Never
-    writes, never triggers compaction. Same estimator as compaction, so pct
-    aligns with the THRESHOLD trigger."""
+    """Read-only current context usage for a session vs the resolved model
+    window. Never writes, never triggers compaction.
+
+    Prefers the provider-reported input_tokens of the last run's final
+    request (sessions.last_real_input_tokens, captured when the endpoint
+    honours stream_options.include_usage) — the provider's own count of the
+    current context. Falls back to the same char-ratio estimator compaction
+    uses, so the fallback pct aligns with the THRESHOLD trigger."""
     window = resolve_window(conn, user_id, model)
+    source = "estimate"
     try:
         # Scope by user_id: a session is only readable by its owner. A
         # non-existent OR not-owned session returns zeros (no cross-user
         # info leak — IDOR guard), mirroring other user-scoped agent endpoints.
         srow = conn.execute(
-            "SELECT rolling_summary, last_overhead_tokens, folded_upto "
+            "SELECT rolling_summary, last_overhead_tokens, folded_upto, "
+            "last_real_input_tokens "
             "FROM sessions WHERE id=? AND user_id=?",
             (session_id, str(user_id))).fetchone()
         if srow is None:
             tokens = 0
+        elif (srow["last_real_input_tokens"] or 0) > 0:
+            tokens = srow["last_real_input_tokens"]
+            source = "provider"
         else:
             summary = srow["rolling_summary"] or ""
             overhead = srow["last_overhead_tokens"] or 0
@@ -355,4 +393,4 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
         _LOG.warning("context usage compute failed for %s: %s", session_id, e)
         tokens = 0
     pct = round(100 * tokens / window) if window else 0
-    return {"tokens": tokens, "window": window, "pct": pct}
+    return {"tokens": tokens, "window": window, "pct": pct, "source": source}
