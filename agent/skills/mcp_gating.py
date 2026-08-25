@@ -17,10 +17,10 @@ does. This module owns the gate-key/handle bookkeeping for that split; the
 actual FunctionTool loading lives in skills/tool_gating.py, which builds a
 server's tools only when its gate is open rather than gating always-built
 tools with an is_enabled callback keyed on gate_key(). Selection at BUILD time
-is deliberate: estimate_tools_tokens (context_compaction.py) counts every tool
-in the list whether is_enabled would hide it or not, so an always-built,
-callback-gated MCP tool would charge the compaction budget its full schema
-cost while showing the model nothing.
+is still deliberate even though estimate_tools_tokens now skips
+is_enabled=False tools: building only open-gated servers keeps the schema
+cache and the "a tool exists in agent.tools ⇒ its gate is open" invariant
+below, and avoids fetching N servers' schemas that nothing will send.
 
 L2 loading therefore has two entry points, sharing tool_gating._fetch_and_build:
   - _load_l2_tools_async — the gate's FIRST opening, mid-run: splice onto the

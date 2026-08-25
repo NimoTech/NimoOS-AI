@@ -98,3 +98,24 @@ def test_usage_excludes_folded_prefix(tmp_path):
     expected = (cc.estimate_tokens("SUM")
                 + cc.estimate_messages_tokens(hist[2:]))
     assert abs(out["tokens"] - expected) <= 2
+
+
+def test_provider_reported_usage_preferred(conn):
+    # last_real_input_tokens (provider-counted context of the last run's
+    # final request) beats the char-ratio estimate when present.
+    _sess(conn)
+    conn.execute("UPDATE sessions SET last_real_input_tokens=4321, "
+                 "last_overhead_tokens=13000 WHERE id='s1'")
+    conn.commit()
+    _snapshot(conn, "s1", [{"role": "user", "content": "x" * 4000}])
+    u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="cloud:4:m")
+    assert u["tokens"] == 4321
+    assert u["source"] == "provider"
+
+
+def test_estimate_fallback_when_no_real_usage(conn):
+    _sess(conn)
+    _snapshot(conn, "s1", [{"role": "user", "content": "hello"}])
+    u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="cloud:4:m")
+    assert u["tokens"] > 0
+    assert u["source"] == "estimate"

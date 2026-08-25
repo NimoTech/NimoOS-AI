@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rolling_summary       TEXT,
     folded_upto           INTEGER NOT NULL DEFAULT 0,
     last_overhead_tokens  INTEGER NOT NULL DEFAULT 0,
+    last_real_input_tokens INTEGER NOT NULL DEFAULT 0,
     source            TEXT NOT NULL DEFAULT 'web'
 );
 
@@ -515,6 +516,11 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "last_overhead_tokens" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "last_overhead_tokens INTEGER NOT NULL DEFAULT 0")
+    if "last_real_input_tokens" not in existing:
+        # Provider-reported input_tokens of the run's LAST request — the
+        # provider's own count of the current context. 0 = never measured.
+        conn.execute("ALTER TABLE sessions ADD COLUMN "
+                     "last_real_input_tokens INTEGER NOT NULL DEFAULT 0")
     if "source" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "source TEXT NOT NULL DEFAULT 'web'")

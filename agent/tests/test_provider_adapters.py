@@ -90,3 +90,16 @@ def test_ollama_qwen_disabled(provider_type):
     )
     assert s.extra_body["think"] is False
     assert s.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+@pytest.mark.parametrize("provider_type", list(ProviderType))
+@pytest.mark.parametrize("thinking", [
+    None, ThinkingConfig(enabled=True, level=ThinkingLevel.MEDIUM),
+    ThinkingConfig(enabled=False, level=ThinkingLevel.MEDIUM),
+])
+def test_include_usage_always_on(provider_type, thinking):
+    """Every settings shape requests stream_options.include_usage — the SDK
+    only defaults it on for api.openai.com, so DeepSeek/Ollama/... would never
+    report real input_tokens without this."""
+    s = build_model_settings(provider_type, thinking)
+    assert s.include_usage is True
