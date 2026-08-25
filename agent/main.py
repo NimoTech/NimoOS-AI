@@ -3025,6 +3025,9 @@ def _task_payload(body: dict, existing=None) -> tuple[dict, dict]:
     if "notify_on_start" in body:
         out["notify_on_start"] = 1 if body["notify_on_start"] else 0
 
+    if "allow_prompt_revision" in body:
+        out["allow_prompt_revision"] = 1 if body["allow_prompt_revision"] else 0
+
     report = _empty_preauth_report()
     if "preauth" in body:
         from tasks import preauth as _preauth
@@ -3049,6 +3052,7 @@ def _task_out(row) -> dict:
     out["preauth"] = _preauth.parse(out.pop("preauth_json", "{}"))
     out["enabled"] = bool(out.get("enabled"))
     out["notify_on_start"] = bool(out.get("notify_on_start"))
+    out["allow_prompt_revision"] = bool(out.get("allow_prompt_revision", True))
     # Derived, never stored: the folder is a pure function of the task id, so a
     # persisted copy could only ever go stale or disagree. `path_for` (not
     # `ensure`) because reading a task must not create directories — the folder
@@ -3322,7 +3326,7 @@ async def tasks_continue_run(task_id: str, run_id: str, request: Request,
     """
     from tasks import resume as _resume
     from tasks import store as _store
-    _owned_task(task_id, x_user_id)
+    task = _owned_task(task_id, x_user_id)
     parent = _db().execute(
         "SELECT * FROM task_runs WHERE id=? AND task_id=? AND user_id=?",
         (run_id, task_id, x_user_id)).fetchone()
@@ -3354,7 +3358,9 @@ async def tasks_continue_run(task_id: str, run_id: str, request: Request,
     supplement = str((body or {}).get("message") or "")
     new_run_id = _store.create_continue_run(
         _db(), task_id, x_user_id, session_id=session_id, resumed_from=run_id,
-        resume_message=_resume.compose_resume_message(parent, supplement))
+        resume_message=_resume.compose_resume_message(
+            parent, supplement,
+            invite_revision=bool(task["allow_prompt_revision"])))
     return JSONResponse({"run_id": new_run_id}, status_code=202)
 
 
@@ -3410,6 +3416,20 @@ async def tasks_runs(task_id: str, limit: int = 50,
     limit = max(_RUNS_LIMIT_RANGE[0], min(_RUNS_LIMIT_RANGE[1], limit))
     return {"runs": [_run_out(r)
                      for r in _store.list_runs(_db(), task_id, limit)]}
+
+
+@app.get("/agent/tasks/{task_id}/prompt-revisions")
+async def tasks_prompt_revisions(task_id: str,
+                                 x_user_id: str = Header(...,
+                                                         alias="X-User-Id")):
+    """Past prompt versions, newest first. Each row is the version that a
+    change (agent revision or human edit) REPLACED; the current version is
+    the task row's own `prompt`."""
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    return {"revisions": [dict(r) for r in
+                          _store.list_prompt_revisions(_db(), task_id,
+                                                       x_user_id)]}
 
 
 def _preauth_from_denied(doc: dict, action: dict) -> tuple[dict, str, object]:

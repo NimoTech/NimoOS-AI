@@ -43,8 +43,13 @@ _UPDATABLE_FIELDS = {
     "name", "prompt", "agent_type", "model", "trigger_type", "cron_expr",
     "interval_seconds", "max_turns", "timeout_seconds", "overlap_policy",
     "catchup_policy", "preauth", "notify_policy", "notify_channel", "enabled",
-    "notify_on_start",
+    "notify_on_start", "allow_prompt_revision",
 }
+
+# Every prompt change (agent tool or human PUT) snapshots the version it
+# replaced; the history is bounded so a task edited daily for a year cannot
+# grow an unbounded audit trail nobody asked for.
+PROMPT_REVISIONS_KEEP = 20
 
 # Touching any of these changes when the task next fires, so next_run_at
 # must be recomputed from "now" — otherwise a re-enabled task would fire
@@ -160,11 +165,13 @@ def update_task(conn, task_id: str, user_id: str, **fields) -> bool:
     # A human edit of the prompt supersedes an agent revision: the undo
     # target would be stale, so the revision bookkeeping clears. Only when
     # the text actually changes — editors PUT the prompt back unchanged on
-    # every save, and that must not wipe a live revision badge.
+    # every save, and that must not wipe a live revision badge. The replaced
+    # version joins the history like any other change.
     if "prompt" in fields and (fields["prompt"] or "") != existing["prompt"]:
         sets.append("prev_prompt=''")
         sets.append("prompt_revised_at=0")
         sets.append("prompt_revised_by=''")
+        add_prompt_revision(conn, task_id, user_id, existing["prompt"], "user")
 
     if not sets:
         return True
@@ -187,6 +194,34 @@ def update_task(conn, task_id: str, user_id: str, **fields) -> bool:
         set_next_run(conn, task_id, next_run_at)
 
     return True
+
+
+def add_prompt_revision(conn, task_id: str, user_id: str, prompt: str,
+                        revised_by: str, reason: str = "") -> None:
+    """Snapshot the version being REPLACED; prune past the retention cap.
+
+    No commit of its own on the update_task path (it rides that caller's
+    transaction); the agent-tool path commits right after calling this.
+    """
+    conn.execute(
+        "INSERT INTO task_prompt_revisions "
+        "(task_id, user_id, prompt, revised_by, reason, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (task_id, user_id, prompt, revised_by, reason, int(time.time())))
+    conn.execute(
+        "DELETE FROM task_prompt_revisions WHERE task_id=? AND id NOT IN "
+        "(SELECT id FROM task_prompt_revisions WHERE task_id=? "
+        " ORDER BY id DESC LIMIT ?)",
+        (task_id, task_id, PROMPT_REVISIONS_KEEP))
+
+
+def list_prompt_revisions(conn, task_id: str, user_id: str):
+    """Newest first. user_id scoping matches every other read here."""
+    return conn.execute(
+        "SELECT id, prompt, revised_by, reason, created_at "
+        "FROM task_prompt_revisions WHERE task_id=? AND user_id=? "
+        "ORDER BY id DESC",
+        (task_id, user_id)).fetchall()
 
 
 # Wall-clock budget for one DELETE. The row work is microseconds; the cost is
@@ -371,6 +406,8 @@ async def delete_task(conn, task_id: str, user_id: str, *,
                             session_deleter=session_deleter, deadline=deadline,
                             monotonic=monotonic)
 
+    conn.execute("DELETE FROM task_prompt_revisions WHERE task_id=?",
+                 (task_id,))
     cur = conn.execute(
         "DELETE FROM scheduled_tasks WHERE id=? AND user_id=?",
         (task_id, user_id),
