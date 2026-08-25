@@ -136,3 +136,116 @@ def test_delivery_rule_is_taught_to_the_model():
     assert "notify channel" in desc
     assert "lark-cli" in desc  # the concrete anti-pattern is named
     assert "notify channel" in tasks_admin._UI_HINT
+
+
+# -- update_task_prompt --------------------------------------------------------
+
+from skills.tool_gating import GATING_SESSION_VAR
+
+
+def _setup_continuation(conn, *, user="u1", running=True, resumed=True):
+    """A task + a running continuation run whose session is 'sess-c'."""
+    from tasks import store as tstore
+    tid = tstore.create_task(conn, user, name="digest", prompt="old prompt",
+                             trigger_type="webhook_only")
+    rid = tstore.create_continue_run(
+        conn, tid, user, session_id="sess-c",
+        resumed_from="parent-run" if resumed else "",
+        resume_message="go") if resumed else tstore.create_run(
+        conn, tid, user, "manual")
+    if not resumed:
+        tstore.attach_session(conn, rid, "sess-c")
+    if running:
+        conn.execute("UPDATE task_runs SET status='running' WHERE id=?", (rid,))
+        conn.commit()
+    return tid, rid
+
+
+async def _revise(**kw):
+    return await tasks_admin._update_task_prompt_impl(
+        new_prompt=kw.get("new_prompt", "new prompt"),
+        reason=kw.get("reason", ""))
+
+
+@pytest.mark.asyncio
+async def test_revise_happy_path_keeps_old_prompt(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn)
+    out = await _revise(new_prompt="better prompt", reason="was ambiguous")
+    row = conn.execute("SELECT * FROM scheduled_tasks WHERE id=?",
+                       (tid,)).fetchone()
+    assert row["prompt"] == "better prompt"
+    assert row["prev_prompt"] == "old prompt"
+    assert row["prompt_revised_by"] == "agent"
+    assert row["prompt_revised_at"] > 0
+    assert "revert" in out.lower() and "was ambiguous" in out
+    # 红线:enabled / preauth 纹丝不动
+    assert row["enabled"] == 1 and json.loads(row["preauth_json"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_revise_refused_outside_continuation_run(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn, resumed=False)  # 普通 run,同 session
+    out = await _revise()
+    assert "CONTINUATION" in out
+    row = conn.execute("SELECT prompt FROM scheduled_tasks WHERE id=?",
+                       (tid,)).fetchone()
+    assert row["prompt"] == "old prompt"
+
+
+@pytest.mark.asyncio
+async def test_revise_refused_when_run_not_running(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, rid = _setup_continuation(conn, running=False)   # 仍 queued
+    assert "CONTINUATION" in await _revise()
+
+
+@pytest.mark.asyncio
+async def test_revise_refused_in_chat(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("chat-session-without-run")
+    assert "CONTINUATION" in await _revise()
+
+
+@pytest.mark.asyncio
+async def test_revise_cross_user_cannot_touch_task(conn):
+    USER_ID_VAR.set("intruder")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn, user="u1")
+    out = await _revise()
+    assert "no longer exists" in out
+    row = conn.execute("SELECT prompt FROM scheduled_tasks WHERE id=?",
+                       (tid,)).fetchone()
+    assert row["prompt"] == "old prompt"
+
+
+@pytest.mark.asyncio
+async def test_revise_validation(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn)
+    assert "required" in await _revise(new_prompt="  ")
+    assert "too long" in await _revise(
+        new_prompt="x" * (tasks_admin.PROMPT_MAX_CHARS + 1))
+    assert "identical" in await _revise(new_prompt="old prompt")
+    USER_ID_VAR.set("")
+    assert "identity" in (await _revise()).lower()
+
+
+def test_update_tool_registered_in_tasks_category():
+    from skills import tool_registry
+    names = [tool_registry._name(t)
+             for t in tool_registry.CATEGORY_TOOLS["tasks"]]
+    assert "update_task_prompt" in names
+    assert tool_registry.category_of("update_task_prompt") == "tasks"
+
+
+def test_update_tool_description_teaches_scope():
+    desc = tasks_admin.update_task_prompt.description
+    assert "CONTINUATION" in desc
+    assert "ONLY the prompt" in desc
+    assert "revert" in desc

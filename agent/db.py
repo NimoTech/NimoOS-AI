@@ -406,6 +406,9 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     notify_policy    TEXT NOT NULL DEFAULT 'failure' CHECK(notify_policy IN ('failure','always','never')),
     notify_channel   TEXT NOT NULL DEFAULT '',
     notify_on_start  INTEGER NOT NULL DEFAULT 0,
+    prev_prompt      TEXT NOT NULL DEFAULT '',
+    prompt_revised_at INTEGER NOT NULL DEFAULT 0,
+    prompt_revised_by TEXT NOT NULL DEFAULT '',
     next_run_at      INTEGER NOT NULL DEFAULT 0,
     last_run_at      INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
@@ -429,6 +432,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary        TEXT NOT NULL DEFAULT '',
     error          TEXT NOT NULL DEFAULT '',
     denied_actions TEXT NOT NULL DEFAULT '[]',
+    resumed_from   TEXT NOT NULL DEFAULT '',
+    resume_message TEXT NOT NULL DEFAULT '',
     started_at     INTEGER NOT NULL DEFAULT 0,
     finished_at    INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL
@@ -556,6 +561,23 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "notify_on_start" not in st_cols:
         conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
                      "notify_on_start INTEGER NOT NULL DEFAULT 0")
+    # Agent prompt self-revision bookkeeping (task run continuation).
+    if "prev_prompt" not in st_cols:
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "prev_prompt TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "prompt_revised_at INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "prompt_revised_by TEXT NOT NULL DEFAULT ''")
+    # Continuation runs reuse the parent run's session; `resumed_from` is what
+    # marks them (the trigger CHECK cannot grow a value without a table
+    # rebuild, so continuations ride trigger='manual').
+    tr_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    if "resumed_from" not in tr_cols:
+        conn.execute("ALTER TABLE task_runs ADD COLUMN "
+                     "resumed_from TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE task_runs ADD COLUMN "
+                     "resume_message TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_staged_batch "
         "ON staged_changes(session_id, batch_id)")

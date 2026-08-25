@@ -157,6 +157,15 @@ def update_task(conn, task_id: str, user_id: str, **fields) -> bool:
         if key in _RECOMPUTE_TRIGGERS:
             recompute = True
 
+    # A human edit of the prompt supersedes an agent revision: the undo
+    # target would be stale, so the revision bookkeeping clears. Only when
+    # the text actually changes — editors PUT the prompt back unchanged on
+    # every save, and that must not wipe a live revision badge.
+    if "prompt" in fields and (fields["prompt"] or "") != existing["prompt"]:
+        sets.append("prev_prompt=''")
+        sets.append("prompt_revised_at=0")
+        sets.append("prompt_revised_by=''")
+
     if not sets:
         return True
 
@@ -226,7 +235,11 @@ async def purge_runs(conn, task_id: str, user_id: str, *, session_deleter,
         remaining = None if deadline is None else deadline - monotonic()
         if remaining is not None and remaining <= 0:
             return False
-        if row["session_id"]:
+        # A continuation shares its parent's session: leave the session for
+        # whichever referencing row goes last (this walk is oldest-first, so
+        # the parent row skips and the continuation row deletes).
+        if row["session_id"] and not _session_still_referenced(
+                conn, row["session_id"], row["id"]):
             try:
                 if remaining is None:
                     await session_deleter(conn, user_id, row["session_id"])
@@ -276,7 +289,10 @@ async def reclaim_orphaned_runs(conn, *, session_deleter) -> int:
         ).fetchone()
         if row is None:
             return reclaimed
-        if row["session_id"]:
+        # Same shared-session guard as purge_runs: the last referencing row
+        # deletes the session.
+        if row["session_id"] and not _session_still_referenced(
+                conn, row["session_id"], row["id"]):
             try:
                 await session_deleter(conn, row["user_id"], row["session_id"])
             except Exception:               # noqa: BLE001 — same trade as
@@ -403,6 +419,59 @@ def create_run(conn, task_id: str, user_id: str, trigger: str) -> str:
     return run_id
 
 
+def create_continue_run(conn, task_id: str, user_id: str, *, session_id: str,
+                        resumed_from: str, resume_message: str) -> str:
+    """Queue a continuation of a finished run, on that run's own session.
+
+    `session_id` is pre-attached HERE, not by the runner: a non-empty
+    `resumed_from` is what tells `process_once` to reuse the session instead
+    of minting a fresh one. The trigger stays 'manual' — the column's CHECK
+    constraint cannot grow a value without a table rebuild, and a continuation
+    is a human action anyway.
+    """
+    run_id = str(uuid.uuid4())
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_runs (id, task_id, user_id, session_id, trigger, "
+        "status, summary, error, denied_actions, resumed_from, resume_message, "
+        "started_at, finished_at, created_at) "
+        "VALUES (?,?,?,?,'manual','queued','','','[]',?,?,0,0,?)",
+        (run_id, task_id, user_id, session_id, resumed_from, resume_message,
+         now),
+    )
+    conn.commit()
+    return run_id
+
+
+def session_active_run(conn, session_id: str):
+    """The queued/running run attached to `session_id`, if any.
+
+    Two runs writing one session's history concurrently would corrupt it, so
+    the continue endpoint refuses while this returns a row.
+    """
+    if not session_id:
+        return None
+    return conn.execute(
+        "SELECT * FROM task_runs WHERE session_id=? "
+        "AND status IN ('queued','running') LIMIT 1",
+        (session_id,),
+    ).fetchone()
+
+
+def _session_still_referenced(conn, session_id: str, excluding_run_id) -> bool:
+    """True if any OTHER task_runs row points at this session.
+
+    Continuation runs share their parent's session, so every deletion path
+    must ask this before deleting a session — otherwise dropping either run
+    row kills the transcript the surviving row still shows.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_runs WHERE session_id=? AND id!=? LIMIT 1",
+        (session_id, excluding_run_id),
+    ).fetchone()
+    return row is not None
+
+
 def claim_run(conn):
     """Atomically move the oldest queued run to running.
 
@@ -485,8 +554,19 @@ def prune_runs(conn, task_id: str, keep: int = 50) -> list[str]:
         (task_id,),
     ).fetchall()
     to_drop = rows[keep:]
-    dropped_sessions = [r["session_id"] for r in to_drop if r["session_id"]]
     for r in to_drop:
         conn.execute("DELETE FROM task_runs WHERE id=?", (r["id"],))
     conn.commit()
+    # A continuation run shares its parent's session, so a session is only
+    # safe to delete once NO surviving run references it — and it must be
+    # handed back at most once even when several dropped rows shared it.
+    dropped_sessions: list[str] = []
+    seen: set[str] = set()
+    for r in to_drop:
+        sid = r["session_id"]
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if not _session_still_referenced(conn, sid, r["id"]):
+            dropped_sessions.append(sid)
     return dropped_sessions

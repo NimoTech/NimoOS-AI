@@ -1402,3 +1402,114 @@ async def test_driver_factory_receives_task_row(conn):
     assert h.driver.task is not None
     assert h.driver.task["id"] == task_id
     assert h.driver.task["user_id"] == "u1"
+
+
+# -- continuation runs ---------------------------------------------------------
+
+def _queue_continue(conn, task_id, h, *, message="resume and finish"):
+    """A finished parent run on a real session row + a queued continuation."""
+    parent = store.create_run(conn, task_id, "u1", "cron")
+    sid = h.session_factory(conn, "u1", "general")
+    store.attach_session(conn, parent, sid)
+    store.finish_run(conn, parent, "failed", error="boom")
+    rid = store.create_continue_run(conn, task_id, "u1", session_id=sid,
+                                    resumed_from=parent, resume_message=message)
+    return rid, sid
+
+
+@pytest.mark.asyncio
+async def test_continuation_reuses_session_and_sends_resume_message(conn):
+    tid = _mk(conn)
+    h = Harness()
+    rid, sid = _queue_continue(conn, tid, h)
+    made_before = len(h.sessions)
+    unlocked = []
+
+    assert await h.run(conn, read_unlocked=lambda s: [],
+                       unlock=lambda s, cats: unlocked.append((s, list(cats)))
+                       ) is True
+
+    row = _run_row(conn, rid)
+    assert row["status"] == "succeeded"
+    assert row["session_id"] == sid                 # 未另开会话
+    assert len(h.sessions) == made_before           # session_factory 未被调用
+    call = h.start_run_calls[0]
+    assert call["session_id"] == sid
+    # resume_message 原样送出——不重复拼 briefing
+    assert call["message"] == "resume and finish"
+    # tasks 类别已在 start_run 前解锁,update_task_prompt 无需 expand_tools
+    assert unlocked and "tasks" in unlocked[0][1]
+
+
+@pytest.mark.asyncio
+async def test_continuation_with_dead_session_fails_cleanly(conn):
+    tid = _mk(conn)
+    h = Harness()
+    rid, sid = _queue_continue(conn, tid, h)
+    conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    conn.commit()
+
+    assert await h.run(conn) is True
+    row = _run_row(conn, rid)
+    assert row["status"] == "failed"
+    assert "session no longer exists" in row["error"]
+    assert h.start_run_calls == []                  # 从未启动 agent
+
+
+@pytest.mark.asyncio
+async def test_continuation_appends_prompt_revision_note(conn):
+    tid = _mk(conn)
+    h = Harness({"status": "succeeded", "summary": "done", "error": "",
+                 "denied": [], "auto_approved": []})
+    rid, _sid = _queue_continue(conn, tid, h)
+
+    def driver_factory(**kw):
+        drv = FakeDriver(h.result, **kw)
+
+        real_drive = drv.drive
+        async def drive(sink):
+            # The agent revises the prompt mid-run: the marker lands while the
+            # run row's started_at is already stamped.
+            conn.execute(
+                "UPDATE scheduled_tasks SET prompt='fixed', prev_prompt='old', "
+                "prompt_revised_at=?, prompt_revised_by='agent' WHERE id=?",
+                (NOW + 10, tid))
+            conn.commit()
+            return await real_drive(sink)
+        drv.drive = drive
+        h.driver = drv
+        return drv
+
+    assert await h.run(conn, driver_factory=driver_factory,
+                       read_unlocked=lambda s: [],
+                       unlock=lambda s, cats: None) is True
+    row = _run_row(conn, rid)
+    assert runner.PROMPT_REVISED_NOTE in row["summary"]
+
+
+@pytest.mark.asyncio
+async def test_stale_revision_marker_is_not_reannounced(conn):
+    tid = _mk(conn)
+    # A revision from some EARLIER run: prompt_revised_at is far in the past.
+    conn.execute(
+        "UPDATE scheduled_tasks SET prev_prompt='old', prompt_revised_at=5, "
+        "prompt_revised_by='agent' WHERE id=?", (tid,))
+    conn.commit()
+    h = Harness()
+    rid, _sid = _queue_continue(conn, tid, h)
+
+    assert await h.run(conn, read_unlocked=lambda s: [],
+                       unlock=lambda s, cats: None) is True
+    assert runner.PROMPT_REVISED_NOTE not in _run_row(conn, rid)["summary"]
+
+
+@pytest.mark.asyncio
+async def test_normal_run_does_not_unlock_tasks_category(conn):
+    tid = _mk(conn)
+    _queue(conn, tid)
+    h = Harness()
+    unlocked = []
+
+    await h.run(conn, read_unlocked=lambda s: [],
+                unlock=lambda s, cats: unlocked.append(list(cats)))
+    assert unlocked == []                           # 无 workspace 也无续跑,不触发

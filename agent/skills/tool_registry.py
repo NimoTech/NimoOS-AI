@@ -53,7 +53,7 @@ CATEGORY_TOOLS: dict[str, list] = {
     "web": list(WEB_TOOLS),                # 2
     "mcp": list(MCP_ADMIN_TOOLS),          # 1 (+ dynamic runtime MCP tools)
     "toolbox": list(TOOLBOX_TOOLS),         # 1
-    "tasks": list(TASKS_ADMIN_TOOLS),       # 1
+    "tasks": list(TASKS_ADMIN_TOOLS),       # 2
 }
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -69,7 +69,8 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "mcp": "register and use tools from connected MCP servers",
     "toolbox": "Install/manage persistent CLI components (toolbox)",
     "tasks": "create scheduled agent tasks (created disabled; the user "
-             "authorizes & enables them on the Tasks page)",
+             "authorizes & enables them on the Tasks page); inside a task "
+             "continuation run, revise that task's own prompt",
 }
 
 # tool name → category name (returns None for always-on/unknown)

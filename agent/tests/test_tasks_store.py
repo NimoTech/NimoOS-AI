@@ -94,6 +94,84 @@ def test_prune_runs_returns_session_ids(conn):
     assert len(store.list_runs(conn, tid)) == 2
 
 
+def test_continue_run_row_shape(conn):
+    from tasks import store
+    tid = _mk(conn)
+    parent = store.create_run(conn, tid, "u1", "cron")
+    store.attach_session(conn, parent, "sess-p")
+    rid = store.create_continue_run(conn, tid, "u1", session_id="sess-p",
+                                    resumed_from=parent,
+                                    resume_message="continue please")
+    row = conn.execute("SELECT * FROM task_runs WHERE id=?", (rid,)).fetchone()
+    assert row["trigger"] == "manual" and row["status"] == "queued"
+    assert row["session_id"] == "sess-p"          # 入队即预挂父会话
+    assert row["resumed_from"] == parent
+    assert row["resume_message"] == "continue please"
+
+
+def test_session_active_run_detects_queued_and_running(conn):
+    from tasks import store
+    tid = _mk(conn)
+    parent = store.create_run(conn, tid, "u1", "cron")
+    store.attach_session(conn, parent, "sess-p")
+    assert store.session_active_run(conn, "sess-p") is not None  # queued
+    store.claim_run(conn)
+    assert store.session_active_run(conn, "sess-p") is not None  # running
+    store.finish_run(conn, parent, "failed", error="x")
+    assert store.session_active_run(conn, "sess-p") is None
+    assert store.session_active_run(conn, "") is None
+
+
+def test_prune_keeps_session_shared_with_surviving_run(conn):
+    from tasks import store
+    tid = _mk(conn)
+    parent = store.create_run(conn, tid, "u1", "cron")
+    store.attach_session(conn, parent, "sess-shared")
+    cont = store.create_continue_run(conn, tid, "u1", session_id="sess-shared",
+                                     resumed_from=parent, resume_message="go")
+    # keep=1 drops the parent (oldest) but the continuation still points at
+    # the shared session — it must NOT be handed back for deletion.
+    dropped = store.prune_runs(conn, tid, keep=1)
+    assert dropped == []
+    assert [r["id"] for r in store.list_runs(conn, tid)] == [cont]
+    # Once the last referencing run is dropped, the session is released once.
+    for _ in range(2):
+        store.create_run(conn, tid, "u1", "cron")
+    dropped = store.prune_runs(conn, tid, keep=1)
+    assert dropped == ["sess-shared"]
+
+
+def test_prune_dedups_shared_session_when_both_rows_drop(conn):
+    from tasks import store
+    tid = _mk(conn)
+    parent = store.create_run(conn, tid, "u1", "cron")
+    store.attach_session(conn, parent, "sess-shared")
+    store.create_continue_run(conn, tid, "u1", session_id="sess-shared",
+                              resumed_from=parent, resume_message="go")
+    newer = store.create_run(conn, tid, "u1", "cron")
+    store.attach_session(conn, newer, "sess-new")
+    dropped = store.prune_runs(conn, tid, keep=1)
+    assert dropped == ["sess-shared"]  # 两行共享,只交还一次
+
+
+def test_user_prompt_edit_clears_agent_revision(conn):
+    from tasks import store
+    tid = _mk(conn)
+    conn.execute("UPDATE scheduled_tasks SET prev_prompt='old', "
+                 "prompt_revised_at=123, prompt_revised_by='agent' WHERE id=?",
+                 (tid,))
+    conn.commit()
+    # Saving without changing the prompt keeps the revision badge alive.
+    store.update_task(conn, tid, "u1", prompt="do it", name="renamed")
+    row = store.get_task(conn, tid, "u1")
+    assert row["prompt_revised_by"] == "agent" and row["prev_prompt"] == "old"
+    # An actual prompt change supersedes the revision.
+    store.update_task(conn, tid, "u1", prompt="do it differently")
+    row = store.get_task(conn, tid, "u1")
+    assert row["prev_prompt"] == "" and row["prompt_revised_at"] == 0
+    assert row["prompt_revised_by"] == ""
+
+
 def test_create_task_enabled_override(conn):
     from tasks import store
     tid = _mk(conn, trigger_type="webhook_only", cron_expr="", enabled=0)
