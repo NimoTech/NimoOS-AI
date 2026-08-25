@@ -3310,6 +3310,54 @@ async def tasks_run_now(task_id: str,
     return JSONResponse({"run_id": run_id}, status_code=202)
 
 
+@app.post("/agent/tasks/{task_id}/runs/{run_id}/continue", status_code=202)
+async def tasks_continue_run(task_id: str, run_id: str, request: Request,
+                             x_user_id: str = Header(..., alias="X-User-Id")):
+    """Queue a continuation of a finished run, on that run's own session.
+
+    The agent resumes with the session's full history plus a composed
+    continuation instruction (previous status/error/denied + the caller's
+    optional supplement). Works on a disabled task for the same reason
+    `run now` does — continuing a failed run is how a user repairs one.
+    """
+    from tasks import resume as _resume
+    from tasks import store as _store
+    _owned_task(task_id, x_user_id)
+    parent = _db().execute(
+        "SELECT * FROM task_runs WHERE id=? AND task_id=? AND user_id=?",
+        (run_id, task_id, x_user_id)).fetchone()
+    if parent is None:
+        raise HTTPException(404, "not_found")
+    if parent["status"] not in _resume.CONTINUABLE_STATUSES:
+        raise HTTPException(409, "not_finished")
+    session_id = parent["session_id"]
+    if not session_id or _db().execute(
+            "SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+        # The run row outlived its session (retention pruned it, or the run
+        # never got one): there is no history left to continue on.
+        raise HTTPException(409, "session_pruned")
+    if _store.session_active_run(_db(), session_id) is not None:
+        # Two runs writing one session's history concurrently would corrupt it.
+        raise HTTPException(409, "already_active")
+
+    # The body is optional (a bare click continues with no supplement), but a
+    # PRESENT body must parse — a malformed supplement silently dropped would
+    # look like the agent ignored the user's words.
+    raw = await request.body()
+    if raw.strip():
+        try:
+            body = json.loads(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "invalid_json")
+    else:
+        body = {}
+    supplement = str((body or {}).get("message") or "")
+    new_run_id = _store.create_continue_run(
+        _db(), task_id, x_user_id, session_id=session_id, resumed_from=run_id,
+        resume_message=_resume.compose_resume_message(parent, supplement))
+    return JSONResponse({"run_id": new_run_id}, status_code=202)
+
+
 @app.post("/agent/tasks/{task_id}/webhook-token/reset")
 async def tasks_reset_webhook_token(task_id: str,
                                     x_user_id: str = Header(..., alias="X-User-Id")):

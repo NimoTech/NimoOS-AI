@@ -118,6 +118,12 @@ _SCRIPT_INTERPRETER_BY_EXT = {
 
 BRIEFING_MAX_CHARS = 1200
 
+# Appended to a continuation run's summary when the agent revised the task's
+# prompt during it, so the notification tells the user where the undo lives.
+PROMPT_REVISED_NOTE = ("[The agent revised this task's prompt during this "
+                       "run. The previous version was kept and can be "
+                       "restored on the Tasks page.]")
+
 # How many scripts to name. A task with fifty pre-authorized scripts is not a
 # real shape, and the briefing must not crowd out the author's own prompt.
 _BRIEFING_MAX_SCRIPTS = 8
@@ -529,17 +535,37 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             # task, never whatever else the author happened to authorize.
             doc["workspace"] = task_dir
 
-        session_id = session_factory(conn, user_id, task["agent_type"])
-        store.attach_session(conn, run_id, session_id)
+        resuming = bool(run["resumed_from"])
+        if resuming:
+            # A continuation reuses the parent run's session (pre-attached at
+            # enqueue) so `_start_run` reloads the full history. The session
+            # can be gone by claim time — the endpoint checked, but pruning
+            # runs between enqueue and claim.
+            session_id = run["session_id"]
+            if not session_id or conn.execute(
+                    "SELECT 1 FROM sessions WHERE id=?",
+                    (session_id,)).fetchone() is None:
+                store.finish_run(conn, run_id, "failed",
+                                 error="session no longer exists; "
+                                       "cannot continue")
+                return True
+        else:
+            session_id = session_factory(conn, user_id, task["agent_type"])
+            store.attach_session(conn, run_id, session_id)
 
         # Hand over the tool that makes the folder usable. Must happen BEFORE
         # start_run: agent.py seeds UNLOCKED_VAR from the session row at the top
         # of the run, so anything written afterwards is read too late.
-        if doc.get("workspace"):
+        # A continuation also unlocks `tasks`, so `update_task_prompt` is
+        # reachable without an expand_tools round-trip.
+        extra_categories = {"tasks"} if resuming else set()
+        if doc.get("workspace") or extra_categories:
             try:
-                unlock(session_id,
-                       unlocked_for_workspace(read_unlocked(session_id),
-                                              doc["workspace"]))
+                cats = read_unlocked(session_id)
+                if doc.get("workspace"):
+                    cats = unlocked_for_workspace(cats, doc["workspace"])
+                merged = sorted(set(cats) | extra_categories)
+                unlock(session_id, merged)
             except Exception:               # noqa: BLE001 — never sink a run
                 logger.warning("tasks runner: could not unlock file tools for "
                                "session %s", session_id, exc_info=True)
@@ -573,11 +599,16 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
             logger.warning("tasks runner: start notification failed for run %s",
                            run_id, exc_info=True)
 
+        # A continuation sends the composed resume instruction VERBATIM — no
+        # briefing re-append: the session's first message already carried it,
+        # and `_start_run` reloads that history.
+        message = (run["resume_message"] if resuming
+                   else compose_prompt(task["prompt"], doc))
         sink = start_run(
             # The briefing rides the PROMPT rather than a new parameter: it is
             # an instruction to the model, and every start_run seam (including
             # the test double) already carries the prompt.
-            session_id, user_id, compose_prompt(task["prompt"], doc), creds,
+            session_id, user_id, message, creds,
             max_turns=resolve_max_turns(task, conn, max_turns_reader),
             pre_confirmed_tools=set(doc["mcp_tools"]),
             run_shell_allowlist=doc["shell"],
@@ -606,6 +637,18 @@ async def process_once(conn, *, start_run, creds_resolver, driver_factory,
         note = format_preauth_note(result.get("auto_approved") or [])
         if note:
             summary = f"{summary}\n\n{note}" if summary else note
+        if resuming:
+            # Surface a prompt self-revision in the result (and therefore in
+            # the notification): freshness is judged against THIS run's
+            # started_at so a stale marker from an earlier continuation does
+            # not re-announce itself.
+            revised = store.get_task(conn, task_id, user_id)
+            if (revised is not None
+                    and revised["prompt_revised_by"] == "agent"
+                    and int(revised["prompt_revised_at"] or 0)
+                    >= int(run["started_at"] or 0) > 0):
+                summary = (f"{summary}\n\n{PROMPT_REVISED_NOTE}"
+                           if summary else PROMPT_REVISED_NOTE)
         store.finish_run(conn, run_id, status,
                          summary=summary, error=str(result.get("error") or ""),
                          denied=result.get("denied") or [])

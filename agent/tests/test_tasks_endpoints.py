@@ -757,3 +757,98 @@ def test_cron_preview_count_clamped(client):
               params={"expr": "* * * * *", "count": 999})
     assert r.status_code == 200
     assert len(r.json()["next"]) <= 5
+
+
+# -- continue a finished run ---------------------------------------------------
+
+def _finished_run(conn, tid, *, status="failed", session="sess-1",
+                  error="boom", summary="", user="u1"):
+    rid = store.create_run(conn, tid, user, "cron")
+    if session:
+        store.attach_session(conn, rid, session)
+        now = 1000
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, user_id, title, created_at, "
+            "updated_at) VALUES (?,?,?,?,?)", (session, user, "t", now, now))
+        conn.commit()
+    conn.execute("UPDATE task_runs SET status=?, error=?, summary=? WHERE id=?",
+                 (status, error, summary, rid))
+    conn.commit()
+    return rid
+
+
+def test_continue_run_queues_on_parent_session(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid, error="disk full")
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H,
+                    json={"message": "clean /tmp first"})
+    assert r.status_code == 202, r.text
+    row = conn.execute("SELECT * FROM task_runs WHERE id=?",
+                       (r.json()["run_id"],)).fetchone()
+    assert row["status"] == "queued" and row["trigger"] == "manual"
+    assert row["session_id"] == "sess-1" and row["resumed_from"] == rid
+    msg = row["resume_message"]
+    # The supplement rides ABOVE the boilerplate; the parent's error is cited.
+    assert msg.startswith("clean /tmp first")
+    assert "status: failed" in msg and "disk full" in msg
+    assert "update_task_prompt" in msg
+
+
+def test_continue_run_empty_body_is_fine(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid)
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert r.status_code == 202, r.text
+
+
+def test_continue_run_user_scoped_404(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid)
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H2)
+    assert r.status_code == 404
+
+
+def test_continue_run_not_finished_409(client, conn):
+    tid = _create_id(client)
+    rid = store.create_run(conn, tid, "u1", "cron")  # still queued
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert r.status_code == 409 and r.json()["detail"] == "not_finished"
+
+
+def test_continue_run_pruned_session_409(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid, session="")  # never had a session
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert r.status_code == 409 and r.json()["detail"] == "session_pruned"
+    rid2 = _finished_run(conn, tid, session="sess-gone")
+    conn.execute("DELETE FROM sessions WHERE id='sess-gone'")
+    conn.commit()
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid2}/continue", headers=H)
+    assert r.status_code == 409 and r.json()["detail"] == "session_pruned"
+
+
+def test_continue_run_already_active_409(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid)
+    first = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert first.status_code == 202
+    # The first continuation is still queued on this session.
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert r.status_code == 409 and r.json()["detail"] == "already_active"
+
+
+def test_continue_run_malformed_body_400(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid)
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H,
+                    content=b"{oops")
+    assert r.status_code == 400
+
+
+def test_run_out_exposes_resumed_from(client, conn):
+    tid = _create_id(client)
+    rid = _finished_run(conn, tid)
+    client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    runs = client.get(f"/agent/tasks/{tid}/runs", headers=H).json()["runs"]
+    marks = {r["id"]: r.get("resumed_from") for r in runs}
+    assert marks[rid] == "" and any(v == rid for v in marks.values())
