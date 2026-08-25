@@ -37,7 +37,7 @@ def _snapshot(conn, sid, history):
 
 @pytest.mark.asyncio
 async def test_empty_session_returns_zero(tmp_path, monkeypatch):
-    """1) Empty session → 200 {tokens:0, window:128000, pct:0} for gpt-4o."""
+    """1) Empty session → 200 {tokens:0, window:cloud default, pct:0} for gpt-4o."""
     monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
     conn = main_module._db()
     _sess(conn, sid="s1", user="u1")
@@ -52,7 +52,7 @@ async def test_empty_session_returns_zero(tmp_path, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["tokens"] == 0
-    assert body["window"] == 128000
+    assert body["window"] == cc.CLOUD_CONTEXT_WINDOW
     assert body["pct"] == 0
 
 
@@ -112,7 +112,7 @@ async def test_missing_user_id_returns_401(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_model_omitted_uses_default_context_window(tmp_path, monkeypatch):
-    """5) model omitted → window == DEFAULT_CONTEXT_WINDOW (8192)."""
+    """5) model omitted → window == DEFAULT_CONTEXT_WINDOW (cloud tier)."""
     monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
     conn = main_module._db()
     _sess(conn, sid="s1", user="u1")

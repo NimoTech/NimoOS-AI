@@ -30,7 +30,7 @@ def test_empty_session_zero(conn):
     _sess(conn)
     u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="gpt-4o")
     assert u["tokens"] == 0 and u["pct"] == 0
-    assert u["window"] == 128000
+    assert u["window"] == cc.CLOUD_CONTEXT_WINDOW
 
 
 def test_history_counts_tokens_and_pct(conn):
@@ -39,7 +39,7 @@ def test_history_counts_tokens_and_pct(conn):
                            {"role": "assistant", "content": "answer" * 50}])
     u = cc.compute_usage(conn, session_id="s1", user_id="u1", model="qwen")
     assert u["tokens"] > 0
-    assert u["window"] == 32768
+    assert u["window"] == cc.CLOUD_CONTEXT_WINDOW
     assert u["pct"] == round(100 * u["tokens"] / u["window"])
 
 
@@ -55,10 +55,11 @@ def test_rolling_summary_is_counted(conn):
 def test_model_changes_window(conn):
     _sess(conn)
     _snapshot(conn, "s1", [{"role": "user", "content": "x" * 4000}])
-    big = cc.compute_usage(conn, session_id="s1", user_id="u1", model="gpt-4o")
-    unknown = cc.compute_usage(conn, session_id="s1", user_id="u1", model="some-local")
-    assert big["window"] == 128000 and unknown["window"] == cc.DEFAULT_CONTEXT_WINDOW
-    assert unknown["pct"] > big["pct"]   # same tokens, smaller window → higher pct
+    big = cc.compute_usage(conn, session_id="s1", user_id="u1", model="cloud:4:gpt-4o")
+    local = cc.compute_usage(conn, session_id="s1", user_id="u1", model="local:qwen3:8b")
+    assert big["window"] == cc.CLOUD_CONTEXT_WINDOW
+    assert local["window"] == cc.LOCAL_CONTEXT_WINDOW
+    assert local["pct"] > big["pct"]   # same tokens, smaller window → higher pct
 
 
 def test_user_context_window_override(conn):

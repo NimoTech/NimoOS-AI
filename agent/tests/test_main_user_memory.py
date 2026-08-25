@@ -105,3 +105,29 @@ async def test_settings_requires_user_id(tmp_path, monkeypatch):
         p = await ac.put("/agent/user-memory/settings", json={"enabled": True})
     assert g.status_code == 401
     assert p.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_settings_context_window_floor(tmp_path, monkeypatch):
+    """Sub-floor windows are rejected (a saved '2' once put every session
+    permanently over budget); 0 clears the override; >= floor round-trips."""
+    monkeypatch.setattr(main_module, "_DB_PATH", str(tmp_path / "agent.db"))
+    main_module._db()
+    transport = ASGITransport(app=main_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        bad = await ac.put("/agent/user-memory/settings",
+                           headers={"X-User-Id": "u1"},
+                           json={"enabled": False, "context_window": 2})
+        assert bad.status_code == 400
+
+        ok = await ac.put("/agent/user-memory/settings",
+                          headers={"X-User-Id": "u1"},
+                          json={"enabled": False, "context_window": 65536})
+        assert ok.status_code == 200
+        assert ok.json()["context_window"] == 65536
+
+        cleared = await ac.put("/agent/user-memory/settings",
+                               headers={"X-User-Id": "u1"},
+                               json={"enabled": False, "context_window": 0})
+        assert cleared.status_code == 200
+        assert cleared.json()["context_window"] is None

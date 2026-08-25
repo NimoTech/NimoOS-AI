@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 
 import memory_store
 import recall_index
@@ -18,11 +17,17 @@ import recall_index
 _LOG = logging.getLogger("nimoos-agent.context_compaction")
 
 THRESHOLD = 0.70
-# Fallback for models missing from MODEL_WINDOW_MAP. Must stay comfortably
-# above realistic system-prompt + tool-schema overhead (an MCP server alone
-# can add >15k tokens); a too-small fallback makes compaction fire on every
-# turn and degrade to hard truncation.
-DEFAULT_CONTEXT_WINDOW = 32768
+# Tier defaults: cloud models 256k, local (Ollama) models 8k. The old
+# per-family MODEL_WINDOW_MAP proved unmaintainable — every new model fell
+# through to a wrong guess. Models whose real window differs are corrected
+# via the user override (settings / chat composer), floored so a stray
+# tiny value can't put every session into a truncate-each-turn spiral.
+CLOUD_CONTEXT_WINDOW = 262144   # 256k
+LOCAL_CONTEXT_WINDOW = 8192     # 8k
+MIN_CONTEXT_WINDOW = 1024
+# Callers with no tier signal (e.g. context-usage with model omitted) are
+# treated as cloud.
+DEFAULT_CONTEXT_WINDOW = CLOUD_CONTEXT_WINDOW
 RECENT_TURNS = 6
 COMPACT_LLM_TIMEOUT = 60
 SAFETY_MARGIN = 1.15
@@ -30,20 +35,6 @@ SUMMARY_OUTPUT_MAX_CHARS = 500   # cap on function_call_output text fed to the
                                  # summarizer (NOT the estimate, which is full)
 TOOLS_BASE_OVERHEAD = 80   # fixed framework boilerplate around the tools array
                            # ("You have access to the following tools…")
-
-# substring (lowercased) → context window (tokens); first containment match wins
-MODEL_WINDOW_MAP = {
-    "gpt-4o": 128000,
-    "gpt-4.1": 128000,
-    "o1": 128000,
-    "o3": 128000,
-    "deepseek": 64000,
-    "qwen": 32768,
-    "glm": 128000,
-    "claude": 200000,
-    "gemini-1.5": 1000000,
-    "gemini-2": 1000000,
-}
 
 SUMMARY_HEADER = "[Conversation history summary (earlier content compacted)]"
 
@@ -139,28 +130,24 @@ def estimate_tools_tokens(tools) -> int:
     return total
 
 
-def _key_matches(key: str, name: str) -> bool:
-    """Substring match for normal keys; short keys (len<4, e.g. 'o1'/'o3')
-    require a non-alphanumeric boundary on both sides, so 'o1-mini'/'-o1'/bare
-    'o1' match but 'do3'/'no1se'/'o13b'/'o1pro' do not (real o1/o3 names are
-    always followed by '-' or end-of-string)."""
-    if len(key) >= 4:
-        return key in name
-    return re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])",
-                     name) is not None
+def resolve_window(conn, user_id, model_name, provider_type: str = "") -> int:
+    """user_settings.context_window (int >= MIN_CONTEXT_WINDOW) > tier
+    default: local (Ollama) 8k, everything else (cloud) 256k.
 
-
-def resolve_window(conn, user_id, model_name) -> int:
-    """user_settings.context_window (positive int) > MODEL_WINDOW_MAP match >
-    DEFAULT_CONTEXT_WINDOW."""
+    Local is detected two ways because callers hold different names: chat
+    runs send the bare model name plus provider_type ("ollama" for local);
+    the context-usage endpoint receives the UI's full selector key
+    ("local:<name>" / "cloud:<id>:<name>"). The MIN_CONTEXT_WINDOW floor is
+    enforced at the settings write path (a stray saved "2" once put every
+    session permanently over budget); reads stay unfloored so tests can
+    force compaction with tiny windows."""
     user_w = memory_store.get_context_window(conn, user_id)
     if user_w:
         return user_w
     name = (model_name or "").lower()
-    for key, win in MODEL_WINDOW_MAP.items():
-        if _key_matches(key, name):
-            return win
-    return DEFAULT_CONTEXT_WINDOW
+    if provider_type == "ollama" or name.startswith("local:"):
+        return LOCAL_CONTEXT_WINDOW
+    return CLOUD_CONTEXT_WINDOW
 
 
 def _user_indices(history) -> list:
@@ -235,7 +222,7 @@ def _truncate_to_fit(send_history, summary_text, current_text, line,
 
 async def compact_for_run(conn, *, session_id, user_id, model_name,
                           history, current_text, summarize_fn, now=None,
-                          overhead_tokens: int = 0):
+                          overhead_tokens: int = 0, provider_type: str = ""):
     try:
         if not memory_store.is_compaction_enabled(conn, user_id):
             return "", history
@@ -247,7 +234,7 @@ async def compact_for_run(conn, *, session_id, user_id, model_name,
             _LOG.warning("stale folded_upto=%d for %s (history=%d); using 0",
                          F, session_id, len(history))
             F = 0
-        W = resolve_window(conn, user_id, model_name)
+        W = resolve_window(conn, user_id, model_name, provider_type)
         line = int(THRESHOLD * W)
         # history[:F] already lives inside S — count only the unfolded part,
         # or a long session would stay "over the line" forever.
