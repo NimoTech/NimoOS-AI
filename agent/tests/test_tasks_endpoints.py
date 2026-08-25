@@ -852,3 +852,42 @@ def test_run_out_exposes_resumed_from(client, conn):
     runs = client.get(f"/agent/tasks/{tid}/runs", headers=H).json()["runs"]
     marks = {r["id"]: r.get("resumed_from") for r in runs}
     assert marks[rid] == "" and any(v == rid for v in marks.values())
+
+
+# -- prompt revision history -----------------------------------------------------
+
+def test_prompt_revisions_listed_newest_first_and_user_scoped(client, conn):
+    tid = _create_id(client)
+    from tasks import store as _tstore
+    _tstore.add_prompt_revision(conn, tid, "u1", "v1", "agent", "too vague")
+    _tstore.add_prompt_revision(conn, tid, "u1", "v2", "user")
+    conn.commit()
+    r = client.get(f"/agent/tasks/{tid}/prompt-revisions", headers=H)
+    assert r.status_code == 200
+    revs = r.json()["revisions"]
+    assert [x["prompt"] for x in revs] == ["v2", "v1"]
+    assert revs[1]["reason"] == "too vague"
+    assert client.get(f"/agent/tasks/{tid}/prompt-revisions",
+                      headers=H2).status_code == 404
+
+
+def test_allow_prompt_revision_roundtrip(client):
+    tid = _create_id(client)
+    r = client.get(f"/agent/tasks/{tid}", headers=H)
+    assert r.json()["allow_prompt_revision"] is True   # default ON
+    assert client.put(f"/agent/tasks/{tid}", headers=H,
+                      json={"allow_prompt_revision": False}).status_code == 200
+    r = client.get(f"/agent/tasks/{tid}", headers=H)
+    assert r.json()["allow_prompt_revision"] is False
+
+
+def test_continue_message_drops_the_invite_when_revision_is_off(client, conn):
+    tid = _create_id(client)
+    client.put(f"/agent/tasks/{tid}", headers=H,
+               json={"allow_prompt_revision": False})
+    rid = _finished_run(conn, tid)
+    r = client.post(f"/agent/tasks/{tid}/runs/{rid}/continue", headers=H)
+    assert r.status_code == 202
+    row = conn.execute("SELECT resume_message FROM task_runs WHERE id=?",
+                       (r.json()["run_id"],)).fetchone()
+    assert "update_task_prompt" not in row["resume_message"]

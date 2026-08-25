@@ -39,6 +39,15 @@ def test_denied_actions_render_and_malformed_json_is_ignored():
     assert "denied" not in msg.lower()
 
 
+def test_revision_invite_follows_the_task_switch():
+    on = resume.compose_resume_message(_run(), invite_revision=True)
+    off = resume.compose_resume_message(_run(), invite_revision=False)
+    assert "update_task_prompt" in on
+    assert "update_task_prompt" not in off
+    # The rest of the instruction survives the switch.
+    assert "FINAL ANSWER" in off
+
+
 def test_oversize_inputs_are_clipped():
     msg = resume.compose_resume_message(
         _run(error="e" * 9000), "s" * 9000)

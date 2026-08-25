@@ -236,6 +236,38 @@ async def test_revise_validation(conn):
     assert "identity" in (await _revise()).lower()
 
 
+@pytest.mark.asyncio
+async def test_revise_refused_when_task_switch_is_off(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn)
+    conn.execute("UPDATE scheduled_tasks SET allow_prompt_revision=0 "
+                 "WHERE id=?", (tid,))
+    conn.commit()
+    out = await _revise(new_prompt="better")
+    assert "disabled" in out
+    row = conn.execute("SELECT prompt FROM scheduled_tasks WHERE id=?",
+                       (tid,)).fetchone()
+    assert row["prompt"] == "old prompt"
+    assert conn.execute("SELECT COUNT(*) FROM task_prompt_revisions "
+                        "WHERE task_id=?", (tid,)).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_revise_records_a_history_row(conn):
+    USER_ID_VAR.set("u1")
+    GATING_SESSION_VAR.set("sess-c")
+    tid, _rid = _setup_continuation(conn)
+    await _revise(new_prompt="better prompt", reason="was ambiguous")
+    rows = conn.execute(
+        "SELECT prompt, revised_by, reason FROM task_prompt_revisions "
+        "WHERE task_id=? ORDER BY id DESC", (tid,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["prompt"] == "old prompt"
+    assert rows[0]["revised_by"] == "agent"
+    assert rows[0]["reason"] == "was ambiguous"
+
+
 def test_update_tool_registered_in_tasks_category():
     from skills import tool_registry
     names = [tool_registry._name(t)

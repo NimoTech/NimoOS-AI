@@ -409,6 +409,7 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     prev_prompt      TEXT NOT NULL DEFAULT '',
     prompt_revised_at INTEGER NOT NULL DEFAULT 0,
     prompt_revised_by TEXT NOT NULL DEFAULT '',
+    allow_prompt_revision INTEGER NOT NULL DEFAULT 1,
     next_run_at      INTEGER NOT NULL DEFAULT 0,
     last_run_at      INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
@@ -441,6 +442,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_claim ON task_runs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS task_prompt_revisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    prompt     TEXT NOT NULL,               -- the version REPLACED by this change
+    revised_by TEXT NOT NULL,               -- 'agent' | 'user'
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_revisions_task
+    ON task_prompt_revisions(task_id, id DESC);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
@@ -569,6 +582,25 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
                      "prompt_revised_at INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
                      "prompt_revised_by TEXT NOT NULL DEFAULT ''")
+    # Per-task switch for the agent's update_task_prompt tool (default ON —
+    # the continuation flow shipped with it available, so leaving existing
+    # tasks as they behaved).
+    if "allow_prompt_revision" not in st_cols:
+        conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN "
+                     "allow_prompt_revision INTEGER NOT NULL DEFAULT 1")
+    # Backfill the single-level prev_prompt into the revision history, once
+    # per task: the pre-history feature kept exactly one undo version, and it
+    # must not vanish the day the history table appears.
+    conn.execute(
+        "INSERT INTO task_prompt_revisions "
+        "(task_id, user_id, prompt, revised_by, reason, created_at) "
+        "SELECT id, user_id, prev_prompt, "
+        "       CASE WHEN prompt_revised_by != '' THEN prompt_revised_by "
+        "            ELSE 'user' END, '', "
+        "       CASE WHEN prompt_revised_at > 0 THEN prompt_revised_at "
+        "            ELSE strftime('%s','now') END "
+        "FROM scheduled_tasks st WHERE prev_prompt != '' AND NOT EXISTS "
+        "(SELECT 1 FROM task_prompt_revisions r WHERE r.task_id = st.id)")
     # Continuation runs reuse the parent run's session; `resumed_from` is what
     # marks them (the trigger CHECK cannot grow a value without a table
     # rebuild, so continuations ride trigger='manual').

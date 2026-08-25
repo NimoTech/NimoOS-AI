@@ -23,12 +23,17 @@ EXCERPT_MAX_CHARS = 1500
 
 _INSTRUCTION = (
     "Absorb what went wrong above and continue the task to completion — the "
-    "full earlier conversation of this session is your context. If the "
-    "failure traces back to the task's own prompt (wrong assumptions, missing "
-    "constraints, an impossible step), call `update_task_prompt` to revise it "
-    "so future scheduled runs do not repeat it; the previous version is kept "
-    "and the user can revert. Your FINAL ANSWER is what gets delivered "
-    "through the task's notify channel."
+    "full earlier conversation of this session is your context. Your FINAL "
+    "ANSWER is what gets delivered through the task's notify channel."
+)
+
+# Appended only when the task allows agent prompt revision — inviting a tool
+# the gate would refuse anyway just burns a turn on the refusal.
+_REVISION_INVITE = (
+    "If the failure traces back to the task's own prompt (wrong assumptions, "
+    "missing constraints, an impossible step), call `update_task_prompt` to "
+    "revise it so future scheduled runs do not repeat it; every previous "
+    "version is kept and the user can review and revert revisions."
 )
 
 
@@ -39,7 +44,8 @@ def _clip(text: str, cap: int) -> str:
     return text
 
 
-def compose_resume_message(run, supplement: str = "") -> str:
+def compose_resume_message(run, supplement: str = "", *,
+                           invite_revision: bool = True) -> str:
     """The full continuation instruction for one parent run.
 
     The user's supplement rides ABOVE the boilerplate — their words are the
@@ -62,7 +68,10 @@ def compose_resume_message(run, supplement: str = "") -> str:
     if supplement:
         parts.append(supplement)
     parts.append("\n".join(lines))
-    parts.append(_INSTRUCTION)
+    instruction = _INSTRUCTION
+    if invite_revision:
+        instruction = f"{_INSTRUCTION} {_REVISION_INVITE}"
+    parts.append(instruction)
     return "\n\n".join(parts)
 
 

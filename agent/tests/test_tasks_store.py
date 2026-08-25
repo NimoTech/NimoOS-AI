@@ -154,6 +154,63 @@ def test_prune_dedups_shared_session_when_both_rows_drop(conn):
     assert dropped == ["sess-shared"]  # 两行共享,只交还一次
 
 
+def test_prompt_revision_history_and_cap(conn):
+    from tasks import store
+    tid = _mk(conn)
+    for i in range(store.PROMPT_REVISIONS_KEEP + 5):
+        store.add_prompt_revision(conn, tid, "u1", f"v{i}", "agent", f"r{i}")
+    conn.commit()
+    rows = store.list_prompt_revisions(conn, tid, "u1")
+    assert len(rows) == store.PROMPT_REVISIONS_KEEP
+    assert rows[0]["prompt"] == f"v{store.PROMPT_REVISIONS_KEEP + 4}"  # newest first
+    assert rows[0]["revised_by"] == "agent"
+    assert store.list_prompt_revisions(conn, tid, "someone-else") == []
+
+
+def test_user_prompt_edit_joins_the_history(conn):
+    from tasks import store
+    tid = _mk(conn)
+    store.update_task(conn, tid, "u1", prompt="do it v2")
+    store.update_task(conn, tid, "u1", prompt="do it v2")   # unchanged: no row
+    store.update_task(conn, tid, "u1", name="renamed")      # no prompt: no row
+    rows = store.list_prompt_revisions(conn, tid, "u1")
+    assert len(rows) == 1
+    assert rows[0]["prompt"] == "do it" and rows[0]["revised_by"] == "user"
+
+
+def test_delete_task_clears_prompt_revisions(conn):
+    import asyncio
+    from tasks import store
+    tid = _mk(conn)
+    store.add_prompt_revision(conn, tid, "u1", "old", "agent")
+    conn.commit()
+
+    async def deleter(conn_, user, sid):
+        pass
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        store.delete_task(conn, tid, "u1", session_deleter=deleter))
+    assert conn.execute("SELECT COUNT(*) FROM task_prompt_revisions "
+                        "WHERE task_id=?", (tid,)).fetchone()[0] == 0
+
+
+def test_backfill_migrates_prev_prompt_once(conn, tmp_path):
+    # A pre-history DB: prev_prompt set, no revision rows. Re-running init_db
+    # (every boot does) must backfill exactly one row, exactly once.
+    from tasks import store
+    tid = _mk(conn)
+    conn.execute("UPDATE scheduled_tasks SET prev_prompt='ancient', "
+                 "prompt_revised_at=111, prompt_revised_by='agent' WHERE id=?",
+                 (tid,))
+    conn.execute("DELETE FROM task_prompt_revisions")
+    conn.commit()
+    for _ in range(2):
+        db_module.init_db(str(tmp_path / "t.db"))
+    rows = store.list_prompt_revisions(conn, tid, "u1")
+    assert len(rows) == 1
+    assert rows[0]["prompt"] == "ancient" and rows[0]["revised_by"] == "agent"
+    assert rows[0]["created_at"] == 111
+
+
 def test_user_prompt_edit_clears_agent_revision(conn):
     from tasks import store
     tid = _mk(conn)

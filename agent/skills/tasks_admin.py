@@ -152,11 +152,20 @@ async def _update_task_prompt_impl(new_prompt: str, reason: str = "") -> str:
         (row["task_id"], user_id)).fetchone()
     if task is None:
         return "The task this run belongs to no longer exists."
+    if not task["allow_prompt_revision"]:
+        # The per-task switch is the user's control surface; the refusal has
+        # to name it so the agent reports something actionable.
+        return ("The user has disabled agent prompt revision for this task "
+                "(Tasks page setting). Describe the suggested prompt change "
+                "in your final answer instead of applying it.")
     old_prompt = task["prompt"]
     if new_prompt == old_prompt:
         return "The new prompt is identical to the current one; nothing to do."
 
+    from tasks import store as _store
     now = int(time.time())
+    _store.add_prompt_revision(conn, task["id"], user_id, old_prompt,
+                               "agent", (reason or "").strip())
     conn.execute(
         "UPDATE scheduled_tasks SET prompt=?, prev_prompt=?, "
         "prompt_revised_at=?, prompt_revised_by='agent', updated_at=? "
@@ -165,8 +174,8 @@ async def _update_task_prompt_impl(new_prompt: str, reason: str = "") -> str:
     conn.commit()
     suffix = f" Reason: {reason.strip()}" if (reason or "").strip() else ""
     return (f"Revised the prompt of task '{task['name']}'. The previous "
-            f"version was kept and the user can revert it on the Tasks "
-            f"page.{suffix}")
+            f"version was kept and the user can review the diff and revert "
+            f"it on the Tasks page.{suffix}")
 
 
 @function_tool
