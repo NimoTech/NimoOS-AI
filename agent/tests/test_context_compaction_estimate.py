@@ -35,45 +35,33 @@ def test_resolve_window_user_override_wins(tmp_path):
     conn.close()
 
 
-def test_resolve_window_map_then_default(tmp_path):
+def test_resolve_window_tier_defaults(tmp_path):
+    # 2026-08-24 tier defaults: cloud 256k, local (Ollama) 8k. The old
+    # per-family map is gone — new models no longer fall onto stale guesses.
     conn = init_db(str(tmp_path / "m.db"))
-    assert cc.resolve_window(conn, "u1", "gpt-4o-mini") == 128000
-    assert cc.resolve_window(conn, "u1", "deepseek-chat") == 64000
-    assert cc.resolve_window(conn, "u1", "qwen2.5-7b") == 32768
-    assert cc.resolve_window(conn, "u1", "some-unknown-local") == cc.DEFAULT_CONTEXT_WINDOW
+    # cloud: bare names (chat runs) and full selector keys (usage endpoint)
+    assert cc.resolve_window(conn, "u1", "gpt-4o-mini") == cc.CLOUD_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "deepseek-v4-flash-260425") == cc.CLOUD_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "cloud:4:deepseek-v4-flash-260425") == cc.CLOUD_CONTEXT_WINDOW
+    # local: provider_type from chat runs, "local:" key from the endpoint
+    assert cc.resolve_window(conn, "u1", "qwen3:8b", "ollama") == cc.LOCAL_CONTEXT_WINDOW
+    assert cc.resolve_window(conn, "u1", "local:qwen3:8b") == cc.LOCAL_CONTEXT_WINDOW
+    # no signal at all → cloud
+    assert cc.resolve_window(conn, "u1", "") == cc.CLOUD_CONTEXT_WINDOW
     conn.close()
 
 
-def test_resolve_window_glm_family(tmp_path):
-    # GLM was missing from the map: glm-5-2-260617 fell to the 8k default and
-    # tripped compaction on every turn (composio-sized tool overhead alone
-    # exceeded 70% of 8192), silently truncating chat history.
-    conn = init_db(str(tmp_path / "m.db"))
-    assert cc.resolve_window(conn, "u1", "glm-5-2-260617") == 128000
-    assert cc.resolve_window(conn, "u1", "glm-4-plus") == 128000
-    assert cc.resolve_window(conn, "u1", "GLM-4.5-Air") == 128000
-    conn.close()
+def test_min_context_window_floor_constant():
+    # The floor is enforced at the settings PUT (see
+    # test_main_user_memory.py::test_settings_context_window_floor), not at
+    # read time — compaction tests rely on tiny windows as a deterministic
+    # trigger lever. Pin the constant so the API error message stays sane.
+    assert 0 < cc.MIN_CONTEXT_WINDOW <= cc.LOCAL_CONTEXT_WINDOW
 
 
 def test_default_window_is_modern():
-    # 8192 was an absurd fallback for 2026-era models: system prompt + one MCP
-    # server's tool schemas alone exceed 70% of it, so unknown models entered a
-    # truncate-every-turn death spiral.
+    # 8192 was an absurd fallback for 2026-era cloud models: system prompt +
+    # one MCP server's tool schemas alone exceed 70% of it, so unknown models
+    # entered a truncate-every-turn death spiral.
     assert cc.DEFAULT_CONTEXT_WINDOW >= 32768
-
-
-def test_resolve_window_short_key_boundary(tmp_path):
-    conn = init_db(str(tmp_path / "m.db"))
-    # real o1/o3 family names match → 128000
-    assert cc.resolve_window(conn, "u1", "o1") == 128000
-    assert cc.resolve_window(conn, "u1", "o1-mini") == 128000
-    assert cc.resolve_window(conn, "u1", "o3-mini") == 128000
-    assert cc.resolve_window(conn, "u1", "openai/o1-preview") == 128000
-    # embedded 'o1'/'o3' that are NOT the o1/o3 family must NOT false-match
-    assert cc.resolve_window(conn, "u1", "do3-test") == cc.DEFAULT_CONTEXT_WINDOW
-    assert cc.resolve_window(conn, "u1", "no1se-model") == cc.DEFAULT_CONTEXT_WINDOW
-    assert cc.resolve_window(conn, "u1", "o13b") == cc.DEFAULT_CONTEXT_WINDOW
-    assert cc.resolve_window(conn, "u1", "o1pro") == cc.DEFAULT_CONTEXT_WINDOW
-    # long-key substring matching still lenient (qwen2.5 glued version)
-    assert cc.resolve_window(conn, "u1", "qwen2.5-7b") == 32768
-    conn.close()
+    assert cc.DEFAULT_CONTEXT_WINDOW == cc.CLOUD_CONTEXT_WINDOW

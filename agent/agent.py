@@ -1074,7 +1074,8 @@ class AgentRunner:
             summary_block, send_history = await context_compaction.compact_for_run(
                 self._conn, session_id=session_id, user_id=str(user_id),
                 model_name=model_name, history=history, current_text=_cur_text,
-                summarize_fn=_summarize_fn, overhead_tokens=_overhead)
+                summarize_fn=_summarize_fn, overhead_tokens=_overhead,
+                provider_type=provider_type)
             if summary_block:
                 full_prompt = full_prompt + "\n\n" + summary_block
             # Compaction only trims what is SENT to the model. The persisted

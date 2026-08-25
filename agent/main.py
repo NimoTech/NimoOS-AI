@@ -2241,6 +2241,17 @@ async def put_memory_settings(request: Request, body: MemorySettingsPayload):
             (user_id, "1" if body.compaction_enabled else "0", int(time.time())),
         )
     if body.context_window is not None:
+        # A tiny window (a user once saved "2") makes every session
+        # permanently over budget: reject instead of storing. 0 / negative
+        # still mean "clear the override, use the model-tier default".
+        if (isinstance(body.context_window, int)
+                and 0 < body.context_window
+                < context_compaction.MIN_CONTEXT_WINDOW):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"context_window must be >= "
+                        f"{context_compaction.MIN_CONTEXT_WINDOW} tokens "
+                        f"(or 0 to reset to the model default)"))
         val = body.context_window if (
             isinstance(body.context_window, int) and body.context_window > 0
         ) else ""
