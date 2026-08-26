@@ -43,6 +43,17 @@ func NewAgentHandler(svc service.Services, agentURL string, timeout int, tickets
 		}
 	}
 
+	// A transport failure (connection refused: the container really is down)
+	// answers with the same 503 body the old availability gate produced, so
+	// existing clients keep their error contract. This is the ONLY place that
+	// verdict is issued now — see the comment in Proxy for why the request
+	// path no longer consults the sampled health bit.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"message":"nimoos-agent is not available"}`))
+	}
+
 	h := &AgentHandler{
 		svc:      svc,
 		agentURL: agentURL,
@@ -119,9 +130,6 @@ func IsWebhookTriggerPattern(routePattern string) bool {
 // as them. Deleting the identity headers before forwarding is what keeps the
 // task's own token the only thing that decides whose task runs.
 func (h *AgentHandler) ProxyAnonymous(c echo.Context) error {
-	if !h.available.Load() {
-		return echo.NewHTTPError(http.StatusServiceUnavailable, "nimoos-agent is not available")
-	}
 	r := c.Request()
 	r.Header.Del("X-NimoOS-User-ID")
 	r.Header.Del("X-NimoOS-User-Name")
@@ -138,10 +146,17 @@ func (h *AgentHandler) Proxy(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "missing user identity")
 	}
 
-	if !h.available.Load() {
-		return echo.NewHTTPError(http.StatusServiceUnavailable, "nimoos-agent is not available")
-	}
-
+	// Deliberately NOT gated on h.available. That bit is a 30s-interval
+	// sample with a 3s ping timeout: a busy agent event loop, or the window
+	// right after a container restart, leaves it false for up to half a
+	// minute while the agent is in fact serving — and the request that got
+	// bounced in that window was, on the live box, a confirmation-card
+	// click the user could then never deliver (2026-08-21). Forwarding is
+	// self-truthful per request: a genuinely down agent refuses the dial
+	// immediately and the proxy's ErrorHandler answers the same 503 the
+	// gate used to; a merely-busy agent queues the request and answers
+	// when its loop frees. The sampled bit remains what Health and the
+	// services-status page report.
 	c.Request().Header.Set("X-User-Id", userID)
 
 	// A fresh user with no skill_state rows never gets .runtime/<uid>/ built,
