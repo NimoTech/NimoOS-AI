@@ -204,6 +204,10 @@ func InitV2Router(svc service.Services, runtimePath string, agentURL string, oll
 	g.DELETE("/parser/allowlist/folders/:id", parserProxy.DeleteAllowlistFolder)
 	g.GET("/parser/files", parserProxy.ListFiles)
 	g.POST("/parser/files/reindex", parserProxy.ReindexFiles)
+	g.GET("/parser/ocr/models", parserProxy.OcrModels)
+	g.POST("/parser/ocr/models/:id/install", parserProxy.InstallOcrModel)
+	g.POST("/parser/ocr/models/:id/activate", parserProxy.ActivateOcrModel)
+	g.DELETE("/parser/ocr/models/:id", parserProxy.DeleteOcrModel)
 
 	// Search proxy → forwards /v1/ai/search/* to the Search service (/v1/search/*)
 	searchProxy := &v2.SearchProxy{Client: searchClient}
