@@ -318,7 +318,7 @@ func (h *AgentHandler) resolveProvider(userID string) (key, provURL string, ok b
 	}
 	for _, p := range providers {
 		if p.Enabled {
-			decrypted, err := h.svc.MasterKey().Decrypt(p.APIKey)
+			decrypted, err := decryptProviderKey(h.svc.MasterKey(), p.APIKey)
 			if err != nil {
 				continue
 			}
@@ -335,7 +335,7 @@ func (h *AgentHandler) resolveProviderByID(userID string, id int64) (key, provUR
 	if err != nil || !p.Enabled {
 		return "", "", false
 	}
-	decrypted, err := h.svc.MasterKey().Decrypt(p.APIKey)
+	decrypted, err := decryptProviderKey(h.svc.MasterKey(), p.APIKey)
 	if err != nil {
 		return "", "", false
 	}
