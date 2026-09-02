@@ -23,7 +23,12 @@ from skills.web import WEB_TOOLS
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "run_command", "read_file", "list_dir",
-    "nimoos_search", "read_skill_file",
+    # The whole retrieval path is always on: nimoos_search finds a file_id,
+    # read_document / read_file_chunk read it. Gating the readers behind
+    # expand_tools made the model fall back to read_file(path) — an
+    # authorization card plus 3-5 wasted turns per question (2026-09-02
+    # Intel2408 eval: 15/55 answers lost to max_turns for this reason).
+    "nimoos_search", "read_document", "read_file_chunk", "read_skill_file",
     "remember", "forget", "recall",
 })
 
@@ -38,7 +43,8 @@ def _exclude(tools, names: set[str]) -> list:
 
 # Carve the gated members out of each module (excluding tools already promoted to always-on).
 _FILES = _exclude(FS_TOOLS, {"read_file", "list_dir"})           # 9
-_DOCUMENTS = _exclude(SEARCH_TOOLS, {"nimoos_search"})           # 3
+_DOCUMENTS = _exclude(SEARCH_TOOLS, {"nimoos_search", "read_document",
+                                     "read_file_chunk"})           # 1 (view_document_page)
 _SYSTEM = list(HEALTHCHECK_TOOLS) + list(STORAGE_TOOLS)         # 3 + 2 = 5
 
 CATEGORY_TOOLS: dict[str, list] = {
@@ -61,7 +67,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "files": "write/edit/delete/mkdir/rename/batch ops/glob/full-text file search",
     "photos": "semantic photo search, album management, view images",
     "wiki": "knowledge-base node read/write, user notes, register roots",
-    "documents": "chunked document reading, docling parsing, page views",
+    "documents": "render a document page to an image for the vision model (text reading is always on)",
     "system": "service/port health, system logs, disks and mounts",
     "events": "message-bus event types, action types, trigger actions",
     "notes": "knowledge notes: save/update/consult long-term conclusions and summaries (writes require user confirmation)",

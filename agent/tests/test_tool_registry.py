@@ -9,8 +9,16 @@ def _name(t):
 def test_core_names_exact():
     assert tr.CORE_TOOL_NAMES == frozenset(
         {"run_command", "read_file", "list_dir",
-         "nimoos_search", "read_skill_file",
+         "nimoos_search", "read_document", "read_file_chunk", "read_skill_file",
          "remember", "forget", "recall"})
+
+
+def test_document_readers_are_core_not_gated():
+    # Regression: the retrieval path must not need expand_tools. Only the
+    # vision-dependent page renderer stays behind the "documents" gate.
+    assert tr.category_of("read_document") is None
+    assert tr.category_of("read_file_chunk") is None
+    assert [_name(t) for t in tr.CATEGORY_TOOLS["documents"]] == ["view_document_page"]
 
 
 def test_categories_exact_keys():

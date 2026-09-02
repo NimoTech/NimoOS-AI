@@ -7,6 +7,7 @@ boundary (it derives accessible roots from the X-NimoOS-User-ID header).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from contextvars import ContextVar
 from typing import Optional
@@ -62,15 +63,87 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
     except httpx.HTTPError as e:
         return json.dumps({"error": f"search request failed: {e}"},
                           ensure_ascii=False)
+    await _inline_small_documents(result, uid)
     result_text = json.dumps(result, ensure_ascii=False)
     # Search hits are external content the model reads — fence them so any
     # injected instructions inside a filename/preview read as data, not
     # commands. Use a generous cap (60000): a realistic aggregated blob
-    # (~3 sources × 20 hits × ~200-char previews + JSON overhead ≈ ≤~30k)
-    # must never be truncated mid-JSON, but keep the backstop for pathological
-    # sizes. fence_untrusted returns "" for empty/whitespace content; fall
-    # back to the unfenced text so the no-results UX is unchanged.
+    # (~3 sources × 20 hits × ~200-char previews + up to INLINE_TOTAL_BUDGET
+    # of inlined full text + JSON overhead ≈ ≤~50k) must never be truncated
+    # mid-JSON, but keep the backstop for pathological sizes. fence_untrusted
+    # returns "" for empty/whitespace content; fall back to the unfenced text
+    # so the no-results UX is unchanged.
     return fence_untrusted("search-results", result_text, cap=60000) or result_text
+
+
+# Small text documents are returned whole, right inside the search result.
+# A spec sheet, a note, a config file is ~2-5k chars: the ~200-char preview
+# never contains the field the user asked about, so every answer used to cost
+# a second hop (read_document, or worse read_file(path) + an authorization
+# card). Inlining the complete text lets the model answer from the search
+# result directly. Bounded three ways so a broad query cannot blow up the
+# context: per-document size, number of documents, total budget.
+INLINE_MAX_DOC_CHARS = 8000
+INLINE_MAX_DOCS = 3
+INLINE_TOTAL_BUDGET = 16000
+_INLINE_MIME_PREFIXES = ("text/",)
+
+
+def _inline_candidates(result) -> list[dict]:
+    """Semantic body hits of small text files, in rank order, deduped by file_id."""
+    groups = result.get("groups") if isinstance(result, dict) else None
+    hits = groups.get("semantic") if isinstance(groups, dict) else None
+    out, seen = [], set()
+    for h in hits or []:
+        if not isinstance(h, dict):
+            continue
+        fid = h.get("file_id")
+        mime = str(h.get("mime") or "")
+        if not fid or fid in seen or h.get("kind", "body") != "body":
+            continue
+        if not mime.startswith(_INLINE_MIME_PREFIXES):
+            continue
+        seen.add(fid)
+        out.append(h)
+        if len(out) >= INLINE_MAX_DOCS:
+            break
+    return out
+
+
+async def _inline_small_documents(result, uid) -> None:
+    """Attach `full_text` to eligible semantic hits (mutates `result` in place).
+
+    Best effort: any failure leaves the hit as it was (preview only). A
+    document longer than INLINE_MAX_DOC_CHARS is never partially inlined —
+    a truncated spec table is worse than none, the model should page it with
+    read_document(file_id) instead.
+    """
+    cands = _inline_candidates(result)
+    if not cands:
+        return
+
+    async def fetch(h):
+        try:
+            return await _client.invoke_tool("read_document", {
+                "file_id": h["file_id"], "offset": 0,
+                "max_chars": INLINE_MAX_DOC_CHARS,
+            }, user_id=uid)
+        except Exception:  # noqa: BLE001 — inlining is an optimisation only
+            return None
+
+    docs = await asyncio.gather(*(fetch(h) for h in cands))
+    used = 0
+    for h, doc in zip(cands, docs):
+        if not isinstance(doc, dict) or doc.get("truncated"):
+            continue
+        text = doc.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if len(text) > INLINE_MAX_DOC_CHARS or used + len(text) > INLINE_TOTAL_BUDGET:
+            continue
+        h["full_text"] = text
+        h["full_text_complete"] = True
+        used += len(text)
 
 
 async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,
@@ -139,6 +212,12 @@ async def nimoos_search(query: str, sources: Optional[str] = None,
     """Unified search over the user's NAS: by content (semantic), by filename,
     photos, and notes. Returns grouped candidates {semantic, filenames, images,
     notes} for the user to choose from.
+
+    Small text documents (spec sheets, notes, CSV/Markdown/plain text up to
+    ~8k chars) come back complete in the hit's `full_text` field — answer from
+    it directly, no further call needed. For anything else use the hit's
+    `file_id` with read_document(file_id) (or read_file_chunk); do not read a
+    search hit via read_file(path), that needs a separate authorization.
 
     Args:
         query: The search query string.
