@@ -260,3 +260,46 @@ func (p *ParserProxy) ReindexFiles(c echo.Context) error {
 	}
 	return c.Blob(code, "application/json", body)
 }
+
+// OcrModels proxies GET /v1/ai/parser/ocr/models → /v1/parser/ocr/models.
+func (p *ParserProxy) OcrModels(c echo.Context) error {
+	body, code, err := p.Client.Get("/v1/parser/ocr/models")
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// InstallOcrModel proxies POST /v1/ai/parser/ocr/models/{id}/install.
+func (p *ParserProxy) InstallOcrModel(c echo.Context) error {
+	id := c.Param("id")
+	body, code, err := p.Client.Post("/v1/parser/ocr/models/"+id+"/install", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// ActivateOcrModel proxies POST /v1/ai/parser/ocr/models/{id}/activate.
+func (p *ParserProxy) ActivateOcrModel(c echo.Context) error {
+	id := c.Param("id")
+	body, code, err := p.Client.Post("/v1/parser/ocr/models/"+id+"/activate", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	return c.Blob(code, "application/json", body)
+}
+
+// DeleteOcrModel proxies DELETE /v1/ai/parser/ocr/models/{id}.
+func (p *ParserProxy) DeleteOcrModel(c echo.Context) error {
+	id := c.Param("id")
+	body, code, err := p.Client.Forward("DELETE",
+		"/v1/parser/ocr/models/"+id, "", nil)
+	if err != nil {
+		return c.JSON(502, echo.Map{"error": err.Error()})
+	}
+	if len(body) == 0 {
+		return c.NoContent(code)
+	}
+	return c.Blob(code, "application/json", body)
+}

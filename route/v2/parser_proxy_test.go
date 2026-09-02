@@ -382,6 +382,117 @@ func TestParserProxy_ReindexFilesForwardsBody(t *testing.T) {
 	}
 }
 
+func TestParserProxy_OcrModels(t *testing.T) {
+	srv, _, _ := startUpstream(t, map[string]string{
+		"/v1/parser/ocr/models": `{"models":[{"id":"ppocr-v4-mobile"}]}`,
+	})
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("GET", "/v1/ai/parser/ocr/models", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if err := p.OcrModels(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"ppocr-v4-mobile"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestParserProxy_InstallOcrModel(t *testing.T) {
+	srv, captured, mu := startUpstream(t, map[string]string{
+		"/v1/parser/ocr/models/ppocr-v4-mobile/install": `{"status":"installing"}`,
+	})
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("POST", "/v1/ai/parser/ocr/models/ppocr-v4-mobile/install", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("ppocr-v4-mobile")
+	if err := p.InstallOcrModel(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"installing"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*captured) != 1 || (*captured)[0].Method != "POST" ||
+		(*captured)[0].Path != "/v1/parser/ocr/models/ppocr-v4-mobile/install" {
+		t.Fatalf("captured = %+v", *captured)
+	}
+}
+
+func TestParserProxy_ActivateOcrModel(t *testing.T) {
+	srv, captured, mu := startUpstream(t, map[string]string{
+		"/v1/parser/ocr/models/ppocr-v4-mobile/activate": `{"status":"active"}`,
+	})
+	defer srv.Close()
+	p := newProxy(t, srv.URL)
+	e := echo.New()
+	req := httptest.NewRequest("POST", "/v1/ai/parser/ocr/models/ppocr-v4-mobile/activate", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("ppocr-v4-mobile")
+	if err := p.ActivateOcrModel(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"active"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*captured) != 1 || (*captured)[0].Method != "POST" ||
+		(*captured)[0].Path != "/v1/parser/ocr/models/ppocr-v4-mobile/activate" {
+		t.Fatalf("captured = %+v", *captured)
+	}
+}
+
+func TestParserProxy_DeleteOcrModel(t *testing.T) {
+	srv, captured, mu := startUpstream(t, nil)
+	defer srv.Close()
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		*captured = append(*captured, capturedReq{r.Method, r.URL.Path, string(b)})
+		mu.Unlock()
+		w.WriteHeader(204)
+	}))
+	defer srv2.Close()
+	p := newProxy(t, srv2.URL)
+	e := echo.New()
+	req := httptest.NewRequest("DELETE", "/v1/ai/parser/ocr/models/ppocr-v4-mobile", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.SetParamNames("id")
+	c.SetParamValues("ppocr-v4-mobile")
+	if err := p.DeleteOcrModel(c); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 204 {
+		t.Fatalf("code = %d, want 204", rec.Code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*captured) != 1 || (*captured)[0].Method != "DELETE" ||
+		(*captured)[0].Path != "/v1/parser/ocr/models/ppocr-v4-mobile" {
+		t.Fatalf("captured = %+v", *captured)
+	}
+}
+
 func TestParserProxy_ListFilesForwardsQueryString(t *testing.T) {
 	var gotRawQuery string
 	var gotPath string
