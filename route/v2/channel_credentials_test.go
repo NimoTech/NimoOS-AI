@@ -154,3 +154,29 @@ func TestProviderCredentialsRejectsMissingOrWrongToken(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec2.Code)
 	require.NotContains(t, rec2.Body.String(), "sk-should-not-leak")
 }
+
+// A cloud provider saved without an API key (self-hosted llama.cpp behind an
+// OpenAI-compatible URL) must yield the no-auth placeholder, not a 500
+// "decrypt failed" — channels and background workers build an OpenAI client
+// from this and the SDK rejects an empty api_key.
+func TestProviderCredentialsCloudNoKey(t *testing.T) {
+	svc := newTestServices(t)
+	p := &service.Provider{
+		UserID:       "u1",
+		Name:         "183",
+		BaseURL:      "http://192.168.1.183:8081/v1",
+		APIKey:       "",
+		Protocol:     service.ProtocolOpenAI,
+		Enabled:      true,
+		DefaultModel: "chadrock",
+		ProviderType: "other",
+	}
+	require.NoError(t, svc.Providers().CreateProvider(p))
+
+	rec := credsCall(t, svc, "u1", "cloud:"+strconv.FormatInt(p.ID, 10)+":chadrock")
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	require.Contains(t, body, `"api_key":"`+noAuthAPIKey+`"`)
+	require.Contains(t, body, `"base_url":"http://192.168.1.183:8081/v1"`)
+	require.Contains(t, body, `"model":"chadrock"`)
+}
