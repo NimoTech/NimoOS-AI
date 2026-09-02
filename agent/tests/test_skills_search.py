@@ -366,3 +366,110 @@ async def test_view_document_page_unauthorized_path(monkeypatch, tmp_path):
     out = await search_skill._view_document_page_impl(path="/etc/passwd", page=1)
     assert "error" in json.loads(out)
     assert called["n"] == 0  # never rendered for an unauthorized path
+
+
+# --- small-document inlining -------------------------------------------------
+
+def _search_result_with(hits):
+    return {"groups": {"semantic": hits, "filenames": [{"path": "/DATA/x.csv"}]}}
+
+
+class _RoutingClient:
+    """invoke_tool that serves nimoos_search and read_document from fixtures."""
+
+    def __init__(self, search_result, docs):
+        self.search_result = search_result
+        self.docs = docs            # file_id -> read_document response (or Exception)
+        self.calls = []
+
+    async def invoke_tool(self, name, arguments, user_id=None):
+        self.calls.append((name, dict(arguments), user_id))
+        if name == "nimoos_search":
+            return self.search_result
+        assert name == "read_document"
+        doc = self.docs[arguments["file_id"]]
+        if isinstance(doc, Exception):
+            raise doc
+        return doc
+
+
+def _hit(fid, mime="text/plain", kind="body"):
+    return {"file_id": fid, "kind": kind, "mime": mime,
+            "preview": {"text": "﻿,Intel Core i5-1235U Processor"}, "score": 0.9}
+
+
+@pytest.mark.asyncio
+async def test_small_text_hits_get_full_text_inline(monkeypatch):
+    client = _RoutingClient(
+        _search_result_with([_hit("small"), _hit("pdf", mime="application/pdf")]),
+        {"small": {"file_id": "small", "text": "Processor Number,i5-1235U\nTDP,15 W",
+                   "truncated": False, "total_chars": 34, "next_offset": 34}})
+    monkeypatch.setattr(search_skill, "_client", client)
+    search_skill.USER_ID_VAR.set("u1")
+    out = await search_skill._nimoos_search_impl("i5-1235U TDP")
+    body = json.loads(unfence(out))
+    sem = body["groups"]["semantic"]
+    assert sem[0]["full_text"] == "Processor Number,i5-1235U\nTDP,15 W"
+    assert sem[0]["full_text_complete"] is True
+    assert "full_text" not in sem[1], "non-text mime must not be fetched"
+    # only the text hit was read, with the caller's identity and a bounded size
+    reads = [c for c in client.calls if c[0] == "read_document"]
+    assert [c[1]["file_id"] for c in reads] == ["small"]
+    assert reads[0][1]["max_chars"] == search_skill.INLINE_MAX_DOC_CHARS
+    assert reads[0][2] == "u1"
+    # the filenames group is untouched
+    assert body["groups"]["filenames"] == [{"path": "/DATA/x.csv"}]
+
+
+@pytest.mark.asyncio
+async def test_truncated_or_oversized_documents_are_not_inlined(monkeypatch):
+    big = "x" * (search_skill.INLINE_MAX_DOC_CHARS + 1)
+    client = _RoutingClient(
+        _search_result_with([_hit("trunc"), _hit("big")]),
+        {"trunc": {"file_id": "trunc", "text": "partial", "truncated": True,
+                   "total_chars": 99999, "next_offset": 8000},
+         "big": {"file_id": "big", "text": big, "truncated": False,
+                 "total_chars": len(big), "next_offset": len(big)}})
+    monkeypatch.setattr(search_skill, "_client", client)
+    out = await search_skill._nimoos_search_impl("q")
+    sem = json.loads(unfence(out))["groups"]["semantic"]
+    assert all("full_text" not in h for h in sem)
+
+
+@pytest.mark.asyncio
+async def test_inline_respects_doc_count_and_total_budget(monkeypatch):
+    # 5 eligible hits (two share a file_id) -> at most INLINE_MAX_DOCS distinct
+    # files are read; the total budget stops inlining once exceeded.
+    chunk = "y" * 7000   # 3 × 7000 > INLINE_TOTAL_BUDGET (16000)
+    hits = [_hit("a"), _hit("a"), _hit("b"), _hit("c"), _hit("d")]
+    docs = {k: {"file_id": k, "text": chunk, "truncated": False,
+                "total_chars": 7000, "next_offset": 7000} for k in "abcd"}
+    client = _RoutingClient(_search_result_with(hits), docs)
+    monkeypatch.setattr(search_skill, "_client", client)
+    out = await search_skill._nimoos_search_impl("q")
+    sem = json.loads(unfence(out))["groups"]["semantic"]
+    read_ids = [c[1]["file_id"] for c in client.calls if c[0] == "read_document"]
+    assert read_ids == ["a", "b", "c"], "dedupe by file_id, cap at INLINE_MAX_DOCS"
+    inlined = [h["file_id"] for h in sem if "full_text" in h]
+    assert inlined == ["a", "b"], "third doc would exceed the total budget"
+
+
+@pytest.mark.asyncio
+async def test_inline_failure_leaves_hit_untouched(monkeypatch):
+    client = _RoutingClient(
+        _search_result_with([_hit("boom")]),
+        {"boom": httpx.HTTPError("search down")})
+    monkeypatch.setattr(search_skill, "_client", client)
+    out = await search_skill._nimoos_search_impl("q")
+    sem = json.loads(unfence(out))["groups"]["semantic"]
+    assert sem[0]["preview"]["text"].endswith("Processor")
+    assert "full_text" not in sem[0]
+
+
+@pytest.mark.asyncio
+async def test_inline_skips_results_without_semantic_group(monkeypatch):
+    client = _RoutingClient({"hits": []}, {})
+    monkeypatch.setattr(search_skill, "_client", client)
+    out = await search_skill._nimoos_search_impl("q")
+    assert json.loads(unfence(out)) == {"hits": []}
+    assert [c[0] for c in client.calls] == ["nimoos_search"]
