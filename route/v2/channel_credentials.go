@@ -103,7 +103,7 @@ func ProviderCredentials(svc service.Services, runtimePath string) echo.HandlerF
 			return c.JSON(http.StatusNotFound,
 				map[string]string{"message": "provider not found"})
 		}
-		key, err := svc.MasterKey().Decrypt(p.APIKey)
+		key, err := decryptProviderKey(svc.MasterKey(), p.APIKey)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError,
 				map[string]string{"message": "decrypt failed"})

@@ -186,7 +186,7 @@ func (h *ChatHandler) forwardToCloud(c echo.Context, userID string, providerID i
 		}
 	}
 
-	apiKey, err := h.svc.MasterKey().Decrypt(provider.APIKey)
+	apiKey, err := decryptProviderKey(h.svc.MasterKey(), provider.APIKey)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to decrypt api key")
 	}
@@ -252,7 +252,7 @@ func (h *ChatHandler) Messages(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "no Anthropic provider configured")
 	}
 
-	apiKey, err := h.svc.MasterKey().Decrypt(provider.APIKey)
+	apiKey, err := decryptProviderKey(h.svc.MasterKey(), provider.APIKey)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to decrypt api key")
 	}
