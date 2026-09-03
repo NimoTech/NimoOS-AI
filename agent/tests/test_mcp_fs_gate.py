@@ -111,3 +111,27 @@ def test_regular_document_unaffected_by_notes_rule(tmp_path):
     open(doc, "w").write("x")
     assert mcp_resolve_read_path(doc, root=root, user_id="1",
                                  notes_root=os.path.join(root, "Notes")) == os.path.realpath(doc)
+
+def test_denies_tool_output_offload_dir(tmp_path):
+    """F5: the tool-output offload root (agent/tool_output.py's default ROOT,
+    /DATA/AppData/nimoos-agent/tool-outputs) must be as unreachable to the MCP
+    server as .system_data — it can contain other sessions' fetched web pages,
+    file contents, etc."""
+    root = str(tmp_path / "DATA")
+    offload_dir = os.path.join(root, "AppData", "nimoos-agent", "tool-outputs")
+    os.makedirs(offload_dir)
+    f = os.path.join(offload_dir, "s1", "call_1.txt")
+    os.makedirs(os.path.dirname(f))
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write("secret tool output")
+    with pytest.raises(McpPathDenied):
+        mcp_resolve_read_path(f, root=root)
+
+
+def test_allows_sibling_appdata_path(tmp_path):
+    root = str(tmp_path / "DATA")
+    sibling = os.path.join(root, "AppData", "other", "x.txt")
+    os.makedirs(os.path.dirname(sibling))
+    with open(sibling, "w", encoding="utf-8") as fh:
+        fh.write("fine")
+    assert mcp_resolve_read_path(sibling, root=root) == os.path.realpath(sibling)

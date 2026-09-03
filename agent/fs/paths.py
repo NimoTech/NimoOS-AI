@@ -68,8 +68,10 @@ def resolve(raw: str, session_id: str, db: sqlite3.Connection) -> str:
     # picked folder keeps its single-folder relative-path anchoring.
     if os.path.isabs(raw):
         real0 = os.path.realpath(raw)
+        root = os.path.realpath(_tool_output.ROOT)
         own = os.path.realpath(_tool_output.chat_dir_for_session(session_id))
-        if real0 == own or real0.startswith(own + os.sep):
+        if (real0.startswith(root + os.sep)
+                and (real0 == own or real0.startswith(own + os.sep))):
             return real0
 
     visible = _load_visible(db, session_id)

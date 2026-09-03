@@ -47,6 +47,10 @@ CALL_ID_VAR: ContextVar[str] = ContextVar("tool_call_id", default="")
 # dedup). agent.py sets a fresh {} per run; tools tolerate it being unset.
 RUN_SCRATCH_VAR: ContextVar[dict] = ContextVar("run_scratch")
 
+# Tools whose output is structured data the UI parses directly (not prose a
+# model pages through); folding it into a placeholder would break that UI.
+OFFLOAD_EXEMPT_TOOLS = frozenset({"search_photos"})
+
 _SAFE_CALL_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 # CONTRACT shared with the UI (streamMappers.ts OFFLOAD_TRAILER_RE). Byte-exact.
 TRAILER_RE = re.compile(r"\[tool output offloaded: chars=(\d+) path=(\S+)\]")
@@ -102,7 +106,7 @@ def store_output(text: str, *, call_id: str, tool_name: str = "") -> str:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, path)
-    except OSError as exc:
+    except Exception as exc:  # noqa: BLE001 — any write failure must not sink a run
         _LOG.warning("tool_output: cannot store %s output to %s: %s",
                      tool_name, path, exc)
         try:
@@ -127,10 +131,13 @@ def make_placeholder(text: str, *, tool_name: str, path: str, chars: int) -> str
         f"{fenced}\n"
         f"[tool output offloaded: chars={chars} path={path}]\n"
         f"The full {tool_name or 'tool'} output ({chars} chars) was too large for "
-        f"the conversation and was saved to that file. Page through it with "
-        f"read_file_lines(path, start, end) (e.g. lines 1-200), or locate text "
-        f"with search_content(query, root={folder}). Do not re-run the tool just "
-        f"to see more of this result."
+        f"the conversation and was saved to that file. Read it in small slices "
+        f"with read_file_lines(path, start, end) — about 50-100 lines per call; "
+        f"a slice longer than {OFFLOAD_THRESHOLD_CHARS} chars is folded again. "
+        f"To find text inside it use search_content(query, root={folder}). If "
+        f'read_file_lines/search_content are not in your tool list, call '
+        f'expand_tools(["files"]) first. Do not re-run the tool just to see '
+        f"more of this result."
     )
 
 
@@ -139,6 +146,8 @@ def postprocess(output, *, tool_name: str, call_id: str):
     (non-str outputs, small outputs, existing placeholders, store failures)
     passes through untouched."""
     if not isinstance(output, str):
+        return output
+    if tool_name in OFFLOAD_EXEMPT_TOOLS or output.startswith("[MCP error]"):
         return output
     n = len(output)
     if n <= OFFLOAD_THRESHOLD_CHARS:
