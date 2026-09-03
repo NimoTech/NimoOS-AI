@@ -62,3 +62,43 @@ def test_hydrate_replaces_attachment_id_with_url(setup):
     blob = json.dumps(user)
     assert "att_xyz" in blob
     assert "/v1/ai/agent/sessions/s1/attachments/att_xyz/raw" in blob
+
+
+def test_hydrate_tool_block_carries_call_id(setup):
+    """F1-backend: a reloaded session's tool block must carry callId so the
+    UI's "View full output" can call the tool-outputs endpoint (which is
+    keyed by call_id) after a page reload — see ToolCard.vue."""
+    _, m = setup
+    history = [
+        {
+            "type": "function_call",
+            "name": "web_fetch",
+            "call_id": "call_7",
+            "arguments": json.dumps({"url": "https://example.com"}),
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_7",
+            "output": "[tool output offloaded: chars=9000 path=/x/call_7.txt]",
+        },
+    ]
+    hydrated = m._hydrate_messages(history, session_id_for_urls="s1")
+    assistant = next(h for h in hydrated if h["role"] == "assistant")
+    tool_block = next(b for b in assistant["blocks"] if b["type"] == "tool")
+    assert tool_block["callId"] == "call_7"
+
+
+def test_hydrate_fake_id_tool_block_has_no_call_id(setup):
+    _, m = setup
+    history = [
+        {
+            "type": "function_call",
+            "name": "web_fetch",
+            "call_id": "__fake_id__",
+            "arguments": "{}",
+        },
+    ]
+    hydrated = m._hydrate_messages(history, session_id_for_urls="s1")
+    assistant = next(h for h in hydrated if h["role"] == "assistant")
+    tool_block = next(b for b in assistant["blocks"] if b["type"] == "tool")
+    assert "callId" not in tool_block

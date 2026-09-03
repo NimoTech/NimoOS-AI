@@ -1604,7 +1604,8 @@ async def get_tool_output(session_id: str, call_id: str,
     if os.path.getsize(path) > _to.MAX_READ_BYTES:
         raise HTTPException(status_code=413, detail="tool output too large")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return PlainTextResponse(f.read())
+        return PlainTextResponse(
+            f.read(), headers={"X-Content-Type-Options": "nosniff"})
 
 
 def _enrich_with_attachments(messages: list, *, session_id: str, conn) -> list:
@@ -1794,14 +1795,17 @@ def _hydrate_messages(history: list, session_id_for_urls: str | None = None) -> 
                 args_pretty = str(args_raw)
                 preview = args_pretty
             bs = blocks()
-            bs.append({
+            call_id = item.get("call_id") or item.get("id")
+            tool_block = {
                 "type": "tool",
                 "state": "success",
                 "name": name,
                 "argsPreview": preview[:80],
                 "sections": [{"label": "ARGUMENTS", "code": args_pretty}],
-            })
-            call_id = item.get("call_id") or item.get("id")
+            }
+            if call_id and call_id != "__fake_id__":
+                tool_block["callId"] = call_id
+            bs.append(tool_block)
             if call_id and call_id != "__fake_id__":
                 state["pending"][call_id] = len(bs) - 1
 

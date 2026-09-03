@@ -28,6 +28,7 @@ def test_owner_reads_plain_text(client):
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/plain")
     assert r.text == "full output here"
+    assert r.headers["x-content-type-options"] == "nosniff"
 
 
 def test_other_user_gets_404(client):

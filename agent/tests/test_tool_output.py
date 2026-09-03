@@ -64,6 +64,22 @@ def test_store_writes_raw_text_under_offload_dir(tmp_path):
     assert open(p, encoding="utf-8").read() == "hello\nworld"
 
 
+def test_store_cleans_up_tmp_on_any_write_exception(tmp_path, monkeypatch):
+    """Minor: store_output must catch any write-time exception (not just
+    OSError) so a stray tmp file never survives a failed store."""
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    real_open = open
+
+    def boom(path, *a, **k):
+        if str(path).endswith(".tmp"):
+            raise ValueError("simulated non-OSError write failure")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(to, "open", boom, raising=False)
+    assert to.store_output("hello", call_id="call_boom") == ""
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_store_refuses_unsafe_call_id_or_missing_dir(tmp_path):
     to.OFFLOAD_DIR_VAR.set(str(tmp_path))
     assert to.store_output("x", call_id="../evil") == ""
@@ -82,6 +98,15 @@ def test_placeholder_has_fenced_preview_and_exact_trailer():
     m = to.TRAILER_RE.search(ph)
     assert m and m.group(1) == str(len(text)) and m.group(2) == "/x/y/c1.txt"
     assert "read_file_lines" in ph and "web_fetch" in ph
+
+
+def test_placeholder_advice_mentions_expand_tools_and_search_content_no_reoffload():
+    text = "A" * 2000 + "B" * 5000 + "C" * 400
+    ph = to.make_placeholder(text, tool_name="web_fetch", path="/x/y/c1.txt", chars=len(text))
+    assert 'expand_tools(["files"])' in ph
+    assert "read_file_lines" in ph
+    assert "search_content(query, root=" in ph
+    assert "Do not re-run the tool" in ph
 
 
 def test_postprocess_small_and_non_str_pass_through(tmp_path):
@@ -136,6 +161,30 @@ def test_sweep_removes_only_expired_files(roots):
     assert n == 2
     assert not old.exists() and new.exists()
     assert not told.exists() and keep.exists()
+
+
+def test_postprocess_exempts_search_photos(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    big = "x" * (to.OFFLOAD_THRESHOLD_CHARS + 1)
+    out = to.postprocess(big, tool_name="search_photos", call_id="c1")
+    assert out == big
+    assert not (tmp_path / "c1.txt").exists()
+
+
+def test_postprocess_exempts_mcp_error_prefix(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    big = "[MCP error] " + "x" * (to.OFFLOAD_THRESHOLD_CHARS + 1)
+    out = to.postprocess(big, tool_name="some_mcp_tool", call_id="c2")
+    assert out == big
+    assert not (tmp_path / "c2.txt").exists()
+
+
+def test_postprocess_still_offloads_web_fetch(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    big = "x" * (to.OFFLOAD_THRESHOLD_CHARS + 1)
+    out = to.postprocess(big, tool_name="web_fetch", call_id="c3")
+    assert out != big
+    assert to.TRAILER_RE.search(out)
 
 
 def test_safe_call_id():

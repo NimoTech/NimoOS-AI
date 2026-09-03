@@ -60,4 +60,8 @@ def mcp_resolve_read_path(path: str, root: str = "/DATA", *,
                 raise McpPathDenied("notes root is not readable")
             if not _within(real, os.path.join(notes_real, str(user_id))):
                 raise McpPathDenied("notes of another user")
+
+    tool_outputs = os.path.join(root_real, "AppData", "nimoos-agent", "tool-outputs")
+    if real == tool_outputs or real.startswith(tool_outputs + os.sep):
+        raise McpPathDenied("path in tool-output offload dir")
     return real
