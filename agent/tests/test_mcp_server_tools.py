@@ -175,7 +175,7 @@ async def test_read_document_rejects_neither():
 @pytest.mark.asyncio
 async def test_read_document_path_goes_through_gate(monkeypatch):
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
-                        lambda p, root="/DATA": "/DATA/ok.txt")
+                        lambda p, root="/DATA", **kw: "/DATA/ok.txt")
     async def fake_extract(path, ocr=False, max_chars=24000, user_id=None):
         assert path == "/DATA/ok.txt"
         return {"text": "hello"}
@@ -186,7 +186,7 @@ async def test_read_document_path_goes_through_gate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_read_document_path_denied_raises(monkeypatch):
-    def deny(p, root="/DATA"):
+    def deny(p, root="/DATA", **kw):
         raise fs_gate.McpPathDenied("outside")
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path", deny)
     with pytest.raises(tools.McpToolError):
@@ -196,7 +196,7 @@ async def test_read_document_path_denied_raises(monkeypatch):
 @pytest.mark.asyncio
 async def test_view_document_page_returns_image(monkeypatch):
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
-                        lambda p, root="/DATA": "/DATA/doc.pdf")
+                        lambda p, root="/DATA", **kw: "/DATA/doc.pdf")
     async def fake_render(path, ps, pe, scale=2.0, user_id=None):
         return {"pages": [{"png_b64": "AAA"}]}
     monkeypatch.setattr(ssearch._parser_client, "render_pages", fake_render)
@@ -207,7 +207,7 @@ async def test_view_document_page_returns_image(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_view_document_page_denied_raises(monkeypatch):
-    def deny(p, root="/DATA"):
+    def deny(p, root="/DATA", **kw):
         raise fs_gate.McpPathDenied("outside")
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path", deny)
     with pytest.raises(tools.McpToolError):
@@ -217,7 +217,7 @@ async def test_view_document_page_denied_raises(monkeypatch):
 @pytest.mark.asyncio
 async def test_view_document_page_missing_page_raises(monkeypatch):
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
-                        lambda p, root="/DATA": "/DATA/doc.pdf")
+                        lambda p, root="/DATA", **kw: "/DATA/doc.pdf")
     async def empty_render(path, ps, pe, scale=2.0, user_id=None):
         return {"pages": []}
     monkeypatch.setattr(ssearch._parser_client, "render_pages", empty_render)
@@ -228,9 +228,28 @@ async def test_view_document_page_missing_page_raises(monkeypatch):
 @pytest.mark.asyncio
 async def test_view_document_page_missing_png_raises(monkeypatch):
     monkeypatch.setattr(fs_gate, "mcp_resolve_read_path",
-                        lambda p, root="/DATA": "/DATA/doc.pdf")
+                        lambda p, root="/DATA", **kw: "/DATA/doc.pdf")
     async def render_no_png(path, ps, pe, scale=2.0, user_id=None):
         return {"pages": [{}]}
     monkeypatch.setattr(ssearch._parser_client, "render_pages", render_no_png)
     with pytest.raises(tools.McpToolError):
         await tools.call("view_document_page", {"path": "/DATA/doc.pdf", "page": 1})
+
+
+@pytest.mark.asyncio
+async def test_read_document_gate_receives_caller_identity(monkeypatch):
+    """The path gate needs the caller's user_id and the notes root to keep
+    other users' notes unreadable; the handler must pass both."""
+    seen = {}
+
+    def gate(p, root="/DATA", **kw):
+        seen.update(kw)
+        return "/DATA/ok.txt"
+    monkeypatch.setattr(fs_gate, "mcp_resolve_read_path", gate)
+
+    async def fake_extract(path, ocr=False, max_chars=24000, user_id=None):
+        return {"text": "hello"}
+    monkeypatch.setattr(ssearch._parser_client, "extract", fake_extract)
+    tools.setup_user_context("42", notes_root="/DATA/MyNotes")
+    await tools.call("read_document", {"path": "/DATA/x.txt"})
+    assert seen == {"user_id": "42", "notes_root": "/DATA/MyNotes"}
