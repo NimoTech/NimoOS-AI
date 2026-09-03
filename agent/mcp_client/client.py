@@ -26,6 +26,7 @@ from mcp_client.elicitation import make_elicitation_callback
 from mcp_client.status import OK, FAILED, CONFIG_ERROR, ServerStatus
 from mcp_client.hashing import schema_hash, desc_hash
 from mcp_client import runtime as mcp_runtime
+import tool_output as _tool_output
 
 logger = logging.getLogger(__name__)
 
@@ -638,7 +639,13 @@ def _wrap_tool(server: dict, meta: dict, slug: str) -> FunctionTool:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         except Exception as e:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
-        return flatten_result(result)
+        out = flatten_result(result)
+        try:
+            return _tool_output.postprocess(
+                out, tool_name=fq_name,
+                call_id=str(getattr(ctx, "tool_call_id", "") or ""))
+        except Exception:  # noqa: BLE001 — never eat an MCP result
+            return out
 
     return FunctionTool(
         name=fq_name,
