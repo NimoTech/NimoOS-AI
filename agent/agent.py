@@ -377,7 +377,7 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
     import tool_output as _to
 
     if profile is not None and profile.tools is not None:
-        return list(profile.tools)
+        return [_to.wrap_tool_output(t) for t in profile.tools]
 
     core, gated = [], []
     for t in ALL_TOOLS:

@@ -27,6 +27,18 @@ def test_select_tools_for_run_keeps_gating_is_enabled(monkeypatch):
     assert read_file.is_enabled is True             # core stays always-on
 
 
+def test_select_tools_for_run_wraps_pinned_profile_tools(monkeypatch):
+    monkeypatch.setattr(agent_module, "_fetch_attachments", lambda ids, sid: [])
+    from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
+    from profiles import PROFILES
+
+    tools = agent_module.select_tools_for_run(
+        [], session_id="s-pin", profile=PROFILES["photos"])
+    assert [t.name for t in tools] == [t.name for t in PHOTOS_TOOLS]
+    assert all(to.is_wrapped(t) for t in tools)
+    assert all(t.is_enabled is True for t in tools)      # pinned profiles stay ungated
+
+
 def test_run_sets_offload_vars_source_contains_wiring():
     # Pin the wiring by source (the run() method needs a live provider to execute).
     src = inspect.getsource(agent_module.AgentRunner.run)
