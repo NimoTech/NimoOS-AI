@@ -214,3 +214,40 @@ def sweep_expired(*, now: float | None = None) -> int:
     except Exception:  # noqa: BLE001
         pass
     return removed
+
+
+# ---------------------------------------------------------------------------
+# FunctionTool wrapper: the one place every NATIVE tool result passes through.
+# (MCP tools call postprocess() directly from mcp_client.client._wrap_tool.)
+# ---------------------------------------------------------------------------
+
+def is_wrapped(tool) -> bool:
+    return bool(getattr(getattr(tool, "on_invoke_tool", None), "_nimoos_offload", False))
+
+
+def wrap_tool_output(tool):
+    """Return `tool` with its on_invoke_tool wrapped so oversized results are
+    offloaded. Idempotent; non-FunctionTool objects are returned as-is."""
+    inner = getattr(tool, "on_invoke_tool", None)
+    if inner is None or not dataclasses.is_dataclass(tool):
+        return tool
+    if getattr(inner, "_nimoos_offload", False):
+        return tool
+    tool_name = str(getattr(tool, "name", "") or "")
+
+    async def _wrapped(ctx, input_json):
+        call_id = str(getattr(ctx, "tool_call_id", "") or "")
+        token = CALL_ID_VAR.set(call_id)
+        try:
+            out = await inner(ctx, input_json)
+        finally:
+            CALL_ID_VAR.reset(token)
+        try:
+            return postprocess(out, tool_name=tool_name, call_id=call_id)
+        except Exception:  # noqa: BLE001 — treatment must never eat a result
+            _LOG.warning("tool_output: postprocess failed for %s", tool_name,
+                         exc_info=True)
+            return out
+
+    _wrapped._nimoos_offload = True  # type: ignore[attr-defined]
+    return dataclasses.replace(tool, on_invoke_tool=_wrapped)
