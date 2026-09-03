@@ -59,6 +59,16 @@ def _build_lowlevel() -> Server:
     return Server("nimoos-mcp", on_list_tools=_list, on_call_tool=_call)
 
 
+def _notes_root(conn) -> str:
+    """Current notes root from settings; falls back to the default so a
+    settings read failure can never widen the path gate."""
+    try:
+        from notes.store import get_notes_root
+        return get_notes_root(conn)
+    except Exception:
+        return "/DATA/Notes"
+
+
 def build(conn):
     server = _build_lowlevel()
     session_manager = StreamableHTTPSessionManager(
@@ -79,7 +89,7 @@ def build(conn):
                         "body": b'{"error":"invalid or missing MCP token"}'})
             return
         # Same task as handle_request → ContextVars reach the tool dispatch.
-        tools.setup_user_context(uid)
+        tools.setup_user_context(uid, notes_root=_notes_root(conn))
         await session_manager.handle_request(scope, receive, send)
 
     return asgi, session_manager

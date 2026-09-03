@@ -6,6 +6,7 @@ Plan-2 path/ocr params). No capability logic is reimplemented here."""
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 
 from mcp_server import fs_gate
@@ -30,9 +31,18 @@ class ImageResult:
         self.mime = mime
 
 
-def setup_user_context(user_id: str) -> None:
+# Filesystem root of the knowledge notes (per-user subtrees live below it).
+# Set per request from the DB-backed setting so the path gate can keep one
+# user's notes invisible to another user's MCP token.
+NOTES_ROOT_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "mcp_notes_root", default="/DATA/Notes")
+
+
+def setup_user_context(user_id: str, notes_root: str | None = None) -> None:
     """Set the per-user ContextVars the whitelisted skills read. MUST run in the
     same asyncio task that will dispatch the tool (ContextVars are per-task)."""
+    if notes_root:
+        NOTES_ROOT_VAR.set(notes_root)
     _search.USER_ID_VAR.set(str(user_id))
     _wiki.WIKI_CLIENT_VAR.set(WikiClient(user_id=str(user_id)))
     _photos.USER_ID_VAR.set(str(user_id))
@@ -57,11 +67,12 @@ async def _h_read_document(args: dict):
         return await _search._read_document_impl(
             file_id=fid, path=None, ocr=False,
             offset=int(args.get("offset", 0) or 0), max_chars=max_chars)
+    uid = _search.USER_ID_VAR.get() or None
     try:
-        abs_path = fs_gate.mcp_resolve_read_path(path)
+        abs_path = fs_gate.mcp_resolve_read_path(
+            path, user_id=uid, notes_root=NOTES_ROOT_VAR.get())
     except fs_gate.McpPathDenied as e:
         raise McpToolError(f"path not allowed: {e}")
-    uid = _search.USER_ID_VAR.get() or None
     try:
         res = await _search._parser_client.extract(
             abs_path, ocr=bool(args.get("ocr", False)),
@@ -116,11 +127,12 @@ async def _h_list_albums(args: dict) -> str:
 
 
 async def _h_view_document_page(args: dict):
+    uid = _search.USER_ID_VAR.get() or None
     try:
-        abs_path = fs_gate.mcp_resolve_read_path(args["path"])
+        abs_path = fs_gate.mcp_resolve_read_path(
+            args["path"], user_id=uid, notes_root=NOTES_ROOT_VAR.get())
     except fs_gate.McpPathDenied as e:
         raise McpToolError(f"path not allowed: {e}")
-    uid = _search.USER_ID_VAR.get() or None
     page = int(args.get("page", 1) or 1)
     try:
         rendered = await asyncio.wait_for(
