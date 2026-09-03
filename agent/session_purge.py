@@ -24,6 +24,7 @@ What must be deleted, and why the order is not negotiable:
 * The recall vectors would keep a deleted session's content answerable by the
   `recall` tool, and the snapshot directory would leak disk for the lifetime
   of the box.
+* tool_output offload files (ROOT/<session_id>) would leak disk like snapshots.
 * The three `*_extract_jobs`/`recall_index_jobs` rows are keyed by session_id
   and would be picked up by their workers after the session they describe is
   gone. One row each, but they are strictly useless once the messages are.
@@ -109,4 +110,11 @@ async def purge_session(conn, user_id: str, session_id: str, *,
 
     root = snapshots_root or default_snapshots_root()
     shutil.rmtree(os.path.join(root, session_id), ignore_errors=True)
+
+    # Offloaded tool results (tool_output.py) live outside the DB too.
+    try:
+        import tool_output as _to  # noqa: PLC0415
+        shutil.rmtree(_to.chat_dir_for_session(session_id), ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        logger.debug("tool_output cleanup skipped for %s", session_id, exc_info=True)
     return True
