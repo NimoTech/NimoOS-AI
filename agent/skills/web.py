@@ -13,11 +13,13 @@ telling the model what to do next, and fencing it would say to ignore it.
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from agents import function_tool
 
 import db as _db
+import tool_output as _tool_output
 from audit import audit
 from fences import fence_untrusted
 from web import backends
@@ -89,8 +91,35 @@ async def _web_search_impl(query: str, max_results: int = 5,
     return _fenced(doc, "web-search-results", _SEARCH_CAP)
 
 
+def dedup_key(url: str) -> str:
+    """Canonical form for same-run duplicate detection: normalized by
+    web.fetch (scheme/host lowercased, userinfo dropped), fragment removed,
+    query parameters sorted. Unparseable input is returned as-is."""
+    norm, err = _fetch.normalize_url(url)
+    if err:
+        return (url or "").strip()
+    try:
+        parts = urlsplit(norm)
+        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+    except ValueError:
+        return norm
+
+
 async def _web_fetch_impl(url: str, max_chars: int = 30000) -> str:
     max_chars = max(500, min(int(max_chars or 30000), 60000))
+    # Same-run dedup (spec §4.2): the radar task fetched one 29 KB page four
+    # times in a run. Only SUCCESSFUL fetches are remembered, so a 429 retry
+    # still goes out. RUN_SCRATCH_VAR is unset outside an agent run → no dedup.
+    scratch = _tool_output.RUN_SCRATCH_VAR.get(None)
+    key = None
+    if scratch is not None:
+        key = ("web_fetch", dedup_key(url), max_chars)
+        prev = scratch.get(key)
+        if prev:
+            return (f"[web_fetch skipped: this URL was already fetched in this run "
+                    f"by call {prev}. Reuse that result (or the file it was saved "
+                    f"to) instead of fetching it again.]")
     out = await _fetch.fetch_page(url, max_chars=max_chars)
     audit("web_fetch", url=url,
           outcome=("error" if "error" in out
@@ -108,6 +137,8 @@ async def _web_fetch_impl(url: str, max_chars: int = 30000) -> str:
         return (f"That URL redirects to a different host: {out['redirect_to']}\n"
                 f"Nothing was fetched. If that destination is what you want, "
                 f"call web_fetch again with the new URL.")
+    if key is not None:
+        scratch[key] = _tool_output.CALL_ID_VAR.get("") or "an earlier call"
     return _fenced(out, "web-page", _PAGE_CAP)
 
 
