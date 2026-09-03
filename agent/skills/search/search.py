@@ -165,6 +165,7 @@ async def _read_document_impl(file_id: Optional[str] = None,
                               ocr: bool = False,
                               offset: int = 0,
                               max_chars: int = 24000) -> str:
+    max_chars = max(500, min(int(max_chars or 24000), 60000))
     # file_id + not ocr → indexed fast path (M1, via Search).
     if file_id and not ocr:
         uid = USER_ID_VAR.get() or None
@@ -270,7 +271,7 @@ async def read_document(file_id: Optional[str] = None,
         path: Absolute path to read on demand (for unindexed files).
         ocr: Force OCR extraction (scanned PDFs); implies the path route.
         offset: Character offset for paging the indexed (file_id) route.
-        max_chars: Maximum characters to return.
+        max_chars: Maximum characters to return (default 24000, max 60000).
     """
     return await _read_document_impl(file_id, path, ocr, offset, max_chars)
 
