@@ -189,6 +189,46 @@ def test_real_doctype_prolog_is_refused():
     assert feed_digest(body) is None
 
 
+def test_doctype_hidden_after_a_prolog_comment_containing_a_bare_tag_is_refused():
+    # Bypass found in review: a prolog comment containing "<a" made a naive
+    # "first '<name'" scan stop INSIDE the comment, so a real DOCTYPE placed
+    # after it was never reached and its entity expanded unchecked. Comments
+    # must be stripped before the root element's start tag is located.
+    body = ('<?xml version="1.0"?>'
+            '<!-- a comment with <a> embedded -->'
+            '<!DOCTYPE rss [<!ENTITY x "lol">]>'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>&x;</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
+def test_prolog_comment_with_a_bare_tag_but_no_doctype_still_digests():
+    # The flip side of the bypass test: a prolog comment containing "<a>" is
+    # legitimate on its own and must not itself cause a false refusal.
+    body = ('<?xml version="1.0"?>'
+            '<!-- a comment with <a> embedded -->'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>d</description></item></channel></rss>')
+    out = feed_digest(body)
+    assert out is not None
+    assert "1. x" in out
+
+
+def test_unterminated_prolog_comment_hiding_a_doctype_is_refused():
+    # An unterminated "<!--" is left in place rather than swallowing the
+    # rest of the scan window — it must fail safe (refuse), not accidentally
+    # let the DOCTYPE/ENTITY behind it slip through unexamined.
+    body = ('<?xml version="1.0"?>'
+            '<!-- unterminated comment '
+            '<!DOCTYPE rss [<!ENTITY x "lol">]>'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>&x;</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
 def test_oversized_body_returns_none_before_parsing():
     huge_desc = "x" * (_MAX_FEED_BYTES + 1000)
     body = (f'<rss version="2.0"><channel><title>T</title>'

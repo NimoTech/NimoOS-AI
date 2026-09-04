@@ -48,19 +48,49 @@ _LINK_MAX = 2048
 # an HTML snippet ("<![CDATA[<!DOCTYPE html>...]]>"). Scanning the whole body
 # for that marker refused exactly the content-rich feeds this digest exists
 # to read.
-_DTD_MARKER_RE = re.compile(r"<!(?:doctype|entity)\b", re.IGNORECASE)
-# First "real" element start tag: a '<' not immediately followed by '?' (a
-# processing instruction, including the XML declaration) or '!' (a comment
-# or the DOCTYPE itself, including any internal-subset "<!ENTITY ...>"
-# declarations nested inside it — those also start with '<!' so this
-# doesn't stop short partway through a DOCTYPE's own brackets).
-_ROOT_START_RE = re.compile(r"<(?!\?|!)[A-Za-z_:]")
+#
+# Finding "the text before the root element's start tag" is NOT just "the
+# text before the first '<name'": a prolog comment can itself contain a bare
+# '<a' ("<!-- a comment with <a> embedded -->"), and searching the raw text
+# for the first element-shaped '<' stops right there — never reaching a real
+# DOCTYPE placed after that comment. Comments and processing instructions
+# are stripped out FIRST, over a bounded window (a real prolog is a few
+# dozen bytes; 64 KiB is already generous), and only then is the first
+# remaining '<name' treated as the root's start tag.
+_PROLOG_SCAN_WINDOW = 65536
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_PI_RE = re.compile(r"<\?.*?\?>", re.S)
+_ROOT_START_RE = re.compile(r"<[A-Za-z_:]")
 
 
 def _prolog(body: str) -> str:
-    """Everything before the root element's opening tag."""
-    m = _ROOT_START_RE.search(body)
-    return body[: m.start()] if m else body
+    """Everything before the root element's opening tag, comments and PIs
+    already stripped.
+
+    An unterminated `<!--` is left in place by the substitution (there is no
+    matching `-->` to close it on) rather than swallowing the rest of the
+    window — which is fine: the leftover text still contains a literal
+    `<!`, so `_prolog_is_hostile()` below refuses it. Failing safe here
+    matters more than parsing a malformed comment "correctly".
+    """
+    head = body[:_PROLOG_SCAN_WINDOW]
+    head = _COMMENT_RE.sub("", head)
+    head = _PI_RE.sub("", head)
+    m = _ROOT_START_RE.search(head)
+    return head[: m.start()] if m else head
+
+
+def _prolog_is_hostile(body: str) -> bool:
+    """True if the (comment/PI-stripped) prolog declares anything with '<!'.
+
+    That covers `<!DOCTYPE` and any internal-subset `<!ENTITY ...>` (the
+    billion-laughs shape) — and, deliberately, anything else starting with
+    `<!` too: once comments and PIs are already stripped out, nothing
+    legitimate remains in a prolog that starts with `<!`, so refusing all of
+    it is simpler and safer than trying to tell a "safe" DOCTYPE apart from
+    a hostile one.
+    """
+    return "<!" in _prolog(body)
 
 
 def _local(tag: str) -> str:
@@ -212,10 +242,10 @@ def _parse(body: str) -> tuple[str, int, list[dict]] | None:
     """
     if not body or not body.strip():
         return None
-    if _DTD_MARKER_RE.search(_prolog(body)):
-        return None
     raw = body.encode("utf-8", errors="replace")
     if len(raw) > _MAX_FEED_BYTES:
+        return None
+    if _prolog_is_hostile(body):
         return None
     try:
         # fromstring() rejects a `str` that itself carries an
