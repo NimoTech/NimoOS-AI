@@ -1,0 +1,191 @@
+"""web/feed.py::feed_digest and its wiring into web/fetch.py::fetch_page.
+
+Found by running the real thing: a scheduled "competitor radar" task fetched
+three RSS/Atom feeds, each came back as ~29 KB of raw XML, got offloaded to a
+file (too big for the tool result), and the model then spent most of its
+turns paging that file with search_content/read_file_lines instead of just
+reading three headlines — 30-minute timeout, zero report. A feed is
+structured data: the model only needs title / link / date / short summary
+per entry, not the raw markup.
+"""
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from web import fetch as wfetch
+from web.feed import feed_digest
+
+_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>GEEKOM Blog</title>
+<item>
+  <title>IT15 review roundup</title>
+  <link>https://www.geekompc.com/blog/it15</link>
+  <pubDate>Mon, 18 Aug 2026 02:30:00 GMT</pubDate>
+  <description>&lt;p&gt;What &lt;b&gt;reviewers&lt;/b&gt; said.&lt;/p&gt;</description>
+</item>
+<item>
+  <title>Mini PC restock</title>
+  <link>https://www.geekompc.com/blog/restock</link>
+  <pubDate>Tue, 19 Aug 2026 02:30:00 GMT</pubDate>
+  <description>Back in stock notice.</description>
+</item>
+<item>
+  <title>New firmware 1.4</title>
+  <link>https://www.geekompc.com/blog/fw14</link>
+  <pubDate>Wed, 20 Aug 2026 02:30:00 GMT</pubDate>
+  <description>Bug fixes and stability improvements.</description>
+</item>
+</channel></rss>"""
+
+_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Minisforum News</title>
+<entry>
+  <title>MS-A2 launches</title>
+  <link rel="self" href="https://minisforum.com/feeds/news/ms-a2"/>
+  <link rel="alternate" href="https://minisforum.com/blogs/news/ms-a2"/>
+  <updated>2026-08-18T11:40:00Z</updated>
+  <summary>The MS-A2 is available now.</summary>
+</entry>
+<entry>
+  <title>UM890 Pro discount</title>
+  <link rel="alternate" href="https://minisforum.com/blogs/news/um890-pro"/>
+  <updated>2026-08-19T09:00:00Z</updated>
+  <content>Discounted for a limited time.</content>
+</entry>
+</feed>"""
+
+
+def test_rss_entries_come_back_numbered_with_tags_stripped():
+    out = feed_digest(_RSS)
+    assert out is not None
+    assert "Feed: GEEKOM Blog — 3 entries (showing 3)" in out
+    assert "1. IT15 review roundup" in out
+    assert "2. Mini PC restock" in out
+    assert "3. New firmware 1.4" in out
+    assert "<b>" not in out and "<p>" not in out
+    assert "reviewers said" in out
+    assert "Mon, 18 Aug 2026" in out
+    assert "link: https://www.geekompc.com/blog/it15" in out
+
+
+def test_atom_entries_resolve_alternate_link_and_use_updated():
+    out = feed_digest(_ATOM)
+    assert out is not None
+    assert "Feed: Minisforum News — 2 entries (showing 2)" in out
+    assert "1. MS-A2 launches" in out
+    assert "link: https://minisforum.com/blogs/news/ms-a2" in out
+    assert "date: 2026-08-18T11:40:00Z" in out
+    assert "summary: The MS-A2 is available now." in out
+    assert "2. UM890 Pro discount" in out
+    assert "link: https://minisforum.com/blogs/news/um890-pro" in out
+    assert "summary: Discounted for a limited time." in out
+
+
+def test_malformed_xml_returns_none():
+    assert feed_digest("<rss><channel><item><title>oops") is None
+    assert feed_digest("not xml at all") is None
+    assert feed_digest("") is None
+
+
+def test_empty_channel_returns_none():
+    assert feed_digest("<rss version=\"2.0\"><channel><title>Empty</title>"
+                       "</channel></rss>") is None
+    assert feed_digest("<feed xmlns=\"http://www.w3.org/2005/Atom\">"
+                       "<title>Empty</title></feed>") is None
+
+
+def test_max_entries_is_respected_but_header_reports_the_real_total():
+    items = "".join(
+        f"<item><title>Item {i}</title><link>https://x.test/{i}</link>"
+        f"<pubDate>2026-08-{(i % 28) + 1:02d}T00:00:00Z</pubDate>"
+        f"<description>d{i}</description></item>"
+        for i in range(50)
+    )
+    body = f"<rss version=\"2.0\"><channel><title>Big</title>{items}</channel></rss>"
+    out = feed_digest(body)
+    assert out is not None
+    assert "Feed: Big — 50 entries (showing 40)" in out
+    assert "1. Item 0" in out
+    assert "40. Item 39" in out
+    assert "41. Item 40" not in out
+    assert "Item 49" not in out
+
+
+def test_summary_is_truncated_to_300_chars():
+    long_summary = "word " * 100  # 500 chars
+    body = (f"<rss version=\"2.0\"><channel><title>T</title>"
+            f"<item><title>x</title><link>https://x.test</link>"
+            f"<description>{long_summary}</description></item>"
+            f"</channel></rss>")
+    out = feed_digest(body)
+    assert out is not None
+    lines = [l for l in out.splitlines() if l.strip().startswith("summary:")]
+    assert len(lines) == 1
+    summary_text = lines[0].split("summary:", 1)[1].strip()
+    assert len(summary_text) <= 300
+
+
+def test_rdf_rss10_items_are_read():
+    body = (
+        '<?xml version="1.0"?>'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+        'xmlns="http://purl.org/rss/1.0/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<channel><title>Old Skool</title></channel>'
+        '<item><title>Entry A</title><link>https://x.test/a</link>'
+        '<dc:date>2026-08-01</dc:date>'
+        '<description>About A.</description></item>'
+        '</rdf:RDF>'
+    )
+    out = feed_digest(body)
+    assert out is not None
+    assert "Feed: Old Skool — 1 entries (showing 1)" in out
+    assert "1. Entry A" in out
+    assert "date: 2026-08-01" in out
+
+
+# --- fetch_page-level wiring -------------------------------------------
+
+def _client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.fixture(autouse=True)
+def _clean_cache():
+    wfetch.clear_cache()
+    yield
+    wfetch.clear_cache()
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_returns_a_digest_for_an_rss_response():
+    async def handler(request):
+        return httpx.Response(200, content=_RSS.encode("utf-8"),
+                              headers={"Content-Type": "application/rss+xml"})
+
+    async with _client(handler) as c:
+        out = await wfetch.fetch_page("https://www.geekompc.com/blog/feed/", client=c)
+
+    assert out.get("kind") == "feed"
+    assert out.get("entries") == 3
+    assert out["content_markdown"].startswith("Feed:")
+    assert "IT15 review roundup" in out["content_markdown"]
+    assert out["title"] == "GEEKOM Blog"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_normal_html_is_unaffected():
+    async def handler(request):
+        return httpx.Response(200, html="<html><head><title>T</title></head>"
+                                        "<body><p>hello body</p></body></html>")
+
+    async with _client(handler) as c:
+        out = await wfetch.fetch_page("https://x.test/a", client=c)
+
+    assert "kind" not in out
+    assert "entries" not in out
+    assert out["title"] == "T"
+    assert "hello body" in out["content_markdown"]

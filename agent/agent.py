@@ -626,6 +626,26 @@ class AgentRunner:
         )
         self._conn.commit()
 
+    def _log_midrun_stats(self, ctx, session_id: str) -> None:
+        """Log the run's compaction-counter summary, once.
+
+        Split out of _persist_midrun_state so the run's `finally` block (which
+        every exit path reaches, including a cancellation/timeout that never
+        reaches either of _persist_midrun_state's call sites — see the P2
+        mid-run compaction comment in run()) can guarantee the stats line
+        still gets written. `ctx.extra["stats_logged"]` is the guard against
+        double-logging when a normal run DOES reach _persist_midrun_state
+        first and the finally block runs afterward regardless."""
+        if ctx.extra.get("stats_logged"):
+            return
+        if ctx.l1_count or ctx.l2_count or ctx.trunc_count or ctx.l1_reasoning_count:
+            _LOG.warning(
+                "compaction-stats: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d "
+                "peak_in=%d last_in=%d",
+                session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
+                ctx.trunc_count, ctx.peak_input_tokens, ctx.last_input_tokens)
+        ctx.extra["stats_logged"] = True
+
     def _persist_midrun_state(self, ctx, session_id: str) -> None:
         """Write the P2 mid-run rolling-summary state and log compaction
         counters after a run ends (success or MaxTurnsExceeded). Shared by
@@ -643,12 +663,7 @@ class AgentRunner:
                         new_cursor, ctx.persist_prefix_len - _prior_F, session_id)
                 context_compaction._write_summary_state(
                     self._conn, session_id, ctx.summary, new_cursor)
-            if ctx.l1_count or ctx.l2_count or ctx.trunc_count or ctx.l1_reasoning_count:
-                _LOG.warning(
-                    "compaction-stats: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d "
-                    "peak_in=%d last_in=%d",
-                    session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
-                    ctx.trunc_count, ctx.peak_input_tokens, ctx.last_input_tokens)
+            self._log_midrun_stats(ctx, session_id)
         except Exception:  # noqa: BLE001
             _LOG.debug("persisting mid-run compaction state failed", exc_info=True)
 
@@ -1354,6 +1369,18 @@ class AgentRunner:
                 # previous run's context.
                 self._active_sinks.pop(session_id, None)
                 self._run_contexts.pop(session_id, None)
+                # A run that ends by cancellation/timeout never reaches
+                # _persist_midrun_state (its call sites are the success path
+                # and the MaxTurnsExceeded branch only) — this is the one
+                # spot every exit path passes through, so it's the backstop
+                # that guarantees the stats line still gets written. Guarded
+                # by ctx.extra so a run that already logged them above
+                # doesn't log twice.
+                if _ctx is not None and not _ctx.extra.get("stats_logged"):
+                    try:
+                        self._log_midrun_stats(_ctx, session_id)
+                    except Exception:  # noqa: BLE001
+                        _LOG.debug("logging mid-run compaction stats failed", exc_info=True)
                 # P2 mid-run compaction: clear the ContextVar so it never
                 # leaks into an unrelated task/context. Best-effort —
                 # _ctx_token is None (guarded, not simply absent) if RunCtx

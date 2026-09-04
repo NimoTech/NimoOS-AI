@@ -22,6 +22,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 
 from web import extract
+from web import feed as _feed
 
 MAX_URL_LEN = 2048
 MAX_BYTES = 5 * 1024 * 1024
@@ -117,6 +118,26 @@ def normalize_url(raw: str) -> tuple[str, str]:
 def _content_type_ok(ctype: str) -> bool:
     head = (ctype or "").split(";")[0].strip().lower()
     return head in _OK_TYPES
+
+
+# Content-types a feed is served under unambiguously vs. ones that need a
+# body sniff first — a WordPress `/feed/` under a misconfigured proxy can
+# still show up as text/html or text/plain, so those get a quick peek at the
+# markup before being treated as ordinary HTML.
+_FEED_XML_TYPES = ("application/rss+xml", "application/atom+xml")
+_FEED_SNIFF_TYPES = ("text/xml", "application/xml", "text/plain", "text/html")
+_FEED_MARKERS = ("<rss", "<feed", "<rdf:rdf")
+_FEED_SNIFF_WINDOW = 2048
+
+
+def _looks_like_feed(ctype: str, body: str) -> bool:
+    head = (ctype or "").split(";")[0].strip().lower()
+    if head in _FEED_XML_TYPES:
+        return True
+    if head in _FEED_SNIFF_TYPES:
+        probe = (body or "")[:_FEED_SNIFF_WINDOW].lower()
+        return any(marker in probe for marker in _FEED_MARKERS)
+    return False
 
 
 async def _read_capped(resp: httpx.Response) -> str:
@@ -231,7 +252,10 @@ async def _fetch_attempt(client: httpx.AsyncClient, url: str,
             return {"error": "unsupported content type — this tool only reads "
                              "web pages; for documents (PDF, Office files) use "
                              "read_document instead"}
-        return {"_body": await _read_capped(resp)}
+        # Carried alongside the body (not re-derived from headers later) so
+        # fetch_page's feed sniff sees the exact Content-Type this response
+        # was actually served under, including on a retried attempt.
+        return {"_body": await _read_capped(resp), "_ctype": ctype}
     except httpx.TimeoutException:
         return {"error": f"timed out after {TIMEOUT_SEC:.0f}s fetching {url}"}
     except httpx.HTTPError as exc:
@@ -294,15 +318,37 @@ async def fetch_page(url: str, *, max_chars: int = 30000, client=None) -> dict:
                 current = norm_target
                 continue
             body = raw["_body"]
-            md = extract.to_markdown(body, url=current)
-            truncated = len(md) > max_chars
-            result = {
-                "url": clean,
-                "final_url": current,
-                "title": extract.title_of(body),
-                "content_markdown": md[:max_chars] if truncated else md,
-                "truncated": truncated,
-            }
+            digest = None
+            if _looks_like_feed(raw.get("_ctype", ""), body):
+                digest = _feed.feed_digest(body)
+            if digest is not None:
+                # feed_title_and_count() re-parses rather than reusing
+                # feed_digest()'s output — cheap at these body sizes, and it
+                # keeps the title/count fields sourced from the same parse
+                # shape feed_digest() itself uses instead of scraping them
+                # back out of formatted text.
+                feed_title, entry_count = _feed.feed_title_and_count(body)
+                text = digest
+                truncated = len(text) > max_chars
+                result = {
+                    "url": clean,
+                    "final_url": current,
+                    "title": feed_title,
+                    "content_markdown": text[:max_chars] if truncated else text,
+                    "truncated": truncated,
+                    "kind": "feed",
+                    "entries": entry_count,
+                }
+            else:
+                md = extract.to_markdown(body, url=current)
+                truncated = len(md) > max_chars
+                result = {
+                    "url": clean,
+                    "final_url": current,
+                    "title": extract.title_of(body),
+                    "content_markdown": md[:max_chars] if truncated else md,
+                    "truncated": truncated,
+                }
             _cache_put(key, result)
             return result
         return {"error": f"too many same-host redirects starting at {clean}"}

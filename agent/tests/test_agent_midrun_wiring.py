@@ -1,4 +1,6 @@
+import asyncio
 import inspect
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -144,3 +146,33 @@ def test_persist_midrun_state_logs_stats_at_warning(runner, caplog):
     rec, msg = stats[0], stats[0].getMessage()
     assert rec.levelno == logging.WARNING
     assert "peak_in=9876" in msg
+
+
+@pytest.mark.asyncio
+async def test_cancelled_run_still_logs_compaction_stats_exactly_once(runner, caplog):
+    """A cancelled/timed-out run never reaches _persist_midrun_state (its
+    call sites are the success path and the MaxTurnsExceeded branch only) —
+    the run's finally block must log the stats itself instead of silently
+    dropping them."""
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        async def _events():
+            rc.current().trunc_count = 1
+            raise asyncio.CancelledError()
+            yield None  # pragma: no cover — makes this an async generator
+        m = MagicMock()
+        m.stream_events = _events
+        m.to_input_list.return_value = []
+        m.final_output = ""
+        m.raw_responses = []
+        return m
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        with caplog.at_level(logging.WARNING, logger="nimoos-agent"):
+            with pytest.raises(asyncio.CancelledError):
+                await runner.run(session_id="s1", user_id="u1", message="hi",
+                                 sink=_CollectSink(), provider_key="k",
+                                 provider_url="http://x", model_name="qwen")
+
+    stats = [r for r in caplog.records if "compaction-stats:" in r.getMessage()]
+    assert len(stats) == 1
+    assert rc.current() is None  # ContextVar still cleared despite cancellation
