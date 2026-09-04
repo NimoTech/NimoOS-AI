@@ -634,13 +634,19 @@ class AgentRunner:
         must not mask the run's own error handling."""
         try:
             if ctx.l2_count and ctx.summary:
+                new_cursor = ctx.persist_prefix_len + ctx.fold_idx
+                _, _prior_F = context_compaction._read_summary_state(self._conn, session_id)
+                if ctx.persist_prefix_len > _prior_F:
+                    _LOG.warning(
+                        "compaction: mid-run cursor %d covers %d start-truncated items "
+                        "never summarised (session %s)",
+                        new_cursor, ctx.persist_prefix_len - _prior_F, session_id)
                 context_compaction._write_summary_state(
-                    self._conn, session_id, ctx.summary,
-                    ctx.persist_prefix_len + ctx.fold_idx)
-            if ctx.l1_count or ctx.l2_count or ctx.trunc_count:
-                _LOG.info("compaction: session=%s l1=%d l2=%d trunc=%d peak_in=%d",
-                          session_id, ctx.l1_count, ctx.l2_count, ctx.trunc_count,
-                          ctx.last_input_tokens)
+                    self._conn, session_id, ctx.summary, new_cursor)
+            if ctx.l1_count or ctx.l2_count or ctx.trunc_count or ctx.l1_reasoning_count:
+                _LOG.info("compaction: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d peak_in=%d",
+                          session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
+                          ctx.trunc_count, ctx.last_input_tokens)
         except Exception:  # noqa: BLE001
             _LOG.debug("persisting mid-run compaction state failed", exc_info=True)
 
@@ -1123,21 +1129,29 @@ class AgentRunner:
             import compaction_filter as _cf
             import run_context as _rc
             import summarizer as _summ
-            _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
-            _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
-            _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
-            _ctx = _rc.RunCtx(
-                session_id=session_id, user_id=str(user_id), model_name=model_name,
-                provider_type=provider_type, window=_win, conn=self._conn,
-                summarize_fn=_mid_summarize, overhead_tokens=_overhead,
-                summary=_S0 or "", persist_prefix_len=len(persist_prefix),
-                compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)))
-            # Pre-seed the BASE prompt (before summary_block was appended just
-            # above) so compaction_filter._with_summary rebuilds base+block
-            # idempotently across every mid-run call instead of re-appending
-            # onto an already-blocked instructions string.
-            _ctx.extra["base_instructions"] = _base_prompt
-            _ctx.extra["recall_hint"] = memory_store.is_memory_enabled(self._conn, str(user_id))
+            try:
+                _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
+                _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
+                _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
+                _ctx = _rc.RunCtx(
+                    session_id=session_id, user_id=str(user_id), model_name=model_name,
+                    provider_type=provider_type, window=_win, conn=self._conn,
+                    summarize_fn=_mid_summarize, overhead_tokens=_overhead,
+                    summary=_S0 or "", persist_prefix_len=len(persist_prefix),
+                    compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)))
+                # Pre-seed the BASE prompt (before summary_block was appended
+                # just above) so compaction_filter._with_summary rebuilds
+                # base+block idempotently across every mid-run call instead of
+                # re-appending onto an already-blocked instructions string.
+                _ctx.extra["base_instructions"] = _base_prompt
+                _ctx.extra["recall_hint"] = memory_store.is_memory_enabled(self._conn, str(user_id))
+            except Exception:  # noqa: BLE001 — P2 setup must never block a run
+                _LOG.warning("mid-run compaction setup failed; running without it", exc_info=True)
+                _mid_summarize = None
+                _ctx = _rc.RunCtx(
+                    session_id=session_id, user_id=str(user_id), model_name=model_name,
+                    provider_type=provider_type, window=context_compaction.CLOUD_CONTEXT_WINDOW,
+                    compaction_enabled=False)
 
             agent = Agent(
                 name="NimoOS Agent",

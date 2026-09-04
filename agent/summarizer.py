@@ -14,7 +14,6 @@ import logging
 from openai import AsyncOpenAI
 
 from context_compaction import COMPACT_LLM_TIMEOUT  # noqa: F401 — monkeypatched in tests
-import context_compaction as _cc
 
 _LOG = logging.getLogger("nimoos-agent.compaction")
 

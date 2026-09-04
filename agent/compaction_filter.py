@@ -52,8 +52,8 @@ def _recent_output_boundary(items, keep_recent_results: int) -> int:
     """Index of the start of the turn containing the keep_recent_results-th
     function_call_output from the end; that turn and everything after it are
     recent. Snapped to the turn start so a kept turn's reasoning/function_call
-    aren't stubbed while its output survives. Fewer outputs → len(items)
-    (nothing old)."""
+    aren't stubbed while its output survives. Fewer outputs than
+    keep_recent_results → 0 (nothing old — everything is recent)."""
     seen = 0
     idx = None
     for i in range(len(items) - 1, -1, -1):
@@ -64,7 +64,7 @@ def _recent_output_boundary(items, keep_recent_results: int) -> int:
                 idx = i
                 break
     if idx is None:
-        return len(items)
+        return 0
     starts = cc.turn_starts(items)
     return max([s for s in starts if s <= idx], default=idx)
 
@@ -76,9 +76,15 @@ def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
     if _COMPACTED_RE.search(out):
         return None                                  # already compacted earlier this run
     head = out[:MICRO_PLACEHOLDER_HEAD]
+    head_part = head
+    if "<untrusted-data" in head and "</untrusted-data>" not in head:
+        # The head cut can land inside a fenced placeholder (P1's own, or any
+        # tool output that opens one) — close the fence ourselves so what
+        # follows is never read as still being inside untrusted data.
+        head_part = head + "\n</untrusted-data>"
     trailer = to.TRAILER_RE.search(out)
     if trailer:
-        text = f"{head}\n…\n{trailer.group(0)}"
+        text = f"{head_part}\n…\n{trailer.group(0)}"
     else:
         cid = str(m.get("call_id") or m.get("id") or "")
         path = ""
@@ -92,10 +98,10 @@ def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
             else:                                      # itself refuses unsafe ids.
                 path = to.store_output(out, call_id=cid, tool_name=tool_name)
         if path:
-            text = (f"{head}\n[earlier tool output compacted: chars={len(out)} path={path} — "
+            text = (f"{head_part}\n[earlier tool output compacted: chars={len(out)} path={path} — "
                     f"read_file_lines(path, start, end) to revisit]")
         else:
-            text = (f"{head}\n[earlier tool output compacted: chars={len(out)}; "
+            text = (f"{head_part}\n[earlier tool output compacted: chars={len(out)}; "
                     f"re-run the tool if you need it again]")
     new = dict(m)
     new["output"] = text
@@ -224,15 +230,21 @@ async def compaction_filter(data):
         est = max(budget(ctx, items), _estimate(ctx, items)) if base_fold == 0 else _estimate(ctx, items)
 
         if est > cc.L1_THRESHOLD * W:
+            before = items
             items, n = micro_compact(items)
             ctx.l1_count += n
+            ctx.l1_reasoning_count += sum(
+                1 for o, c in zip(before, items)
+                if isinstance(o, dict) and isinstance(c, dict)
+                and o.get("type") == "reasoning" and c.get("type") == "reasoning"
+                and o.get("summary") != c.get("summary"))
             est = _estimate(ctx, items)
 
         # L1's decision above may be provider-scaled (via budget()); L2 and
         # hard below are always estimate-scaled (_estimate) — accepted, since
         # by this point `items` has already been mutated by L1 and the
         # provider has no number for that shape yet.
-        if est > cc.L2_THRESHOLD * W and ctx.summarize_fn is not None:
+        if est > cc.L2_THRESHOLD * W and ctx.summarize_fn is not None and not ctx.l2_disabled:
             cut = cc.cut_keep_recent_turns(items, cc.RECENT_TOOL_TURNS)
             if cut > 0:
                 fold_text = "\n".join(
@@ -242,8 +254,18 @@ async def compaction_filter(data):
                     ctx.summary = out.strip()
                     ctx.fold_idx = base_fold + cut
                     ctx.l2_count += 1
+                    ctx.l2_fail_count = 0
                     items = items[cut:]
                     est = _estimate(ctx, items)
+                else:
+                    # Empty summary or rejected by the bloat gate — back off
+                    # after two failures so a broken/rate-limited summarizer
+                    # doesn't eat a timeout budget on every remaining call
+                    # this run; hard truncation still covers the overflow.
+                    ctx.l2_fail_count += 1
+                    if ctx.l2_fail_count >= 2:
+                        ctx.l2_disabled = True
+                        _LOG.warning("compaction: L2 disabled for this run after 2 failed summaries")
 
         if est > cc.HARD_THRESHOLD * W:
             items = truncate_turns(items, keep_turns=2)

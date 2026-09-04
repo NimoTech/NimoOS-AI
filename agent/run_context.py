@@ -28,7 +28,10 @@ class RunCtx:
     fold_idx: int = 0
     persist_prefix_len: int = 0
     l1_count: int = 0
+    l1_reasoning_count: int = 0
     l2_count: int = 0
+    l2_fail_count: int = 0
+    l2_disabled: bool = False
     trunc_count: int = 0
     compaction_enabled: bool = True
     extra: dict = field(default_factory=dict)

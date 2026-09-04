@@ -96,3 +96,37 @@ async def test_history_persisted_is_original_not_filtered(runner):
 def test_run_streamed_call_site_has_hooks():
     src = inspect.getsource(agent_module.AgentRunner.run)
     assert "hooks=" in src and "compaction_filter" in src
+
+
+@pytest.mark.asyncio
+async def test_p2_setup_failure_falls_back_to_disabled_ctx(runner, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("resolve_window exploded")
+    monkeypatch.setattr(cc, "resolve_window", boom)
+    seen = {}
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        seen["ctx"] = rc.current()
+        return _fake_stream(input_messages, [{"role": "assistant", "content": "ok"}])
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="hi", sink=_CollectSink(),
+                         provider_key="k", provider_url="http://x", model_name="qwen")
+    ctx = seen["ctx"]
+    assert ctx is not None
+    assert ctx.compaction_enabled is False
+    assert ctx.window == cc.CLOUD_CONTEXT_WINDOW
+    assert rc.current() is None                          # cleared after the run
+
+
+def test_persist_midrun_state_warns_on_start_truncated_gap(runner, caplog):
+    import logging
+    ctx = rc.RunCtx(session_id="s1", user_id="u1", model_name="m", provider_type="other",
+                    window=1000, persist_prefix_len=3, fold_idx=2, l2_count=1, summary="S")
+    with caplog.at_level(logging.WARNING, logger="nimoos-agent"):
+        runner._persist_midrun_state(ctx, "s1")
+    row = runner._conn.execute(
+        "SELECT rolling_summary, folded_upto FROM sessions WHERE id='s1'").fetchone()
+    assert row["folded_upto"] == 5
+    warnings = [r for r in caplog.records if "start-truncated" in r.getMessage()]
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "5" in msg and "3" in msg and "s1" in msg

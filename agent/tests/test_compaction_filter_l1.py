@@ -111,3 +111,34 @@ def test_offload_file_not_rewritten_on_second_compact(tmp_path):
     assert os.stat(path).st_mtime == 1                # file not rewritten
     out = [m for m in new if m.get("type") == "function_call_output"][0]["output"]
     assert n == 4 and "path=" in out
+
+
+def test_recent_boundary_with_few_outputs_keeps_everything():
+    # F1 regression: with fewer than keep_recent_results outputs, nothing is
+    # old — everything the model just produced must survive untouched.
+    items = _run(3, 5000)
+    new, n = cf.micro_compact(items)          # default keep_recent_results=8
+    assert n == 0
+    outs = [m for m in new if m.get("type") == "function_call_output"]
+    assert all(len(m["output"]) > 4000 for m in outs)
+    rs = [m for m in new if m.get("type") == "reasoning"]
+    assert all(r["summary"][0]["text"].startswith("think") for r in rs)
+
+
+def test_placeholder_head_cut_reclosed_when_fence_left_open():
+    # F2 regression: MICRO_PLACEHOLDER_HEAD (300 chars) truncates the head
+    # well before a P1-style placeholder's own closing fence, leaving
+    # <untrusted-data ...> unclosed downstream. The compacted result must
+    # close the fence itself.
+    to.OFFLOAD_DIR_VAR.set("")
+    trailer = "[tool output offloaded: chars=9000 path=/DATA/x/call_1.txt]"
+    ph = ("<untrusted-data source=\"tool-output-preview\">\n" + "p" * 1500
+          + "\n</untrusted-data>\n" + trailer + "\nUse read_file_lines...")
+    items = [_u("go"), _fc("c0"), _fo("c0", ph)] + sum(
+        [[_fc(f"c{i}"), _fo(f"c{i}", "y" * 10)] for i in range(1, 10)], [])
+    new, n = cf.micro_compact(items, keep_recent_results=8, keep_chars=800)
+    out = [m for m in new if m.get("type") == "function_call_output"][0]["output"]
+    assert n == 1
+    assert out.count("<untrusted-data") == 1
+    assert out.count("</untrusted-data>") == 1
+    assert trailer in out

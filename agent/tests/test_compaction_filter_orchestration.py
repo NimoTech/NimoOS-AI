@@ -194,3 +194,67 @@ async def test_hooks_tolerate_missing_usage():
     class R: usage = None
     await cf.ContextHooks().on_llm_end(None, None, R())
     assert ctx.last_input_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_l2_disabled_after_two_failures_and_summarizer_not_called_again(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    calls = []
+    async def always_empty(instr, prior, fold):
+        calls.append(1)
+        return ""
+    ctx = _ctx(window=4_000, summarize_fn=always_empty)
+    items = _items(20, 2000)
+    await cf.compaction_filter(_data(items))
+    assert ctx.l2_fail_count == 1 and ctx.l2_disabled is False
+    await cf.compaction_filter(_data(items))
+    assert ctx.l2_disabled is True and len(calls) == 2
+    assert ctx.trunc_count >= 1
+    trunc_before = ctx.trunc_count
+    await cf.compaction_filter(_data(items))
+    assert len(calls) == 2                      # summarizer not invoked a 3rd time
+    assert ctx.trunc_count > trunc_before        # hard truncation still runs
+
+
+@pytest.mark.asyncio
+async def test_l1_pass_counts_reasoning_stubs(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    ctx = _ctx(window=10_000, last_input_tokens=6_000, items_seen_at_last_call=41)
+
+    def _r(t, id_): return {"type": "reasoning", "id": id_, "summary": [{"type": "summary_text", "text": t}]}
+    items = [_u("go")]
+    for i in range(20):
+        items += [_r(f"think {i}", f"r{i}"), _fc(f"c{i}"), _fo(f"c{i}", "x" * 2000)]
+    await cf.compaction_filter(_data(items))
+    assert ctx.l1_reasoning_count > 0
+
+
+@pytest.mark.asyncio
+async def test_convergence_over_many_turns(tmp_path):
+    """F8: 40 growing turns must never blow the budget once compaction has
+    had a chance to kick in, tool-call/output pairs must stay intact in the
+    outgoing copy, and the persisted originals must never be mutated."""
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    calls = []
+    async def summ(instr, prior, fold):
+        calls.append(1)
+        return f"SUMMARY {len(calls)}"
+    W = 32_000
+    ctx = _ctx(window=W, summarize_fn=summ)
+
+    def _r(id_):
+        return {"type": "reasoning", "id": id_, "summary": [{"type": "summary_text", "text": "t" * 4000}]}
+
+    items = [_u("go")]
+    for turn in range(40):
+        cid = f"c{turn}"
+        items = items + [_r(f"r{turn}"), _fc(cid), _fo(cid, "o" * 4000)]
+        out = await cf.compaction_filter(_data(list(items)))
+        if turn >= 5:
+            assert cc.estimate_messages_tokens(out.input) <= 0.85 * W + 2000
+        fcs = {m["call_id"] for m in out.input if m.get("type") == "function_call"}
+        fos = {m["call_id"] for m in out.input if m.get("type") == "function_call_output"}
+        assert fcs == fos
+
+    # originals untouched throughout
+    assert items[3]["output"] == "o" * 4000
