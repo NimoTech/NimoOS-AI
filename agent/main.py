@@ -2914,7 +2914,7 @@ _TASK_ENUMS = {
 # under a minute is a foot-gun rather than a feature. The store does not
 # enforce it (it takes whatever it is given); this is the only gate.
 _MIN_INTERVAL_SECONDS = 60
-_MAX_TURNS_RANGE = (1, 100)
+_MAX_TURNS_RANGE = (1, 300)
 _TIMEOUT_RANGE = (60, 7200)
 _RUNS_LIMIT_RANGE = (1, 200)
 
