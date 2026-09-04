@@ -19,7 +19,11 @@ import os
 import re
 from typing import Any
 
+from agents import RunHooks
+from agents.run import ModelInputData
+
 import context_compaction as cc
+import run_context as rc
 import tool_output as to
 
 _LOG = logging.getLogger("nimoos-agent.compaction")
@@ -39,6 +43,11 @@ def _call_names(items) -> dict[str, str]:
     return names
 
 
+# NOTE: snapping to turn_starts protects a turn with several parallel outputs
+# WHOLE — such a turn may push the kept count above keep_recent_results
+# (e.g. 3 parallel calls in the boundary turn keeps 10 outputs when asked for
+# 8). That's intended: splitting one turn's outputs would stub a still-live
+# tool result the model is about to reason over.
 def _recent_output_boundary(items, keep_recent_results: int) -> int:
     """Index of the start of the turn containing the keep_recent_results-th
     function_call_output from the end; that turn and everything after it are
@@ -74,11 +83,13 @@ def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
         cid = str(m.get("call_id") or m.get("id") or "")
         path = ""
         if cid:
-            d = to.OFFLOAD_DIR_VAR.get("")
-            existing = os.path.join(d, f"{cid}.txt") if d else ""
-            if existing and os.path.isfile(existing):
-                path = existing                      # already offloaded this run
-            else:
+            existing = ""
+            if to.is_safe_call_id(cid):               # build/check the reuse path
+                d = to.OFFLOAD_DIR_VAR.get("")         # only for a safe id — an
+                existing = os.path.join(d, f"{cid}.txt") if d else ""  # unsafe
+            if existing and os.path.isfile(existing):  # id skips straight to
+                path = existing                        # store_output, which
+            else:                                      # itself refuses unsafe ids.
                 path = to.store_output(out, call_id=cid, tool_name=tool_name)
         if path:
             text = (f"{head}\n[earlier tool output compacted: chars={len(out)} path={path} — "
@@ -142,3 +153,101 @@ def truncate_turns(items: list, *, keep_turns: int) -> list:
 def estimate_since(items: list, from_idx: int) -> int:
     from_idx = max(0, min(from_idx, len(items)))
     return cc.estimate_messages_tokens(items[from_idx:])
+
+
+def budget(ctx: rc.RunCtx, items: list) -> int:
+    """Estimated total input tokens for the upcoming call (spec §5.2). Prefer
+    the provider's own last-call count plus only what changed since (cheap,
+    accurate); fall back to a full estimate when there is no provider number
+    yet (first call, or after a fold shifted the base — see compaction_filter)."""
+    if ctx.last_input_tokens > 0:
+        return ctx.last_input_tokens + estimate_since(items, ctx.items_seen_at_last_call)
+    return ctx.overhead_tokens + cc.estimate_tokens(ctx.summary) + cc.estimate_messages_tokens(items)
+
+
+def _estimate(ctx: rc.RunCtx, items: list) -> int:
+    """Full estimate, used to recheck the budget after L1/L2 mutate `items`
+    within one call — the provider's last-call count is stale at that point."""
+    return ctx.overhead_tokens + cc.estimate_tokens(ctx.summary) + cc.estimate_messages_tokens(items)
+
+
+def _with_summary(ctx: rc.RunCtx, instructions: str | None) -> str | None:
+    """Append the current summary block to the BASE instructions, never
+    stacking onto a block appended by a previous call. `ctx.extra
+    ["base_instructions"]` is captured once (on the first call that ever
+    reaches here) so re-running this on the same ctx is idempotent."""
+    if not ctx.summary:
+        return instructions
+    base = ctx.extra.get("base_instructions")
+    if base is None:
+        base = instructions or ""
+        ctx.extra["base_instructions"] = base
+    block = cc.summary_block(ctx.summary, recall_hint=bool(ctx.extra.get("recall_hint")))
+    return f"{base}\n\n{block}" if block else base
+
+
+async def compaction_filter(data):
+    """SDK model-input filter (spec §5): rewrite a COPY of the outgoing
+    input/instructions before every model call. Never mutates `data` or the
+    persisted history; never raises — any failure returns the untouched
+    model_data."""
+    md = data.model_data
+    ctx = rc.current()
+    if ctx is None or not ctx.compaction_enabled:
+        return md
+    try:
+        full = list(md.input or [])
+        ctx.extra["last_sent_len"] = len(full)
+        base_fold = ctx.fold_idx
+        items = full[base_fold:] if 0 < base_fold <= len(full) else full
+        W = max(int(ctx.window), 1)
+        est = budget(ctx, items) if base_fold == 0 else _estimate(ctx, items)
+
+        if est > cc.L1_THRESHOLD * W:
+            items, n = micro_compact(items)
+            ctx.l1_count += n
+            est = _estimate(ctx, items)
+
+        if est > cc.L2_THRESHOLD * W and ctx.summarize_fn is not None:
+            cut = cc.cut_keep_recent_turns(items, cc.RECENT_TOOL_TURNS)
+            if cut > 0:
+                fold_text = "\n".join(
+                    cc._message_text(m, max_output_chars=cc.SUMMARY_OUTPUT_MAX_CHARS) for m in items[:cut])
+                out = await ctx.summarize_fn(cc.SUMMARIZE_INSTRUCTION, ctx.summary, fold_text)
+                if out and out.strip() and cc.estimate_tokens(out) < cc.estimate_tokens(fold_text):
+                    ctx.summary = out.strip()
+                    ctx.fold_idx = base_fold + cut
+                    ctx.l2_count += 1
+                    items = items[cut:]
+                    est = _estimate(ctx, items)
+
+        if est > cc.HARD_THRESHOLD * W:
+            items = truncate_turns(items, keep_turns=2)
+            ctx.trunc_count += 1
+
+        return ModelInputData(input=items, instructions=_with_summary(ctx, md.instructions))
+    except Exception:  # noqa: BLE001 — SDK re-raises filter errors; never fail the run
+        _LOG.warning("compaction_filter bypassed after error", exc_info=True)
+        return md
+
+
+class ContextHooks(RunHooks):
+    """Records the provider's real input usage after every model call (spec §5.1)."""
+
+    async def on_llm_end(self, context, agent, response) -> None:
+        ctx = rc.current()
+        if ctx is None:
+            return
+        try:
+            usage = getattr(response, "usage", None)
+            tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+            if tokens <= 0:
+                return
+            ctx.last_input_tokens = tokens
+            ctx.items_seen_at_last_call = int(ctx.extra.get("last_sent_len", 0) or 0)
+            if ctx.conn is not None:
+                ctx.conn.execute("UPDATE sessions SET last_real_input_tokens=? WHERE id=?",
+                                 (tokens, ctx.session_id))
+                ctx.conn.commit()
+        except Exception:  # noqa: BLE001
+            _LOG.debug("ContextHooks.on_llm_end failed", exc_info=True)
