@@ -175,12 +175,22 @@ def _with_summary(ctx: rc.RunCtx, instructions: str | None) -> str | None:
     """Append the current summary block to the BASE instructions, never
     stacking onto a block appended by a previous call. `ctx.extra
     ["base_instructions"]` is captured once (on the first call that ever
-    reaches here) so re-running this on the same ctx is idempotent."""
+    reaches here) so re-running this on the same ctx is idempotent.
+
+    agent.py (Task 6) is expected to pre-seed `ctx.extra["base_instructions"]`
+    with the pre-block prompt before the first filter call, so this function
+    normally just reads it back. The `SUMMARY_HEADER` strip below is a
+    fallback for a caller that skips that seeding (e.g. a test, or a future
+    caller) and whose `instructions` already contains a block from a prior
+    run/session — without it that stale block would be captured as part of
+    "base" and re-appended on every call, alongside the fresh one."""
     if not ctx.summary:
         return instructions
     base = ctx.extra.get("base_instructions")
     if base is None:
         base = instructions or ""
+        if cc.SUMMARY_HEADER in base:
+            base = base[:base.index(cc.SUMMARY_HEADER)].rstrip()
         ctx.extra["base_instructions"] = base
     block = cc.summary_block(ctx.summary, recall_hint=bool(ctx.extra.get("recall_hint")))
     return f"{base}\n\n{block}" if block else base
@@ -201,13 +211,27 @@ async def compaction_filter(data):
         base_fold = ctx.fold_idx
         items = full[base_fold:] if 0 < base_fold <= len(full) else full
         W = max(int(ctx.window), 1)
-        est = budget(ctx, items) if base_fold == 0 else _estimate(ctx, items)
+        # max(provider, estimate): the provider's last-call count catches
+        # things the char-ratio estimate can't see (tool-schema growth,
+        # actual tokenizer behavior), but it reflects the PREVIOUS call's
+        # OUTGOING (post-compaction) items while `items` here are the
+        # originals again — after an L1 pass, budget()'s provider path
+        # (last_input_tokens + only-what's-new-since) understates the true
+        # size of the un-compacted list by exactly the L1 savings, which
+        # would make L1/hard skip alternate calls (oscillation, possible
+        # mid-run 400 on the call that never gets compacted). Estimating
+        # both and taking the max means neither blind spot wins.
+        est = max(budget(ctx, items), _estimate(ctx, items)) if base_fold == 0 else _estimate(ctx, items)
 
         if est > cc.L1_THRESHOLD * W:
             items, n = micro_compact(items)
             ctx.l1_count += n
             est = _estimate(ctx, items)
 
+        # L1's decision above may be provider-scaled (via budget()); L2 and
+        # hard below are always estimate-scaled (_estimate) — accepted, since
+        # by this point `items` has already been mutated by L1 and the
+        # provider has no number for that shape yet.
         if est > cc.L2_THRESHOLD * W and ctx.summarize_fn is not None:
             cut = cc.cut_keep_recent_turns(items, cc.RECENT_TOOL_TURNS)
             if cut > 0:
@@ -223,6 +247,16 @@ async def compaction_filter(data):
 
         if est > cc.HARD_THRESHOLD * W:
             items = truncate_turns(items, keep_turns=2)
+            # truncate_turns only re-adds a leading user message if items[0]
+            # (its own input) already is one — true on a first-call hard
+            # truncation, but not after an L2 fold has already dropped the
+            # prefix containing it. Re-attach the FULL list's original first
+            # user message (the task prompt / initial question) here so a
+            # folded-then-truncated run doesn't lose it.
+            head_user = (full[0] if full and isinstance(full[0], dict)
+                        and full[0].get("role") == "user" else None)
+            if head_user is not None and (not items or items[0] is not head_user):
+                items = [head_user] + list(items)
             ctx.trunc_count += 1
 
         return ModelInputData(input=items, instructions=_with_summary(ctx, md.instructions))
