@@ -238,9 +238,14 @@ def keepk_cut(history, keep_turns) -> int:
 
 
 def _prev_user_boundary(history, cut) -> int:
-    """Largest user-message index strictly < cut, else 0."""
-    us = [i for i in _user_indices(history) if i < cut]
-    return us[-1] if us else 0
+    """Largest boundary index strictly < cut, else 0. Boundary means a user
+    message when there are ≥ 2 of them; otherwise (a single-user task
+    session) falls back to tool-turn boundaries so fold-shrinking can still
+    step down one tool turn at a time instead of collapsing to F."""
+    all_us = _user_indices(history)
+    bounds = all_us if len(all_us) >= 2 else turn_starts(history)
+    bs = [i for i in bounds if i < cut]
+    return bs[-1] if bs else 0
 
 
 def _read_summary_state(conn, session_id) -> tuple[str, int]:

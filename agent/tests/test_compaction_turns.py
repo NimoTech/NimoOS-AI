@@ -44,3 +44,17 @@ def test_constants():
     assert cc.CLOUD_CONTEXT_WINDOW == 131072 and cc.COMPACT_LLM_TIMEOUT == 45
     assert (cc.L1_THRESHOLD, cc.L2_THRESHOLD, cc.HARD_THRESHOLD) == (0.50, 0.70, 0.85)
     assert cc.KEEP_RECENT_TOOL_RESULTS == 8 and cc.MICRO_KEEP_CHARS == 800 and cc.RECENT_TOOL_TURNS == 6
+
+
+def test_prev_boundary_falls_back_to_tool_turns_for_single_user():
+    items = [_u("task")] + sum([[_fc(f"c{i}"), _fo(f"c{i}")] for i in range(5)], [])
+    starts = cc.turn_starts(items)          # [1, 3, 5, 7, 9]
+    assert cc._prev_user_boundary(items, 7) == 5
+    assert cc._prev_user_boundary(items, 1) == 0
+
+
+def test_prev_boundary_keeps_user_semantics_with_many_users():
+    items = []
+    for i in range(4):
+        items += [_u(f"q{i}"), _a(f"a{i}")]
+    assert cc._prev_user_boundary(items, 6) == 4
