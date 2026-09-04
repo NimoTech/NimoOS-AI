@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from web import fetch as wfetch
-from web.feed import feed_digest
+from web.feed import _MAX_FEED_BYTES, feed_digest
 
 _RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -114,7 +114,7 @@ def test_max_entries_is_respected_but_header_reports_the_real_total():
     assert "Item 49" not in out
 
 
-def test_summary_is_truncated_to_300_chars():
+def test_summary_is_truncated_to_300_chars_with_an_ellipsis():
     long_summary = "word " * 100  # 500 chars
     body = (f"<rss version=\"2.0\"><channel><title>T</title>"
             f"<item><title>x</title><link>https://x.test</link>"
@@ -126,6 +126,7 @@ def test_summary_is_truncated_to_300_chars():
     assert len(lines) == 1
     summary_text = lines[0].split("summary:", 1)[1].strip()
     assert len(summary_text) <= 300
+    assert summary_text.endswith("…")
 
 
 def test_rdf_rss10_items_are_read():
@@ -142,9 +143,79 @@ def test_rdf_rss10_items_are_read():
     )
     out = feed_digest(body)
     assert out is not None
-    assert "Feed: Old Skool — 1 entries (showing 1)" in out
+    assert "Feed: Old Skool — 1 entry (showing 1)" in out
     assert "1. Entry A" in out
     assert "date: 2026-08-01" in out
+
+
+def test_rss_with_default_namespace_on_root_still_digests():
+    # Non-standard but seen in the wild: a default xmlns on <rss> itself,
+    # which breaks a plain (namespace-blind) root.find("channel")/
+    # findall("item").
+    body = ('<?xml version="1.0"?>'
+            '<rss version="2.0" xmlns="http://purl.org/rss/1.0/">'
+            '<channel><title>NSFeed</title>'
+            '<item><title>Only item</title><link>https://x.test/only</link>'
+            '<pubDate>2026-01-01</pubDate><description>d</description></item>'
+            '</channel></rss>')
+    out = feed_digest(body)
+    assert out is not None
+    assert "Feed: NSFeed — 1 entry (showing 1)" in out
+    assert "1. Only item" in out
+
+
+def test_doctype_inside_a_cdata_description_does_not_block_the_digest():
+    # A feed's <description> legitimately quoting an HTML snippet via CDATA
+    # is content, not a prolog DTD — it comes long after the root's own
+    # start tag and must not be mistaken for one.
+    body = ('<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description><![CDATA[<!DOCTYPE html><p>hi</p>]]></description>'
+            '</item></channel></rss>')
+    out = feed_digest(body)
+    assert out is not None
+    assert "1. x" in out
+
+
+def test_real_doctype_prolog_is_refused():
+    # A DOCTYPE (with an internal-subset ENTITY, the billion-laughs shape)
+    # declared where the XML grammar actually allows one — before the root
+    # element's start tag — must still be refused.
+    body = ('<?xml version="1.0"?>'
+            '<!DOCTYPE rss [<!ENTITY x "lol">]>'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>&x;</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
+def test_oversized_body_returns_none_before_parsing():
+    huge_desc = "x" * (_MAX_FEED_BYTES + 1000)
+    body = (f'<rss version="2.0"><channel><title>T</title>'
+            f'<item><title>i</title><link>https://x.test</link>'
+            f'<description>{huge_desc}</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
+def test_title_link_date_are_whitespace_collapsed_and_capped():
+    # A newline inside a title must not be able to forge what looks like an
+    # extra numbered entry line in the rendered digest.
+    injected_title = "Real Title\n2. Fake Entry\n   link: https://evil.test"
+    huge_link = "https://x.test/" + ("a" * 3000)
+    body = (f'<rss version="2.0"><channel><title>T</title>'
+            f'<item><title>{injected_title}</title>'
+            f'<link>{huge_link}</link>'
+            f'<pubDate>{"2026-01-01 " * 20}</pubDate>'
+            f'<description>d</description></item></channel></rss>')
+    out = feed_digest(body)
+    assert out is not None
+    lines = out.splitlines()
+    assert "2. Fake Entry" not in lines
+    assert any(l.startswith("1. Real Title 2. Fake Entry") for l in lines)
+    link_line = next(l for l in lines if l.strip().startswith("link:"))
+    assert len(link_line.split("link:", 1)[1].strip()) <= 2048
+    date_line = next(l for l in lines if l.strip().startswith("date:"))
+    assert len(date_line.split("date:", 1)[1].strip()) <= 64
 
 
 # --- fetch_page-level wiring -------------------------------------------

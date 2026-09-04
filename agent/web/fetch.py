@@ -318,17 +318,15 @@ async def fetch_page(url: str, *, max_chars: int = 30000, client=None) -> dict:
                 current = norm_target
                 continue
             body = raw["_body"]
-            digest = None
+            feed_result = None
             if _looks_like_feed(raw.get("_ctype", ""), body):
-                digest = _feed.feed_digest(body)
-            if digest is not None:
-                # feed_title_and_count() re-parses rather than reusing
-                # feed_digest()'s output — cheap at these body sizes, and it
-                # keeps the title/count fields sourced from the same parse
-                # shape feed_digest() itself uses instead of scraping them
-                # back out of formatted text.
-                feed_title, entry_count = _feed.feed_title_and_count(body)
-                text = digest
+                # Single parse: digest_with_meta() walks the XML once and
+                # hands back the rendered text plus the title/count fetch_page
+                # needs, rather than fetch_page parsing the same body twice
+                # (once to render, once to count).
+                feed_result = _feed.digest_with_meta(body)
+            if feed_result is not None:
+                text, feed_title, entry_count = feed_result
                 truncated = len(text) > max_chars
                 result = {
                     "url": clean,
