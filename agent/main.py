@@ -41,7 +41,7 @@ _MAX_SKILL_MD_BYTES = 50 * 1024
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 import agent_md
@@ -289,6 +289,14 @@ async def _attachments_startup():
                        age_seconds=ATTACHMENT_GC_AGE)
     except Exception as e:
         _LOG.warning("attachment GC failed: %s", e)
+
+    try:
+        import tool_output as _to
+        n = _to.sweep_expired()
+        if n:
+            _LOG.info("tool_output: swept %d expired offload files", n)
+    except Exception as e:  # noqa: BLE001 — must never block startup
+        _LOG.warning("tool_output sweep failed: %s", e)
 
 
 @app.on_event("startup")
@@ -1577,6 +1585,29 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
+@app.get("/agent/sessions/{session_id}/tool-outputs/{call_id}")
+async def get_tool_output(session_id: str, call_id: str,
+                          x_user_id: str = Header(..., alias="X-User-Id")):
+    """Serve one offloaded tool result (spec §4.3). Read-only; the file must
+    sit directly inside this session's own offload folder."""
+    import tool_output as _to
+    row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",
+                        (session_id, x_user_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not _to.is_safe_call_id(call_id):
+        raise HTTPException(status_code=400, detail="invalid call_id")
+    folder = os.path.realpath(_to.resolve_offload_dir(_conn, session_id))
+    path = os.path.realpath(os.path.join(folder, f"{call_id}.txt"))
+    if os.path.dirname(path) != folder or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    if os.path.getsize(path) > _to.MAX_READ_BYTES:
+        raise HTTPException(status_code=413, detail="tool output too large")
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return PlainTextResponse(
+            f.read(), headers={"X-Content-Type-Options": "nosniff"})
+
+
 def _enrich_with_attachments(messages: list, *, session_id: str, conn) -> list:
     """Backfill user messages with their attachments.
 
@@ -1764,14 +1795,17 @@ def _hydrate_messages(history: list, session_id_for_urls: str | None = None) -> 
                 args_pretty = str(args_raw)
                 preview = args_pretty
             bs = blocks()
-            bs.append({
+            call_id = item.get("call_id") or item.get("id")
+            tool_block = {
                 "type": "tool",
                 "state": "success",
                 "name": name,
                 "argsPreview": preview[:80],
                 "sections": [{"label": "ARGUMENTS", "code": args_pretty}],
-            })
-            call_id = item.get("call_id") or item.get("id")
+            }
+            if call_id and call_id != "__fake_id__":
+                tool_block["callId"] = call_id
+            bs.append(tool_block)
             if call_id and call_id != "__fake_id__":
                 state["pending"][call_id] = len(bs) - 1
 

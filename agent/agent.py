@@ -374,9 +374,10 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
     import dataclasses
     from skills import tool_registry as _reg
     from skills import tool_gating as _gat
+    import tool_output as _to
 
     if profile is not None and profile.tools is not None:
-        return list(profile.tools)
+        return [_to.wrap_tool_output(t) for t in profile.tools]
 
     core, gated = [], []
     for t in ALL_TOOLS:
@@ -386,6 +387,9 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
         # entirely. web_fetch needs no provider and always stays.
         if name == "web_search" and not _web_search_available():
             continue
+        # Spec §4.1: every native tool result passes through tool_output.
+        # Wrap BEFORE the gating replace so the gated copy inherits it.
+        t = _to.wrap_tool_output(t)
         if name in _reg.CORE_TOOL_NAMES:
             core.append(t)
             continue
@@ -393,13 +397,13 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
         assert cat is not None, f"tool {name!r} missing from CATEGORY_TOOLS"
         gated.append(dataclasses.replace(t, is_enabled=_gat.make_is_enabled(cat)))
 
-    tools = core + [_gat.expand_tools] + gated
+    tools = core + [_to.wrap_tool_output(_gat.expand_tools)] + gated
 
     # conditionally append read_attachment (always-on, follows the original logic)
     rows = _fetch_attachments(attachment_ids, session_id)
     if any(r["kind"] != "image" for r in rows):
         from skills.attachments import read_attachment
-        tools.append(read_attachment)
+        tools.append(_to.wrap_tool_output(read_attachment))
 
     # channel-only outbound file tool: register only for channel-sourced
     # sessions (sessions.source != 'web'), never for the web chat UI.
@@ -409,7 +413,7 @@ def select_tools_for_run(attachment_ids, *, session_id: str, profile=None):
             "SELECT source FROM sessions WHERE id=?", (session_id,)).fetchone()
         if row and row["source"] and row["source"] != "web":
             from skills.send_attachment import send_attachment
-            tools.append(send_attachment)
+            tools.append(_to.wrap_tool_output(send_attachment))
     except Exception:
         pass
     return tools
@@ -788,6 +792,13 @@ class AgentRunner:
             fs_skills.USER_PATTERNS_VAR.set(user_patterns or [])
             fs_skills.CONFIRM_MGR_VAR.set(self._confirm_mgr)
             fs_access_request.clear_denied_for_session(session_id)
+
+            # Tool-output offload (spec §4): the folder this run writes large
+            # results to, plus a fresh run-scoped scratch dict (web_fetch
+            # dedup). "" disables offloading for the run; never raises.
+            import tool_output as _to
+            _to.OFFLOAD_DIR_VAR.set(_to.ensure_offload_dir(self._conn, session_id))
+            _to.RUN_SCRATCH_VAR.set({})
 
             from skills.send_attachment import SESSION_ID_VAR as _SA_SESSION_VAR
             from skills.send_attachment import SEND_FILE_VAR as _SA_F
