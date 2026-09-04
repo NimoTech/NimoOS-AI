@@ -14,8 +14,8 @@ Any exception → the input is returned unchanged.
 """
 from __future__ import annotations
 
-import copy
 import logging
+import os
 import re
 from typing import Any
 
@@ -40,16 +40,24 @@ def _call_names(items) -> dict[str, str]:
 
 
 def _recent_output_boundary(items, keep_recent_results: int) -> int:
-    """Index of the keep_recent_results-th function_call_output from the end;
-    outputs at or after it are recent. Fewer outputs → len(items) (nothing old)."""
+    """Index of the start of the turn containing the keep_recent_results-th
+    function_call_output from the end; that turn and everything after it are
+    recent. Snapped to the turn start so a kept turn's reasoning/function_call
+    aren't stubbed while its output survives. Fewer outputs → len(items)
+    (nothing old)."""
     seen = 0
+    idx = None
     for i in range(len(items) - 1, -1, -1):
         m = items[i]
         if isinstance(m, dict) and m.get("type") == "function_call_output":
             seen += 1
             if seen >= keep_recent_results:
-                return i
-    return len(items)
+                idx = i
+                break
+    if idx is None:
+        return len(items)
+    starts = cc.turn_starts(items)
+    return max([s for s in starts if s <= idx], default=idx)
 
 
 def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
@@ -64,7 +72,14 @@ def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
         text = f"{head}\n…\n{trailer.group(0)}"
     else:
         cid = str(m.get("call_id") or m.get("id") or "")
-        path = to.store_output(out, call_id=cid, tool_name=tool_name) if cid else ""
+        path = ""
+        if cid:
+            d = to.OFFLOAD_DIR_VAR.get("")
+            existing = os.path.join(d, f"{cid}.txt") if d else ""
+            if existing and os.path.isfile(existing):
+                path = existing                      # already offloaded this run
+            else:
+                path = to.store_output(out, call_id=cid, tool_name=tool_name)
         if path:
             text = (f"{head}\n[earlier tool output compacted: chars={len(out)} path={path} — "
                     f"read_file_lines(path, start, end) to revisit]")

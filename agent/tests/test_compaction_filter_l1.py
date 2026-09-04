@@ -1,3 +1,5 @@
+import os
+
 import compaction_filter as cf
 import tool_output as to
 
@@ -85,3 +87,27 @@ def test_truncate_turns_keeps_first_user_and_last_turns():
 def test_estimate_since():
     items = _run(3, 100)
     assert cf.estimate_since(items, 0) > cf.estimate_since(items, 5) >= 0
+
+
+def test_recent_boundary_keeps_whole_recent_turns():
+    items = _run(12, 2000)                    # [user, (r,fc,fo) x 12]
+    new, _ = cf.micro_compact(items, keep_recent_results=8, keep_chars=800)
+    rs = [m for m in new if m.get("type") == "reasoning"]
+    outs = [m for m in new if m.get("type") == "function_call_output"]
+    # the 8 kept outputs are turns 4..11; their reasoning must be intact too
+    assert [r["summary"][0]["text"] for r in rs[4:]] == [f"think {i}" for i in range(4, 12)]
+    assert all(r["summary"][0]["text"] == "(reasoning compacted)" for r in rs[:4])
+    assert all(len(o["output"]) > 1000 for o in outs[4:]) and all("compacted" in o["output"] for o in outs[:4])
+
+
+def test_offload_file_not_rewritten_on_second_compact(tmp_path):
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    items = _run(12, 2000)
+    cf.micro_compact(items, keep_recent_results=8, keep_chars=800)
+    path = tmp_path / "c0.txt"
+    assert path.is_file()
+    os.utime(path, (1, 1))
+    new, n = cf.micro_compact(items, keep_recent_results=8, keep_chars=800)
+    assert os.stat(path).st_mtime == 1                # file not rewritten
+    out = [m for m in new if m.get("type") == "function_call_output"][0]["output"]
+    assert n == 4 and "path=" in out
