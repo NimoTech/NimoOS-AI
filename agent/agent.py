@@ -40,6 +40,7 @@ import skills.search as search_skills
 import skills.memory as memory_skills
 import memory_store
 import context_compaction
+import summarizer
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
@@ -112,21 +113,11 @@ def _make_summarize_fn(client, model_name):
     """Build the (injected) summarize callable for context compaction. Uses the
     conversation's OWN provider client/model (no new model). Returns the
     summary text; raises on failure (compact_for_run wraps with wait_for and
-    catches)."""
-    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
-        body = (f"[Existing summary]\n{prior_summary or '(none)'}\n\n"
-                f"[Earlier conversation excerpts]\n{fold_text}")
-        resp = await client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "system", "content": instruction},
-                      {"role": "user", "content": body}],
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        if resp.choices:
-            return (getattr(resp.choices[0].message, "content", "") or "").strip()
-        return ""
-    return _summarize
+    catches).
+
+    Thin wrapper — the actual implementation lives in summarizer.py so it can
+    be shared with make_summarizer's background-model preference path."""
+    return summarizer.session_summarize_fn(client, model_name)
 
 
 # Human-readable skip reasons, rendered into the system prompt so the model
