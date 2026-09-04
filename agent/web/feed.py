@@ -57,15 +57,27 @@ _LINK_MAX = 2048
 # are stripped out FIRST, over a bounded window (a real prolog is a few
 # dozen bytes; 64 KiB is already generous), and only then is the first
 # remaining '<name' treated as the root's start tag.
+#
+# That bounded window is itself a second bypass surface: pad the prolog with
+# ~64 KiB of whitespace (or well-formed comments, which strip to nothing) so
+# no root start tag falls inside the window at all, and a DOCTYPE/ENTITY
+# placed right after byte 65536 is never inspected — it reaches
+# ET.fromstring() untouched. So "no root element found within the window" is
+# NOT "no prolog to worry about, carry on"; it means the scan couldn't even
+# locate where the prolog ends, and that has to fail safe (refuse) exactly
+# like an unterminated comment does. A real feed's prolog is a few dozen
+# bytes — an XML declaration and maybe a short comment — so failing to find
+# the root element within 64 KiB is already a strong signal this isn't one.
 _PROLOG_SCAN_WINDOW = 65536
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _PI_RE = re.compile(r"<\?.*?\?>", re.S)
 _ROOT_START_RE = re.compile(r"<[A-Za-z_:]")
 
 
-def _prolog(body: str) -> str:
-    """Everything before the root element's opening tag, comments and PIs
-    already stripped.
+def _prolog(body: str) -> tuple[str, bool]:
+    """(text before the root element's opening tag, whether that tag was
+    actually found within the scan window), comments and PIs already
+    stripped.
 
     An unterminated `<!--` is left in place by the substitution (there is no
     matching `-->` to close it on) rather than swallowing the rest of the
@@ -77,20 +89,30 @@ def _prolog(body: str) -> str:
     head = _COMMENT_RE.sub("", head)
     head = _PI_RE.sub("", head)
     m = _ROOT_START_RE.search(head)
-    return head[: m.start()] if m else head
+    if m:
+        return head[: m.start()], True
+    return head, False
 
 
 def _prolog_is_hostile(body: str) -> bool:
-    """True if the (comment/PI-stripped) prolog declares anything with '<!'.
+    """True if the (comment/PI-stripped) prolog declares anything with '<!',
+    OR no root element start tag was found within the scan window at all.
 
-    That covers `<!DOCTYPE` and any internal-subset `<!ENTITY ...>` (the
-    billion-laughs shape) — and, deliberately, anything else starting with
-    `<!` too: once comments and PIs are already stripped out, nothing
-    legitimate remains in a prolog that starts with `<!`, so refusing all of
-    it is simpler and safer than trying to tell a "safe" DOCTYPE apart from
-    a hostile one.
+    The '<!' check covers `<!DOCTYPE` and any internal-subset
+    `<!ENTITY ...>` (the billion-laughs shape) — and, deliberately, anything
+    else starting with `<!` too: once comments and PIs are already stripped
+    out, nothing legitimate remains in a prolog that starts with `<!`, so
+    refusing all of it is simpler and safer than trying to tell a "safe"
+    DOCTYPE apart from a hostile one.
+
+    The "root not found" branch closes the padding bypass: see the window
+    comment above _PROLOG_SCAN_WINDOW for why an unbounded search would let
+    a DOCTYPE placed past the window through unexamined.
     """
-    return "<!" in _prolog(body)
+    prolog, found_root = _prolog(body)
+    if not found_root:
+        return True
+    return "<!" in prolog
 
 
 def _local(tag: str) -> str:

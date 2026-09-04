@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from web import fetch as wfetch
-from web.feed import _MAX_FEED_BYTES, feed_digest
+from web.feed import _MAX_FEED_BYTES, _PROLOG_SCAN_WINDOW, feed_digest
 
 _RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -208,6 +208,54 @@ def test_prolog_comment_with_a_bare_tag_but_no_doctype_still_digests():
     # legitimate on its own and must not itself cause a false refusal.
     body = ('<?xml version="1.0"?>'
             '<!-- a comment with <a> embedded -->'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>d</description></item></channel></rss>')
+    out = feed_digest(body)
+    assert out is not None
+    assert "1. x" in out
+
+
+def test_prolog_padded_with_whitespace_past_the_scan_window_is_refused():
+    # Bypass found in review: pad the prolog with enough junk that no root
+    # start tag falls inside the bounded scan window at all. Round 2 made
+    # "no root tag found" fall back to treating the whole window as an
+    # (apparently harmless) prolog — which let a DOCTYPE/ENTITY placed right
+    # after the window boundary reach ET.fromstring() completely unexamined.
+    prefix = '<?xml version="1.0"?>'
+    head_part = prefix + " " * (_PROLOG_SCAN_WINDOW - len(prefix))
+    assert len(head_part) == _PROLOG_SCAN_WINDOW
+    body = (head_part +
+            '<!DOCTYPE rss [<!ENTITY x "lol">]>'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>&x;</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
+def test_prolog_padded_with_a_wellformed_comment_past_the_scan_window_is_refused():
+    # Same bypass shape as above, but the padding itself is a legitimate,
+    # fully-closed comment (not just whitespace) — it must strip cleanly and
+    # STILL be refused once no root tag is left inside the window, rather
+    # than the successful strip being mistaken for "nothing to worry about".
+    prefix = '<?xml version="1.0"?>'
+    comment = "<!--" + ("x" * 60000) + "-->"
+    before = prefix + comment
+    head_part = before + " " * (_PROLOG_SCAN_WINDOW - len(before))
+    assert len(head_part) == _PROLOG_SCAN_WINDOW
+    body = (head_part +
+            '<!DOCTYPE rss [<!ENTITY x "lol">]>'
+            '<rss version="2.0"><channel><title>T</title>'
+            '<item><title>x</title><link>https://x.test</link>'
+            '<description>&x;</description></item></channel></rss>')
+    assert feed_digest(body) is None
+
+
+def test_normal_feed_with_a_1kb_comment_prolog_still_digests():
+    # No false positive: a real (short-ish) prolog comment, well within the
+    # scan window, must not itself trigger the "no root found" refusal.
+    comment = "<!--" + ("y" * 1000) + "-->"
+    body = ('<?xml version="1.0"?>' + comment +
             '<rss version="2.0"><channel><title>T</title>'
             '<item><title>x</title><link>https://x.test</link>'
             '<description>d</description></item></channel></rss>')
