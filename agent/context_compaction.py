@@ -22,19 +22,26 @@ THRESHOLD = 0.70
 # through to a wrong guess. Models whose real window differs are corrected
 # via the user override (settings / chat composer), floored so a stray
 # tiny value can't put every session into a truncate-each-turn spiral.
-CLOUD_CONTEXT_WINDOW = 262144   # 256k
+CLOUD_CONTEXT_WINDOW = 131072   # cloud default; most user-selected models are
+                                 # 128k — P3 makes this per-model
 LOCAL_CONTEXT_WINDOW = 8192     # 8k
 MIN_CONTEXT_WINDOW = 1024
 # Callers with no tier signal (e.g. context-usage with model omitted) are
 # treated as cloud.
 DEFAULT_CONTEXT_WINDOW = CLOUD_CONTEXT_WINDOW
 RECENT_TURNS = 6
-COMPACT_LLM_TIMEOUT = 60
+COMPACT_LLM_TIMEOUT = 45
 SAFETY_MARGIN = 1.15
 SUMMARY_OUTPUT_MAX_CHARS = 500   # cap on function_call_output text fed to the
                                  # summarizer (NOT the estimate, which is full)
 TOOLS_BASE_OVERHEAD = 80   # fixed framework boilerplate around the tools array
                            # ("You have access to the following tools…")
+RECENT_TOOL_TURNS = 6
+KEEP_RECENT_TOOL_RESULTS = 8
+MICRO_KEEP_CHARS = 800
+L1_THRESHOLD = 0.50
+L2_THRESHOLD = 0.70
+HARD_THRESHOLD = 0.85
 
 SUMMARY_HEADER = "[Conversation history summary (earlier content compacted)]"
 
@@ -184,13 +191,50 @@ def _user_indices(history) -> list:
             if isinstance(m, dict) and m.get("role") == "user"]
 
 
-def keepk_cut(history, keep_turns) -> int:
-    """Index of the keep_turns-th user message from the end (history[cut:]
-    keeps the last keep_turns turns). Fewer than keep_turns users → 0."""
-    us = _user_indices(history)
-    if len(us) <= keep_turns:
+_TURN_KINDS = ("function_call", "reasoning")
+
+
+def _is_assistant_message(m) -> bool:
+    return isinstance(m, dict) and m.get("type") == "message" and m.get("role") == "assistant"
+
+
+def _is_turn_item(m) -> bool:
+    return isinstance(m, dict) and (m.get("type") in _TURN_KINDS or _is_assistant_message(m))
+
+
+def turn_starts(items) -> list[int]:
+    """Indices where an assistant turn begins: a reasoning/function_call/
+    assistant-message item whose predecessor is not part of the same turn
+    (i.e. the predecessor is a tool output, a user item, or nothing).
+    Task sessions have one user message, so user boundaries are useless;
+    these are the boundaries every mid-run decision uses."""
+    starts: list[int] = []
+    for i, m in enumerate(items):
+        if not _is_turn_item(m):
+            continue
+        prev = items[i - 1] if i > 0 else None
+        if prev is None or not _is_turn_item(prev):
+            starts.append(i)
+    return starts
+
+
+def cut_keep_recent_turns(items, k: int) -> int:
+    """Index of the k-th turn start from the end (items[cut:] keeps k turns).
+    Fewer than k turns → 0."""
+    starts = turn_starts(items)
+    if k <= 0 or len(starts) < k:
         return 0
-    return us[len(us) - keep_turns]
+    return starts[len(starts) - k]
+
+
+def keepk_cut(history, keep_turns) -> int:
+    """Index of the keep_turns-th user message from the end. A history with
+    too few user messages (a task run has exactly one) falls back to tool-turn
+    boundaries so a long single-prompt run can still be folded."""
+    us = _user_indices(history)
+    if len(us) > keep_turns:
+        return us[len(us) - keep_turns]
+    return cut_keep_recent_turns(history, RECENT_TOOL_TURNS)
 
 
 def _prev_user_boundary(history, cut) -> int:
@@ -236,17 +280,19 @@ SUMMARIZE_INSTRUCTION = (
 
 def _truncate_to_fit(send_history, summary_text, current_text, line,
                      overhead=0) -> list:
-    """Drop oldest user-turns from send_history (user boundaries) until it fits
-    line; always keep at least the last turn."""
+    """Drop oldest turns from send_history (user boundaries, or tool-turn
+    boundaries when there are too few user messages to be useful) until it
+    fits line; always keep at least the last turn."""
     us = _user_indices(send_history)
-    if not us:
+    boundaries = us if len(us) >= 2 else turn_starts(send_history)
+    if not boundaries:
         return send_history
     base = overhead + estimate_tokens(summary_text) + estimate_tokens(current_text)
-    for c in us:                      # ascending user boundaries
+    for c in boundaries:               # ascending boundaries
         cand = send_history[c:]
         if base + estimate_messages_tokens(cand) <= line:
             return cand
-    return send_history[us[-1]:]       # keep only the last turn
+    return send_history[boundaries[-1]:]       # keep only the last turn
 
 
 async def compact_for_run(conn, *, session_id, user_id, model_name,
