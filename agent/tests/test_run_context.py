@@ -10,6 +10,7 @@ def test_defaults_and_current():
         assert rc.current() is ctx
         assert ctx.last_input_tokens == 0 and ctx.summary == "" and ctx.fold_idx == 0
         assert ctx.compaction_enabled is True
+        assert ctx.peak_input_tokens == 0
     finally:
         rc.RUN_CTX_VAR.reset(tok)
     assert rc.current() is None

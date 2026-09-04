@@ -29,6 +29,7 @@ import tool_output as to
 _LOG = logging.getLogger("nimoos-agent.compaction")
 
 MICRO_PLACEHOLDER_HEAD = 300
+REASONING_KEEP_CHARS = 200
 _COMPACTED_RE = re.compile(r"\[earlier tool output compacted: chars=\d+")
 _SYNTHETIC_ID = "__synthetic__"
 
@@ -131,12 +132,17 @@ def micro_compact(items: list, *, keep_recent_results: int = cc.KEEP_RECENT_TOOL
         elif t == "reasoning" and m.get("id") != _SYNTHETIC_ID:
             summ = m.get("summary")
             already = (isinstance(summ, list) and len(summ) == 1
-                       and isinstance(summ[0], dict) and summ[0].get("text") == "(reasoning compacted)")
+                       and isinstance(summ[0], dict)
+                       and str(summ[0].get("text") or "").endswith("…(reasoning compacted)"))
             if not already:
-                new = dict(m)
-                new["summary"] = [{"type": "summary_text", "text": "(reasoning compacted)"}]
-                out_items.append(new)
-                continue
+                original_text = cc._message_text(m)
+                if original_text:
+                    head = original_text[:REASONING_KEEP_CHARS]
+                    new = dict(m)
+                    new["summary"] = [{"type": "summary_text",
+                                        "text": head + " …(reasoning compacted)"}]
+                    out_items.append(new)
+                    continue
         out_items.append(m)
     if replaced == 0 and out_items == items:
         return items, 0
@@ -300,6 +306,7 @@ class ContextHooks(RunHooks):
             if tokens <= 0:
                 return
             ctx.last_input_tokens = tokens
+            ctx.peak_input_tokens = max(ctx.peak_input_tokens, tokens)
             ctx.items_seen_at_last_call = int(ctx.extra.get("last_sent_len", 0) or 0)
             if ctx.conn is not None:
                 ctx.conn.execute("UPDATE sessions SET last_real_input_tokens=? WHERE id=?",

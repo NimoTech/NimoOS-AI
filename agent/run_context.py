@@ -23,6 +23,7 @@ class RunCtx:
     summarize_fn: Any = None
     overhead_tokens: int = 0
     last_input_tokens: int = 0
+    peak_input_tokens: int = 0
     items_seen_at_last_call: int = 0
     summary: str = ""
     fold_idx: int = 0

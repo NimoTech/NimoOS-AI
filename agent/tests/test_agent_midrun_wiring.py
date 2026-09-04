@@ -130,3 +130,17 @@ def test_persist_midrun_state_warns_on_start_truncated_gap(runner, caplog):
     assert len(warnings) == 1
     msg = warnings[0].getMessage()
     assert "5" in msg and "3" in msg and "s1" in msg
+
+
+def test_persist_midrun_state_logs_stats_at_warning(runner, caplog):
+    import logging
+    ctx = rc.RunCtx(session_id="s1", user_id="u1", model_name="m", provider_type="other",
+                    window=1000, l1_count=2, l1_reasoning_count=1, peak_input_tokens=9876)
+    with caplog.at_level(logging.WARNING, logger="nimoos-agent"):
+        runner._persist_midrun_state(ctx, "s1")
+    stats = [r for r in caplog.records
+             if "compaction-stats:" in r.getMessage()]
+    assert len(stats) == 1
+    rec, msg = stats[0], stats[0].getMessage()
+    assert rec.levelno == logging.WARNING
+    assert "peak_in=9876" in msg

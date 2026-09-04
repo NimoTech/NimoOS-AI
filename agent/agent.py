@@ -644,9 +644,11 @@ class AgentRunner:
                 context_compaction._write_summary_state(
                     self._conn, session_id, ctx.summary, new_cursor)
             if ctx.l1_count or ctx.l2_count or ctx.trunc_count or ctx.l1_reasoning_count:
-                _LOG.info("compaction: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d peak_in=%d",
-                          session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
-                          ctx.trunc_count, ctx.last_input_tokens)
+                _LOG.warning(
+                    "compaction-stats: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d "
+                    "peak_in=%d last_in=%d",
+                    session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
+                    ctx.trunc_count, ctx.peak_input_tokens, ctx.last_input_tokens)
         except Exception:  # noqa: BLE001
             _LOG.debug("persisting mid-run compaction state failed", exc_info=True)
 

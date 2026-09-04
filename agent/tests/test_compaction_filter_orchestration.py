@@ -185,6 +185,21 @@ async def test_hooks_record_usage_and_write_session(tmp_path):
     await cf.ContextHooks().on_llm_end(None, None, R())
     assert ctx.last_input_tokens == 4321 and ctx.items_seen_at_last_call == 7
     assert conn.execute("SELECT last_real_input_tokens FROM sessions WHERE id='s'").fetchone()[0] == 4321
+    assert ctx.peak_input_tokens == 4321
+
+
+@pytest.mark.asyncio
+async def test_hooks_track_peak_input_tokens_across_calls():
+    to.OFFLOAD_DIR_VAR.set("")
+    ctx = _ctx(window=100)
+    class U1: input_tokens = 4321
+    class R1: usage = U1()
+    class U2: input_tokens = 1000
+    class R2: usage = U2()
+    await cf.ContextHooks().on_llm_end(None, None, R1())
+    await cf.ContextHooks().on_llm_end(None, None, R2())
+    assert ctx.last_input_tokens == 1000
+    assert ctx.peak_input_tokens == 4321
 
 
 @pytest.mark.asyncio

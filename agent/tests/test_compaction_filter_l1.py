@@ -66,9 +66,32 @@ def test_old_reasoning_compacted_synthetic_and_recent_kept():
     new, _ = cf.micro_compact(items, keep_recent_results=8)
     rs = [m for m in new if m.get("type") == "reasoning"]
     assert rs[0]["id"] == "__synthetic__" and "no reasoning captured" in rs[0]["summary"][0]["text"]
-    assert rs[1]["summary"][0]["text"] == "(reasoning compacted)"
+    text = rs[1]["summary"][0]["text"]
+    assert text.endswith("…(reasoning compacted)") and text.startswith("think 0")
     assert rs[-1]["summary"][0]["text"] == "think 11"
     assert items[2]["summary"][0]["text"] == "think 0"               # original untouched
+
+
+def test_reasoning_stub_keeps_200_char_head_of_original():
+    original = "t" * 500
+    items = _run(9, 10)
+    items.insert(1, _r(original, "rlong"))
+    new, _ = cf.micro_compact(items, keep_recent_results=8)
+    stubbed = [m for m in new if m.get("id") == "rlong"][0]
+    text = stubbed["summary"][0]["text"]
+    assert text.endswith("…(reasoning compacted)")
+    assert text.startswith(original[:cf.REASONING_KEEP_CHARS])
+    assert len(text) <= cf.REASONING_KEEP_CHARS + len(" …(reasoning compacted)")
+
+
+def test_reasoning_stub_idempotent_on_second_compact():
+    items = _run(9, 10)
+    items.insert(1, _r("t" * 500, "rlong"))
+    once, _ = cf.micro_compact(items, keep_recent_results=8)
+    twice, _ = cf.micro_compact(once, keep_recent_results=8)
+    once_text = [m for m in once if m.get("id") == "rlong"][0]["summary"][0]["text"]
+    twice_text = [m for m in twice if m.get("id") == "rlong"][0]["summary"][0]["text"]
+    assert once_text == twice_text
 
 
 def test_non_str_outputs_left_alone():
@@ -96,7 +119,7 @@ def test_recent_boundary_keeps_whole_recent_turns():
     outs = [m for m in new if m.get("type") == "function_call_output"]
     # the 8 kept outputs are turns 4..11; their reasoning must be intact too
     assert [r["summary"][0]["text"] for r in rs[4:]] == [f"think {i}" for i in range(4, 12)]
-    assert all(r["summary"][0]["text"] == "(reasoning compacted)" for r in rs[:4])
+    assert all(r["summary"][0]["text"].endswith("…(reasoning compacted)") for r in rs[:4])
     assert all(len(o["output"]) > 1000 for o in outs[4:]) and all("compacted" in o["output"] for o in outs[:4])
 
 
