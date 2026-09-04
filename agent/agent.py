@@ -1082,6 +1082,7 @@ class AgentRunner:
                 model_name=model_name, history=history, current_text=_cur_text,
                 summarize_fn=_summarize_fn, overhead_tokens=_overhead,
                 provider_type=provider_type)
+            _base_prompt = full_prompt
             if summary_block:
                 full_prompt = full_prompt + "\n\n" + summary_block
             # Compaction only trims what is SENT to the model. The persisted
@@ -1094,6 +1095,32 @@ class AgentRunner:
             _dropped = len(history) - len(send_history)
             persist_prefix = (stored_history[:_dropped]
                               if 0 < _dropped <= len(stored_history) else [])
+
+            # --- P2 mid-run compaction state (spec §5.1) ---
+            # _ctx_token/_mid_summarize initialised before any of this can
+            # raise, so the finally block below never NameErrors even if
+            # RunCtx construction itself fails partway through.
+            _ctx_token = None
+            _mid_summarize = None
+            import compaction_filter as _cf
+            import run_context as _rc
+            import summarizer as _summ
+            _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
+            _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
+            _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
+            _ctx = _rc.RunCtx(
+                session_id=session_id, user_id=str(user_id), model_name=model_name,
+                provider_type=provider_type, window=_win, conn=self._conn,
+                summarize_fn=_mid_summarize, overhead_tokens=_overhead,
+                summary=_S0 or "", persist_prefix_len=len(persist_prefix),
+                compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)))
+            # Pre-seed the BASE prompt (before summary_block was appended just
+            # above) so compaction_filter._with_summary rebuilds base+block
+            # idempotently across every mid-run call instead of re-appending
+            # onto an already-blocked instructions string.
+            _ctx.extra["base_instructions"] = _base_prompt
+            _ctx.extra["recall_hint"] = memory_store.is_memory_enabled(self._conn, str(user_id))
+            _ctx_token = _rc.RUN_CTX_VAR.set(_ctx)
 
             agent = Agent(
                 name="NimoOS Agent",
@@ -1117,10 +1144,11 @@ class AgentRunner:
             try:
                 _trace_cfg = phoenix_tracing.build_trace_run_config(
                     phoenix_tracing.tracing_enabled_now(),
-                    session_id, user_id, model_name, kind)
+                    session_id, user_id, model_name, kind,
+                    call_model_input_filter=_cf.compaction_filter)
                 stream = Runner.run_streamed(
                     agent, input_messages, max_turns=max_turns,
-                    run_config=_trace_cfg)
+                    hooks=_cf.ContextHooks(), run_config=_trace_cfg)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).
@@ -1197,6 +1225,17 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+                try:
+                    if _ctx.l2_count and _ctx.summary:
+                        context_compaction._write_summary_state(
+                            self._conn, session_id, _ctx.summary,
+                            _ctx.persist_prefix_len + _ctx.fold_idx)
+                    if _ctx.l1_count or _ctx.l2_count or _ctx.trunc_count:
+                        _LOG.info("compaction: session=%s l1=%d l2=%d trunc=%d peak_in=%d",
+                                  session_id, _ctx.l1_count, _ctx.l2_count, _ctx.trunc_count,
+                                  _ctx.last_input_tokens)
+                except Exception:  # noqa: BLE001
+                    _LOG.debug("persisting mid-run compaction state failed", exc_info=True)
                 # Provider-reported usage: the LAST request's input_tokens is
                 # the provider's own count of the current context (the
                 # accumulated context_wrapper.usage sums all turns — wrong
@@ -1235,6 +1274,18 @@ class AgentRunner:
                             attachment_ids=attachment_ids, data_root=data_root)
                         partial = _repair_dangling_tool_calls(partial)
                         self._save_history(session_id, persist_prefix + partial)
+                        try:
+                            if _ctx.l2_count and _ctx.summary:
+                                context_compaction._write_summary_state(
+                                    self._conn, session_id, _ctx.summary,
+                                    _ctx.persist_prefix_len + _ctx.fold_idx)
+                            if _ctx.l1_count or _ctx.l2_count or _ctx.trunc_count:
+                                _LOG.info("compaction: session=%s l1=%d l2=%d trunc=%d peak_in=%d",
+                                          session_id, _ctx.l1_count, _ctx.l2_count, _ctx.trunc_count,
+                                          _ctx.last_input_tokens)
+                        except Exception:  # noqa: BLE001
+                            _LOG.debug("persisting mid-run compaction state failed (max_turns)",
+                                       exc_info=True)
                 except Exception:
                     pass
                 await sink.put({
@@ -1282,6 +1333,21 @@ class AgentRunner:
                 # previous run's context.
                 self._active_sinks.pop(session_id, None)
                 self._run_contexts.pop(session_id, None)
+                # P2 mid-run compaction: clear the ContextVar so it never
+                # leaks into an unrelated task/context, and release the
+                # background-model client the summarizer may have opened.
+                # Both are best-effort — _ctx_token/_mid_summarize are None
+                # (guarded, not simply absent) if RunCtx setup itself failed.
+                if _ctx_token is not None:
+                    try:
+                        _rc.RUN_CTX_VAR.reset(_ctx_token)
+                    except Exception:  # noqa: BLE001
+                        _LOG.debug("RUN_CTX_VAR reset failed", exc_info=True)
+                if _mid_summarize is not None:
+                    try:
+                        await _mid_summarize.aclose()
+                    except Exception:  # noqa: BLE001
+                        _LOG.debug("mid-run summarizer aclose failed", exc_info=True)
                 # Drop the run-scoped shell grant as soon as the run ends
                 # (best-effort — see the note at the set site above).
                 try:
