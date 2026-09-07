@@ -25,6 +25,7 @@ def test_turn1_general_tool_schema_under_budget():
         schema = getattr(t, "params_json_schema", None)
         if schema:
             size += len(json.dumps(schema, ensure_ascii=False))
-    # the schema for the 6 always-on tools + expand_tools is far smaller than this;
-    # leaves plenty of margin, threshold is roughly ~2k tokens.
-    assert size < 8000, f"turn-1 tool schema size too large: {size} chars"
+    # 2026-09-07 (P4, spec §7): the always-on set is now 12 tools + expand_tools
+    # (update_plan / delegate joined deliberately; their descriptions are kept
+    # terse). Threshold raised 8000 -> 9500 (~2.4k tokens) — still a bloat guard.
+    assert size < 9500, f"turn-1 tool schema size too large: {size} chars"

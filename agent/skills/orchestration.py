@@ -50,13 +50,11 @@ async def _update_plan_impl(steps) -> str:
 
 @function_tool
 async def update_plan(steps_json: str) -> str:
-    """Replace your whole working plan and show it to the user as a checklist.
-    Call it before starting any task with more than three steps, and again
-    whenever a step changes status. `steps_json` is a JSON array of
-    {"id": "1", "title": "...", "status": "pending" | "in_progress" | "done"
-    | "skipped", "note": "optional short result"}. Max 30 steps, 200 chars per
-    field. Pass "[]" to clear the plan. The current plan is always visible to
-    you in a <plan> block."""
+    """Replace your whole working plan (shown to the user as a checklist). Call
+    it before any task with more than three steps and whenever a step changes
+    status. steps_json: JSON array of {"id","title","status":"pending"|
+    "in_progress"|"done"|"skipped","note"?}; max 30 steps, 200 chars per
+    field; "[]" clears. The current plan stays visible to you in <plan>."""
     try:
         steps = json.loads(steps_json)
     except (TypeError, ValueError) as exc:
@@ -265,16 +263,13 @@ async def _delegate_impl(goal: str, context: str = "", expected_output: str = ""
 @function_tool
 async def delegate(goal: str, context: str = "", expected_output: str = "",
                    max_turns: int = DELEGATE_DEFAULT_TURNS) -> str:
-    """Hand one self-contained sub-task to a fresh sub-agent that has your
-    tools but none of this conversation, and get back only its final answer.
-    Use it for bulky work — fetching and reading several pages or feeds,
-    scanning a folder, comparing documents — so the raw material never enters
-    your own context. Give it everything it needs: a precise goal, the
-    context it cannot see (paths, URLs, what is already known), and the exact
-    shape of the answer you want. Several independent delegate calls in one
-    turn run in parallel. max_turns 1-30 (default 15); it cannot delegate
-    further, edit the plan, or manage memory/tasks; its permission prompts are
-    shown to the user like yours."""
+    """Run one self-contained sub-task in a fresh sub-agent (your tools, none of
+    this conversation) and get back only its final answer. Use it for bulky
+    work — reading several pages/feeds/documents, scanning a folder — so raw
+    material stays out of your context. Give it a precise goal, the context it
+    cannot see (paths, URLs, known facts) and the exact answer shape. Several
+    independent calls in one turn run in parallel. max_turns 1-30 (default 15).
+    It cannot delegate, edit the plan or manage memory/tasks."""
     return await _delegate_impl(goal, context, expected_output, max_turns)
 
 
