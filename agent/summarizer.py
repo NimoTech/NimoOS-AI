@@ -105,7 +105,7 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
             timeout = globals()["COMPACT_LLM_TIMEOUT"]
             return await asyncio.wait_for(fn(instruction, prior, fold), timeout=timeout)
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("compaction summarize failed: %s", exc)
+            _LOG.warning("compaction summarize failed: %s %r", type(exc).__name__, exc)
             return ""
 
     async def complete(instruction: str, body: str, *, max_tokens: int = 1024,
@@ -118,7 +118,7 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
             timeout = timeout if timeout is not None else globals()["COMPACT_LLM_TIMEOUT"]
             return await asyncio.wait_for(fn(instruction, body, max_tokens=max_tokens), timeout=timeout)
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("compaction complete() failed: %s", exc)
+            _LOG.warning("compaction complete() failed: %s %r", type(exc).__name__, exc)
             return ""
 
     async def aclose():
