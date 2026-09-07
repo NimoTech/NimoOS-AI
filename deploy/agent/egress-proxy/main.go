@@ -164,6 +164,27 @@ var hopByHopHeaders = map[string]bool{
 var controlPlaneMu sync.RWMutex
 var controlPlanePorts = map[string]bool{}
 
+// proxySelf is the proxy's own listen ip:port; a target equal to it is
+// denied on every path so the proxy cannot be chained through itself.
+var proxySelfIP net.IP
+var proxySelfPort string
+
+func setProxySelf(listenAddr string) {
+	controlPlaneMu.Lock()
+	defer controlPlaneMu.Unlock()
+	proxySelfIP, proxySelfPort = nil, ""
+	if h, p, err := net.SplitHostPort(listenAddr); err == nil {
+		proxySelfIP = normalizeIP(net.ParseIP(h))
+		proxySelfPort = p
+	}
+}
+
+func isProxySelf(ip net.IP, port string) bool {
+	controlPlaneMu.RLock()
+	defer controlPlaneMu.RUnlock()
+	return proxySelfIP != nil && ip.Equal(proxySelfIP) && port == proxySelfPort
+}
+
 func registerControlPlanePort(port string) {
 	if port == "" {
 		return
@@ -176,6 +197,7 @@ func registerControlPlanePort(port string) {
 func resetControlPlanePorts() {
 	controlPlaneMu.Lock()
 	controlPlanePorts = map[string]bool{}
+	proxySelfIP, proxySelfPort = nil, ""
 	controlPlaneMu.Unlock()
 }
 
@@ -190,6 +212,7 @@ func isControlPlanePort(port string) bool {
 // the grant server's actual address, and the confirm callback URL (scheme
 // default when the URL carries no port).
 func registerControlPlaneFromConfig(listenAddr, grantAddr, confirmURL string) {
+	setProxySelf(listenAddr)
 	for _, a := range []string{listenAddr, grantAddr} {
 		if _, port, err := net.SplitHostPort(a); err == nil {
 			registerControlPlanePort(port)
@@ -242,18 +265,31 @@ func isInternalPath(p string) bool {
 }
 
 // controlPlaneDeny returns a non-empty reason when the request must be
-// refused. ip is the normalized resolved destination; reqPath is empty for
-// CONNECT (no path is visible there, which is exactly why rule 3 exists).
+// refused. ip is the normalized destination — the pre-dial resolution in the
+// handlers, and the address actually being dialed inside secureDialer's
+// Control hook, so a multi-A-record or rebinding answer cannot land on a
+// control-plane endpoint that the handler-level check never saw. reqPath is
+// empty for CONNECT (no path is visible there, which is why rule 3 exists).
+//  1. internal ip + control-plane port (proxy listen / grant / confirm) → deny
+//  2. internal ip + plain HTTP + internal-only path → deny
+//  3. internal ip + CONNECT → deny (the container shares the host network,
+//     so LAN/bridge addresses are dialable; a tunnel to the Gateway would
+//     hide /_internal/ from rule 2)
+//  4. the proxy's own listen ip:port → deny (no self-chaining)
 func controlPlaneDeny(ip net.IP, port string, isConnect bool, reqPath string) string {
-	if ip.IsLoopback() {
-		if isConnect {
-			return "CONNECT to loopback is not allowed (control plane)"
-		}
-		if isControlPlanePort(port) {
-			return "loopback port " + port + " is the proxy control plane"
-		}
+	if isProxySelf(ip, port) {
+		return "target is the egress proxy itself"
 	}
-	if !isConnect && isInternal(ip) && isInternalPath(reqPath) {
+	if !isInternal(ip) {
+		return ""
+	}
+	if isConnect {
+		return "CONNECT to internal address " + ip.String() + " is not allowed (control plane)"
+	}
+	if isControlPlanePort(port) {
+		return "internal port " + port + " is the proxy control plane"
+	}
+	if isInternalPath(reqPath) {
 		return "internal-only route " + reqPath
 	}
 	return ""
@@ -545,7 +581,7 @@ func hasGrant(host string) bool {
 // IP at connect time to prevent DNS rebinding attacks.
 // classifiedInternal must match the classification made at request-parse time;
 // the hook blocks if the true IP disagrees.
-func secureDialer(classifiedInternal bool) *net.Dialer {
+func secureDialer(classifiedInternal, isConnect bool, reqPath string) *net.Dialer {
 	return &net.Dialer{
 		Timeout: 30 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -573,6 +609,15 @@ func secureDialer(classifiedInternal bool) *net.Dialer {
 			reallyInternal := isInternal(ip)
 			if reallyInternal != classifiedInternal {
 				return fmt.Errorf("rebinding-check: IP %s classification mismatch (pre=%v now=%v)", ip, classifiedInternal, reallyInternal)
+			}
+			// Control-plane rules re-applied to the IP actually dialed. Loopback
+			// is internal, so the classification check above cannot tell a LAN
+			// A record from a loopback fallback: a name resolving to
+			// [dead-LAN, 127.0.0.1] passed every handler-level rule and the
+			// dialer's per-address fallback landed on 127.0.0.1:8889.
+			_, dialPort, _ := net.SplitHostPort(address)
+			if reason := controlPlaneDeny(ip, dialPort, isConnect, reqPath); reason != "" {
+				return fmt.Errorf("rebinding-check: %s", reason)
 			}
 			return nil
 		},
@@ -675,7 +720,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Dial with anti-rebinding control hook.
-	dialer := secureDialer(internal)
+	dialer := secureDialer(internal, true, "")
 	dst, err := dialer.Dial("tcp", hostport)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -847,7 +892,7 @@ func proxyPlainHTTP(w http.ResponseWriter, r *http.Request) {
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return secureDialer(internal).DialContext(ctx, network, addr)
+			return secureDialer(internal, false, r.URL.Path).DialContext(ctx, network, addr)
 		},
 	}
 
