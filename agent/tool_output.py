@@ -131,7 +131,7 @@ def make_placeholder(text: str, *, tool_name: str, path: str, chars: int) -> str
         f"{fenced}\n"
         f"[tool output offloaded: chars={chars} path={path}]\n"
         f"The full {tool_name or 'tool'} output ({chars} chars) was too large for "
-        f"the conversation and was saved to that file. Read it in small slices "
+        f"the conversation and was saved to that file. If a reading guide is shown above, use it to pick line ranges. Read it in small slices "
         f"with read_file_lines(path, start, end) — about 50-100 lines per call; "
         f"a slice longer than {OFFLOAD_THRESHOLD_CHARS} chars is folded again. "
         f"To find text inside it use search_content(query, root={folder}). If "
@@ -159,6 +159,25 @@ def postprocess(output, *, tool_name: str, call_id: str):
     if not path:
         return output
     return make_placeholder(output, tool_name=tool_name, path=path, chars=n)
+
+
+async def postprocess_async(output, *, tool_name: str, call_id: str, args_hint: str = ""):
+    """postprocess() plus, when an offload happened, a reading guide of the
+    full text in place of the preview (offload_summary). Falls back to the
+    plain placeholder on any failure."""
+    treated = postprocess(output, tool_name=tool_name, call_id=call_id)
+    if treated is output or not isinstance(treated, str):
+        return treated
+    m = TRAILER_RE.search(treated)
+    if not m:
+        return treated
+    try:
+        import offload_summary  # noqa: PLC0415 — lazy: offload_summary imports fences/run_context only
+        return await offload_summary.attach(treated, output, tool_name=tool_name,
+                                            path=m.group(2), args_hint=args_hint)
+    except Exception:  # noqa: BLE001 — the guide is best-effort
+        _LOG.warning("tool_output: reading guide failed for %s", tool_name, exc_info=True)
+        return treated
 
 
 def _within(child: str, parent: str) -> bool:
@@ -252,7 +271,9 @@ def wrap_tool_output(tool):
         finally:
             CALL_ID_VAR.reset(token)
         try:
-            return postprocess(out, tool_name=tool_name, call_id=call_id)
+            hint = input_json if isinstance(input_json, str) else ""
+            return await postprocess_async(out, tool_name=tool_name, call_id=call_id,
+                                           args_hint=hint)
         except Exception:  # noqa: BLE001 — treatment must never eat a result
             _LOG.warning("tool_output: postprocess failed for %s", tool_name,
                          exc_info=True)

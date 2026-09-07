@@ -23,6 +23,7 @@ from agents import RunHooks
 from agents.run import ModelInputData
 
 import context_compaction as cc
+import offload_summary as _os
 import run_context as rc
 import tool_output as to
 
@@ -84,7 +85,15 @@ def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
         # follows is never read as still being inside untrusted data.
         head_part = head + "\n</untrusted-data>"
     trailer = to.TRAILER_RE.search(out)
-    if trailer:
+    guide = _os.SUMMARY_BLOCK_RE.search(out) if trailer else None
+    if guide:
+        # P1 placeholder that carries a reading guide: keep the whole guide
+        # (it is the useful part) and drop only the advice text after the
+        # trailer. Idempotent — a second pass sees the same compact form.
+        text = f"{guide.group(0)}\n{trailer.group(0)}"
+        if out.strip() == text:
+            return None
+    elif trailer:
         text = f"{head_part}\n…\n{trailer.group(0)}"
     else:
         cid = str(m.get("call_id") or m.get("id") or "")

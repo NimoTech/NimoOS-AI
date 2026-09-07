@@ -22,18 +22,27 @@ def _new_client(base_url: str, api_key: str):
     return AsyncOpenAI(base_url=base_url, api_key=api_key or "none", max_retries=0)
 
 
-def session_summarize_fn(client, model_name, extra_kwargs=None):
-    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
-        body = (f"[Existing summary]\n{prior_summary or '(none)'}\n\n"
-                f"[Earlier conversation excerpts]\n{fold_text}")
+def session_complete_fn(client, model_name, extra_kwargs=None):
+    """Generic one-shot completion (system + user -> text) on `client`."""
+    async def _complete(instruction: str, body: str, *, max_tokens: int = 1024) -> str:
         resp = await client.chat.completions.create(
             model=model_name,
             messages=[{"role": "system", "content": instruction},
                       {"role": "user", "content": body}],
-            temperature=0.3, max_tokens=1024, **(extra_kwargs or {}))
+            temperature=0.3, max_tokens=max_tokens, **(extra_kwargs or {}))
         if resp.choices:
             return (getattr(resp.choices[0].message, "content", "") or "").strip()
         return ""
+    return _complete
+
+
+def session_summarize_fn(client, model_name, extra_kwargs=None):
+    complete = session_complete_fn(client, model_name, extra_kwargs)
+
+    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
+        body = (f"[Existing summary]\n{prior_summary or '(none)'}\n\n"
+                f"[Earlier conversation excerpts]\n{fold_text}")
+        return await complete(instruction, body)
     return _summarize
 
 
@@ -60,8 +69,16 @@ async def resolve_background_client(conn, user_id: str, *, creds_resolver=None):
     return _new_client(creds["base_url"], creds.get("api_key", "")), creds["model"], extra
 
 
+def _summarize_via(complete):
+    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
+        body = (f"[Existing summary]\n{prior_summary or '(none)'}\n\n"
+                f"[Earlier conversation excerpts]\n{fold_text}")
+        return await complete(instruction, body)
+    return _summarize
+
+
 def make_summarizer(conn, user_id: str, session_client, model_name: str, *, creds_resolver=None):
-    state: dict = {"resolved": False, "bg": None, "fn": None}
+    state: dict = {"resolved": False, "bg": None, "fn": None, "complete": None}
 
     async def _pick():
         if state["resolved"]:
@@ -76,9 +93,10 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
         if bg:
             client, model, extra = bg
             state["bg"] = client
-            state["fn"] = session_summarize_fn(client, model, extra)
+            state["complete"] = session_complete_fn(client, model, extra)
         else:
-            state["fn"] = session_summarize_fn(session_client, model_name)
+            state["complete"] = session_complete_fn(session_client, model_name)
+        state["fn"] = _summarize_via(state["complete"])
         return state["fn"]
 
     async def summarize(instruction: str, prior: str, fold: str) -> str:
@@ -90,6 +108,19 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
             _LOG.warning("compaction summarize failed: %s", exc)
             return ""
 
+    async def complete(instruction: str, body: str, *, max_tokens: int = 1024,
+                       timeout: float | None = None) -> str:
+        """One-shot completion on the same (background-preferred) client;
+        used by offload summaries. Returns "" on any failure."""
+        try:
+            await _pick()
+            fn = state["complete"]
+            timeout = timeout if timeout is not None else globals()["COMPACT_LLM_TIMEOUT"]
+            return await asyncio.wait_for(fn(instruction, body, max_tokens=max_tokens), timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("compaction complete() failed: %s", exc)
+            return ""
+
     async def aclose():
         bg = state.get("bg")
         if bg is not None:
@@ -99,4 +130,5 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
                 pass
 
     summarize.aclose = aclose  # type: ignore[attr-defined]
+    summarize.complete = complete  # type: ignore[attr-defined]
     return summarize
