@@ -298,6 +298,14 @@ async def _attachments_startup():
     except Exception as e:  # noqa: BLE001 — must never block startup
         _LOG.warning("tool_output sweep failed: %s", e)
 
+    try:
+        # Batched + yielding, and off the startup path: the first sweep on a
+        # box with a 1.7 M-row backlog must not block request handling.
+        from run_sink import event_log_sweeper as _event_log_sweeper
+        asyncio.get_running_loop().create_task(_event_log_sweeper(_db()), name="event-log-sweeper")
+    except Exception as e:  # noqa: BLE001 — must never block startup
+        _LOG.warning("event_log sweeper not started: %s", e)
+
 
 @app.on_event("startup")
 async def _tracing_startup():
