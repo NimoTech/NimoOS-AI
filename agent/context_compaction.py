@@ -37,9 +37,9 @@ SUMMARY_OUTPUT_MAX_CHARS = 500   # cap on function_call_output text fed to the
 TOOLS_BASE_OVERHEAD = 80   # fixed framework boilerplate around the tools array
                            # ("You have access to the following tools…")
 RECENT_TOOL_TURNS = 6
-KEEP_RECENT_TOOL_RESULTS = 8
+KEEP_RECENT_TOOL_RESULTS = 4
 MICRO_KEEP_CHARS = 800
-L1_THRESHOLD = 0.50
+L1_THRESHOLD = 0.35
 L2_THRESHOLD = 0.70
 HARD_THRESHOLD = 0.85
 

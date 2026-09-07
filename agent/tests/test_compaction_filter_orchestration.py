@@ -59,9 +59,9 @@ async def test_l1_triggers_on_provider_usage(tmp_path):
     ctx = _ctx(window=10_000, last_input_tokens=6_000, items_seen_at_last_call=41)
     items = _items(20, 2000)
     out = await cf.compaction_filter(_data(items))
-    assert ctx.l1_count == 12
+    assert ctx.l1_count == 16
     outs = [m for m in out.input if m.get("type") == "function_call_output"]
-    assert all("compacted" in m["output"] for m in outs[:12])
+    assert all("compacted" in m["output"] for m in outs[:16])
     assert items[2]["output"] == "x" * 2000            # originals untouched
     assert ctx.extra["last_sent_len"] == len(items)
 
@@ -136,17 +136,18 @@ async def test_l2_bloat_gate_rejects_longer_summary(tmp_path):
 
 @pytest.mark.asyncio
 async def test_hard_truncation_keeps_head_user_after_fold(tmp_path):
-    # Same window/items shape as test_l2_folds_and_updates_ctx's original
-    # (rejected) window=4_000 case: L1 fires (est ~11582 -> ~6124), L2 folds
-    # (cut=29, accepted since "S" is trivially shorter than fold_text), but
-    # the remaining last-6-turns estimate (~3474) still exceeds
-    # HARD_THRESHOLD*4000 (3400) so hard truncation also fires afterward.
+    # window=3_000 with 20 x 2000-char outputs: L1 fires (keeps the last 4
+    # outputs whole), L2 folds (accepted since "S" is trivially shorter than
+    # fold_text), but the remaining last-6-turns estimate still exceeds
+    # HARD_THRESHOLD*3000 (2550) so hard truncation also fires afterward.
+    # (Was window=4_000 with KEEP_RECENT_TOOL_RESULTS=8; with 4 kept the
+    # post-L1 estimate no longer crosses 0.85*4000.)
     # After the L2 fold, items[0] is no longer the original user message —
     # truncate_turns' own "keep items[0] if it's a user message" fallback
     # can't see it, so compaction_filter must re-attach it from `full`.
     to.OFFLOAD_DIR_VAR.set(str(tmp_path))
     async def summ(instr, prior, fold): return "S"
-    ctx = _ctx(window=4_000, summarize_fn=summ)
+    ctx = _ctx(window=3_000, summarize_fn=summ)
     items = _items(20, 2000)
     out = await cf.compaction_filter(_data(items))
     assert ctx.l2_count == 1 and ctx.trunc_count == 1

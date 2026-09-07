@@ -42,8 +42,8 @@ def test_keepk_cut_still_uses_user_boundaries_when_enough_users():
 
 def test_constants():
     assert cc.CLOUD_CONTEXT_WINDOW == 131072 and cc.COMPACT_LLM_TIMEOUT == 45
-    assert (cc.L1_THRESHOLD, cc.L2_THRESHOLD, cc.HARD_THRESHOLD) == (0.50, 0.70, 0.85)
-    assert cc.KEEP_RECENT_TOOL_RESULTS == 8 and cc.MICRO_KEEP_CHARS == 800 and cc.RECENT_TOOL_TURNS == 6
+    assert (cc.L1_THRESHOLD, cc.L2_THRESHOLD, cc.HARD_THRESHOLD) == (0.35, 0.70, 0.85)
+    assert cc.KEEP_RECENT_TOOL_RESULTS == 4 and cc.MICRO_KEEP_CHARS == 800 and cc.RECENT_TOOL_TURNS == 6
 
 
 def test_prev_boundary_falls_back_to_tool_turns_for_single_user():
