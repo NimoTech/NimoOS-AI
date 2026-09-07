@@ -107,8 +107,45 @@ func TestAllBuiltinBundlesPassValidation(t *testing.T) {
 	require.Contains(t, ids, "desktop-app-builder")
 	require.Contains(t, ids, "toolbox-helper")
 	require.Contains(t, ids, "task-scheduler")
+	require.Contains(t, ids, "deep-search")
 	// 7 pre-existing bundles + desktop-app-builder + toolbox-helper +
-	// task-scheduler. A silently-skipped (invalid) bundle would make this
-	// count drop.
-	require.Len(t, ms, 10)
+	// task-scheduler + deep-search. A silently-skipped (invalid) bundle would
+	// make this count drop.
+	require.Len(t, ms, 11)
+}
+
+// deep-search is the planned multi-step retrieval skill (EC-RAG deep_search
+// shape): plan → step-wise nimoos_search → no re-reading of seen chunks →
+// every claim cited. Pin the load-bearing phrases so a rewrite cannot drop
+// the contract silently, and pin the manifest rules the index injector
+// enforces (auto trigger, single-line description without angle brackets).
+func TestDeepSearchBundleContract(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, service.SeedBuiltinSkills(root, builtinSkillsFS))
+	store := &service.SkillsStore{Root: root}
+	ms, err := store.ListBuiltin()
+	require.NoError(t, err)
+	var m *service.SkillManifest
+	for _, x := range ms {
+		if x.ID == "deep-search" {
+			m = x
+		}
+	}
+	require.NotNil(t, m, "deep-search bundle missing or invalid")
+	require.Equal(t, "auto", m.Trigger)
+	require.NotContains(t, m.Description, "\n")
+	require.NotContains(t, m.Description, "<")
+	require.LessOrEqual(t, len([]rune(m.Description)), 256)
+
+	b, err := os.ReadFile(filepath.Join(store.BuiltinPath("deep-search"), "SKILL.md"))
+	require.NoError(t, err)
+	s := string(b)
+	require.False(t, strings.HasPrefix(s, "---"), "built-in SKILL.md carries no YAML frontmatter; metadata lives in manifest.json")
+	for _, want := range []string{
+		"nimoos_search", "read_file_chunk", "read_document",
+		"plan", "already", "Sources", "not found", "untrusted",
+		"file-reader",
+	} {
+		require.Contains(t, s, want)
+	}
 }
