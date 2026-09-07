@@ -12,7 +12,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -142,6 +144,119 @@ var hopByHopHeaders = map[string]bool{
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
 	"Proxy-Connection":    true,
+}
+
+// ─── Control-plane deny ───────────────────────────────────────────────────────
+//
+// The sandbox's only route out is this proxy, and the proxy dials from the
+// container's default netns. So a sandboxed command that asks for
+// "127.0.0.1" reaches the container loopback: the grant server, the Python
+// agent (/internal/egress-confirm and its API) and every host microservice
+// that keeps an _internal route behind a mounted token. Internal targets
+// used to skip every check, which let a plain
+// `curl -X POST http://127.0.0.1:8889/grant` self-issue an upload ticket and
+// let the mounted ai_internal.token open Go's _internal endpoints. The
+// control plane must never be reachable through its own data plane:
+//  1. loopback + a control-plane port (proxy listen, grant, confirm URL) → deny
+//  2. internal target + plain-HTTP path under /_internal/ or /internal/ → deny
+//     (the same rule the Gateway applies to external callers)
+//  3. any CONNECT to loopback → deny (a tunnel would hide the path from 2)
+var controlPlaneMu sync.RWMutex
+var controlPlanePorts = map[string]bool{}
+
+func registerControlPlanePort(port string) {
+	if port == "" {
+		return
+	}
+	controlPlaneMu.Lock()
+	controlPlanePorts[port] = true
+	controlPlaneMu.Unlock()
+}
+
+func resetControlPlanePorts() {
+	controlPlaneMu.Lock()
+	controlPlanePorts = map[string]bool{}
+	controlPlaneMu.Unlock()
+}
+
+func isControlPlanePort(port string) bool {
+	controlPlaneMu.RLock()
+	defer controlPlaneMu.RUnlock()
+	return controlPlanePorts[port]
+}
+
+// registerControlPlaneFromConfig derives the control-plane ports from the
+// proxy's own configuration so no new flag is needed: its listen address,
+// the grant server's actual address, and the confirm callback URL (scheme
+// default when the URL carries no port).
+func registerControlPlaneFromConfig(listenAddr, grantAddr, confirmURL string) {
+	for _, a := range []string{listenAddr, grantAddr} {
+		if _, port, err := net.SplitHostPort(a); err == nil {
+			registerControlPlanePort(port)
+		}
+	}
+	if confirmURL == "" {
+		return
+	}
+	u, err := url.Parse(confirmURL)
+	if err != nil {
+		return
+	}
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+	registerControlPlanePort(port)
+}
+
+// isInternalPath reports whether a request path addresses an internal-only
+// route (/_internal/… or /internal/…). One round of percent-decoding and a
+// path.Clean run first so //_internal, /./_internal, /x/../_internal and
+// %5Finternal all resolve to the same answer; comparison is case-insensitive.
+func isInternalPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if dec, err := url.PathUnescape(p); err == nil {
+		p = dec
+	}
+	clean := strings.ToLower(path.Clean("/" + p))
+	segs := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	// "_internal" is a route namespace the Go services mount under their own
+	// prefix (/v1/ai/_internal/…, /v1/wiki/_internal/…), so it is denied as
+	// any path segment — the Gateway applies the same "contains /_internal/"
+	// rule to external callers. "internal" is only the Python agent's
+	// root-level namespace (/internal/egress-confirm), so it is denied as
+	// the first segment only; "/api/internal_notes" stays reachable.
+	for _, seg := range segs {
+		if seg == "_internal" {
+			return true
+		}
+	}
+	return len(segs) > 0 && segs[0] == "internal"
+}
+
+// controlPlaneDeny returns a non-empty reason when the request must be
+// refused. ip is the normalized resolved destination; reqPath is empty for
+// CONNECT (no path is visible there, which is exactly why rule 3 exists).
+func controlPlaneDeny(ip net.IP, port string, isConnect bool, reqPath string) string {
+	if ip.IsLoopback() {
+		if isConnect {
+			return "CONNECT to loopback is not allowed (control plane)"
+		}
+		if isControlPlanePort(port) {
+			return "loopback port " + port + " is the proxy control plane"
+		}
+	}
+	if !isConnect && isInternal(ip) && isInternalPath(reqPath) {
+		return "internal-only route " + reqPath
+	}
+	return ""
 }
 
 func removeHopByHop(h http.Header) {
@@ -534,6 +649,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if reason := controlPlaneDeny(normIP, portStr, true, ""); reason != "" {
+		log.Printf("blocked CONNECT %s: %s", hostport, reason)
+		http.Error(w, "blocked: "+reason, http.StatusForbidden)
+		return
+	}
+
 	internal := isInternal(normIP)
 
 	// Port policy: external targets only on 80/443.
@@ -695,6 +816,12 @@ func proxyPlainHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if isMetadataIP(normIP) {
 		http.Error(w, "blocked: cloud metadata endpoint", http.StatusForbidden)
+		return
+	}
+
+	if reason := controlPlaneDeny(normIP, portStr, false, r.URL.Path); reason != "" {
+		log.Printf("blocked %s %s%s: %s", r.Method, hostport, r.URL.Path, reason)
+		http.Error(w, "blocked: "+reason, http.StatusForbidden)
 		return
 	}
 
@@ -999,6 +1126,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("grant server: %v", err)
 	}
+	registerControlPlaneFromConfig(*listen, actualGrantAddr, confirmURL)
+	log.Printf("control-plane ports denied to the sandbox: proxy %s, grant %s, confirm %s", *listen, actualGrantAddr, confirmURL)
 	log.Printf("grant-server on %s", actualGrantAddr)
 
 	srv := &http.Server{
