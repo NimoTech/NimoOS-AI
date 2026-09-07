@@ -165,3 +165,23 @@ def test_placeholder_head_cut_reclosed_when_fence_left_open():
     assert out.count("<untrusted-data") == 1
     assert out.count("</untrusted-data>") == 1
     assert trailer in out
+
+
+def test_l1_never_folds_delegate_or_update_plan_outputs(tmp_path):
+    """A delegate result is the sub-agent's distilled conclusion; folding it made
+    the parent re-delegate the same work on 118. update_plan acks are tiny."""
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+    items = [{"role": "user", "content": "go"}]
+    for i in range(6):
+        name = "delegate" if i % 2 == 0 else "web_fetch"
+        items += [{"type": "function_call", "call_id": f"c{i}", "name": name, "arguments": "{}"},
+                  {"type": "function_call_output", "call_id": f"c{i}", "output": "x" * 3000}]
+    items += [{"type": "function_call", "call_id": "p", "name": "update_plan", "arguments": "{}"},
+              {"type": "function_call_output", "call_id": "p", "output": '{"status": "ok", "steps": 5}' + "y" * 900}]
+    new, n = cf.micro_compact(items, keep_recent_results=0, keep_chars=800)
+    outs = {m["call_id"]: m["output"] for m in new if m.get("type") == "function_call_output"}
+    assert outs["c0"] == "x" * 3000 and outs["c2"] == "x" * 3000 and outs["c4"] == "x" * 3000
+    assert outs["p"].startswith('{"status": "ok"') and len(outs["p"]) > 800
+    assert all(len(outs[f"c{i}"]) < 3000 for i in (1, 3, 5))
+    assert n == 3
+    assert cf.L1_EXEMPT_TOOLS == frozenset({"delegate", "update_plan"})

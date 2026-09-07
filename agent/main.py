@@ -1593,6 +1593,16 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
+@app.get("/agent/sessions/{session_id}/plan")
+async def get_session_plan(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",
+                        (session_id, x_user_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="session not found")
+    import db as _dbm  # noqa: PLC0415
+    return {"steps": _dbm.get_plan_json(_conn, session_id)}
+
+
 @app.get("/agent/sessions/{session_id}/tool-outputs/{call_id}")
 async def get_tool_output(session_id: str, call_id: str,
                           x_user_id: str = Header(..., alias="X-User-Id")):

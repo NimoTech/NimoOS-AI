@@ -10,7 +10,8 @@ def test_core_names_exact():
     assert tr.CORE_TOOL_NAMES == frozenset(
         {"run_command", "read_file", "list_dir",
          "nimoos_search", "read_document", "read_file_chunk", "read_skill_file",
-         "remember", "forget", "recall"})
+         "remember", "forget", "recall",
+         "update_plan", "delegate"})
 
 
 def test_document_readers_are_core_not_gated():
