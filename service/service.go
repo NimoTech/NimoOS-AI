@@ -93,35 +93,11 @@ func NewService(cfg *config.Config) Services {
 	mcpRuntimeSvc := &mcpRuntimeService{db: db}
 	mcpApprovalsSvc := &mcpApprovalService{db: db}
 
-	// Rebuild .runtime/<uid>/ for every user we know about. The skill_state
-	// table lists users; if a user has no row, the agent layer rebuilds on
-	// first agent run.
-	if rows, err := db.Query(`SELECT DISTINCT user_id FROM skill_state`); err == nil {
-		for rows.Next() {
-			var uid string
-			if rows.Scan(&uid) == nil {
-				uninstalled := map[string]bool{}
-				disabled := map[string]bool{}
-				uRows, _ := db.Query(
-					`SELECT skill_id, enabled, uninstalled FROM skill_state WHERE user_id=?`, uid)
-				for uRows.Next() {
-					var id string
-					var en, un int
-					if uRows.Scan(&id, &en, &un) == nil {
-						if un != 0 {
-							uninstalled[id] = true
-						}
-						if en == 0 && un == 0 {
-							disabled[id] = true
-						}
-					}
-				}
-				uRows.Close()
-				_ = RebuildRuntimeView(store, uid, uninstalled, disabled)
-			}
-		}
-		rows.Close()
-	}
+	// Rebuild .runtime/<uid>/ for every user we know about — users with
+	// skill_state rows and users that already hold a view — so a built-in
+	// added by this binary reaches everyone (audit P2). A user with neither
+	// gets their view lazily from EnsureRuntimeView on the first agent run.
+	rebuildAllRuntimeViews(db, store, skillsSvc)
 
 	return &services{
 		db:              db,

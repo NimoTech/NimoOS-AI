@@ -87,6 +87,12 @@ func RebuildRuntimeView(s *SkillsStore, userID string, uninstalled, disabled map
 		return err
 	}
 	swapped = true
+	// Stamp the seed version this view reflects; EnsureRuntimeView compares
+	// it against the running binary's and rebuilds stale views (audit P2:
+	// new built-ins never reached users whose view already existed).
+	if err := os.WriteFile(s.RuntimeSeedPath(userID), []byte(s.seedVersion()), 0o644); err != nil {
+		return fmt.Errorf("write seed stamp: %w", err)
+	}
 
 	// Sweep stale leftovers: prior versioned dirs (incl. the one this
 	// rebuild replaced) and any orphaned .tmp-<ts> symlinks from crashed
