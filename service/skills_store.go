@@ -65,6 +65,44 @@ func validateSkillDescription(d string) error {
 // SkillsStore owns disk paths and writes for skill bundles.
 type SkillsStore struct {
 	Root string // typically /var/lib/nimoos/skills
+	// SeedVersion is the built-in catalog version runtime views are stamped
+	// with (see RuntimeSeedPath); empty means BuiltinSeedVersion. Tests set
+	// it to simulate a new binary shipping a new built-in.
+	SeedVersion string
+}
+
+func (s *SkillsStore) seedVersion() string {
+	if s.SeedVersion != "" {
+		return s.SeedVersion
+	}
+	return BuiltinSeedVersion
+}
+
+// RuntimeSeedPath is the sidecar next to a user's runtime view recording the
+// seed version the view was built from: .runtime/<uid>.seed. It sits beside
+// the view, never inside it — the view is ro-bind-mounted into the sandbox at
+// /skill and must contain bundles only.
+func (s *SkillsStore) RuntimeSeedPath(userID string) string {
+	return filepath.Join(s.Root, ".runtime", userID+".seed")
+}
+
+// RuntimeUsers lists the users that currently hold a runtime view (the
+// <uid> symlinks in .runtime/), whether or not they have skill_state rows.
+func (s *SkillsStore) RuntimeUsers() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(s.Root, ".runtime"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink != 0 && !strings.Contains(e.Name(), ".") {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
 }
 
 func (s *SkillsStore) BuiltinPath(id string) string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Skill struct {
@@ -91,21 +92,55 @@ func (s *skillsService) loadRuntimeFilterMaps(userID string) (uninstalled, disab
 // rebuildAfter atomically rebuilds the user's runtime view after a
 // mutating call (CreateUser / SetEnabled / Delete). Best-effort: a
 // rebuild failure logs but doesn't fail the call (the next service
-// start re-runs RebuildRuntimeView for every user).
+// start re-runs RebuildRuntimeView for every user via
+// rebuildAllRuntimeViews, and EnsureRuntimeView retries on the next touch).
 func (s *skillsService) rebuildAfter(userID string) {
 	u, d, _ := s.loadRuntimeFilterMaps(userID)
 	_ = RebuildRuntimeView(s.store, userID, u, d)
 }
 
-// EnsureRuntimeView builds .runtime/<uid>/ if it's missing. A fresh user
-// (no skill_state rows) is skipped by the startup rebuild loop, so the
-// agent's skill index would render empty until the user toggled
-// something in the UI. Callers on hot paths (agent proxy, List) invoke
+// EnsureRuntimeView builds .runtime/<uid>/ if it's missing or stale. A view
+// is stale when its seed stamp differs from the running binary's
+// BuiltinSeedVersion — i.e. this binary ships a built-in catalog the view
+// has never seen. Before this check a user who never toggled a skill kept
+// their first-ever view forever and new built-ins never reached them
+// (audit P2, 2026-09-03). Callers on hot paths (agent proxy, List) invoke
 // this lazily so the agent can always discover built-in skills.
 func (s *skillsService) EnsureRuntimeView(userID string) {
 	if _, err := os.Stat(s.store.RuntimePath(userID)); errors.Is(err, os.ErrNotExist) {
 		s.rebuildAfter(userID)
+		return
 	}
+	b, err := os.ReadFile(s.store.RuntimeSeedPath(userID))
+	if err != nil || strings.TrimSpace(string(b)) != s.store.seedVersion() {
+		s.rebuildAfter(userID)
+	}
+}
+
+// rebuildAllRuntimeViews is the startup sweep: every user with skill_state
+// rows plus every user that already holds a view (rows or not) gets their
+// view rebuilt against the built-in catalog this binary seeded. Returns the
+// number of views rebuilt.
+func rebuildAllRuntimeViews(db *sql.DB, store *SkillsStore, svc *skillsService) int {
+	users := map[string]bool{}
+	if rows, err := db.Query(`SELECT DISTINCT user_id FROM skill_state`); err == nil {
+		for rows.Next() {
+			var uid string
+			if rows.Scan(&uid) == nil {
+				users[uid] = true
+			}
+		}
+		rows.Close()
+	}
+	if ids, err := store.RuntimeUsers(); err == nil {
+		for _, uid := range ids {
+			users[uid] = true
+		}
+	}
+	for uid := range users {
+		svc.rebuildAfter(uid)
+	}
+	return len(users)
 }
 
 // loadStateMap returns the skill_state overlay for a user.
