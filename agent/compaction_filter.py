@@ -71,7 +71,17 @@ def _recent_output_boundary(items, keep_recent_results: int) -> int:
     return max([s for s in starts if s <= idx], default=idx)
 
 
+# Tool outputs L1 never folds: a delegate result IS the distilled conclusion of
+# a sub-agent run (<= 4000 chars, offloaded beyond that) — folding it to a
+# 300-char head made the model re-delegate the same work (118 radar
+# experiment, 2026-09-07: wave 2 of 4 delegates repeated wave 1). update_plan
+# acks are tiny. Spec §7.2.
+L1_EXEMPT_TOOLS = frozenset({"delegate", "update_plan"})
+
+
 def _compact_output(m: dict, tool_name: str, keep_chars: int) -> dict | None:
+    if tool_name in L1_EXEMPT_TOOLS:
+        return None
     out = m.get("output")
     if not isinstance(out, str) or len(out) <= keep_chars:
         return None
