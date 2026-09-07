@@ -343,13 +343,15 @@ See the repo root `scripts/` (distributed alongside the NimoOS install scripts):
 Skill bundles live at:
 - `/var/lib/nimoos/skills/builtin/<id>/` — read-only, seeded from `//go:embed` on service start.
 - `/var/lib/nimoos/skills/users/<uid>/<id>/` — user-writable.
-- `/var/lib/nimoos/skills/.runtime/<uid>/` — per-user symlink view, ro-bind-mounted into bwrap at `/skill` for every agent run.
+- `/var/lib/nimoos/skills/.runtime/<uid>/` — per-user symlink view, ro-bind-mounted into bwrap at `/skill` for every agent run. A `.runtime/<uid>.seed` sidecar records the `BuiltinSeedVersion` the view was built from; `EnsureRuntimeView` rebuilds a view whose stamp differs from the running binary's, and the startup sweep rebuilds every user that has rows in `skill_state` or already holds a view — so a new built-in reaches existing users without them touching the skills UI.
 
 Each bundle is a directory containing:
 - `manifest.json` — metadata (id, name, trigger, color, icon, description, examples, version, author).
 - `SKILL.md` — instructions the LLM reads to use the skill (capped at 50 KiB).
 - `scripts/` — optional executable scripts.
 - `resources/` — optional supporting files.
+
+Built-in catalog (11): file-reader, deep-search (planned multi-step retrieval with per-statement citations; auto trigger), doc-summarizer, wiki-keeper, photo-curator, duplicate-sweeper, storage-audit, mcp-helper, toolbox-helper, task-scheduler, desktop-app-builder. Adding or changing one requires bumping `BuiltinSeedVersion` (`service/skills_seed.go`).
 
 LLM-visible surface: an `<available-skills>` index (id + description of every enabled auto/slash skill, sanitized, 16 KiB cap) is injected into the system prompt on every run; the model loads a skill's instructions on demand via `read_skill_file(skill_id)`. Manual-trigger skills are hidden from the index and surface only via UI "Try in chat" injection (`X-Skill-Id` header). The former `list_skills` tool was removed as redundant.
 
