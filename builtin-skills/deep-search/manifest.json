@@ -3,16 +3,21 @@
   "id": "deep-search",
   "name": "deep-search",
   "title": "Deep search",
-  "description": "Answer broad or multi-part questions from the NAS knowledge base with a planned, step-by-step search: break the question into sub-queries, search each, read only new material, and cite every source.",
+  "description": "Use when a question should be answered from the user's own files rather than memory: list all / every X, compare A and B, which has the most or least, what do my documents say. Plans sub-queries, searches step by step, cites every statement.",
   "color": "indigo",
   "icon": "search",
   "trigger": "auto",
   "examples": [
+    "Which Core i3 models are 12th generation? List them all, sorted",
+    "How much did the E3-1225's TDP drop from v3 to v6?",
+    "Compare the memory specs of the i7-1255U and the i7-1355U",
     "List every Lunar Lake processor in my docs, sorted by model number",
-    "Compare the memory specs of the i7-1255U and the i7-1355U from my spec sheets",
     "What do my notes and reports say about the 2025 budget, across all documents?"
   ],
-  "permissions": { "network": false, "writable_paths": [] },
-  "version": "0.1.0",
+  "permissions": {
+    "network": false,
+    "writable_paths": []
+  },
+  "version": "0.2.0",
   "author": "Nimo"
 }
