@@ -48,7 +48,20 @@ _TERMINAL_TYPES = ("done",)
 COALESCE_TYPES = frozenset({"thinking", "message_delta"})
 FLUSH_INTERVAL = 0.25          # max age of an open delta buffer (seconds)
 COALESCE_MAX_CHARS = 4000      # flush a scope when its merged content grows past this
-EVENT_LOG_TTL_DAYS = int(os.environ.get("NIMOOS_EVENT_LOG_TTL_DAYS", "30") or 30)
+
+
+def _ttl_days(raw: str | None, default: int = 30) -> int:
+    """Parse NIMOOS_EVENT_LOG_TTL_DAYS defensively: garbage or <1 → default
+    (a bad value must not stop the agent from starting, and 0/negative would
+    delete in-flight runs' rows)."""
+    try:
+        v = int(str(raw).strip()) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 1 else default
+
+
+EVENT_LOG_TTL_DAYS = _ttl_days(os.environ.get("NIMOOS_EVENT_LOG_TTL_DAYS"))
 SWEEP_BATCH = 20000            # rows per DELETE batch (bounds the WAL spike)
 
 

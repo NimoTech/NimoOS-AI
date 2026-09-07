@@ -230,3 +230,9 @@ def test_ttl_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("NIMOOS_EVENT_LOG_TTL_DAYS")
         importlib.reload(rs)
+
+
+def test_ttl_days_parser_is_defensive():
+    assert rs._ttl_days(None) == 30 and rs._ttl_days("") == 30
+    assert rs._ttl_days("7") == 7 and rs._ttl_days(" 12 ") == 12
+    assert rs._ttl_days("garbage") == 30 and rs._ttl_days("0") == 30 and rs._ttl_days("-3") == 30
