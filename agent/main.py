@@ -298,6 +298,14 @@ async def _attachments_startup():
     except Exception as e:  # noqa: BLE001 — must never block startup
         _LOG.warning("tool_output sweep failed: %s", e)
 
+    try:
+        from run_sink import sweep_event_log as _sweep_events
+        n = _sweep_events(_db())
+        if n:
+            _LOG.warning("event_log: swept %d rows older than the retention window", n)
+    except Exception as e:  # noqa: BLE001 — must never block startup
+        _LOG.warning("event_log sweep failed: %s", e)
+
 
 @app.on_event("startup")
 async def _tracing_startup():
