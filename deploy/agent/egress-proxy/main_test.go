@@ -74,12 +74,13 @@ func lanListener(t *testing.T) net.Listener {
 	return nil
 }
 
-func TestHandleConnectHijackUnsupported(t *testing.T) {
-	// Start a real TCP listener so net.Dial inside handleConnect succeeds.
-	// Loopback CONNECTs are denied (control plane), so bind a LAN address.
+func TestHandleConnectInternalDeniedWithoutPanic(t *testing.T) {
+	// Formerly asserted the "no Hijacker → 500" path via a loopback CONNECT.
+	// CONNECT to any internal address is now a control-plane deny (rule 3),
+	// so an internal listener is never dialed; the test keeps the no-panic
+	// guarantee on a ResponseRecorder and pins the 403 for a LAN target.
 	ln := lanListener(t)
 	defer ln.Close()
-	// Accept connections in background to prevent handleConnect from blocking.
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -89,25 +90,12 @@ func TestHandleConnectHijackUnsupported(t *testing.T) {
 			c.Close()
 		}
 	}()
-
-	// Point confirm URL to a localhost mock that always allows, so TOFU passes.
-	confirmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(confirmResp{Allow: true})
-	}))
-	defer confirmSrv.Close()
-	old := confirmURL
-	confirmURL = confirmSrv.URL
-	defer func() { confirmURL = old }()
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
 
-	// A LAN address is internal, so TOFU is skipped entirely.
 	req := httptest.NewRequest(http.MethodConnect, "https://"+ln.Addr().String(), nil)
 	req.Host = ln.Addr().String()
-
 	rw := httptest.NewRecorder()
-
-	// Must not panic.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -116,9 +104,8 @@ func TestHandleConnectHijackUnsupported(t *testing.T) {
 		}()
 		handleConnect(rw, req)
 	}()
-
-	if rw.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500, got %d", rw.Code)
+	if rw.Code != http.StatusForbidden {
+		t.Errorf("CONNECT to a LAN listener: want 403, got %d body=%s", rw.Code, rw.Body.String())
 	}
 }
 
@@ -889,17 +876,17 @@ func TestControlPlanePortRegisteredFromConfig(t *testing.T) {
 	defer resetControlPlanePorts()
 	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1:8282/internal/egress-confirm")
 	for _, p := range []string{"8888", "8889", "8282"} {
-		if !controlPlanePorts[p] {
+		if !isControlPlanePort(p) {
 			t.Errorf("port %s should be control plane", p)
 		}
 	}
-	if controlPlanePorts["80"] {
+	if isControlPlanePort("80") {
 		t.Error("80 must not be control plane")
 	}
 	// A confirm URL without an explicit port implies the scheme default.
 	resetControlPlanePorts()
 	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1/internal/egress-confirm")
-	if !controlPlanePorts["80"] {
+	if !isControlPlanePort("80") {
 		t.Error("confirm URL without port should register the scheme default 80")
 	}
 }
@@ -1014,7 +1001,7 @@ func TestHopByHopStripping(t *testing.T) {
 // calling the Control function directly with a mismatched IP.
 func TestAntiRebindingCheck(t *testing.T) {
 	// Classified as external (false), but IP is internal → should reject.
-	dialer := secureDialer(false) // classified external
+	dialer := secureDialer(false, false, "/") // classified external
 
 	// The Control hook runs synchronously before connect(), so the Dial must
 	// return an error that originates from our rebinding check — not from a
@@ -1031,7 +1018,7 @@ func TestAntiRebindingCheck(t *testing.T) {
 
 // TestAntiRebindingCheckInternalToExternal: classified as internal but IP is external → reject.
 func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
-	dialer := secureDialer(true) // classified internal
+	dialer := secureDialer(true, false, "/") // classified internal
 
 	// Try to connect to an external IP (8.8.8.8) when classified as internal.
 	// The Control hook must fire before the OS connect attempt and return an
@@ -1052,7 +1039,7 @@ func TestAntiRebindingCheckInternalToExternal(t *testing.T) {
 // DNS-rebinding bypass where the first resolved IP is a dead internal address and
 // the actual dial lands on the metadata endpoint.
 func TestAntiRebindingCheckMetadata(t *testing.T) {
-	dialer := secureDialer(true) // classified internal (169.254/16 is internal)
+	dialer := secureDialer(true, false, "/") // classified internal (169.254/16 is internal)
 
 	_, err := dialer.Dial("tcp", "169.254.169.254:80")
 	if err == nil {
@@ -1556,5 +1543,97 @@ func TestDNSCapDisabled(t *testing.T) {
 	long := buildDNSQuery("aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccc.attacker.com")
 	if dnsShouldDrop("udp", long) {
 		t.Error("cap disabled (0) should never drop")
+	}
+}
+
+func TestControlPlaneConnectAnyInternalDenied(t *testing.T) {
+	// Review finding (2026-09-07): the container runs with network_mode=host,
+	// so LAN/bridge addresses are dialable. `CONNECT 192.168.1.143:80` would be
+	// an uninspected byte pipe to the Gateway over which the sandbox writes
+	// /v1/ai/%5Finternal/... with the mounted token. Internal traffic has no
+	// need of tunnels here: deny CONNECT to every internal target, not just
+	// loopback. (No listener needed — the deny happens before the dial.)
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+	for _, h := range []string{"192.168.1.143:80", "10.0.0.5:443", "172.17.0.1:8080", "169.254.7.2:443", "[fd00::1]:443"} {
+		req := httptest.NewRequest(http.MethodConnect, "https://"+h, nil)
+		req.Host = h
+		rw := httptest.NewRecorder()
+		handleConnect(rw, req)
+		if rw.Code != http.StatusForbidden {
+			t.Errorf("CONNECT %s: want 403, got %d body=%s", h, rw.Code, rw.Body.String())
+		}
+	}
+}
+
+func TestControlPlaneProxySelfDenied(t *testing.T) {
+	// The proxy must not be chainable through itself (unbounded goroutine/fd
+	// growth): its own listen host:port is denied on both handlers, and on
+	// the listen IP specifically — the port alone is not loopback.
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1:8282/internal/egress-confirm")
+
+	req := httptest.NewRequest(http.MethodGet, "http://169.254.7.1:8888/", nil)
+	req.Host = "169.254.7.1:8888"
+	rw := httptest.NewRecorder()
+	proxyPlainHTTP(rw, req)
+	if rw.Code != http.StatusForbidden {
+		t.Errorf("plain HTTP to the proxy itself: want 403, got %d", rw.Code)
+	}
+	creq := httptest.NewRequest(http.MethodConnect, "https://169.254.7.1:8888", nil)
+	creq.Host = "169.254.7.1:8888"
+	crw := httptest.NewRecorder()
+	handleConnect(crw, creq)
+	if crw.Code != http.StatusForbidden {
+		t.Errorf("CONNECT to the proxy itself: want 403, got %d", crw.Code)
+	}
+}
+
+func TestSecureDialerEnforcesControlPlaneAtDialTime(t *testing.T) {
+	// Critical review finding: the anti-rebinding Control hook re-checked
+	// only internal-vs-external. Loopback IS internal, so a hostname whose
+	// A records are [dead LAN IP, 127.0.0.1] classified internal, passed
+	// every handler-level rule, and the dialer's address fallback landed on
+	// 127.0.0.1:8889 (grant) or :8282 (agent) — deterministically, no race.
+	// The hook must apply the same rules to the IP it is actually dialing.
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1:8282/internal/egress-confirm")
+
+	// classified internal (from a LAN A record), plain HTTP, ordinary path:
+	// dialing the grant port on loopback must fail in the hook.
+	d := secureDialer(true, false, "/grant")
+	if err := d.Control("tcp", "127.0.0.1:8889", nil); err == nil {
+		t.Error("dial-time: loopback control-plane port must be denied")
+	}
+	// same request, but the fallback address carries an internal path
+	if err := d.Control("tcp", "127.0.0.1:39811", nil); err != nil {
+		t.Errorf("dial-time: ordinary loopback port with a non-internal path should pass, got %v", err)
+	}
+	d2 := secureDialer(true, false, "/v1/ai/_internal/agent/x")
+	if err := d2.Control("tcp", "127.0.0.1:39811", nil); err == nil {
+		t.Error("dial-time: internal path to an internal IP must be denied")
+	}
+	// CONNECT classified internal: any internal fallback IP is denied.
+	d3 := secureDialer(true, true, "")
+	if err := d3.Control("tcp", "127.0.0.1:8282", nil); err == nil {
+		t.Error("dial-time: CONNECT landing on loopback must be denied")
+	}
+	if err := d3.Control("tcp", "10.0.0.5:443", nil); err == nil {
+		t.Error("dial-time: CONNECT landing on a LAN IP must be denied")
+	}
+	// The proxy itself.
+	if err := secureDialer(true, false, "/").Control("tcp", "169.254.7.1:8888", nil); err == nil {
+		t.Error("dial-time: the proxy's own listen address must be denied")
+	}
+	// External classification with an external IP and a control-plane port
+	// number is fine — the port rule is about internal IPs only.
+	if err := secureDialer(false, false, "/").Control("tcp", "93.184.216.34:80", nil); err != nil {
+		t.Errorf("dial-time: external 80 should pass, got %v", err)
 	}
 }
