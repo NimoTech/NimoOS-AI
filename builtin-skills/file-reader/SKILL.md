@@ -33,6 +33,9 @@ read_document reports it is not authorized, ask the user to grant access to
 that folder.
 
 ### How to answer a question ACROSS documents
+For broad or multi-part questions ("list all", "compare", "everything about
+X") prefer the deep-search skill: it plans sub-queries and cites every
+statement. The steps below are enough when two or three documents settle it.
 1. `nimoos_search(query, sources="semantic")` to find the most relevant files.
 2. For the top hits, call `read_document(file_id)` to read their content.
 3. Synthesize an answer grounded in what you read; cite each source file

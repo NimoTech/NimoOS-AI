@@ -35,7 +35,7 @@ func RebuildRuntimeView(s *SkillsStore, userID string, uninstalled, disabled map
 	}
 
 	// Generate a unique versioned dir name. Time-based suffix is enough —
-	// rebuilds for the same user are serialised by the caller's lock.
+	// rebuilds for the same user are serialised by skillsService.rebuildLock.
 	verDir := filepath.Join(rtDir, userID+".v"+fmt.Sprintf("%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(verDir, 0o755); err != nil {
 		return err
@@ -111,12 +111,15 @@ func sweepStaleRuntimeArtifacts(rtDir, userID, keepDir string) {
 	}
 	verPrefix := userID + ".v"
 	tmpPrefix := userID + ".tmp-"
+	// Belt and braces beside the per-user lock: never remove whatever the
+	// live <uid> symlink points at, even if it is not keepDir.
+	live, _ := os.Readlink(filepath.Join(rtDir, userID))
 	for _, e := range entries {
 		name := e.Name()
 		full := filepath.Join(rtDir, name)
 		switch {
 		case strings.HasPrefix(name, verPrefix):
-			if full == keepDir {
+			if full == keepDir || full == live {
 				continue
 			}
 			_ = os.RemoveAll(full)
