@@ -16,7 +16,9 @@ import stat
 import time
 from typing import Optional
 
+import tool_output as _tool_output
 from audit import audit as _audit
+from fences import fence_untrusted
 from fs import paths, ignore, ownership, staging, access_request
 from fs.snapshots import SnapshotTooLarge
 
@@ -180,6 +182,18 @@ async def read_file(ctx, path: str) -> str:
     if not os.path.isfile(abs_):
         return f"Error: not a file: {abs_}"
     size = os.path.getsize(abs_)
+    if (_tool_output.is_offload_path(abs_)
+            and size > _tool_output.OFFLOAD_THRESHOLD_CHARS):
+        # This file IS a saved tool result. Returning it whole would offload
+        # it again into a duplicate copy (F3: no re-offload loop) — return a
+        # fenced head plus pointer to read_file_lines instead.
+        with open(abs_, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        return (fence_untrusted("tool-output", text[:_tool_output.PREVIEW_HEAD],
+                                 cap=_tool_output.PREVIEW_HEAD + 100)
+                + f"\n[offloaded result: {size} bytes at {abs_}. This file is "
+                  "already a saved tool result; read it in slices with "
+                  "read_file_lines(path, start, end), ~50-100 lines per call.]")
     if size > READ_MAX_BYTES:
         return (f"<file too large: {size} bytes; "
                 f"use read_file_lines or edit_file>")
@@ -187,7 +201,8 @@ async def read_file(ctx, path: str) -> str:
     if bm:
         return bm
     with open(abs_, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+        text = f.read()
+    return _fence_if_offload(abs_, text)
 
 
 async def read_file_lines(ctx, path: str, start: int, end: int) -> str:
@@ -206,7 +221,15 @@ async def read_file_lines(ctx, path: str, start: int, end: int) -> str:
                 break
             if i >= start:
                 out.append(line)
-    return "".join(out)
+    return _fence_if_offload(abs_, "".join(out))
+
+
+def _fence_if_offload(abs_: str, text: str) -> str:
+    """Offloaded tool results are external content (web pages, logs) that the
+    agent did not author: fence them on the way back in (L3 guardrail)."""
+    if text and _tool_output.is_offload_path(abs_):
+        return fence_untrusted("tool-output", text, cap=len(text) + 1) or text
+    return text
 
 
 # ---------- write tools ----------
