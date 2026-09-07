@@ -136,6 +136,24 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	require.NotContains(t, m.Description, "\n")
 	require.NotContains(t, m.Description, "<")
 	require.LessOrEqual(t, len([]rune(m.Description)), 256)
+	// Trigger surface: the first cut only matched questions that named the
+	// knowledge base; the model answered "list all X / compare A and B" from
+	// memory. The description must lead with those question shapes and say
+	// the answer comes from the user's files rather than memory, and the
+	// examples must include questions that never mention docs or a knowledge
+	// base.
+	for _, want := range []string{"rather than memory", "list all", "compare"} {
+		require.Contains(t, strings.ToLower(m.Description), want)
+	}
+	require.GreaterOrEqual(t, len(m.Examples), 4)
+	bare := 0
+	for _, ex := range m.Examples {
+		l := strings.ToLower(ex)
+		if !strings.Contains(l, "doc") && !strings.Contains(l, "knowledge") && !strings.Contains(l, "file") && !strings.Contains(l, "note") {
+			bare++
+		}
+	}
+	require.GreaterOrEqual(t, bare, 2, "at least two examples must not name docs/files/notes")
 
 	b, err := os.ReadFile(filepath.Join(store.BuiltinPath("deep-search"), "SKILL.md"))
 	require.NoError(t, err)
