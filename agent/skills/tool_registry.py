@@ -30,6 +30,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     # Intel2408 eval: 15/55 answers lost to max_turns for this reason).
     "nimoos_search", "read_document", "read_file_chunk", "read_skill_file",
     "remember", "forget", "recall",
+    "update_plan", "delegate",
 })
 
 

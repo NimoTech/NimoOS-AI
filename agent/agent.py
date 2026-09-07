@@ -1156,7 +1156,8 @@ class AgentRunner:
                     provider_type=provider_type, window=_win, conn=self._conn,
                     summarize_fn=_mid_summarize, overhead_tokens=_overhead,
                     summary=_S0 or "", persist_prefix_len=len(persist_prefix),
-                    compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)))
+                    compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)),
+                    plan=db_module.get_plan_json(self._conn, session_id), sink=sink)
                 # Pre-seed the BASE prompt (before summary_block was appended
                 # just above) so compaction_filter._with_summary rebuilds
                 # base+block idempotently across every mid-run call instead of
@@ -1169,7 +1170,7 @@ class AgentRunner:
                 _ctx = _rc.RunCtx(
                     session_id=session_id, user_id=str(user_id), model_name=model_name,
                     provider_type=provider_type, window=context_compaction.CLOUD_CONTEXT_WINDOW,
-                    compaction_enabled=False)
+                    compaction_enabled=False, sink=sink)
 
             agent = Agent(
                 name="NimoOS Agent",

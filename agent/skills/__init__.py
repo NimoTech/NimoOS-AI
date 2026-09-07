@@ -17,6 +17,7 @@ from skills.search import SEARCH_TOOLS
 from skills.memory import MEMORY_TOOLS
 from skills.notes import NOTES_TOOLS
 from skills.web import WEB_TOOLS
+from skills.orchestration import ORCHESTRATION_TOOLS
 
 # Wiki tools — write tools added in Task 7.
 WIKI_TOOLS = [
@@ -28,4 +29,4 @@ ALL_TOOLS = (APP_TOOLS + STORAGE_TOOLS + HEALTHCHECK_TOOLS
              + MESSAGEBUS_TOOLS + FS_TOOLS + SHELL_TOOLS + PHOTOS_TOOLS
              + WIKI_TOOLS + SKILLS_REGISTRY_TOOLS + SEARCH_TOOLS + MCP_ADMIN_TOOLS
              + TOOLBOX_TOOLS + TASKS_ADMIN_TOOLS + MEMORY_TOOLS + NOTES_TOOLS
-             + WEB_TOOLS)
+             + WEB_TOOLS + ORCHESTRATION_TOOLS)
