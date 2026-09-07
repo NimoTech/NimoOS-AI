@@ -27,7 +27,7 @@ func TestIsInternal(t *testing.T) {
 		"169.254.7.1":  true,
 		"8.8.8.8":      false,
 		"1.1.1.1":      false,
-		"::1":           true,
+		"::1":          true,
 		"2001:4860::1": false,
 		// IPv4-mapped IPv6 aliases for internal addresses must be treated as internal.
 		"::ffff:192.168.1.1": true,
@@ -49,12 +49,35 @@ func TestIsInternal(t *testing.T) {
 // TestHandleConnectHijackUnsupported ensures handleConnect does not panic and
 // returns 500 when the ResponseWriter does not implement http.Hijacker.
 // httptest.NewRecorder() intentionally does NOT implement Hijacker.
+// lanListener returns a TCP listener bound to a non-loopback internal
+// (RFC-1918 / link-local / ULA) interface address, or skips the test when the
+// machine has none. CONNECT to loopback is denied outright since the
+// control-plane rules, so tests that need to reach the dial/hijack stage of
+// an *internal* CONNECT must use a LAN address.
+func lanListener(t *testing.T) net.Listener {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skip("cannot enumerate interfaces")
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.IsLoopback() || ipn.IP.To4() == nil || !isInternal(ipn.IP) || isMetadataIP(ipn.IP) {
+			continue
+		}
+		ln, err := net.Listen("tcp", net.JoinHostPort(ipn.IP.String(), "0"))
+		if err == nil {
+			return ln
+		}
+	}
+	t.Skip("no non-loopback internal IPv4 interface to listen on")
+	return nil
+}
+
 func TestHandleConnectHijackUnsupported(t *testing.T) {
 	// Start a real TCP listener so net.Dial inside handleConnect succeeds.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	// Loopback CONNECTs are denied (control plane), so bind a LAN address.
+	ln := lanListener(t)
 	defer ln.Close()
 	// Accept connections in background to prevent handleConnect from blocking.
 	go func() {
@@ -78,7 +101,7 @@ func TestHandleConnectHijackUnsupported(t *testing.T) {
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
 
-	// Use 127.0.0.1 (internal) so TOFU is skipped entirely.
+	// A LAN address is internal, so TOFU is skipped entirely.
 	req := httptest.NewRequest(http.MethodConnect, "https://"+ln.Addr().String(), nil)
 	req.Host = ln.Addr().String()
 
@@ -129,12 +152,12 @@ func mockDNSServer(t *testing.T) (addr string, cleanup func()) {
 			binary.BigEndian.PutUint16(resp[6:8], 1)
 			// Append answer: name pointer to offset 12, type A, class IN, TTL 60, rdlength 4, rdata 127.0.0.2
 			answer := resp[n:]
-			answer[0] = 0xc0 // pointer
-			answer[1] = 0x0c // offset 12 (question section)
-			binary.BigEndian.PutUint16(answer[2:4], 1)    // type A
-			binary.BigEndian.PutUint16(answer[4:6], 1)    // class IN
-			binary.BigEndian.PutUint32(answer[6:10], 60)  // TTL
-			binary.BigEndian.PutUint16(answer[10:12], 4)  // rdlength
+			answer[0] = 0xc0                             // pointer
+			answer[1] = 0x0c                             // offset 12 (question section)
+			binary.BigEndian.PutUint16(answer[2:4], 1)   // type A
+			binary.BigEndian.PutUint16(answer[4:6], 1)   // class IN
+			binary.BigEndian.PutUint32(answer[6:10], 60) // TTL
+			binary.BigEndian.PutUint16(answer[10:12], 4) // rdlength
 			answer[12] = 127
 			answer[13] = 0
 			answer[14] = 0
@@ -162,7 +185,7 @@ func buildDNSQuery(name string) []byte {
 		pkt = append(pkt, byte(len(l)))
 		pkt = append(pkt, []byte(l)...)
 	}
-	pkt = append(pkt, 0x00) // root label
+	pkt = append(pkt, 0x00)       // root label
 	pkt = append(pkt, 0x00, 0x01) // QTYPE A
 	pkt = append(pkt, 0x00, 0x01) // QCLASS IN
 	return pkt
@@ -208,8 +231,8 @@ func mockTCPDNSServer(t *testing.T) (addr string, cleanup func()) {
 				binary.BigEndian.PutUint16(resp[6:8], 1)
 				// Append answer: name pointer, type A, class IN, TTL 60, rdlength 4, rdata 127.0.0.3
 				answer := resp[msgLen:]
-				answer[0] = 0xc0 // pointer
-				answer[1] = 0x0c // offset 12
+				answer[0] = 0xc0                             // pointer
+				answer[1] = 0x0c                             // offset 12
 				binary.BigEndian.PutUint16(answer[2:4], 1)   // type A
 				binary.BigEndian.PutUint16(answer[4:6], 1)   // class IN
 				binary.BigEndian.PutUint32(answer[6:10], 60) // TTL
@@ -658,9 +681,9 @@ func TestGrantServerExpired(t *testing.T) {
 // TestNormalizeIP: alias / rejection cases.
 func TestNormalizeIP(t *testing.T) {
 	cases := []struct {
-		input    string
-		wantNil  bool
-		wantStr  string
+		input   string
+		wantNil bool
+		wantStr string
 	}{
 		// IPv4-mapped → plain IPv4
 		{"::ffff:192.168.1.1", false, "192.168.1.1"},
@@ -760,60 +783,209 @@ func TestPortPolicyExternalHTTPS(t *testing.T) {
 
 // TestInternalAnyPort: internal targets bypass port restrictions.
 func TestInternalAnyPort(t *testing.T) {
+	// Internal (loopback) targets are exempt from the 80/443 port policy —
+	// but only over plain HTTP: CONNECT to loopback is a control-plane deny
+	// (TestControlPlaneConnectLoopbackDenied), so the exemption is exercised
+	// through proxyPlainHTTP against a non-control-plane port.
 	resetConfirmedHosts()
 	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
 
-	// Start a listener on a non-standard port (loopback = internal).
-	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("target listen: %v", err)
-	}
-	defer targetLn.Close()
-	go func() {
-		for {
-			c, err := targetLn.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-
-	targetAddr := targetLn.Addr().String()
-	_, portStr, _ := net.SplitHostPort(targetAddr)
-
-	// Confirm that port is not 80 or 443.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer target.Close()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(target.URL, "http://"))
 	if portStr == "80" || portStr == "443" {
 		t.Skip("got port 80/443 by chance, skip")
 	}
 
-	// CONNECT to internal address on non-80/443 port.
-	req := httptest.NewRequest(http.MethodConnect, "https://"+targetAddr, nil)
-	req.Host = targetAddr
+	req := httptest.NewRequest(http.MethodGet, target.URL+"/api/ok", nil)
+	req.Host = strings.TrimPrefix(target.URL, "http://")
 	rw := httptest.NewRecorder()
+	proxyPlainHTTP(rw, req)
 
-	handleConnect(rw, req)
-
-	// Should get 500 (hijack unsupported from httptest.ResponseRecorder),
-	// NOT 403. 500 means we passed port check and reached dial/hijack stage.
-	if rw.Code == http.StatusForbidden {
-		t.Errorf("internal port %s should NOT be blocked, got 403", portStr)
+	if rw.Code != http.StatusTeapot {
+		t.Errorf("internal port %s over plain HTTP should be proxied (418), got %d body=%s", portStr, rw.Code, rw.Body.String())
 	}
-	// 500 is expected because httptest.ResponseRecorder doesn't support Hijack.
-	if rw.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 (hijack unsupported for internal), got %d", rw.Code)
+}
+
+// ─── Control-plane deny (2026-09-07) ─────────────────────────────────────────
+//
+// The sandbox's only route is this proxy, and the proxy dials from the
+// container's default netns — so "127.0.0.1" seen by a sandboxed command is
+// the container loopback where the grant server, the Python agent
+// (/internal/egress-confirm) and every host microservice with an _internal
+// route live. Before these rules an internal target skipped every check:
+// a plain `curl -X POST http://127.0.0.1:8889/grant` self-issued an upload
+// ticket, and the mounted ai_internal.token opened Go's _internal endpoints
+// (provider credentials). The control plane must not be reachable through
+// its own data plane.
+
+func TestIsInternalPath(t *testing.T) {
+	cases := map[string]bool{
+		"/_internal/files":         true,
+		"/_internal":               true,
+		"/internal/egress-confirm": true,
+		"/internal":                true,
+		"//_internal/files":        true,
+		"/./_internal/files":       true,
+		"/api/../_internal/files":  true,
+		"/%5Finternal/files":       true,
+		"/_INTERNAL/files":         true,
+		"/v1/ai/_internal/agent/x": true,
+		"/v1/wiki/_internal/files": true,
+		"/api/internal_notes":      false,
+		"/internals/x":             false,
+		"/v1/parser/stats":         false,
+		"/":                        false,
+		"":                         false,
+		"/_internalx/y":            false,
+	}
+	for in, want := range cases {
+		if got := isInternalPath(in); got != want {
+			t.Errorf("isInternalPath(%q)=%v want %v", in, got, want)
+		}
+	}
+}
+
+func TestControlPlanePortDenied(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+
+	// A stand-in grant server; the port is registered as control plane the
+	// way main() registers the real one.
+	grant := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer grant.Close()
+	hostport := strings.TrimPrefix(grant.URL, "http://")
+	_, port, _ := net.SplitHostPort(hostport)
+	registerControlPlanePort(port)
+
+	req := httptest.NewRequest(http.MethodPost, grant.URL+"/grant", strings.NewReader(`{"host":"evil.example","max_bytes":1,"ttl_sec":60}`))
+	req.Host = hostport
+	rw := httptest.NewRecorder()
+	proxyPlainHTTP(rw, req)
+	if rw.Code != http.StatusForbidden {
+		t.Fatalf("POST to control-plane port via plain HTTP: want 403, got %d body=%s", rw.Code, rw.Body.String())
+	}
+
+	// Same port over CONNECT.
+	creq := httptest.NewRequest(http.MethodConnect, "https://"+hostport, nil)
+	creq.Host = hostport
+	crw := httptest.NewRecorder()
+	handleConnect(crw, creq)
+	if crw.Code != http.StatusForbidden {
+		t.Fatalf("CONNECT to control-plane port: want 403, got %d", crw.Code)
+	}
+}
+
+func TestControlPlanePortRegisteredFromConfig(t *testing.T) {
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1:8282/internal/egress-confirm")
+	for _, p := range []string{"8888", "8889", "8282"} {
+		if !controlPlanePorts[p] {
+			t.Errorf("port %s should be control plane", p)
+		}
+	}
+	if controlPlanePorts["80"] {
+		t.Error("80 must not be control plane")
+	}
+	// A confirm URL without an explicit port implies the scheme default.
+	resetControlPlanePorts()
+	registerControlPlaneFromConfig("169.254.7.1:8888", "127.0.0.1:8889", "http://127.0.0.1/internal/egress-confirm")
+	if !controlPlanePorts["80"] {
+		t.Error("confirm URL without port should register the scheme default 80")
+	}
+}
+
+func TestInternalPathDeniedOnInternalTargets(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+
+	hit := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	hostport := strings.TrimPrefix(target.URL, "http://")
+
+	for _, pth := range []string{"/_internal/files", "/v1/ai/_internal/agent/provider-credentials?user_id=1", "/internal/egress-confirm", "//_internal/files", "/%5Finternal/x"} {
+		req := httptest.NewRequest(http.MethodGet, target.URL+pth, nil)
+		req.Host = hostport
+		rw := httptest.NewRecorder()
+		proxyPlainHTTP(rw, req)
+		if rw.Code != http.StatusForbidden {
+			t.Errorf("%s: want 403, got %d", pth, rw.Code)
+		}
+	}
+	if hit != 0 {
+		t.Fatalf("target must never be reached for internal paths, hits=%d", hit)
+	}
+
+	// A non-internal path on the same internal host is still proxied.
+	req := httptest.NewRequest(http.MethodGet, target.URL+"/v1/parser/stats", nil)
+	req.Host = hostport
+	rw := httptest.NewRecorder()
+	proxyPlainHTTP(rw, req)
+	if rw.Code != http.StatusOK || hit != 1 {
+		t.Fatalf("ordinary internal path: want 200 and one hit, got %d hits=%d", rw.Code, hit)
+	}
+}
+
+func TestControlPlaneConnectLoopbackDenied(t *testing.T) {
+	resetConfirmedHosts()
+	defer resetConfirmedHosts()
+	resetControlPlanePorts()
+	defer resetControlPlanePorts()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	hostport := ln.Addr().String()
+
+	// Any loopback port, even one that is not control plane: a CONNECT
+	// tunnel would hide the request path from the /_internal/ rule.
+	req := httptest.NewRequest(http.MethodConnect, "https://"+hostport, nil)
+	req.Host = hostport
+	rw := httptest.NewRecorder()
+	handleConnect(rw, req)
+	if rw.Code != http.StatusForbidden {
+		t.Fatalf("CONNECT to loopback: want 403, got %d", rw.Code)
+	}
+
+	// IPv4-mapped IPv6 loopback spelled differently must not slip through.
+	_, port, _ := net.SplitHostPort(hostport)
+	for _, h := range []string{"[::ffff:127.0.0.1]:" + port, "[::1]:" + port, "localhost:" + port} {
+		req := httptest.NewRequest(http.MethodConnect, "https://"+h, nil)
+		req.Host = h
+		rw := httptest.NewRecorder()
+		handleConnect(rw, req)
+		if rw.Code != http.StatusForbidden {
+			t.Errorf("CONNECT to %s: want 403, got %d", h, rw.Code)
+		}
 	}
 }
 
 // TestHopByHopStripping verifies that hop-by-hop headers are removed.
 func TestHopByHopStripping(t *testing.T) {
 	h := http.Header{
-		"Content-Type":        {"application/json"},
-		"Connection":          {"keep-alive, X-Custom-Hop"},
-		"Keep-Alive":          {"timeout=5"},
-		"Transfer-Encoding":   {"chunked"},
-		"X-Custom-Hop":        {"value"},
-		"X-Real-Header":       {"keep-me"},
+		"Content-Type":      {"application/json"},
+		"Connection":        {"keep-alive, X-Custom-Hop"},
+		"Keep-Alive":        {"timeout=5"},
+		"Transfer-Encoding": {"chunked"},
+		"X-Custom-Hop":      {"value"},
+		"X-Real-Header":     {"keep-me"},
 	}
 	removeHopByHop(h)
 
@@ -1184,12 +1356,18 @@ func TestUploadGateDenyNoDataLeak(t *testing.T) {
 func TestSyntheticGrantIsBounded(t *testing.T) {
 	old := grantTTL
 	defer func() { grantTTL = old }()
-	grantStore.Lock(); grantStore.m = make(map[string]*ticket); grantStore.Unlock()
+	grantStore.Lock()
+	grantStore.m = make(map[string]*ticket)
+	grantStore.Unlock()
 	grantTTL = 10 * time.Minute
 	// Simulate what handleConnect registers after a threshold confirm:
 	registerSyntheticGrant("h1", 100_000) // helper introduced by this task
-	grantStore.Lock(); tk := grantStore.m["h1"]; grantStore.Unlock()
-	if tk == nil { t.Fatal("grant not registered") }
+	grantStore.Lock()
+	tk := grantStore.m["h1"]
+	grantStore.Unlock()
+	if tk == nil {
+		t.Fatal("grant not registered")
+	}
 	if tk.MaxBytes > 100_000+grantHeadroom {
 		t.Fatalf("grant budget unbounded: %d", tk.MaxBytes)
 	}
