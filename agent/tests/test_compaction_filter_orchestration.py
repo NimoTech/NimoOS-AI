@@ -204,6 +204,17 @@ async def test_hooks_track_peak_input_tokens_across_calls():
 
 
 @pytest.mark.asyncio
+async def test_hooks_count_llm_calls():
+    to.OFFLOAD_DIR_VAR.set("")
+    ctx = _ctx(window=100)
+    class U: input_tokens = 10
+    class R: usage = U()
+    await cf.ContextHooks().on_llm_end(None, None, R())
+    await cf.ContextHooks().on_llm_end(None, None, R())
+    assert ctx.extra["llm_calls"] == 2
+
+
+@pytest.mark.asyncio
 async def test_hooks_tolerate_missing_usage():
     to.OFFLOAD_DIR_VAR.set("")
     ctx = _ctx(window=100)

@@ -180,3 +180,55 @@ async def test_delegate_uses_final_output_or_streamed_text(tmp_path):
          patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
         to.CALL_ID_VAR.set("call_p6")
         assert await orch._delegate_impl("g", "", "", 15) == "ab"
+
+
+@pytest.mark.asyncio
+async def test_delegate_suppresses_duplicate_consolidated_message(tmp_path):
+    # Chat-completions-shaped providers (DeepSeek, Ollama, OpenAI-compatible)
+    # stream message_delta pieces AND then emit one consolidated "message"
+    # item for the same text. That consolidated item must not be forwarded
+    # to the nested event stream (it would render the answer twice in the
+    # SubagentCard/transcript) nor double-counted in the returned text.
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    inner = [{"type": "message_delta", "content": "he"},
+             {"type": "message_delta", "content": "llo"},
+             {"type": "message", "content": "hello"}]
+
+    def _convert(e, call_names, state):
+        if e.get("type") == "message_delta":
+            state["streamed_message"] = True
+        return e
+
+    with patch("skills.orchestration.Runner.run_streamed", return_value=_fake_stream(inner, final=None)), \
+         patch("skills.orchestration._convert_event", side_effect=_convert):
+        to.CALL_ID_VAR.set("call_p7")
+        out = await orch._delegate_impl("g", "", "", 15)
+    assert out == "hello"                      # answer appears once in the returned text
+    wrapped = [e for e in sink.events if e["type"] == "subagent_event"]
+    forwarded_types = [w["event"]["type"] for w in wrapped]
+    assert forwarded_types == ["message_delta", "message_delta"]   # consolidated "message" NOT forwarded
+
+
+@pytest.mark.asyncio
+async def test_delegate_cancel_mid_stream_emits_subagent_end_and_propagates(tmp_path):
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    started = asyncio.Event()
+
+    async def _slow():
+        yield {"type": "message_delta", "content": "partial"}
+        started.set()
+        await asyncio.sleep(10)
+        yield {"type": "message_delta", "content": "never"}
+
+    m = SimpleNamespace(stream_events=_slow, final_output=None, cancel=lambda *a, **k: None)
+    with patch("skills.orchestration.Runner.run_streamed", return_value=m), \
+         patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
+        to.CALL_ID_VAR.set("call_p8")
+        task = asyncio.ensure_future(orch._delegate_impl("g", "", "", 15))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert sink.events[-1]["type"] == "subagent_end" and sink.events[-1]["status"] == "cancelled"

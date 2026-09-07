@@ -70,7 +70,22 @@ DELEGATE_TIMEOUT = 600          # seconds, wall clock for the whole sub-run
 DELEGATE_RESULT_OFFLOAD_CHARS = 4000
 DELEGATE_PARTIAL_CHARS = 2000
 DELEGATE_CONCURRENCY = 3
-_SEM = asyncio.Semaphore(DELEGATE_CONCURRENCY)
+# Lazily bound per running loop rather than a single Semaphore built at
+# import time: a module-level asyncio.Semaphore binds its internals to
+# whichever loop first awaits it, which is a trap the moment anything runs
+# delegate() from more than one loop (e.g. per-test loops under pytest).
+_SEM_BY_LOOP: "dict[int, asyncio.Semaphore]" = {}
+
+
+def _sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _SEM_BY_LOOP.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(DELEGATE_CONCURRENCY)
+        _SEM_BY_LOOP[key] = sem
+    return sem
+
 
 SUBAGENT_PROMPT = (
     "You are a focused sub-agent of the NimoOS assistant, working on ONE delegated goal for "
@@ -96,6 +111,9 @@ def _child_user_message(goal: str, context: str, expected_output: str) -> str:
     return "\n\n".join(parts)
 
 
+_AGENT_MOD = None  # cached by _convert_event below — set once, not per event
+
+
 def _convert_event(event, call_names, state):
     """Lazy proxy onto agent._convert_event.
 
@@ -105,9 +123,14 @@ def _convert_event(event, call_names, state):
     the import to call time breaks the cycle; by the time this actually
     runs, `agent` module has always finished importing. Tests patch
     `skills.orchestration._convert_event` directly, which this satisfies.
+    The module object is cached after the first call so a chatty child
+    doesn't pay an `__import__` lookup per stream event.
     """
-    import agent as _agent  # noqa: PLC0415 — lazy: agent imports skills
-    return _agent._convert_event(event, call_names, state)
+    global _AGENT_MOD
+    if _AGENT_MOD is None:
+        import agent as _agent  # noqa: PLC0415 — lazy: agent imports skills
+        _AGENT_MOD = _agent
+    return _AGENT_MOD._convert_event(event, call_names, state)
 
 
 class _WrapSink:
@@ -169,6 +192,14 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
     ctx_token = rc.RUN_CTX_VAR.set(child_ctx)
     import mcp_client.client as _mc  # noqa: PLC0415 — avoid import cycle at module scope
     agent_token = _mc.RUN_AGENT_VAR.set(child)
+    import skills.tool_gating as _tg  # noqa: PLC0415 — avoid import cycle at module scope
+    # Copy (not alias) the inherited unlocked-category set: current_unlocked()
+    # returns the SAME set object the parent's expand_tools mutates in place,
+    # so without this copy a child's own expand_tools call would leak new
+    # categories into the parent's run once the contextvar's underlying
+    # object is shared. Inheriting downward (child starts unlocked like the
+    # parent) is intended; leaking upward is not.
+    unlocked_token = _tg.UNLOCKED_VAR.set(set(_tg.current_unlocked()))
     try:
         cfg = phoenix_tracing.build_trace_run_config(
             phoenix_tracing.tracing_enabled_now(), parent_ctx.session_id, parent_ctx.user_id,
@@ -185,7 +216,13 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
                     continue
                 if sse["type"] == "message_delta":
                     text_parts.append(str(sse.get("content", "")))
-                elif sse["type"] == "message" and not state["streamed_message"]:
+                elif sse["type"] == "message":
+                    if state["streamed_message"]:
+                        # The SDK's consolidated message_output_item would
+                        # duplicate the streamed deltas — mirrors agent.py's
+                        # own run loop, which suppresses it for the same
+                        # reason (see its `if et == "message":` branch).
+                        continue
                     text_parts.append(str(sse.get("content", "")))
                 if wrap is not None:
                     await wrap.put(sse)
@@ -200,6 +237,7 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
             return final.strip()
         return "".join(text_parts).strip()
     finally:
+        _tg.UNLOCKED_VAR.reset(unlocked_token)
         _mc.RUN_AGENT_VAR.reset(agent_token)
         rc.RUN_CTX_VAR.reset(ctx_token)
 
@@ -224,16 +262,29 @@ async def _delegate_impl(goal: str, context: str = "", expected_output: str = ""
     turns = max(1, min(turns, DELEGATE_MAX_TURNS))
     call_id = to.CALL_ID_VAR.get("") or f"d{int(time.time() * 1000)}"
     sink = ctx.sink
+    sent_start = False
     if sink is not None:
-        await sink.put({"type": "subagent_start", "call_id": call_id, "goal": str(goal)[:200]})
-    status, result, peak, t0 = "ok", "", 0, time.monotonic()
+        try:
+            await sink.put({"type": "subagent_start", "call_id": call_id, "goal": str(goal)[:200]})
+            sent_start = True
+        except Exception:  # noqa: BLE001 — never raise into the parent run
+            _LOG.warning("delegate: subagent_start emit failed", exc_info=True)
+    status, result, peak, llm_calls, t0 = "ok", "", 0, 0, time.monotonic()
     child_partial: list[str] = []
     holder: dict = {}
-    try:
-        async with _SEM:
-            task = asyncio.ensure_future(run_subagent(
+
+    async def _acquire_and_run():
+        # The concurrency wait is INSIDE the timed task (Minor 7): a child
+        # queued behind DELEGATE_CONCURRENCY other delegates must not be able
+        # to sit past DELEGATE_TIMEOUT before its own run even starts.
+        async with _sem():
+            return await run_subagent(
                 str(goal), str(context or ""), str(expected_output or ""), turns,
-                parent_ctx=ctx, parent_agent=parent_agent, call_id=call_id, holder=holder))
+                parent_ctx=ctx, parent_agent=parent_agent, call_id=call_id, holder=holder)
+
+    try:
+        try:
+            task = asyncio.ensure_future(_acquire_and_run())
             try:
                 result = await asyncio.wait_for(task, timeout=DELEGATE_TIMEOUT)
             finally:
@@ -241,22 +292,43 @@ async def _delegate_impl(goal: str, context: str = "", expected_output: str = ""
                 if cctx is not None:
                     peak = int(getattr(cctx, "peak_input_tokens", 0) or 0)
                     child_partial = list(cctx.extra.get("partial") or [])
-    except asyncio.TimeoutError:
-        status = "timeout"
-        partial = "".join(child_partial)[:DELEGATE_PARTIAL_CHARS]
-        result = f"[delegate failed: timeout after {DELEGATE_TIMEOUT}s; partial: {partial}]"
-    except Exception as exc:  # noqa: BLE001 — never raise into the parent run
-        status = "error"
-        partial = "".join(child_partial)[:DELEGATE_PARTIAL_CHARS]
-        result = f"[delegate failed: {type(exc).__name__}: {exc}; partial: {partial}]"
-    if status == "ok" and len(result) > DELEGATE_RESULT_OFFLOAD_CHARS:
-        path = to.store_output(result, call_id=call_id, tool_name="delegate")
-        if path:
-            result = to.make_placeholder(result, tool_name="delegate", path=path, chars=len(result))
-    if sink is not None:
-        await sink.put({"type": "subagent_end", "call_id": call_id, "status": status,
-                        "turns": turns, "input_tokens_peak": peak,
-                        "elapsed_ms": int((time.monotonic() - t0) * 1000)})
+                    llm_calls = int(cctx.extra.get("llm_calls", 0) or 0)
+        except asyncio.CancelledError:
+            # Parent /cancel, the task watchdog, or the SDK cancelling a
+            # sibling tool call all land here. Record a terminal status for
+            # the finally below and MUST re-raise — cancellation is never
+            # swallowed.
+            status = "cancelled"
+            result = ""
+            raise
+        except asyncio.TimeoutError:
+            status = "timeout"
+            partial = "".join(child_partial)[:DELEGATE_PARTIAL_CHARS]
+            result = f"[delegate failed: timeout after {DELEGATE_TIMEOUT}s; partial: {partial}]"
+        except Exception as exc:  # noqa: BLE001 — never raise into the parent run
+            status = "error"
+            partial = "".join(child_partial)[:DELEGATE_PARTIAL_CHARS]
+            result = f"[delegate failed: {type(exc).__name__}: {exc}; partial: {partial}]"
+        if status == "ok" and not result.strip():
+            result = "[delegate produced no answer]"
+        if status == "ok" and len(result) > DELEGATE_RESULT_OFFLOAD_CHARS:
+            try:
+                path = to.store_output(result, call_id=call_id, tool_name="delegate")
+                if path:
+                    result = to.make_placeholder(result, tool_name="delegate", path=path, chars=len(result))
+            except Exception:  # noqa: BLE001 — offload must never fail the call
+                _LOG.warning("delegate: offload failed", exc_info=True)
+    finally:
+        # Runs on every path — ok/timeout/error/cancelled — so a
+        # subagent_start always gets a terminal subagent_end (event_log/
+        # SubagentCard rely on that pairing). Never raises itself.
+        if sent_start and sink is not None:
+            try:
+                await sink.put({"type": "subagent_end", "call_id": call_id, "status": status,
+                                "turns": llm_calls, "input_tokens_peak": peak,
+                                "elapsed_ms": int((time.monotonic() - t0) * 1000)})
+            except Exception:  # noqa: BLE001 — never raise into the parent run
+                _LOG.warning("delegate: subagent_end emit failed", exc_info=True)
     return result
 
 

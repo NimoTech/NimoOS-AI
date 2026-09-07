@@ -321,6 +321,10 @@ class ContextHooks(RunHooks):
         if ctx is None:
             return
         try:
+            # Counted before the tokens<=0 early return below, so every model
+            # call counts even when usage is missing/zero (spec §7.2:
+            # delegate's subagent_end.turns reports calls actually used).
+            ctx.extra["llm_calls"] = int(ctx.extra.get("llm_calls", 0)) + 1
             usage = getattr(response, "usage", None)
             tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
             if tokens <= 0:
