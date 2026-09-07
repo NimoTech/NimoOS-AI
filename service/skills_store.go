@@ -98,9 +98,16 @@ func (s *SkillsStore) RuntimeUsers() ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if e.Type()&os.ModeSymlink != 0 && !strings.Contains(e.Name(), ".") {
-			out = append(out, e.Name())
+		name := e.Name()
+		// The <uid> view is a symlink; so are orphaned <uid>.tmp-* links from
+		// a crashed swap. Version dirs (<uid>.v*) are directories and the
+		// <uid>.seed stamp is a file, so the symlink test already excludes
+		// them; filter the tmp links by their suffix rather than banning
+		// dots, so a uid shape change cannot silently drop users.
+		if e.Type()&os.ModeSymlink == 0 || strings.Contains(name, ".tmp-") || strings.HasSuffix(name, ".seed") {
+			continue
 		}
+		out = append(out, name)
 	}
 	return out, nil
 }

@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"go.uber.org/zap"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type Skill struct {
@@ -42,6 +44,18 @@ var ErrSkillInvalid = errors.New("invalid skill")
 type skillsService struct {
 	db    *sql.DB
 	store *SkillsStore
+	// rebuildLocks serialises runtime-view rebuilds per user. Two concurrent
+	// rebuilds (agent proxy + skills List landing together right after a
+	// deploy, when every view is stale) would otherwise race: the first
+	// one's sweep deletes the second one's half-built version dir, and the
+	// second then swaps the <uid> symlink onto a directory that no longer
+	// exists — an empty skills index until the next touch.
+	rebuildLocks sync.Map // userID -> *sync.Mutex
+}
+
+func (s *skillsService) rebuildLock(userID string) *sync.Mutex {
+	mu, _ := s.rebuildLocks.LoadOrStore(userID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
 }
 
 // Store gives external access to the underlying disk store (for handler-side
@@ -95,8 +109,18 @@ func (s *skillsService) loadRuntimeFilterMaps(userID string) (uninstalled, disab
 // start re-runs RebuildRuntimeView for every user via
 // rebuildAllRuntimeViews, and EnsureRuntimeView retries on the next touch).
 func (s *skillsService) rebuildAfter(userID string) {
-	u, d, _ := s.loadRuntimeFilterMaps(userID)
-	_ = RebuildRuntimeView(s.store, userID, u, d)
+	mu := s.rebuildLock(userID)
+	mu.Lock()
+	defer mu.Unlock()
+	u, d, err := s.loadRuntimeFilterMaps(userID)
+	if err != nil {
+		zap.L().Warn("skills: load runtime filter maps", zap.String("user", userID), zap.Error(err))
+	}
+	if err := RebuildRuntimeView(s.store, userID, u, d); err != nil {
+		// Not fatal, but never silent: a persistent failure (read-only
+		// .runtime/, ENOSPC) would otherwise make every request rebuild.
+		zap.L().Warn("skills: rebuild runtime view", zap.String("user", userID), zap.Error(err))
+	}
 }
 
 // EnsureRuntimeView builds .runtime/<uid>/ if it's missing or stale. A view

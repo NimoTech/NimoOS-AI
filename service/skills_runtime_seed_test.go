@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -113,5 +114,62 @@ func TestRebuildAllRuntimeViews_CoversUsersWithoutStateRows(t *testing.T) {
 	}
 	if !hasLink(store, "8", "beta") || hasLink(store, "8", "alpha") {
 		t.Fatal("user with rows keeps their overlay and receives the new built-in")
+	}
+}
+
+func TestEnsureRuntimeView_RebuildsWhenSeedStampIsMissing(t *testing.T) {
+	// The real first-upgrade state: views built by a binary that predates the
+	// stamp have a view but no <uid>.seed. They must be treated as stale.
+	root := t.TempDir()
+	store := &SkillsStore{Root: root, SeedVersion: "1"}
+	seedBuiltin(t, store, "alpha")
+	db, _ := NewDB(filepath.Join(root, "ai.db"))
+	defer db.Close()
+	svc := &skillsService{db: db, store: store}
+
+	svc.EnsureRuntimeView("7")
+	if err := os.Remove(store.RuntimeSeedPath("7")); err != nil {
+		t.Fatal(err)
+	}
+	seedBuiltin(t, store, "beta")
+	svc.EnsureRuntimeView("7")
+	if !hasLink(store, "7", "beta") {
+		t.Fatal("a view without a seed stamp must be rebuilt")
+	}
+}
+
+func TestEnsureRuntimeView_ConcurrentStaleTouchesKeepALiveView(t *testing.T) {
+	// Right after a deploy every view is stale and the agent proxy and the
+	// skills List land together. Without serialisation one rebuild's sweep
+	// deleted the other's half-built dir and the <uid> link ended dangling.
+	root := t.TempDir()
+	store := &SkillsStore{Root: root, SeedVersion: "1"}
+	seedBuiltin(t, store, "alpha")
+	db, _ := NewDB(filepath.Join(root, "ai.db"))
+	defer db.Close()
+	svc := &skillsService{db: db, store: store}
+	svc.EnsureRuntimeView("7")
+
+	seedBuiltin(t, store, "beta")
+	store.SeedVersion = "2"
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svc.EnsureRuntimeView("7")
+		}()
+	}
+	wg.Wait()
+
+	target, err := os.Readlink(store.RuntimePath("7"))
+	if err != nil {
+		t.Fatalf("view symlink unreadable: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("view symlink dangling (%s): %v", target, err)
+	}
+	if !hasLink(store, "7", "alpha") || !hasLink(store, "7", "beta") {
+		t.Fatal("rebuilt view must hold both built-ins")
 	}
 }

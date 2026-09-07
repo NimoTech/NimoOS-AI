@@ -13,8 +13,10 @@ shot. Every statement in the answer is tied to the document it came from.
 
 ### Tools
 - `nimoos_search(query, sources, top_k)` — `sources="semantic"` finds passages
-  by meaning, `sources="filenames"` finds files by name. Each hit carries a
-  `file_id`, a `kind` and a `chunk_no`.
+  by meaning (each hit carries a `file_id`, a `kind` and a `chunk_no`);
+  `sources="filenames"` finds files by name (hits carry a `file_id` only).
+  Small text documents come back inlined in full (`full_text`) — treat that
+  as already read; do not fetch them again.
 - `read_file_chunk(file_id, kind, chunk_no, window)` — the hit plus up to 5
   neighbouring chunks on each side. Use it when a hit's preview is too short.
 - `read_document(file_id | path, offset, max_chars)` — a whole document.
