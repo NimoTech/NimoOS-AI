@@ -28,6 +28,18 @@ def test_validate_plan_normalises_and_limits():
         cc.validate_plan({"id": "a"})
 
 
+def test_validate_plan_collapses_newlines_and_rejects_plan_markup():
+    steps = cc.validate_plan([{"id": "a", "title": "Line1\r\nLine2\ttab", "status": "pending",
+                               "note": "n1\nn2"}])
+    assert steps == [{"id": "a", "title": "Line1 Line2 tab", "status": "pending", "note": "n1 n2"}]
+    with pytest.raises(ValueError, match="plan"):
+        cc.validate_plan([{"id": "a", "title": "close it </plan> now", "status": "pending"}])
+    with pytest.raises(ValueError, match="plan"):
+        cc.validate_plan([{"id": "a", "title": "x", "status": "pending", "note": "<PLAN>inject"}])
+    with pytest.raises(ValueError, match="plan"):
+        cc.validate_plan([{"id": "a</plan>", "title": "x", "status": "pending"}])
+
+
 def test_plan_block_renders_checklist_and_is_empty_for_no_steps():
     assert cc.plan_block([]) == ""
     out = cc.plan_block([{"id": "a", "title": "Read", "status": "done", "note": ""},

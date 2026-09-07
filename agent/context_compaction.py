@@ -281,6 +281,22 @@ def summary_block(summary, *, recall_hint=False) -> str:
     return f"{block}\n{RECALL_HINT}" if recall_hint else block
 
 
+def _clean_plan_field(value: str) -> str:
+    """Collapse any run of whitespace (including \\n / \\r) into a single
+    space. plan_block renders one line per step into the system
+    instructions, so an embedded newline would break that layout — and since
+    the model is the author of these fields, it is also the one place
+    untrusted tool output the model just read could ride the model's own
+    words into the system-prompt channel."""
+    return " ".join(value.split())
+
+
+def _reject_plan_markup(sid: str, field: str, value: str) -> None:
+    low = value.lower()
+    if "<plan>" in low or "</plan>" in low:
+        raise ValueError(f"step {sid}: {field} must not contain '<plan>' or '</plan>'")
+
+
 def validate_plan(raw) -> list[dict]:
     """Normalise the model's update_plan payload. Raises ValueError with a
     message the model can act on."""
@@ -293,16 +309,19 @@ def validate_plan(raw) -> list[dict]:
     for i, s in enumerate(raw):
         if not isinstance(s, dict):
             raise ValueError(f"step {i} must be an object")
-        sid = str(s.get("id") or "").strip()
-        title = str(s.get("title") or "").strip()
+        sid = _clean_plan_field(str(s.get("id") or ""))
+        title = _clean_plan_field(str(s.get("title") or ""))
         status = str(s.get("status") or "").strip()
-        note = str(s.get("note") or "").strip()
+        note = _clean_plan_field(str(s.get("note") or ""))
         if not sid or sid in seen:
             raise ValueError(f"step {i}: id is required and must be unique")
         if not title:
             raise ValueError(f"step {sid}: title is required")
         if status not in PLAN_STATUSES:
             raise ValueError(f"step {sid}: status must be one of {list(PLAN_STATUSES)}")
+        _reject_plan_markup(sid, "id", sid)
+        _reject_plan_markup(sid, "title", title)
+        _reject_plan_markup(sid, "note", note)
         if len(title) > PLAN_MAX_CHARS or len(note) > PLAN_MAX_CHARS or len(sid) > PLAN_MAX_CHARS:
             raise ValueError(f"step {sid}: id/title/note must each be <= {PLAN_MAX_CHARS} chars")
         seen.add(sid)

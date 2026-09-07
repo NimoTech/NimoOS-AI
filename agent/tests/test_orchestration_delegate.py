@@ -232,3 +232,168 @@ async def test_delegate_cancel_mid_stream_emits_subagent_end_and_propagates(tmp_
         with pytest.raises(asyncio.CancelledError):
             await task
     assert sink.events[-1]["type"] == "subagent_end" and sink.events[-1]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_child_expand_tools_does_not_persist_to_parent_session(tmp_path, monkeypatch):
+    # Minor 1: a child's in-run expand_tools() must not durably widen the
+    # PARENT session's unlocked-tool set. run_subagent sets
+    # GATING_SESSION_VAR to "" for the child, which makes tool_gating._persist
+    # a no-op — spy on db.set_unlocked_categories (the actual write) to prove
+    # it is never called.
+    import db
+    import skills.tool_gating as tg
+    persisted = []
+    monkeypatch.setattr(db, "set_unlocked_categories", lambda *a, **kw: persisted.append((a, kw)))
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    parent_gate_token = tg.GATING_SESSION_VAR.set("s1")
+    try:
+        def fake_run_streamed(agent, input_messages, **kwargs):
+            # Simulate the child model calling expand_tools mid-run.
+            tg.expand_categories(["apps"])
+            return _fake_stream([])
+        with patch("skills.orchestration.Runner.run_streamed", side_effect=fake_run_streamed), \
+             patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
+            to.CALL_ID_VAR.set("call_gate1")
+            await orch._delegate_impl("g", "", "", 5)
+        assert persisted == []                                  # never written to the DB
+        assert tg.GATING_SESSION_VAR.get("") == "s1"             # parent's var restored after the child
+    finally:
+        tg.GATING_SESSION_VAR.reset(parent_gate_token)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_child_forwards_synthetic_message_for_card(tmp_path):
+    # Minor 2: when the child streams no message/message_delta events at all
+    # (only tool calls, say) but final_output holds the real answer, forward
+    # one synthetic {"type": "message", ...} through the wrap so the
+    # SubagentCard isn't left empty.
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    inner = [{"type": "tool_call", "tool": "read_file", "args": {}, "call_id": "c1"}]
+    with patch("skills.orchestration.Runner.run_streamed",
+              return_value=_fake_stream(inner, final="reasoning answer")), \
+         patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
+        to.CALL_ID_VAR.set("call_p9")
+        out = await orch._delegate_impl("g", "", "", 15)
+    assert out == "reasoning answer"
+    wrapped = [e["event"] for e in sink.events if e["type"] == "subagent_event"]
+    assert wrapped[0]["type"] == "tool_call"
+    assert wrapped[-1] == {"type": "message", "content": "reasoning answer"}
+
+
+@pytest.mark.asyncio
+async def test_streamed_child_does_not_get_a_duplicate_synthetic_message(tmp_path):
+    # The flip side of the above: a child that DID stream a message must not
+    # also get the synthetic one appended.
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    inner = [{"type": "message_delta", "content": "hi"}]
+    with patch("skills.orchestration.Runner.run_streamed",
+              return_value=_fake_stream(inner, final="hi")), \
+         patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
+        to.CALL_ID_VAR.set("call_p10")
+        out = await orch._delegate_impl("g", "", "", 15)
+    assert out == "hi"
+    wrapped = [e["event"] for e in sink.events if e["type"] == "subagent_event"]
+    assert wrapped == inner                                      # no extra synthetic message
+
+
+def test_sem_by_loop_is_weak_keyed_and_reused_per_loop():
+    # Minor 3: keyed on the loop OBJECT via a WeakKeyDictionary, not id(loop)
+    # in a plain dict — two distinct loops get two distinct semaphores, the
+    # same loop reuses the same one, and dead loops don't linger.
+    import weakref
+    assert isinstance(orch._SEM_BY_LOOP, weakref.WeakKeyDictionary)
+    orch._SEM_BY_LOOP.clear()
+
+    async def _get():
+        return orch._sem()
+
+    loop1 = asyncio.new_event_loop()
+    loop2 = asyncio.new_event_loop()
+    try:
+        sem1a = loop1.run_until_complete(_get())
+        sem1b = loop1.run_until_complete(_get())
+        sem2 = loop2.run_until_complete(_get())
+        assert sem1a is sem1b
+        assert sem1a is not sem2
+        assert len(orch._SEM_BY_LOOP) == 2
+    finally:
+        loop1.close()
+        loop2.close()
+
+
+@pytest.mark.asyncio
+async def test_delegate_concurrency_capped_at_delegate_concurrency(tmp_path, monkeypatch):
+    # Spec §10 concurrency-semaphore case: 4 concurrent _delegate_impl calls
+    # must never run more than DELEGATE_CONCURRENCY children at once, and all
+    # four must still complete. Uses an asyncio.Event handshake (no sleeps):
+    # every child blocks until the 3rd concurrent entry proves the cap was
+    # reached, then all release together.
+    monkeypatch.setattr(orch, "DELEGATE_CONCURRENCY", 3)
+    orch._SEM_BY_LOOP.clear()
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    live = 0
+    peak = 0
+    at_cap = asyncio.Event()
+    completed: list[str] = []
+
+    async def fake_run_subagent(goal, context, expected_output, max_turns, *,
+                                parent_ctx, parent_agent, call_id, holder=None):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        if live == orch.DELEGATE_CONCURRENCY:
+            at_cap.set()
+        await at_cap.wait()      # hold every child until 3 are proven concurrent
+        live -= 1
+        completed.append(goal)
+        return f"done-{goal}"
+
+    with patch("skills.orchestration.run_subagent", side_effect=fake_run_subagent):
+        to.CALL_ID_VAR.set("")
+        results = await asyncio.gather(*[orch._delegate_impl(f"g{i}", "", "", 5) for i in range(4)])
+
+    assert peak == orch.DELEGATE_CONCURRENCY                      # never exceeded the cap
+    assert sorted(completed) == [f"g{i}" for i in range(4)]        # all four ran
+    assert sorted(results) == [f"done-g{i}" for i in range(4)]     # all four completed ok
+
+
+@pytest.mark.asyncio
+async def test_child_confirmation_card_reaches_parent_sink_unwrapped(tmp_path):
+    # Minor 4: a gated tool inside the child raises its confirmation/access
+    # card through the per-module EVENT_QUEUE_VAR it was built around (here
+    # skills.filesystem's), NOT through ctx.sink / _WrapSink. run_subagent
+    # never touches that var, so the child inherits the parent's sink
+    # unchanged and the card must land UNWRAPPED at the parent sink's top
+    # level (tasks/driver.py and channels/driver.py key on the top-level
+    # `type`) — while the child's own stream events still arrive wrapped as
+    # `subagent_event`.
+    import skills.filesystem as fsskill
+    sink = _Sink()
+    _parent(sink, tmp_path)
+    gate_token = fsskill.EVENT_QUEUE_VAR.set(sink)
+    try:
+        inner = [{"type": "message_delta", "content": "hi"}]
+
+        async def _events():
+            await fsskill.EVENT_QUEUE_VAR.get().put(
+                {"type": "access_request", "call_id": "fs1", "path": "/DATA/x"})
+            for e in inner:
+                yield e
+
+        m = SimpleNamespace(stream_events=_events, final_output=None, cancel=lambda *a, **k: None)
+        with patch("skills.orchestration.Runner.run_streamed", return_value=m), \
+             patch("skills.orchestration._convert_event", side_effect=lambda e, n, s: e):
+            to.CALL_ID_VAR.set("call_gate2")
+            await orch._delegate_impl("g", "", "", 15)
+    finally:
+        fsskill.EVENT_QUEUE_VAR.reset(gate_token)
+
+    access = next(e for e in sink.events if e["type"] == "access_request")
+    assert access == {"type": "access_request", "call_id": "fs1", "path": "/DATA/x"}  # unwrapped
+    wrapped = [e["event"] for e in sink.events if e["type"] == "subagent_event"]
+    assert wrapped == inner                                        # child's stream events wrapped

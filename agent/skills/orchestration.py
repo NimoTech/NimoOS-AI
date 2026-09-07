@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import time
+import weakref
 
 from agents import Agent, Runner, function_tool
 
@@ -57,7 +58,9 @@ async def update_plan(steps_json: str) -> str:
     field; "[]" clears. The current plan stays visible to you in <plan>."""
     try:
         steps = json.loads(steps_json)
-    except (TypeError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 — any decode failure (incl. RecursionError on
+        # a deeply nested payload) must return the tool's actionable {"error": …}
+        # contract, never escape into the SDK's default tool-error formatter.
         return _err(f"steps_json must be a JSON array: {exc}")
     return await _update_plan_impl(steps)
 
@@ -74,16 +77,22 @@ DELEGATE_CONCURRENCY = 3
 # import time: a module-level asyncio.Semaphore binds its internals to
 # whichever loop first awaits it, which is a trap the moment anything runs
 # delegate() from more than one loop (e.g. per-test loops under pytest).
-_SEM_BY_LOOP: "dict[int, asyncio.Semaphore]" = {}
+# Keyed on the loop OBJECT (not id(loop)): a plain dict keyed by id() never
+# drops an entry once the loop that produced it is garbage-collected, and
+# CPython is free to reuse that same id() for an unrelated later loop — which
+# would then hand out a Semaphore internally bound to a *dead* loop, breaking
+# every delegate call on the new loop with the same id forever. A
+# WeakKeyDictionary drops the entry automatically when the loop is collected.
+_SEM_BY_LOOP: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = \
+    weakref.WeakKeyDictionary()
 
 
 def _sem() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
-    key = id(loop)
-    sem = _SEM_BY_LOOP.get(key)
+    sem = _SEM_BY_LOOP.get(loop)
     if sem is None:
         sem = asyncio.Semaphore(DELEGATE_CONCURRENCY)
-        _SEM_BY_LOOP[key] = sem
+        _SEM_BY_LOOP[loop] = sem
     return sem
 
 
@@ -134,7 +143,29 @@ def _convert_event(event, call_names, state):
 
 
 class _WrapSink:
-    """Forwards a child's converted stream events to the parent sink, wrapped."""
+    """Forwards a child's converted stream events to the parent sink, wrapped.
+
+    Contract (load-bearing, keep in sync with tasks/driver.py and
+    channels/driver.py): this wraps ONLY the converted model-stream events
+    that flow through `run_subagent`'s `wrap.put(sse)` calls below. Gate /
+    confirmation cards (`confirmation_required`, `access_request`) and other
+    side events (`judging`, `staged_change`, `visible_resource_added`, ...)
+    are emitted by the gated tools themselves through their own module-level
+    EVENT_QUEUE_VARs (skills.filesystem.EVENT_QUEUE_VAR, skills.shell.
+    EVENT_QUEUE_VAR, mcp_client.EVENT_QUEUE_VAR, APP_EVENT_VAR, ...), all of
+    which are set to the parent RunSink at agent.py's run setup and are
+    inherited UNCHANGED by the child (run_subagent never touches them). So a
+    child's `access_request`/`confirmation_required` reaches the parent sink
+    UNWRAPPED, at the top level, exactly like one raised by the parent's own
+    tool call. This is by design and required: tasks/driver.py and
+    channels/driver.py both key on the *top-level* `type` to find and answer
+    a pending confirmation; if a future refactor routed gate events through
+    `RunCtx.sink` (and therefore through this wrapper) instead, a child's
+    card would arrive as a buried `subagent_event` that neither driver
+    recognises, and the child would sit on ConfirmManager.wait()'s default
+    timeout for the rest of DELEGATE_TIMEOUT with no one able to answer it.
+    Do not route gate/confirmation events through _WrapSink.
+    """
     def __init__(self, parent_sink, call_id: str):
         self._p = parent_sink
         self._cid = call_id
@@ -200,6 +231,15 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
     # object is shared. Inheriting downward (child starts unlocked like the
     # parent) is intended; leaking upward is not.
     unlocked_token = _tg.UNLOCKED_VAR.set(set(_tg.current_unlocked()))
+    # A child's expand_tools must not durably widen the PARENT session's
+    # unlocked-tool set: _persist() (tool_gating.py) keys off
+    # GATING_SESSION_VAR, which the child would otherwise inherit unchanged
+    # and write straight back to `sessions.unlocked_tool_categories` for
+    # parent_ctx.session_id. Setting it to "" makes _persist() a no-op (it
+    # only writes when session_id is truthy) while the in-memory
+    # UNLOCKED_VAR copy above still lets the child use newly unlocked tools
+    # for the rest of its own run.
+    gate_token = _tg.GATING_SESSION_VAR.set("")
     try:
         cfg = phoenix_tracing.build_trace_run_config(
             phoenix_tracing.tracing_enabled_now(), parent_ctx.session_id, parent_ctx.user_id,
@@ -209,6 +249,7 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
             max_turns=max_turns, hooks=_cf.ContextHooks(), run_config=cfg)
         call_names: dict[str, str] = {}
         state: dict = {"streamed_message": False}
+        message_emitted = False
         try:
             async for ev in stream.stream_events():
                 sse = _convert_event(ev, call_names, state)
@@ -216,6 +257,7 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
                     continue
                 if sse["type"] == "message_delta":
                     text_parts.append(str(sse.get("content", "")))
+                    message_emitted = True
                 elif sse["type"] == "message":
                     if state["streamed_message"]:
                         # The SDK's consolidated message_output_item would
@@ -224,6 +266,7 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
                         # reason (see its `if et == "message":` branch).
                         continue
                     text_parts.append(str(sse.get("content", "")))
+                    message_emitted = True
                 if wrap is not None:
                     await wrap.put(sse)
         except BaseException:
@@ -234,9 +277,23 @@ async def run_subagent(goal: str, context: str, expected_output: str, max_turns:
             raise
         final = getattr(stream, "final_output", None)
         if isinstance(final, str) and final.strip():
-            return final.strip()
+            final = final.strip()
+            if wrap is not None and not message_emitted:
+                # A "reasoning-only" child: nothing came through as a
+                # message/message_delta event (e.g. a provider that only
+                # streamed tool calls and reasoning, with the actual answer
+                # showing up only in final_output). Without this, the
+                # SubagentCard/task-run transcript would show tool calls and
+                # then just stop, even though a real answer exists — mirror
+                # agent.py's own synthetic-message fallback for the parent.
+                try:
+                    await wrap.put({"type": "message", "content": final})
+                except Exception:  # noqa: BLE001 — never raise into the parent run
+                    _LOG.debug("run_subagent: reasoning-only message forward failed", exc_info=True)
+            return final
         return "".join(text_parts).strip()
     finally:
+        _tg.GATING_SESSION_VAR.reset(gate_token)
         _tg.UNLOCKED_VAR.reset(unlocked_token)
         _mc.RUN_AGENT_VAR.reset(agent_token)
         rc.RUN_CTX_VAR.reset(ctx_token)

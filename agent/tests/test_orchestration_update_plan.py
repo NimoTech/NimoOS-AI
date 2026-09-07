@@ -1,5 +1,6 @@
 import asyncio
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -63,6 +64,29 @@ async def test_update_plan_without_ctx_or_in_child_is_refused():
     assert "error" in json.loads(await orch._update_plan_impl([]))
     _ctx(depth=1)
     assert "not available" in json.loads(await orch._update_plan_impl([]))["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_plan_tool_rejects_any_decode_failure_not_just_typeerror_valueerror():
+    # Minor 8: the wrapper's json.loads guard must catch ANY decode failure
+    # (e.g. RecursionError on a pathologically nested payload), not just
+    # (TypeError, ValueError), and return the tool's {"error": ...} contract
+    # rather than letting it escape into the SDK's default tool-error path.
+    _ctx()
+    out = await orch.update_plan.on_invoke_tool(MagicMock(), json.dumps({"steps_json": "not json"}))
+    data = json.loads(out)
+    assert "error" in data and "JSON array" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_plan_tool_rejects_non_list_json_via_validate_plan():
+    # A syntactically valid JSON document that isn't a list (e.g. "{}") must
+    # decode fine and then be rejected by validate_plan's own "must be a
+    # list" check, not silently accepted.
+    _ctx()
+    out = await orch.update_plan.on_invoke_tool(MagicMock(), json.dumps({"steps_json": "{}"}))
+    data = json.loads(out)
+    assert "error" in data and "list" in data["error"]
 
 
 @pytest.mark.asyncio
