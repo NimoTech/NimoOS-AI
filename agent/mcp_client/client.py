@@ -641,9 +641,10 @@ def _wrap_tool(server: dict, meta: dict, slug: str) -> FunctionTool:
             return f"[MCP error] MCP tool {tool_name} failed: {e}"
         out = flatten_result(result)
         try:
-            return _tool_output.postprocess(
+            return await _tool_output.postprocess_async(
                 out, tool_name=fq_name,
-                call_id=str(getattr(ctx, "tool_call_id", "") or ""))
+                call_id=str(getattr(ctx, "tool_call_id", "") or ""),
+                args_hint=input_json if isinstance(input_json, str) else "")
         except Exception:  # noqa: BLE001 — never eat an MCP result
             return out
 

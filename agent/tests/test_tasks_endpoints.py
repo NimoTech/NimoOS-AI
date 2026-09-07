@@ -145,7 +145,7 @@ def test_missing_user_header_is_401(client):
       "interval_seconds": 30}, "bad_interval"),
     ({"trigger_type": "interval", "cron_expr": ""}, "bad_interval"),
     ({"max_turns": 0}, "bad_max_turns"),
-    ({"max_turns": 101}, "bad_max_turns"),
+    ({"max_turns": 301}, "bad_max_turns"),
     ({"timeout_seconds": 59}, "bad_timeout"),
     ({"timeout_seconds": 7201}, "bad_timeout"),
     ({"overlap_policy": "explode"}, "bad_overlap_policy"),

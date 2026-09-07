@@ -40,6 +40,7 @@ import skills.search as search_skills
 import skills.memory as memory_skills
 import memory_store
 import context_compaction
+import summarizer
 import skills.photos as photos_skills
 from fs.snapshots import SnapshotStore
 import mcp_client.client as mcp_client
@@ -112,21 +113,11 @@ def _make_summarize_fn(client, model_name):
     """Build the (injected) summarize callable for context compaction. Uses the
     conversation's OWN provider client/model (no new model). Returns the
     summary text; raises on failure (compact_for_run wraps with wait_for and
-    catches)."""
-    async def _summarize(instruction: str, prior_summary: str, fold_text: str) -> str:
-        body = (f"[Existing summary]\n{prior_summary or '(none)'}\n\n"
-                f"[Earlier conversation excerpts]\n{fold_text}")
-        resp = await client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "system", "content": instruction},
-                      {"role": "user", "content": body}],
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        if resp.choices:
-            return (getattr(resp.choices[0].message, "content", "") or "").strip()
-        return ""
-    return _summarize
+    catches).
+
+    Thin wrapper — the actual implementation lives in summarizer.py so it can
+    be shared with make_summarizer's background-model preference path."""
+    return summarizer.session_summarize_fn(client, model_name)
 
 
 # Human-readable skip reasons, rendered into the system prompt so the model
@@ -635,6 +626,47 @@ class AgentRunner:
         )
         self._conn.commit()
 
+    def _log_midrun_stats(self, ctx, session_id: str) -> None:
+        """Log the run's compaction-counter summary, once.
+
+        Split out of _persist_midrun_state so the run's `finally` block (which
+        every exit path reaches, including a cancellation/timeout that never
+        reaches either of _persist_midrun_state's call sites — see the P2
+        mid-run compaction comment in run()) can guarantee the stats line
+        still gets written. `ctx.extra["stats_logged"]` is the guard against
+        double-logging when a normal run DOES reach _persist_midrun_state
+        first and the finally block runs afterward regardless."""
+        if ctx.extra.get("stats_logged"):
+            return
+        if ctx.l1_count or ctx.l2_count or ctx.trunc_count or ctx.l1_reasoning_count:
+            _LOG.warning(
+                "compaction-stats: session=%s l1=%d l1_reasoning=%d l2=%d trunc=%d "
+                "peak_in=%d last_in=%d",
+                session_id, ctx.l1_count, ctx.l1_reasoning_count, ctx.l2_count,
+                ctx.trunc_count, ctx.peak_input_tokens, ctx.last_input_tokens)
+        ctx.extra["stats_logged"] = True
+
+    def _persist_midrun_state(self, ctx, session_id: str) -> None:
+        """Write the P2 mid-run rolling-summary state and log compaction
+        counters after a run ends (success or MaxTurnsExceeded). Shared by
+        both call sites so the two branches can't drift. Never raises —
+        callers wrap this in their own outer try anyway, but a failure here
+        must not mask the run's own error handling."""
+        try:
+            if ctx.l2_count and ctx.summary:
+                new_cursor = ctx.persist_prefix_len + ctx.fold_idx
+                _, _prior_F = context_compaction._read_summary_state(self._conn, session_id)
+                if ctx.persist_prefix_len > _prior_F:
+                    _LOG.warning(
+                        "compaction: mid-run cursor %d covers %d start-truncated items "
+                        "never summarised (session %s)",
+                        new_cursor, ctx.persist_prefix_len - _prior_F, session_id)
+                context_compaction._write_summary_state(
+                    self._conn, session_id, ctx.summary, new_cursor)
+            self._log_midrun_stats(ctx, session_id)
+        except Exception:  # noqa: BLE001
+            _LOG.debug("persisting mid-run compaction state failed", exc_info=True)
+
     def _finalize_history(self, stream, *, session_id: str,
                           attachment_ids, data_root: str) -> list:
         """Snapshot the SDK's cumulative item list and compact inline image
@@ -1091,6 +1123,7 @@ class AgentRunner:
                 model_name=model_name, history=history, current_text=_cur_text,
                 summarize_fn=_summarize_fn, overhead_tokens=_overhead,
                 provider_type=provider_type)
+            _base_prompt = full_prompt
             if summary_block:
                 full_prompt = full_prompt + "\n\n" + summary_block
             # Compaction only trims what is SENT to the model. The persisted
@@ -1103,6 +1136,39 @@ class AgentRunner:
             _dropped = len(history) - len(send_history)
             persist_prefix = (stored_history[:_dropped]
                               if 0 < _dropped <= len(stored_history) else [])
+
+            # --- P2 mid-run compaction state (spec §5.1) ---
+            # _ctx_token/_mid_summarize initialised before any of this can
+            # raise, so the finally block below never NameErrors even if
+            # RunCtx construction itself fails partway through.
+            _ctx_token = None
+            _mid_summarize = None
+            import compaction_filter as _cf
+            import run_context as _rc
+            import summarizer as _summ
+            try:
+                _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
+                _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
+                _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
+                _ctx = _rc.RunCtx(
+                    session_id=session_id, user_id=str(user_id), model_name=model_name,
+                    provider_type=provider_type, window=_win, conn=self._conn,
+                    summarize_fn=_mid_summarize, overhead_tokens=_overhead,
+                    summary=_S0 or "", persist_prefix_len=len(persist_prefix),
+                    compaction_enabled=memory_store.is_compaction_enabled(self._conn, str(user_id)))
+                # Pre-seed the BASE prompt (before summary_block was appended
+                # just above) so compaction_filter._with_summary rebuilds
+                # base+block idempotently across every mid-run call instead of
+                # re-appending onto an already-blocked instructions string.
+                _ctx.extra["base_instructions"] = _base_prompt
+                _ctx.extra["recall_hint"] = memory_store.is_memory_enabled(self._conn, str(user_id))
+            except Exception:  # noqa: BLE001 — P2 setup must never block a run
+                _LOG.warning("mid-run compaction setup failed; running without it", exc_info=True)
+                _mid_summarize = None
+                _ctx = _rc.RunCtx(
+                    session_id=session_id, user_id=str(user_id), model_name=model_name,
+                    provider_type=provider_type, window=context_compaction.CLOUD_CONTEXT_WINDOW,
+                    compaction_enabled=False)
 
             agent = Agent(
                 name="NimoOS Agent",
@@ -1124,12 +1190,17 @@ class AgentRunner:
 
             stream = None
             try:
+                # Set the ContextVar as the first thing inside the try whose
+                # finally resets it, so a failure between here and the
+                # Runner.run_streamed call still gets cleaned up.
+                _ctx_token = _rc.RUN_CTX_VAR.set(_ctx)
                 _trace_cfg = phoenix_tracing.build_trace_run_config(
                     phoenix_tracing.tracing_enabled_now(),
-                    session_id, user_id, model_name, kind)
+                    session_id, user_id, model_name, kind,
+                    call_model_input_filter=_cf.compaction_filter)
                 stream = Runner.run_streamed(
                     agent, input_messages, max_turns=max_turns,
-                    run_config=_trace_cfg)
+                    hooks=_cf.ContextHooks(), run_config=_trace_cfg)
                 # Maps tool call_id -> tool name so tool_result events can
                 # report which tool produced the output (the SDK's output item
                 # only carries call_id, not the name).
@@ -1206,6 +1277,7 @@ class AgentRunner:
                     stream, session_id=session_id,
                     attachment_ids=attachment_ids, data_root=data_root)
                 self._save_history(session_id, final_history)
+                self._persist_midrun_state(_ctx, session_id)
                 # Provider-reported usage: the LAST request's input_tokens is
                 # the provider's own count of the current context (the
                 # accumulated context_wrapper.usage sums all turns — wrong
@@ -1244,6 +1316,12 @@ class AgentRunner:
                             attachment_ids=attachment_ids, data_root=data_root)
                         partial = _repair_dangling_tool_calls(partial)
                         self._save_history(session_id, persist_prefix + partial)
+                        # _repair_dangling_tool_calls may insert synthetic
+                        # outputs below fold_idx, so persist_prefix_len +
+                        # fold_idx can under-count by the number inserted —
+                        # safe direction (a boundary turn is re-sent, never
+                        # dropped); do not "correct" it upward.
+                        self._persist_midrun_state(_ctx, session_id)
                 except Exception:
                     pass
                 await sink.put({
@@ -1291,6 +1369,30 @@ class AgentRunner:
                 # previous run's context.
                 self._active_sinks.pop(session_id, None)
                 self._run_contexts.pop(session_id, None)
+                # A run that ends by cancellation/timeout never reaches
+                # _persist_midrun_state (its call sites are the success path
+                # and the MaxTurnsExceeded branch only) — this is the one
+                # spot every exit path passes through, so it's the backstop
+                # that guarantees the stats line still gets written. Guarded
+                # by ctx.extra so a run that already logged them above
+                # doesn't log twice.
+                if _ctx is not None and not _ctx.extra.get("stats_logged"):
+                    try:
+                        self._log_midrun_stats(_ctx, session_id)
+                    except Exception:  # noqa: BLE001
+                        _LOG.debug("logging mid-run compaction stats failed", exc_info=True)
+                # P2 mid-run compaction: clear the ContextVar so it never
+                # leaks into an unrelated task/context. Best-effort —
+                # _ctx_token is None (guarded, not simply absent) if RunCtx
+                # setup itself failed. If .reset() itself fails (token from
+                # another context — mirrors the shell-var pattern below),
+                # force the var back to None rather than leaving the last
+                # run's RunCtx live for whatever runs next in this context.
+                if _ctx_token is not None:
+                    try:
+                        _rc.RUN_CTX_VAR.reset(_ctx_token)
+                    except Exception:  # noqa: BLE001 — token from another context
+                        _rc.RUN_CTX_VAR.set(None)
                 # Drop the run-scoped shell grant as soon as the run ends
                 # (best-effort — see the note at the set site above).
                 try:
@@ -1302,6 +1404,16 @@ class AgentRunner:
                 except Exception:  # noqa: BLE001 — token from another context
                     shell_skills.RUN_SCRIPTS_VAR.set(())
                 await mcp_client.close_run_conns()
+                # Release the background-model client the mid-run summarizer
+                # may have opened. Placed alongside the other awaited
+                # cleanup (not right after the sync ContextVar resets above)
+                # so a CancelledError re-delivered at this await point can't
+                # skip those sync resets — they've already run by now.
+                if _mid_summarize is not None:
+                    try:
+                        await _mid_summarize.aclose()
+                    except Exception:  # noqa: BLE001
+                        _LOG.debug("mid-run summarizer aclose failed", exc_info=True)
                 if _mcp_write_token:
                     # Shrink the token's replay window back down to this run's
                     # actual duration instead of leaving it valid for Go's 24h

@@ -161,12 +161,13 @@ def _tool_error_kwargs() -> dict:
     }
 
 
-def build_trace_run_config(enabled: bool, session_id, user_id, model_name, kind):
+def build_trace_run_config(enabled: bool, session_id, user_id, model_name, kind,
+                            *, call_model_input_filter=None):
     """Always return a RunConfig. enabled=False → tracing_disabled=True.
 
-    Also the single place this repo configures tool-error handling: there is
-    exactly one RunConfig factory, and every run goes through it whether
-    tracing is on or off.
+    Also the single place this repo configures tool-error handling and (P2)
+    hangs the mid-run compaction filter: there is exactly one RunConfig
+    factory, and every run goes through it whether tracing is on or off.
     """
     from agents import RunConfig
     base = {"tracing_disabled": True} if not enabled else {
@@ -179,10 +180,34 @@ def build_trace_run_config(enabled: bool, session_id, user_id, model_name, kind)
         },
         "tracing_disabled": False,
     }
+    filter_kwargs = {"call_model_input_filter": call_model_input_filter} if call_model_input_filter else {}
+    try:
+        return RunConfig(**base, **_tool_error_kwargs(), **filter_kwargs)
+    except TypeError:
+        # SDK too old for one (or more) of these parameters: keep the run
+        # working. Narrow the retry below rather than dropping everything —
+        # an SDK that rejects tool_not_found_behavior/tool_error_formatter
+        # but does support call_model_input_filter must not lose the P2
+        # compaction filter just because the unrelated tool-error kwargs
+        # aren't supported.
+        _LOG.warning("SDK RunConfig rejected tool-error/filter parameters; "
+                     "retrying narrower", exc_info=True)
+    except Exception:
+        _LOG.warning("build_trace_run_config failed; disabling trace for this run",
+                     exc_info=True)
+        return RunConfig(tracing_disabled=True)
+    try:
+        return RunConfig(**base, **filter_kwargs)
+    except TypeError:
+        _LOG.warning("SDK RunConfig rejected the filter parameter; "
+                     "falling back without it", exc_info=True)
+    except Exception:
+        _LOG.warning("build_trace_run_config failed; disabling trace for this run",
+                     exc_info=True)
+        return RunConfig(tracing_disabled=True)
     try:
         return RunConfig(**base, **_tool_error_kwargs())
     except TypeError:
-        # SDK too old for these parameters: keep the run working.
         _LOG.warning("SDK RunConfig rejected tool-error parameters; "
                      "falling back without them", exc_info=True)
     except Exception:

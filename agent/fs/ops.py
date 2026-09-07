@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 import tool_output as _tool_output
+import offload_summary as _offload_summary
 from audit import audit as _audit
 from fences import fence_untrusted
 from fs import paths, ignore, ownership, staging, access_request
@@ -189,6 +190,13 @@ async def read_file(ctx, path: str) -> str:
         # fenced head plus pointer to read_file_lines instead.
         with open(abs_, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
+        guide = _offload_summary.load_summary(abs_)
+        if guide:
+            # A reading guide exists: hand it back instead of a blind head so
+            # the model pages only the line ranges it names.
+            return (_offload_summary.render_block(guide, total_lines=len(text.splitlines()) or 1)
+                    + f"\n[offloaded result: {size} bytes at {abs_}. Read slices with "
+                      "read_file_lines(path, start, end) using the ranges above.]")
         return (fence_untrusted("tool-output", text[:_tool_output.PREVIEW_HEAD],
                                  cap=_tool_output.PREVIEW_HEAD + 100)
                 + f"\n[offloaded result: {size} bytes at {abs_}. This file is "

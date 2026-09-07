@@ -179,6 +179,9 @@ async def web_fetch(url: str, max_chars: int = 30000) -> str:
     host, nothing is fetched and you are told the new URL — call again with
     it if that is where you meant to go.
 
+    RSS/Atom feeds are returned as a compact entry digest (title/link/date/
+    summary), not raw XML.
+
     The first fetch of a host the box has not seen before asks the user to
     confirm. That is expected; it is not an error.
 
