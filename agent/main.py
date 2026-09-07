@@ -299,12 +299,12 @@ async def _attachments_startup():
         _LOG.warning("tool_output sweep failed: %s", e)
 
     try:
-        from run_sink import sweep_event_log as _sweep_events
-        n = _sweep_events(_db())
-        if n:
-            _LOG.warning("event_log: swept %d rows older than the retention window", n)
+        # Batched + yielding, and off the startup path: the first sweep on a
+        # box with a 1.7 M-row backlog must not block request handling.
+        from run_sink import event_log_sweeper as _event_log_sweeper
+        asyncio.get_running_loop().create_task(_event_log_sweeper(_db()), name="event-log-sweeper")
     except Exception as e:  # noqa: BLE001 — must never block startup
-        _LOG.warning("event_log sweep failed: %s", e)
+        _LOG.warning("event_log sweeper not started: %s", e)
 
 
 @app.on_event("startup")
