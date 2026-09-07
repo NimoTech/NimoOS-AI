@@ -10,10 +10,8 @@ def _names(tools):
 def test_general_turn1_visible_is_core_plus_expand():
     tools = agent_mod.select_tools_for_run([], session_id="s1", profile=None)
     names = _names(tools)
-    # 6 always-on tools + expand_tools must always be present. "delegate" is
-    # reserved in CORE_TOOL_NAMES ahead of its Task 3 implementation and has
-    # no tool object yet, so it is excluded from this actual-run-tools check.
-    assert (tr.CORE_TOOL_NAMES - {"delegate"}) <= names
+    # always-on tools + expand_tools must always be present.
+    assert tr.CORE_TOOL_NAMES <= names
     assert "expand_tools" in names
     # gated tool objects exist but default to not visible (is_enabled is False with an empty unlocked set)
     tg.UNLOCKED_VAR.set(set())

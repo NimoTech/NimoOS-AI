@@ -38,10 +38,7 @@ def test_partition_is_complete_and_disjoint():
     for tools in tr.CATEGORY_TOOLS.values():
         categorized += [_name(t) for t in tools]
     # the mcp category's only static member is add_mcp_server (runtime MCP tools are attached dynamically, not here)
-    # "delegate" is reserved in CORE_TOOL_NAMES ahead of its Task 3 implementation
-    # (skills/orchestration.py); select_tools_for_run only looks names up against
-    # ALL_TOOLS, so a name with no matching tool object is inert until then.
-    covered = (set(tr.CORE_TOOL_NAMES) - {"delegate"}) | set(categorized)
+    covered = set(tr.CORE_TOOL_NAMES) | set(categorized)
     assert covered == set(all_names), (
         f"uncovered: {set(all_names) - covered}; extra: {covered - set(all_names)}")
     assert len(categorized) == len(set(categorized)), "a tool was placed in multiple categories"
