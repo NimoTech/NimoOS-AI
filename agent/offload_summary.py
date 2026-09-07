@@ -24,7 +24,8 @@ from fences import fence_untrusted
 _LOG = logging.getLogger("nimoos-agent.tool_output")
 
 ENABLED = os.environ.get("NIMOOS_OFFLOAD_SUMMARY", "1").strip() not in ("0", "false", "no")
-SUMMARY_TIMEOUT = 25            # seconds for the LLM call
+SUMMARY_TIMEOUT = 40            # seconds for the LLM call (60k chars took ~8s on
+                                # deepseek-v4-flash; 25s lost 4 of 11 guides on 118)
 MAX_INPUT_CHARS = 60_000        # numbered text fed to the summarizer
 MAX_SUMMARY_CHARS = 1_200       # hard cap on what we keep
 MAX_ARGS_HINT_CHARS = 300
