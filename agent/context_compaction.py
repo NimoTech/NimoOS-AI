@@ -45,6 +45,12 @@ HARD_THRESHOLD = 0.85
 
 SUMMARY_HEADER = "[Conversation history summary (earlier content compacted)]"
 
+PLAN_MAX_STEPS = 30
+PLAN_MAX_CHARS = 200
+PLAN_STATUSES = ("pending", "in_progress", "done", "skipped")
+PLAN_HEADER = "<plan>"
+_PLAN_MARK = {"pending": "[ ]", "in_progress": "[>]", "done": "[x]", "skipped": "[-]"}
+
 
 def _is_cjk(ch: str) -> bool:
     o = ord(ch)
@@ -273,6 +279,53 @@ def summary_block(summary, *, recall_hint=False) -> str:
         return ""
     block = f"{SUMMARY_HEADER}\n{s}"
     return f"{block}\n{RECALL_HINT}" if recall_hint else block
+
+
+def validate_plan(raw) -> list[dict]:
+    """Normalise the model's update_plan payload. Raises ValueError with a
+    message the model can act on."""
+    if not isinstance(raw, list):
+        raise ValueError("steps must be a list of {id, title, status, note?}")
+    if len(raw) > PLAN_MAX_STEPS:
+        raise ValueError(f"too many steps: {len(raw)} > {PLAN_MAX_STEPS}")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            raise ValueError(f"step {i} must be an object")
+        sid = str(s.get("id") or "").strip()
+        title = str(s.get("title") or "").strip()
+        status = str(s.get("status") or "").strip()
+        note = str(s.get("note") or "").strip()
+        if not sid or sid in seen:
+            raise ValueError(f"step {i}: id is required and must be unique")
+        if not title:
+            raise ValueError(f"step {sid}: title is required")
+        if status not in PLAN_STATUSES:
+            raise ValueError(f"step {sid}: status must be one of {list(PLAN_STATUSES)}")
+        if len(title) > PLAN_MAX_CHARS or len(note) > PLAN_MAX_CHARS or len(sid) > PLAN_MAX_CHARS:
+            raise ValueError(f"step {sid}: id/title/note must each be <= {PLAN_MAX_CHARS} chars")
+        seen.add(sid)
+        out.append({"id": sid, "title": title, "status": status, "note": note})
+    return out
+
+
+def plan_block(steps: list[dict]) -> str:
+    """The checklist appended to the system instructions on every model call
+    (spec §7.1). Empty string when there is no plan."""
+    if not steps:
+        return ""
+    lines = [PLAN_HEADER,
+             "Your current plan (update it with update_plan as you progress; "
+             "mark a step done before starting the next):"]
+    for s in steps:
+        mark = _PLAN_MARK.get(s.get("status", "pending"), "[ ]")
+        line = f"{mark} {s['id']}. {s['title']}"
+        if s.get("note"):
+            line += f" — {s['note']}"
+        lines.append(line)
+    lines.append("</plan>")
+    return "\n".join(lines)
 
 
 SUMMARIZE_INSTRUCTION = (

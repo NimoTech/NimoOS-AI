@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sqlite3
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     folded_upto           INTEGER NOT NULL DEFAULT 0,
     last_overhead_tokens  INTEGER NOT NULL DEFAULT 0,
     last_real_input_tokens INTEGER NOT NULL DEFAULT 0,
+    plan_json         TEXT,
     source            TEXT NOT NULL DEFAULT 'web'
 );
 
@@ -542,6 +544,10 @@ def init_db(path: str | None = None, snapshots_root: str | None = None) -> sqlit
     if "source" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN "
                      "source TEXT NOT NULL DEFAULT 'web'")
+    if "plan_json" not in existing:
+        # P4 (spec §7.1): the session's pinned plan as a JSON list of
+        # {id,title,status,note}; NULL/empty = no plan.
+        conn.execute("ALTER TABLE sessions ADD COLUMN plan_json TEXT")
     # Idempotent ALTER for existing databases without the reason_key column.
     ar_cols = {row["name"] for row in conn.execute("PRAGMA table_info(access_requests)")}
     if ar_cols and "reason_key" not in ar_cols:
@@ -730,4 +736,21 @@ def set_unlocked_categories(session_id: str, categories: list[str], conn=None) -
         "UPDATE sessions SET unlocked_tool_categories=? WHERE id=?",
         (payload, session_id),
     )
+    conn.commit()
+
+
+def get_plan_json(conn, session_id: str) -> list:
+    row = conn.execute("SELECT plan_json FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not row or not row["plan_json"]:
+        return []
+    try:
+        data = json.loads(row["plan_json"])
+        return data if isinstance(data, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def set_plan_json(conn, session_id: str, steps: list) -> None:
+    conn.execute("UPDATE sessions SET plan_json=? WHERE id=?",
+                 (json.dumps(steps, ensure_ascii=False) if steps else None, session_id))
     conn.commit()

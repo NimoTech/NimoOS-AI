@@ -35,6 +35,13 @@ class RunCtx:
     l2_disabled: bool = False
     trunc_count: int = 0
     compaction_enabled: bool = True
+    # P4 (spec §7): pinned plan (list of {id,title,status,note}), sub-agent depth
+    # (0 = top-level run, 1 = delegate child), the run's event sink (anything
+    # with async put(event)) and, for a child, the parent's delegate call_id.
+    plan: list = field(default_factory=list)
+    depth: int = 0
+    sink: Any = None
+    parent_call_id: str = ""
     extra: dict = field(default_factory=dict)
 
 

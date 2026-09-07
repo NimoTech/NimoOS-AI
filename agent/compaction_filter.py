@@ -193,28 +193,29 @@ def _estimate(ctx: rc.RunCtx, items: list) -> int:
 
 
 def _with_summary(ctx: rc.RunCtx, instructions: str | None) -> str | None:
-    """Append the current summary block to the BASE instructions, never
-    stacking onto a block appended by a previous call. `ctx.extra
-    ["base_instructions"]` is captured once (on the first call that ever
-    reaches here) so re-running this on the same ctx is idempotent.
-
-    agent.py (Task 6) is expected to pre-seed `ctx.extra["base_instructions"]`
-    with the pre-block prompt before the first filter call, so this function
-    normally just reads it back. The `SUMMARY_HEADER` strip below is a
-    fallback for a caller that skips that seeding (e.g. a test, or a future
-    caller) and whose `instructions` already contains a block from a prior
-    run/session — without it that stale block would be captured as part of
-    "base" and re-appended on every call, alongside the fresh one."""
-    if not ctx.summary:
+    """Append the current summary block AND the plan block (spec §7.1) to the
+    BASE instructions, never stacking onto blocks appended by a previous call.
+    `ctx.extra["base_instructions"]` is captured once so re-running this on the
+    same ctx is idempotent (agent.py pre-seeds it; the header strips below are
+    the fallback for callers that skip the seeding)."""
+    if not ctx.summary and not ctx.plan:
         return instructions
     base = ctx.extra.get("base_instructions")
     if base is None:
         base = instructions or ""
-        if cc.SUMMARY_HEADER in base:
-            base = base[:base.index(cc.SUMMARY_HEADER)].rstrip()
+        for header in (cc.SUMMARY_HEADER, cc.PLAN_HEADER):
+            if header in base:
+                base = base[:base.index(header)].rstrip()
         ctx.extra["base_instructions"] = base
-    block = cc.summary_block(ctx.summary, recall_hint=bool(ctx.extra.get("recall_hint")))
-    return f"{base}\n\n{block}" if block else base
+    parts = [base]
+    if ctx.summary:
+        block = cc.summary_block(ctx.summary, recall_hint=bool(ctx.extra.get("recall_hint")))
+        if block:
+            parts.append(block)
+    pb = cc.plan_block(ctx.plan)
+    if pb:
+        parts.append(pb)
+    return "\n\n".join(parts)
 
 
 async def compaction_filter(data):
@@ -224,8 +225,18 @@ async def compaction_filter(data):
     model_data."""
     md = data.model_data
     ctx = rc.current()
-    if ctx is None or not ctx.compaction_enabled:
+    if ctx is None:
         return md
+    if not ctx.compaction_enabled:
+        # Compaction proper is off, but a pinned plan (spec §7.1) still needs
+        # to ride along on every model call — items are left untouched.
+        if not ctx.plan:
+            return md
+        try:
+            return ModelInputData(input=md.input, instructions=_with_summary(ctx, md.instructions))
+        except Exception:  # noqa: BLE001 — never fail the run
+            _LOG.warning("compaction_filter (plan-only) bypassed after error", exc_info=True)
+            return md
     try:
         full = list(md.input or [])
         ctx.extra["last_sent_len"] = len(full)
