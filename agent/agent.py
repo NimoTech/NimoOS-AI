@@ -109,6 +109,25 @@ ORCHESTRATION_GUIDANCE = (
     "yourself when a sub-agent can return the conclusion.]"
 )
 
+CONTEXT_RESCUE_MAX = 1
+
+
+def _rescue_estimates(items: list, window: int) -> tuple[int, int]:
+    """(tokens before, tokens after) for the context_recovered event: `after`
+    is what compaction_filter will roughly send next — L1 on old outputs,
+    then truncation to fit 0.85 * window. Pure; never raises."""
+    import compaction_filter as _cf  # noqa: PLC0415
+    try:
+        before = context_compaction.estimate_messages_tokens(items)
+        compacted, _ = _cf.micro_compact(items)
+        budget = int(window * 0.85)
+        if context_compaction.estimate_messages_tokens(compacted) > budget:
+            compacted = _cf.truncate_turns(compacted, keep_turns=2)
+        return before, min(before, context_compaction.estimate_messages_tokens(compacted))
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
 _SNAPSHOT_STORE = SnapshotStore()
 
 _session_locks: dict[str, asyncio.Lock] = {}
@@ -1220,18 +1239,10 @@ class AgentRunner:
                     phoenix_tracing.tracing_enabled_now(),
                     session_id, user_id, model_name, kind,
                     call_model_input_filter=_cf.compaction_filter)
-                stream = Runner.run_streamed(
-                    agent, input_messages, max_turns=max_turns,
-                    hooks=_cf.ContextHooks(), run_config=_trace_cfg)
-                # Maps tool call_id -> tool name so tool_result events can
-                # report which tool produced the output (the SDK's output item
-                # only carries call_id, not the name).
-                call_names: dict[str, str] = {}
                 # Per-run scratch shared with _convert_event:
                 #   streamed_message — True once any message_delta is emitted.
                 #     Used to suppress the SDK's final consolidated
                 #     message_output_item (it would duplicate the streamed text).
-                conv_state: dict = {"streamed_message": False}
                 message_emitted = False  # any user-visible message text reached the client
                 t_start = time.monotonic()
                 t_first_token: float | None = None
@@ -1239,24 +1250,74 @@ class AgentRunner:
                 FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
                 BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
 
-                async for event in stream.stream_events():
-                    sse_event = _convert_event(event, call_names, conv_state)
-                    if sse_event is None:
-                        continue
-                    et = sse_event["type"]
-                    if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
-                        t_first_token = time.monotonic()
-                    if et in BYTE_COUNT_TYPES:
-                        content = sse_event.get("content")
-                        if isinstance(content, str):
-                            output_bytes += len(content.encode("utf-8"))
-                    if et == "message_delta":
-                        message_emitted = True
-                    elif et == "message":
-                        if conv_state["streamed_message"]:
-                            continue
-                        message_emitted = True
-                    await sink.put(sse_event)
+                # Context-limit rescue (spec §6.2, ruling P3-R2): if the model
+                # call 400s on a context-length overflow, learn a shrunk
+                # window, retry ONCE on the partial input (stream.to_input_list()
+                # up to the failure) with max_turns reduced by the llm calls
+                # already spent, and emit context_recovered. Only stream
+                # creation + consumption live inside this loop — everything
+                # after it (reasoning fallback, stats, finalize) runs once,
+                # against the LAST `stream`.
+                _rescues = 0
+                _attempt_input = input_messages
+                _attempt_turns = max_turns
+                while True:
+                    stream = Runner.run_streamed(
+                        agent, _attempt_input, max_turns=_attempt_turns,
+                        hooks=_cf.ContextHooks(), run_config=_trace_cfg)
+                    # Maps tool call_id -> tool name so tool_result events can
+                    # report which tool produced the output (the SDK's output
+                    # item only carries call_id, not the name).
+                    call_names: dict[str, str] = {}
+                    conv_state: dict = {"streamed_message": False}
+                    try:
+                        async for event in stream.stream_events():
+                            sse_event = _convert_event(event, call_names, conv_state)
+                            if sse_event is None:
+                                continue
+                            et = sse_event["type"]
+                            if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
+                                t_first_token = time.monotonic()
+                            if et in BYTE_COUNT_TYPES:
+                                content = sse_event.get("content")
+                                if isinstance(content, str):
+                                    output_bytes += len(content.encode("utf-8"))
+                            if et == "message_delta":
+                                message_emitted = True
+                            elif et == "message":
+                                if conv_state["streamed_message"]:
+                                    continue
+                                message_emitted = True
+                            await sink.put(sse_event)
+                        break                                   # normal completion
+                    except MaxTurnsExceeded:
+                        raise
+                    except Exception as _exc:  # noqa: BLE001
+                        import context_errors as _ce  # noqa: PLC0415
+                        _cl = _ce.classify(_exc, last_input_tokens=_ctx.last_input_tokens)
+                        if (_cl is None or _cl.window is None or _cl.window < context_compaction.MIN_CONTEXT_WINDOW
+                                or _rescues >= CONTEXT_RESCUE_MAX or _ctx.depth > 0):
+                            raise
+                        _rescues += 1
+                        try:
+                            import model_windows as _mw  # noqa: PLC0415
+                            _new_w = _mw.learn(self._conn, _mw.model_key(model_name, provider_type), _cl.window)
+                        except Exception:  # noqa: BLE001
+                            _new_w = _cl.window
+                        _ctx.window = _new_w
+                        _ctx.last_input_tokens = 0            # provider count is stale for the new input
+                        _ctx.items_seen_at_last_call = 0
+                        try:
+                            _attempt_input = stream.to_input_list()
+                        except Exception:  # noqa: BLE001
+                            raise _exc
+                        _used = int(_ctx.extra.get("llm_calls", 0) or 0)
+                        if _attempt_turns is not None:
+                            _attempt_turns = max(1, _attempt_turns - _used)
+                        _before, _after = _rescue_estimates(_attempt_input, _new_w)
+                        _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
+                                     session_id, _new_w, _before, _after, _attempt_turns)
+                        await sink.put({"type": "context_recovered", "before": _before, "after": _after, "window": _new_w})
 
                 # Reasoning-only fallback. The fallback text also counts toward
                 # output_bytes so the token count is meaningful for these models.
