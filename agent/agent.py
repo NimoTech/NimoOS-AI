@@ -1258,43 +1258,66 @@ class AgentRunner:
                         "forced_tool": forced_tool,
                         "injected": activation_injected,
                     })
-                stream = Runner.run_streamed(
-                    agent, input_messages, max_turns=max_turns,
-                    hooks=_cf.ContextHooks(), run_config=_trace_cfg)
-                # Maps tool call_id -> tool name so tool_result events can
-                # report which tool produced the output (the SDK's output item
-                # only carries call_id, not the name).
-                call_names: dict[str, str] = {}
-                # Per-run scratch shared with _convert_event:
-                #   streamed_message — True once any message_delta is emitted.
-                #     Used to suppress the SDK's final consolidated
-                #     message_output_item (it would duplicate the streamed text).
-                conv_state: dict = {"streamed_message": False}
-                message_emitted = False  # any user-visible message text reached the client
-                t_start = time.monotonic()
-                t_first_token: float | None = None
-                output_bytes = 0
-                FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
-                BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
+                forced_retry_done = False
+                while True:
+                    stream = Runner.run_streamed(
+                        agent, input_messages, max_turns=max_turns,
+                        hooks=_cf.ContextHooks(), run_config=_trace_cfg)
+                    # Maps tool call_id -> tool name so tool_result events can
+                    # report which tool produced the output (the SDK's output item
+                    # only carries call_id, not the name).
+                    call_names: dict[str, str] = {}
+                    # Per-run scratch shared with _convert_event:
+                    #   streamed_message — True once any message_delta is emitted.
+                    #     Used to suppress the SDK's final consolidated
+                    #     message_output_item (it would duplicate the streamed text).
+                    conv_state: dict = {"streamed_message": False}
+                    message_emitted = False  # any user-visible message text reached the client
+                    t_start = time.monotonic()
+                    t_first_token: float | None = None
+                    output_bytes = 0
+                    FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
+                    BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
 
-                async for event in stream.stream_events():
-                    sse_event = _convert_event(event, call_names, conv_state)
-                    if sse_event is None:
-                        continue
-                    et = sse_event["type"]
-                    if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
-                        t_first_token = time.monotonic()
-                    if et in BYTE_COUNT_TYPES:
-                        content = sse_event.get("content")
-                        if isinstance(content, str):
-                            output_bytes += len(content.encode("utf-8"))
-                    if et == "message_delta":
-                        message_emitted = True
-                    elif et == "message":
-                        if conv_state["streamed_message"]:
+                    async for event in stream.stream_events():
+                        sse_event = _convert_event(event, call_names, conv_state)
+                        if sse_event is None:
                             continue
-                        message_emitted = True
-                    await sink.put(sse_event)
+                        et = sse_event["type"]
+                        if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
+                            t_first_token = time.monotonic()
+                        if et in BYTE_COUNT_TYPES:
+                            content = sse_event.get("content")
+                            if isinstance(content, str):
+                                output_bytes += len(content.encode("utf-8"))
+                        if et == "message_delta":
+                            message_emitted = True
+                        elif et == "message":
+                            if conv_state["streamed_message"]:
+                                continue
+                            message_emitted = True
+                        await sink.put(sse_event)
+
+                    # Forced first tool call that produced nothing at all: some
+                    # providers (火山 doubao, 2026-09-08 probe) answer a pinned
+                    # tool_choice with finish_reason=tool_calls and no tool_calls
+                    # delta. Retry the turn once with the pin released; the
+                    # <activated-skill> block still steers the model to search.
+                    if (forced_tool and not forced_retry_done
+                            and not message_emitted and not call_names):
+                        forced_retry_done = True
+                        _LOG.warning("skill activation: forced %s produced no tool call "
+                                     "and no text; retrying without tool_choice", forced_tool)
+                        await sink.put({
+                            "type": "skill_activation_fallback",
+                            "skill_id": activated.skill_id if activated else None,
+                            "forced_tool": forced_tool,
+                            "reason": "empty_completion",
+                        })
+                        agent.model_settings = dataclasses.replace(
+                            agent.model_settings, tool_choice=None)
+                        continue
+                    break
 
                 # Reasoning-only fallback. The fallback text also counts toward
                 # output_bytes so the token count is meaningful for these models.

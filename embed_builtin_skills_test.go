@@ -172,7 +172,7 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	for _, want := range []string{
 		"nimoos_search", "read_file_chunk", "read_document",
 		"plan", "already", "Sources", "not found", "untrusted",
-		"file-reader", "activated-skill",
+		"file-reader", "activated-skill", "kind_in", "caption",
 	} {
 		require.Contains(t, s, want)
 	}
