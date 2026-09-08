@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -146,3 +147,79 @@ async def test_run_guarded_never_raises():
                                sink=sink, conn=conn, search=Boom(), parser=Parser())
     assert res.evidence_block == ""
     assert any(e["type"] == "ask_stage" and e["status"] == "error" for e in sink.events)
+
+
+def _big_hits(fid_prefix, n, chars):
+    return [_hit(f"{fid_prefix}{i}", i, "x" * chars) for i in range(n)]
+
+
+@pytest.mark.asyncio
+async def test_step_summaries_gate_uses_pre_budget_pool(monkeypatch):
+    """auto mode must gate on the candidate pool BEFORE the budget cut.
+    pack.total_chars is post-budget and therefore always <= budget, so the old
+    gate turned summaries on for every list/compare/aggregate question."""
+    monkeypatch.setenv("NIMOOS_ASK_STEP_SUMMARY", "auto")
+    calls = []
+
+    async def complete(instruction, body, *, max_tokens, timeout):
+        calls.append(instruction)
+        return json.dumps({"needs_retrieval": True, "intent": "list", "answer_shape": "list",
+                           "queries": [{"q": "q1"}, {"q": "q2"}]})
+
+    # more candidates than EVIDENCE_MAX_ITEMS (so pack.dropped > 0, which used
+    # to flip the gate on) but a tiny total pool
+    search = Search({"q1": [_hit(f"f{i}", 1, "small") for i in range(12)], "q2": []})
+    res = await pl.run(question="list them", session_id="s", user_id="u", run_id="r", complete=complete,
+                       sink=Sink(), conn=_conn(), search=search, parser=Parser())
+    assert res.sources and res.dropped > 0  # the pack was built and did drop items
+    assert len(calls) == 1                  # rewrite only, no summary calls
+
+
+@pytest.mark.asyncio
+async def test_step_summaries_run_in_parallel_and_survive_one_timeout(monkeypatch):
+    """A hung summary must cost at most its own per-call timeout and must not
+    take the finished pack with it (C2: serial 10s calls used to push past
+    run_guarded's wait_for and discard everything)."""
+    monkeypatch.setenv("NIMOOS_ASK_STEP_SUMMARY", "always")
+    monkeypatch.setattr(pl.config, "STEP_SUMMARY_TIMEOUT_S", 0.2)
+
+    async def complete(instruction, body, *, max_tokens, timeout):
+        if instruction.startswith("You plan the retrieval"):
+            return _plan_json("q1", "q2")
+        if "q1" in body:
+            await asyncio.sleep(30)         # never returns
+        return "q2 says beta [2]"
+
+    sink, conn = Sink(), _conn()
+    search = Search({"q1": [_hit("a", 1, "alpha")], "q2": [_hit("b", 1, "beta")]})
+    t0 = time.monotonic()
+    res = await pl.run_guarded(question="q", session_id="s", user_id="u", run_id="r1",
+                               complete=complete, sink=sink, conn=conn, search=search, parser=Parser())
+    assert time.monotonic() - t0 < 5        # parallel + bounded, not 30s
+    body = unfence(res.evidence_block, source="evidence")
+    assert "[EVIDENCE END]" in body
+    assert "q2 says beta" in body and "q1:" not in body
+    assert [e for e in sink.events if e["type"] == "ask_sources"][-1]["items"]
+    assert len(store.list_turns(conn, "s")) == 1
+
+
+@pytest.mark.asyncio
+async def test_step_summaries_skipped_when_the_deadline_is_near(monkeypatch):
+    """Under 8s of pipeline budget left, summaries are not started at all —
+    the pack, the ask_sources event and the ask_turns row still ship."""
+    monkeypatch.setenv("NIMOOS_ASK_STEP_SUMMARY", "always")
+    monkeypatch.setattr(pl.config, "PIPELINE_TIMEOUT_S", 6.0)
+    calls = []
+
+    async def complete(instruction, body, *, max_tokens, timeout):
+        calls.append(instruction)
+        return _plan_json("q1", "q2")
+
+    sink, conn = Sink(), _conn()
+    search = Search({"q1": [_hit("a", 1, "alpha")], "q2": [_hit("b", 1, "beta")]})
+    res = await pl.run(question="q", session_id="s", user_id="u", run_id="r1", complete=complete,
+                       sink=sink, conn=conn, search=search, parser=Parser())
+    assert len(calls) == 1                  # rewrite only
+    assert "[EVIDENCE END]" in unfence(res.evidence_block, source="evidence")
+    assert [e for e in sink.events if e["type"] == "ask_sources"][-1]["items"]
+    assert len(store.list_turns(conn, "s")) == 1

@@ -1,8 +1,9 @@
 """Knobs for the knowledge-ask pipeline (spec 2026-09-08-knowledge-ask-agent-design §3.3).
 
 Every number lives here so tests and operators have one place to look.
-Environment overrides are read at call time (not import time) where a test
-or operator may flip them; pure constants are module-level.
+Module-level names are constants read at import time; the switches
+(pipeline_enabled, step_summary_mode) are read at call time, so an operator
+or a test can flip them without reimporting.
 """
 from __future__ import annotations
 
@@ -24,6 +25,13 @@ PER_QUERY_TIMEOUT_S = 15.0
 REWRITE_TIMEOUT_S = 12.0
 REWRITE_MAX_TOKENS = 400
 STEP_SUMMARY_MAX_TOKENS = 120
+# Step summaries are a nicety, the finished evidence pack is not: they run in
+# parallel, each capped at STEP_SUMMARY_TIMEOUT_S, and are not started at all
+# unless STEP_SUMMARY_MIN_REMAINING_S of the pipeline budget is still left
+# (minus the STEP_SUMMARY_RESERVE_S kept for rendering and persistence).
+STEP_SUMMARY_TIMEOUT_S = 10.0
+STEP_SUMMARY_MIN_REMAINING_S = 8.0
+STEP_SUMMARY_RESERVE_S = 5.0
 SEARCH_TOP_K = 10
 NOTES_TOP_K = 5
 RRF_K = 60

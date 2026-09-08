@@ -45,26 +45,43 @@ def _plan_event(plan: rewrite.Plan, hits: list[int] | None) -> dict:
             "needs_retrieval": plan.needs_retrieval}
 
 
-async def _step_summaries(plan, pack, complete) -> list[str]:
+async def _step_summaries(plan, pack, complete, *, pool_chars: int, deadline: float) -> list[str]:
+    """One-line-per-sub-query digests, prepended to the evidence pack.
+
+    Bounded three ways, because the pack itself must never be at risk: the
+    gate looks at the PRE-budget candidate pool (pack.total_chars is
+    post-budget and so always <= budget — testing it meant "on for every
+    list/compare/aggregate question"), the calls run concurrently, and each
+    one is capped so a hung background model costs one timeout instead of
+    the whole run.
+    """
     mode = config.step_summary_mode()
     if complete is None or mode == "off":
         return []
-    big = pack.total_chars > config.EVIDENCE_BUDGET_CHARS * 1.5 or bool(pack.dropped)
+    big = pool_chars > config.EVIDENCE_BUDGET_CHARS * 1.5
     if mode == "auto" and not (big and plan.intent in ("list", "compare", "aggregate")):
         return []
-    out = []
-    for qi, q in enumerate(plan.queries):
+    remaining = deadline - time.monotonic() - config.STEP_SUMMARY_RESERVE_S
+    if remaining < config.STEP_SUMMARY_MIN_REMAINING_S:
+        return []
+    per_call = min(config.STEP_SUMMARY_TIMEOUT_S, remaining)
+
+    async def one(qi: int, q) -> str:
         items = [f"[{n}] {c.text[:600]}" for n, c in enumerate(pack.items, 1) if qi in c.hit_queries]
         if not items:
-            continue
+            return ""
         try:
-            s = await complete(STEP_SUMMARY_INSTRUCTION, f"Query: {q.q}\n\n" + "\n\n".join(items),
-                               max_tokens=config.STEP_SUMMARY_MAX_TOKENS, timeout=10)
-        except Exception:  # noqa: BLE001
-            s = ""
-        if s and s.strip():
-            out.append(f"{q.q}: {s.strip()}")
-    return out
+            s = await asyncio.wait_for(
+                complete(STEP_SUMMARY_INSTRUCTION, f"Query: {q.q}\n\n" + "\n\n".join(items),
+                         max_tokens=config.STEP_SUMMARY_MAX_TOKENS, timeout=per_call),
+                timeout=per_call)
+        except Exception:  # noqa: BLE001 — this query gets no summary, nothing else changes
+            return ""
+        return f"{q.q}: {s.strip()}" if s and s.strip() else ""
+
+    got = await asyncio.gather(*(one(qi, q) for qi, q in enumerate(plan.queries)),
+                               return_exceptions=True)
+    return [g for g in got if isinstance(g, str) and g]
 
 
 async def run(*, question: str, session_id: str, user_id: str, run_id: str, complete, sink, conn,
@@ -126,6 +143,8 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
     except Exception:  # noqa: BLE001
         seen = set()
     ranked = retrieve.apply_mece(rr.candidates, seen)
+    # Pre-budget pool size: what the step-summary gate must look at.
+    pool_chars = sum(len(c.text) for c in ranked)
     await st.end("rank", "done", f"kept={len(ranked)} seen_excluded={len(rr.candidates) - len(ranked)}")
 
     # 4 pack
@@ -133,7 +152,8 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
     budget = config.budget_for_window(window_tokens)
     pack = await evidence.build_pack(ranked, invoke_tool=search.invoke_tool, user_id=user_id,
                                      max_items=config.EVIDENCE_MAX_ITEMS, budget_chars=budget)
-    pack.step_summaries = await _step_summaries(plan, pack, complete)
+    pack.step_summaries = await _step_summaries(plan, pack, complete,
+                                                pool_chars=pool_chars, deadline=deadline)
     result.sources = evidence.sources_payload(pack, total_queries=len(plan.queries))
     result.dropped = pack.dropped
     result.evidence_block = evidence.render_pack(pack, budget_chars=budget)
