@@ -89,6 +89,6 @@ def test_search_profile_pins_four_retrieval_tools_and_pre_run():
     tools = agent_module.select_tools_for_run([], session_id="s-ask", profile=p)
     assert sorted(t.name for t in tools) == ["nimoos_search", "read_document", "read_file_chunk", "view_document_page"]
     assert p.pre_run == "ask" and p.max_turns == 5 and p.compose_resources is False
-    assert "[n]" in p.prompt and "EVIDENCE" in p.prompt
+    assert "[n]" in p.prompt and "[EVIDENCE START]" in p.prompt
     assert PROFILES["general"].pre_run is None and PROFILES["general"].max_turns is None
     assert PROFILES["photos"].pre_run is None
