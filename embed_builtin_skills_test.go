@@ -155,6 +155,16 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	}
 	require.GreaterOrEqual(t, bare, 2, "at least two examples must not name docs/files/notes")
 
+	// Server-side activation (spec 2026-09-08): the agent force-loads this
+	// skill on keyword hits and pins the first call to nimoos_search.
+	require.NotNil(t, m.Activation, "deep-search must declare activation")
+	require.Equal(t, "nimoos_search", m.Activation.FirstTool)
+	require.GreaterOrEqual(t, len(m.Activation.Keywords), 20)
+	for _, want := range []string{"哪些", "全部列出", "对比", "最低", "list all", "compare", "the most", "my documents"} {
+		require.Contains(t, m.Activation.Keywords, want)
+	}
+	require.LessOrEqual(t, len(m.Activation.Keywords), service.MaxActivationKeywords)
+
 	b, err := os.ReadFile(filepath.Join(store.BuiltinPath("deep-search"), "SKILL.md"))
 	require.NoError(t, err)
 	s := string(b)
@@ -162,7 +172,7 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	for _, want := range []string{
 		"nimoos_search", "read_file_chunk", "read_document",
 		"plan", "already", "Sources", "not found", "untrusted",
-		"file-reader",
+		"file-reader", "activated-skill",
 	} {
 		require.Contains(t, s, want)
 	}
