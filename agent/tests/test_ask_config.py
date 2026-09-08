@@ -1,6 +1,3 @@
-import importlib
-
-
 def test_budget_for_window_caps_by_window(monkeypatch):
     from ask import config
     assert config.budget_for_window(None) == config.EVIDENCE_BUDGET_CHARS
