@@ -463,3 +463,52 @@ func TestSkillsStore_LoadManifest_RejectsBadActivation(t *testing.T) {
 		})
 	}
 }
+
+func TestSkillsStore_LoadManifest_PinKeywords(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := s.BuiltinPath("deep-search")
+	writeManifestBundle(t, dir, `{
+		"schema_version": 1, "id": "deep-search", "name": "deep-search",
+		"title": "Deep search", "description": "d", "color": "blue", "icon": "search",
+		"trigger": "auto", "examples": [], "version": "0.3.0", "author": "Nimo",
+		"activation": {"keywords": ["哪些", "最低"], "pin_keywords": ["最低"], "first_tool": "nimoos_search"}
+	}`)
+	m, err := s.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if len(m.Activation.PinKeywords) != 1 || m.Activation.PinKeywords[0] != "最低" {
+		t.Fatalf("pin_keywords: %+v", m.Activation.PinKeywords)
+	}
+}
+
+func TestSkillsStore_LoadManifest_RejectsBadPinKeywords(t *testing.T) {
+	many := make([]string, 65)
+	for i := range many {
+		many[i] = fmt.Sprintf("kw%02d", i)
+	}
+	manyJSON, _ := json.Marshal(many)
+	cases := map[string]string{
+		"too many pin keywords": `{"keywords": ["哪些"], "pin_keywords": ` + string(manyJSON) + `}`,
+		"short pin keyword":     `{"keywords": ["哪些"], "pin_keywords": ["a"]}`,
+	}
+	for name, act := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			s := &SkillsStore{Root: root}
+			dir := s.BuiltinPath("bad")
+			writeManifestBundle(t, dir, `{
+				"schema_version": 1, "id": "bad", "name": "bad", "title": "Bad",
+				"description": "d", "color": "blue", "icon": "sparkle", "trigger": "auto",
+				"examples": [], "version": "0.1.0", "author": "Nimo",
+				"activation": `+act+`
+			}`)
+			if _, err := s.LoadManifest(dir); err == nil {
+				t.Fatalf("expected error for %s", name)
+			} else if !strings.Contains(err.Error(), "pin_keywords") {
+				t.Fatalf("error should name pin_keywords, got: %v", err)
+			}
+		})
+	}
+}

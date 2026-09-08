@@ -145,8 +145,12 @@ func ValidateSkillID(id string) error {
 // keyword hit on the user's message injects SKILL.md into that turn's system
 // prompt, and FirstTool (optional) pins the first model call to that tool.
 type SkillActivation struct {
-	Keywords  []string `json:"keywords"`
-	FirstTool string   `json:"first_tool,omitempty"`
+	Keywords []string `json:"keywords"`
+	// PinKeywords: phrases whose single hit is enough to pin the first tool
+	// call; without one, the pin needs two distinct keyword hits. Injection
+	// of SKILL.md happens on any keyword hit regardless.
+	PinKeywords []string `json:"pin_keywords,omitempty"`
+	FirstTool   string   `json:"first_tool,omitempty"`
 }
 
 // MaxActivationKeywords caps the keyword list; the Python matcher reads at
@@ -179,6 +183,17 @@ func validateActivation(a *SkillActivation) error {
 		n := utf8.RuneCountInString(strings.TrimSpace(k))
 		if n < minActivationKeywordRunes || n > maxActivationKeywordRunes {
 			return fmt.Errorf("manifest.activation.keywords[%d] must be %d..%d characters after trimming, got %d",
+				i, minActivationKeywordRunes, maxActivationKeywordRunes, n)
+		}
+	}
+	if len(a.PinKeywords) > MaxActivationKeywords {
+		return fmt.Errorf("manifest.activation.pin_keywords must have at most %d entries, got %d",
+			MaxActivationKeywords, len(a.PinKeywords))
+	}
+	for i, k := range a.PinKeywords {
+		n := utf8.RuneCountInString(strings.TrimSpace(k))
+		if n < minActivationKeywordRunes || n > maxActivationKeywordRunes {
+			return fmt.Errorf("manifest.activation.pin_keywords[%d] must be %d..%d characters after trimming, got %d",
 				i, minActivationKeywordRunes, maxActivationKeywordRunes, n)
 		}
 	}

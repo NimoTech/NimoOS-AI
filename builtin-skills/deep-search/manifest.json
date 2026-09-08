@@ -27,6 +27,12 @@
       "first to", "sorted", "ranked", "how much", "how many",
       "my documents", "my files", "my notes", "my docs", "what do my", "according to my"
     ],
+    "pin_keywords": [
+      "资料库", "我的文档", "我的资料", "我的文件", "我的笔记", "文档里", "文档中", "资料里",
+      "全部列出", "列出所有", "列出全部", "最低", "最高", "最早", "首个",
+      "my documents", "my files", "my notes", "my docs", "what do my", "according to my",
+      "list all", "list every", "lowest", "highest", "earliest"
+    ],
     "first_tool": "nimoos_search"
   },
   "permissions": {

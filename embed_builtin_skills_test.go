@@ -165,6 +165,18 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	}
 	require.LessOrEqual(t, len(m.Activation.Keywords), service.MaxActivationKeywords)
 
+	// The tool_choice pin needs either two keyword hits or one pin_keyword
+	// hit, so broad single words (compare, 排序) inject the skill but do
+	// not force a search. Every probe question must still pin: 最低 covers
+	// "TDP 最低的是哪一款".
+	require.NotEmpty(t, m.Activation.PinKeywords)
+	for _, want := range []string{"最低", "最高", "资料库", "list all", "my documents"} {
+		require.Contains(t, m.Activation.PinKeywords, want)
+	}
+	for _, k := range m.Activation.PinKeywords {
+		require.Contains(t, m.Activation.Keywords, k, "every pin_keyword must also be a keyword")
+	}
+
 	b, err := os.ReadFile(filepath.Join(store.BuiltinPath("deep-search"), "SKILL.md"))
 	require.NoError(t, err)
 	s := string(b)
