@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import dataclasses
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ import skills.shell as shell_skills
 import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
+import skills.skill_activation as skill_activation
 import skills.search as search_skills
 import skills.memory as memory_skills
 import memory_store
@@ -998,6 +1000,34 @@ class AgentRunner:
                 if skills_block:
                     full_prompt = full_prompt + "\n\n" + skills_block
 
+            # Server-side skill auto-activation (spec 2026-09-08). A keyword
+            # hit on THIS message force-loads one skill's SKILL.md into the
+            # turn's system prompt and, when the provider allows, pins the
+            # first model call to the skill's first_tool. Prompt-only
+            # activation was measured at 0/5 (doubao) and 1/5 (DeepSeek) on
+            # the Intel2408 probes. Turn-scoped: nothing is persisted.
+            activated = None
+            activation_injected = False
+            if profile.tools is None and kind == "chat" and not continue_run:
+                activated = skill_activation.select_auto_skill(
+                    message, skills_registry._scan_runtime_view())
+            if activated is not None:
+                md = skills_registry._read_skill_file(activated.skill_id, "SKILL.md")
+                if md.startswith("Error:"):
+                    _LOG.warning("skill activation: cannot read %s: %s", activated.skill_id, md)
+                elif len(md.encode("utf-8")) > skill_activation.INJECT_CAP_BYTES:
+                    _LOG.warning("skill activation: %s SKILL.md exceeds %d bytes; index only",
+                                 activated.skill_id, skill_activation.INJECT_CAP_BYTES)
+                else:
+                    full_prompt = full_prompt + "\n\n" + skill_activation.render_activation_block(
+                        activated.skill_id, md)
+                    activation_injected = True
+            forced_tool = None
+            if (activated is not None and activated.first_tool
+                    and skill_activation.forcing_enabled()
+                    and provider_type in skill_activation.FORCE_PROVIDER_TYPES):
+                forced_tool = activated.first_tool
+
             if attachment_ids and profile.tools is None:
                 # Pinned-profile runs skip the attachment block: read_attachment
                 # is not in their tool list, so advertising it would make the
@@ -1104,6 +1134,13 @@ class AgentRunner:
             # estimate sees the session's real unlock state.
             run_tools = select_tools_for_run(
                 attachment_ids, session_id=session_id, profile=profile) + mcp_tools + _mcp_l2_tools
+            # Pin the first model call to the activated skill's first_tool.
+            # Agent.reset_tool_choice defaults to True, so the SDK returns
+            # tool_choice to "auto" after that one call.
+            if forced_tool and any(getattr(t, "name", "") == forced_tool for t in run_tools):
+                model_settings = dataclasses.replace(model_settings, tool_choice=forced_tool)
+            else:
+                forced_tool = None
             try:
                 _overhead = (context_compaction.estimate_tokens(full_prompt)
                              + context_compaction.estimate_tools_tokens(run_tools))
@@ -1213,6 +1250,14 @@ class AgentRunner:
                     phoenix_tracing.tracing_enabled_now(),
                     session_id, user_id, model_name, kind,
                     call_model_input_filter=_cf.compaction_filter)
+                if activated is not None:
+                    await sink.put({
+                        "type": "skill_activated",
+                        "skill_id": activated.skill_id,
+                        "mode": "auto",
+                        "forced_tool": forced_tool,
+                        "injected": activation_injected,
+                    })
                 stream = Runner.run_streamed(
                     agent, input_messages, max_turns=max_turns,
                     hooks=_cf.ContextHooks(), run_config=_trace_cfg)
