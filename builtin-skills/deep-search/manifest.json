@@ -25,7 +25,7 @@
       "compare", "comparison", "versus", "difference between",
       "the most", "the least", "highest", "lowest", "largest", "smallest", "earliest", "latest",
       "first to", "sorted", "ranked", "how much", "how many",
-      "in my documents", "my documents", "in my files", "in my notes", "my docs", "what do my", "according to my"
+      "my documents", "my files", "my notes", "my docs", "what do my", "according to my"
     ],
     "first_tool": "nimoos_search"
   },
