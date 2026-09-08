@@ -2271,6 +2271,47 @@ async def get_context_usage(request: Request):
         _db(), session_id=session_id, user_id=user_id, model=model)
 
 
+class ModelWindowPayload(BaseModel):
+    model: str
+    provider_type: str = ""
+    window: int
+
+
+@app.get("/agent/model-windows")
+async def get_model_window(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    model = request.query_params.get("model", "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model required")
+    provider_type = request.query_params.get("provider_type", "")
+    import model_windows as _mw  # noqa: PLC0415
+    conn = _db()
+    key = _mw.model_key(model, provider_type)
+    window, source = context_compaction.resolve_window_with_source(conn, user_id, model, provider_type)
+    stored = _mw.get(conn, key)
+    return {"model_key": key, "window": window, "source": source,
+            "stored": {"window": stored["window"], "source": stored["source"]} if stored else None}
+
+
+@app.put("/agent/model-windows")
+async def put_model_window(request: Request, body: ModelWindowPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    import model_windows as _mw  # noqa: PLC0415
+    conn = _db()
+    key = _mw.model_key(body.model, body.provider_type)
+    if body.window == 0:
+        _mw.delete_manual(conn, key)
+        return {"status": "ok", "model_key": key, "window": None, "source": None}
+    if body.window < context_compaction.MIN_CONTEXT_WINDOW:
+        raise HTTPException(status_code=400, detail="window_too_small")
+    _mw.upsert(conn, key, int(body.window), "manual")
+    return {"status": "ok", "model_key": key, "window": int(body.window), "source": "manual"}
+
+
 @app.put("/agent/user-memory/settings")
 async def put_memory_settings(request: Request, body: MemorySettingsPayload):
     user_id = request.headers.get("X-User-Id", "")
