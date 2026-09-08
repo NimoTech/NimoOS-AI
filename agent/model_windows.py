@@ -66,7 +66,6 @@ def resolve_stored(conn, key: str) -> tuple[int, str] | None:
     return (int(row["window"]), row["source"]) if row else None
 
 
-import asyncio
 import re
 
 import httpx
@@ -158,3 +157,20 @@ async def ensure_fetched(conn, *, provider_type: str, provider_url: str, model_n
             _LOG.info("model_windows: fetched %s = %d", key, w)
         except Exception as exc:  # noqa: BLE001
             _LOG.debug("model_windows: store failed: %s", exc)
+
+
+def learn(conn, key: str, window: int) -> int:
+    """Record a window learned from a context-limit 400 (only ever shrinks a
+    machine-written row; never touches a manual one). Returns the row's
+    effective window afterwards."""
+    cur = get(conn, key)
+    if cur is not None and cur["source"] == "manual":
+        return int(cur["window"])
+    target = int(window)
+    if cur is not None:
+        target = min(target, int(cur["window"]))
+    try:
+        upsert(conn, key, target, "learned")
+    except ValueError:
+        return int(cur["window"]) if cur else target
+    return target
