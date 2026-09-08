@@ -1,7 +1,10 @@
+import time
+
 import httpx
 import pytest
 from openai import BadRequestError, RateLimitError
 
+import context_compaction as cc
 import context_errors as ce
 import model_windows as mw
 from db import init_db
@@ -47,6 +50,23 @@ def test_classify_reads_body_when_message_is_generic():
     assert err is not None and err.window == 65536
 
 
+def test_classify_matches_ollama_llamacpp_context_size_message():
+    err = ce.classify(_bad_request("the request exceeds the available context size"))
+    assert isinstance(err, ce.ContextLimitError) and err.matched
+
+
+def test_classify_is_linear_time_on_adversarial_body():
+    # A provider echoing a very long prompt back in the error body must not
+    # be able to hang the (synchronous, event-loop-blocking) classify() call.
+    body = {"error": {"message": "tokens " * 30_000 + "x"}}
+    exc = _bad_request("Error code: 400", body=body)
+    t0 = time.perf_counter()
+    result = ce.classify(exc)  # must not raise regardless of match outcome
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.05, f"classify() took {elapsed:.3f}s on adversarial input"
+    assert result is None or isinstance(result, ce.ContextLimitError)
+
+
 def test_learn_shrinks_and_respects_manual(tmp_path):
     conn = init_db(str(tmp_path / "l.db"))
     assert mw.learn(conn, "cloud:m", 100_000) == 100_000
@@ -55,3 +75,11 @@ def test_learn_shrinks_and_respects_manual(tmp_path):
     mw.upsert(conn, "cloud:m", 64_000, "manual")
     assert mw.learn(conn, "cloud:m", 30_000) == 64_000          # manual untouched
     assert mw.get(conn, "cloud:m")["source"] == "manual"
+
+
+def test_learn_clamps_to_min_window_and_returns_stored_value(tmp_path):
+    conn = init_db(str(tmp_path / "l2.db"))
+    tiny = cc.MIN_CONTEXT_WINDOW - 1
+    result = mw.learn(conn, "cloud:tiny", tiny)
+    assert result == cc.MIN_CONTEXT_WINDOW                       # floored, never phantom
+    assert mw.get(conn, "cloud:tiny")["window"] == result        # always what's persisted

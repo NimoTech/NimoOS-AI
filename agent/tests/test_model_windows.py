@@ -161,5 +161,17 @@ def test_ensure_fetched_stores_once_and_respects_manual(conn, fake_httpx):
     assert mw.get(conn, "cloud:m")["window"] == 20000
 
 
+def test_ensure_fetched_also_respects_a_learned_row(conn, fake_httpx):
+    # A learned row is evidence from a real context-limit 400 and must block
+    # metadata fetching too, or a later fetched value could silently undo the
+    # shrink that learn() was meant to guarantee.
+    fake_httpx.routes[("GET", "https://api.x/v1/models")] = _Resp(200, {"data": [{"id": "m", "context_length": 99000}]})
+    mw.upsert(conn, "cloud:m", 40000, "learned")
+    asyncio.new_event_loop().run_until_complete(
+        mw.ensure_fetched(conn, provider_type="other", provider_url="https://api.x/v1", model_name="m", api_key=""))
+    assert len(fake_httpx.calls) == 0                     # learned row → no fetch at all
+    assert mw.get(conn, "cloud:m") == {**mw.get(conn, "cloud:m"), "window": 40000, "source": "learned"}
+
+
 def test_model_key_handles_colon_inside_bare_name():
     assert mw.model_key("cloud:4:qwen3:32b") == "cloud:qwen3:32b"

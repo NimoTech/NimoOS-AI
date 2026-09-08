@@ -141,13 +141,15 @@ async def fetch_window(provider_type: str, provider_url: str, model_name: str, a
 
 async def ensure_fetched(conn, *, provider_type: str, provider_url: str, model_name: str,
                          api_key: str = "") -> None:
-    """Populate a `fetched` row once per process unless a manual/fetched row
-    already exists. Never raises; never blocks longer than FETCH_TIMEOUT."""
+    """Populate a `fetched` row once per process unless a row already exists
+    (manual, fetched, or learned — a learned row is evidence from a real
+    context-limit 400 and must not be clobbered by a later, possibly larger,
+    fetched value). Never raises; never blocks longer than FETCH_TIMEOUT."""
     key = model_key(model_name, provider_type)
     if key in _TRIED:
         return
     cur = get(conn, key)
-    if cur is not None and cur["source"] in ("manual", "fetched"):
+    if cur is not None:
         return
     _TRIED.add(key)
     w = await fetch_window(provider_type, provider_url, model_name, api_key)
@@ -162,15 +164,15 @@ async def ensure_fetched(conn, *, provider_type: str, provider_url: str, model_n
 def learn(conn, key: str, window: int) -> int:
     """Record a window learned from a context-limit 400 (only ever shrinks a
     machine-written row; never touches a manual one). Returns the row's
-    effective window afterwards."""
+    effective window afterwards — always the value actually persisted (the
+    target is floored to MIN_CONTEXT_WINDOW before the upsert, so it can
+    never be rejected and no phantom, unstored value can be returned)."""
     cur = get(conn, key)
     if cur is not None and cur["source"] == "manual":
         return int(cur["window"])
     target = int(window)
     if cur is not None:
         target = min(target, int(cur["window"]))
-    try:
-        upsert(conn, key, target, "learned")
-    except ValueError:
-        return int(cur["window"]) if cur else target
+    target = max(target, cc.MIN_CONTEXT_WINDOW)
+    upsert(conn, key, target, "learned")
     return target

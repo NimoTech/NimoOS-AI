@@ -6,11 +6,13 @@ import re
 
 PATTERNS: tuple[str, ...] = (
     r"context length", r"maximum context", r"context_length_exceeded", r"prompt is too long",
-    r"too many tokens", r"input tokens exceed", r"max_tokens.*context", r"tokens.*exceed.*limit",
-    r"context window",
+    r"too many tokens", r"input tokens exceed", r"max_tokens[^\n]{0,120}context",
+    r"tokens[^\n]{0,120}exceed[^\n]{0,120}limit", r"context window",
+    r"exceeds the available context", r"context size",
 )
-_PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I | re.S)
+_PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I)
 _LIMIT_RE = re.compile(r"(\d{4,7})\s*tokens", re.I)
+_MAX_TEXT_LEN = 4000
 
 
 class ContextLimitError(Exception):
@@ -22,6 +24,9 @@ class ContextLimitError(Exception):
 
 
 def _text_of(exc) -> str:
+    """Text to scan for a context-limit pattern, capped so a provider echoing
+    an arbitrarily large prompt/body back in the error can't blow up the
+    (already linear-time) regex work below."""
     parts = [str(getattr(exc, "message", "") or ""), str(exc)]
     body = getattr(exc, "body", None)
     if body is not None:
@@ -29,7 +34,8 @@ def _text_of(exc) -> str:
             parts.append(json.dumps(body, ensure_ascii=False))
         except Exception:  # noqa: BLE001
             parts.append(str(body))
-    return "\n".join(p for p in parts if p)
+    text = "\n".join(p for p in parts if p)
+    return text[:_MAX_TEXT_LEN]
 
 
 def classify(exc, *, last_input_tokens: int = 0) -> ContextLimitError | None:
