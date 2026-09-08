@@ -72,3 +72,94 @@ def test_compute_usage_reports_window_source(conn):
     assert out["window"] == 64_000 and out["window_source"] == "manual"
     out2 = cc.compute_usage(conn, session_id="s1", user_id="u1", model="local:x")
     assert out2["window"] == cc.LOCAL_CONTEXT_WINDOW and out2["window_source"] == "default"
+
+
+import asyncio
+import json
+import types
+
+
+def test_parse_ollama_show_prefers_num_ctx_then_context_length():
+    assert mw._parse_ollama_show({"parameters": "num_ctx                        32768\nstop  <|im_end|>",
+                                  "model_info": {"qwen3.context_length": 40960}}) == 32768
+    assert mw._parse_ollama_show({"model_info": {"llama.context_length": 131072}}) == 131072
+    assert mw._parse_ollama_show({"parameters": "stop x"}) is None
+    assert mw._parse_ollama_show({}) is None
+
+
+def test_parse_models_list_matches_id_and_known_fields():
+    payload = {"data": [{"id": "gpt-x", "context_window": 200000},
+                        {"id": "deepseek-chat", "context_length": 128000},
+                        {"id": "other", "max_context_length": "64000"}]}
+    assert mw._parse_models_list(payload, "deepseek-chat") == 128000
+    assert mw._parse_models_list(payload, "gpt-x") == 200000
+    assert mw._parse_models_list(payload, "other") == 64000
+    assert mw._parse_models_list(payload, "missing") is None
+    assert mw._parse_models_list({"data": [{"id": "m"}]}, "m") is None
+
+
+class _Resp:
+    def __init__(self, status, payload): self.status_code = status; self._p = payload
+    def json(self): return self._p
+
+
+class _Client:
+    """httpx.AsyncClient stand-in recording calls."""
+    calls: list = []
+    routes: dict = {}
+    def __init__(self, *a, **kw): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def get(self, url, headers=None):
+        _Client.calls.append(("GET", url, headers)); return _Client.routes.get(("GET", url), _Resp(404, {}))
+    async def post(self, url, json=None, headers=None):
+        _Client.calls.append(("POST", url, json)); return _Client.routes.get(("POST", url), _Resp(404, {}))
+
+
+@pytest.fixture
+def fake_httpx(monkeypatch):
+    import httpx
+    _Client.calls, _Client.routes = [], {}
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    mw._TRIED.clear()
+    return _Client
+
+
+def test_fetch_window_ollama_uses_api_show(fake_httpx):
+    fake_httpx.routes[("POST", "http://127.0.0.1:11434/api/show")] = _Resp(200, {"parameters": "num_ctx 16384"})
+    w = asyncio.new_event_loop().run_until_complete(
+        mw.fetch_window("ollama", "http://127.0.0.1:11434/v1/", "qwen3:8b"))
+    assert w == 16384
+    assert fake_httpx.calls[0][1] == "http://127.0.0.1:11434/api/show" and fake_httpx.calls[0][2] == {"name": "qwen3:8b"}
+
+
+def test_fetch_window_openai_compatible_uses_models_list_with_bearer(fake_httpx):
+    fake_httpx.routes[("GET", "https://openrouter.ai/api/v1/models")] = _Resp(200, {"data": [{"id": "x/y", "context_length": 65536}]})
+    w = asyncio.new_event_loop().run_until_complete(
+        mw.fetch_window("other", "https://openrouter.ai/api/v1", "x/y", api_key="k"))
+    assert w == 65536 and fake_httpx.calls[0][2] == {"Authorization": "Bearer k"}
+
+
+def test_fetch_window_never_raises(fake_httpx, monkeypatch):
+    async def boom(*a, **k): raise RuntimeError("net down")
+    monkeypatch.setattr(_Client, "get", boom)
+    assert asyncio.new_event_loop().run_until_complete(mw.fetch_window("other", "https://x/v1", "m")) is None
+
+
+def test_ensure_fetched_stores_once_and_respects_manual(conn, fake_httpx):
+    fake_httpx.routes[("GET", "https://api.x/v1/models")] = _Resp(200, {"data": [{"id": "m", "context_length": 32000}]})
+    run = lambda: asyncio.new_event_loop().run_until_complete(  # noqa: E731
+        mw.ensure_fetched(conn, provider_type="other", provider_url="https://api.x/v1", model_name="m", api_key=""))
+    run()
+    assert mw.get(conn, "cloud:m") == {**mw.get(conn, "cloud:m"), "window": 32000, "source": "fetched"}
+    run(); run()
+    assert len(fake_httpx.calls) == 1                     # tried once per process
+    mw._TRIED.clear()
+    mw.upsert(conn, "cloud:m", 20000, "manual")
+    run()
+    assert len(fake_httpx.calls) == 1                     # manual row → no fetch at all
+    assert mw.get(conn, "cloud:m")["window"] == 20000
+
+
+def test_model_key_handles_colon_inside_bare_name():
+    assert mw.model_key("cloud:4:qwen3:32b") == "cloud:qwen3:32b"

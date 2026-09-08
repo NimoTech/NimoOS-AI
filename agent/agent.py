@@ -1161,6 +1161,13 @@ class AgentRunner:
             import run_context as _rc
             import summarizer as _summ
             try:
+                try:
+                    import model_windows as _mw  # noqa: PLC0415
+                    await asyncio.wait_for(_mw.ensure_fetched(
+                        self._conn, provider_type=provider_type, provider_url=provider_url,
+                        model_name=model_name, api_key=provider_key), timeout=_mw.FETCH_TIMEOUT + 0.5)
+                except Exception:  # noqa: BLE001 — metadata is a nicety
+                    pass
                 _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
                 _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
                 _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
