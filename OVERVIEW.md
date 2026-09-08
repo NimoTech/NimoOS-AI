@@ -355,6 +355,8 @@ Built-in catalog (11): file-reader, deep-search (planned multi-step retrieval wi
 
 LLM-visible surface: an `<available-skills>` index (id + description of every enabled auto/slash skill, sanitized, 16 KiB cap) is injected into the system prompt on every run; the model loads a skill's instructions on demand via `read_skill_file(skill_id)`. Manual-trigger skills are hidden from the index and surface only via UI "Try in chat" injection (`X-Skill-Id` header). The former `list_skills` tool was removed as redundant.
 
+**Server-side activation.** A manifest may carry `activation: {keywords, first_tool}`. `agent/skills/skill_activation.py` matches the user's message (CJK substring, Latin whole-word, NAS-ops negative guard, at most one skill per turn); `agent.run()` appends that skill's SKILL.md inside `<activated-skill>` for the turn, pins `tool_choice` to `first_tool` for the first model call on allow-listed provider types (`NIMOOS_SKILL_FORCE_FIRST_TOOL=0` disables), and emits `skill_activated`. Spec: `nimo_os_docs/docs/superpowers/specs/2026-09-08-skill-auto-activation-design.md`.
+
 REST endpoints (`/v1/ai/skills/*`):
 - `GET /` — list all skills with state overlay
 - `POST /` — create a user skill (simple-form JSON; tar.gz upload deferred to v2)
