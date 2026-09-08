@@ -108,7 +108,7 @@ def parse_plan(raw: str, question: str) -> Plan | None:
         if len(queries) >= config.MAX_QUERIES:
             break
     if not needs:
-        return Plan(False, "chat" if intent == "chat" else intent, tuple(queries), shape)
+        return Plan(False, intent, tuple(queries), shape)
     if len(queries) < config.MIN_QUERIES:
         return None
     return Plan(True, intent, tuple(queries), shape)
@@ -116,7 +116,16 @@ def parse_plan(raw: str, question: str) -> Plan | None:
 
 async def rewrite(question: str, *, complete, history_hint: str = "",
                   timeout: float | None = None) -> Plan:
-    """Ask the background model for a plan; one retry; then fallback_plan()."""
+    """Ask the background model for a plan; one retry; then fallback_plan().
+
+    The retry is spent ONLY on an answer that came back and was unusable
+    (prose, malformed JSON, too few queries) — a model that is confused once
+    is often fine on the second try. A call that produced nothing (timeout,
+    transport error, or the empty string make_summarizer.complete returns
+    when it swallows its own timeout) goes straight to the deterministic
+    plan: retrying would spend another REWRITE_TIMEOUT_S of the 15s
+    answer-start budget for the same likely outcome.
+    """
     if complete is None:
         return fallback_plan(question)
     timeout = timeout if timeout is not None else config.REWRITE_TIMEOUT_S
@@ -131,8 +140,11 @@ async def rewrite(question: str, *, complete, history_hint: str = "",
                 timeout=timeout)
         except Exception as exc:  # noqa: BLE001 — never raise out of the rewrite stage
             _LOG.info("ask rewrite attempt %d failed: %r", attempt, exc)
-            raw = ""
-        plan = parse_plan(raw or "", question)
+            return fallback_plan(question)
+        if not (raw or "").strip():
+            _LOG.info("ask rewrite attempt %d returned nothing", attempt)
+            return fallback_plan(question)
+        plan = parse_plan(raw, question)
         if plan is not None:
             return plan
     return fallback_plan(question)

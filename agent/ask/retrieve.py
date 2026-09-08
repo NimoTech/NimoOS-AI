@@ -134,7 +134,14 @@ async def retrieve(plan, *, question: str, user_id: str, search, parser, deadlin
     statuses = ["curated", "draft"] if include_draft_notes else ["curated"]
 
     async def one_query(qi: int, q: str):
-        out = await search.search_text(q, user_id=user_id, top_k=config.SEARCH_TOP_K, rerank=True,
+        # Rerank only the primary sub-query. Search's cross-encoder costs
+        # ~1.3s per candidate on a CPU NAS, and every parallel sub-query
+        # shares one 15s wall clock (G1: answer start <= 15s p50), so
+        # reranking all of them made `partial` the normal outcome. The fused
+        # list still gets cross-encoder order where it matters most and
+        # vector order elsewhere.
+        out = await search.search_text(q, user_id=user_id, top_k=config.SEARCH_TOP_K,
+                                       rerank=(qi == 0),
                                        timeout_s=config.PER_QUERY_TIMEOUT_S)
         cands = [c for c in (candidate_from_hit(h) for h in out.get("hits") or []) if c]
         return qi, cands, list(out.get("warnings") or [])
@@ -159,8 +166,16 @@ async def retrieve(plan, *, question: str, user_id: str, search, parser, deadlin
     budget = max(0.05, min(config.PER_QUERY_TIMEOUT_S, deadline - time.monotonic()))
     done, pending = await asyncio.wait(set(tasks), timeout=budget)
     partial = bool(pending)
+    cancelled_queries = 0
     for t in pending:
+        if tasks[t][0] == "q":
+            cancelled_queries += 1
         t.cancel()
+    if pending:
+        # Let the cancellations actually land. Without this the tasks are
+        # never awaited: their exceptions stay unretrieved and asyncio emits
+        # "Task was destroyed but it is pending" at GC time.
+        await asyncio.gather(*pending, return_exceptions=True)
 
     ranked: list[list[Candidate]] = [[] for _ in queries]
     per_hits = [0] * len(queries)
@@ -190,6 +205,15 @@ async def retrieve(plan, *, question: str, user_id: str, search, parser, deadlin
     lists = ranked + [note_cands]
     weights = [1.0] * len(ranked) + [config.NOTE_WEIGHT]
     fused = rrf_fuse(lists, weights=weights)
-    all_failed = len(queries) > 0 and failed_queries == len(queries) and not note_cands
+    # Notes ride along as the last fusion list purely to get an RRF score;
+    # they are not a sub-query, so they carry no hit_queries (and render no
+    # "hit by: qN" line, and report [] in ask_sources).
+    for c in fused:
+        if c.source == "note":
+            c.hit_queries = []
+    # A query that was still pending at the deadline produced nothing, exactly
+    # like one that raised: counting only exceptions made a hung Search report
+    # "retrieve done hits=0" instead of an error.
+    all_failed = bool(queries) and not fused and (failed_queries + cancelled_queries) == len(queries)
     return RetrieveResult(candidates=fused, per_query_hits=per_hits, warnings=warnings,
                           all_failed=all_failed, partial=partial)

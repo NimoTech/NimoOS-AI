@@ -101,3 +101,36 @@ async def test_rewrite_timeout_falls_back():
 
     plan = await rw.rewrite("slow question", complete=slow, timeout=0.01)
     assert plan.fallback is True
+
+
+@pytest.mark.asyncio
+async def test_rewrite_timeout_does_not_retry():
+    """A second round trip after a timeout costs another REWRITE_TIMEOUT_S of
+    the 15s answer-start budget and rarely helps (G1)."""
+    calls = []
+
+    async def slow(instruction, body, *, max_tokens, timeout):
+        calls.append(body)
+        await asyncio.sleep(0.5)
+        return "{}"
+
+    plan = await rw.rewrite("slow question", complete=slow, timeout=0.01)
+    assert plan.fallback is True and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rewrite_empty_answer_does_not_retry():
+    """make_summarizer's complete() swallows its own timeout and returns "";
+    that is a failed call, not an unusable answer, so it must not be retried."""
+    calls = []
+
+    async def empty(instruction, body, *, max_tokens, timeout):
+        calls.append(body)
+        return "   "
+
+    plan = await rw.rewrite("q", complete=empty)
+    assert plan.fallback is True and len(calls) == 1
+
+
+def test_rewrite_timeout_default_fits_the_answer_budget():
+    assert rw.config.REWRITE_TIMEOUT_S == 8.0

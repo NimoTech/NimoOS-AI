@@ -103,7 +103,13 @@ async def test_retrieve_fans_out_and_fuses():
     assert any(c.source == "note" and c.name == "T" for c in res.candidates)
     assert "rerank_unavailable" in res.warnings
     assert parser.calls[0][3] == ["curated"] and parser.calls[0][1] == "orig"
-    assert all(call[2] == rt.config.SEARCH_TOP_K and call[3] is True for call in search.calls)
+    assert all(call[2] == rt.config.SEARCH_TOP_K for call in search.calls)
+    # only the primary sub-query pays for the cross-encoder (~1.3s per
+    # candidate on CPU); the rest keep vector order (G1: answer start <= 15s)
+    assert {call[0]: call[3] for call in search.calls} == {"q1": True, "w": False}
+    # notes are not a sub-query: no phantom hit_queries entry
+    note = next(c for c in res.candidates if c.source == "note")
+    assert note.hit_queries == []
 
 
 @pytest.mark.asyncio
@@ -127,6 +133,27 @@ async def test_retrieve_deadline_returns_partial():
     assert time.monotonic() - t0 < 2
     assert res.partial is True and [c.key for c in res.candidates] == ["doc:a:body:1"]
     assert res.per_query_hits == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_all_queries_timing_out_is_all_failed():
+    """A hung Search cancels every pending query task; those cancellations
+    used to count as neither failure nor hit, so the pipeline reported
+    "done hits=0" instead of an error."""
+    search = _Search({}, slow={"s1", "s2"})
+    res = await rt.retrieve(_plan("s1", "s2"), question="q", user_id="u", search=search,
+                            parser=_Parser(), deadline=time.monotonic() + 0.3)
+    assert res.all_failed is True and res.partial is True
+    assert res.candidates == []
+
+
+@pytest.mark.asyncio
+async def test_retrieve_notes_only_is_not_all_failed():
+    search = _Search({}, slow={"s1", "s2"})
+    parser = _Parser(hits=[{"note_id": "n1", "chunk_no": 0, "text": "note text", "score": 0.7}])
+    res = await rt.retrieve(_plan("s1", "s2"), question="q", user_id="u", search=search,
+                            parser=parser, deadline=time.monotonic() + 0.3)
+    assert res.all_failed is False and [c.source for c in res.candidates] == ["note"]
 
 
 @pytest.mark.asyncio
