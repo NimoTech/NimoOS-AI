@@ -90,3 +90,11 @@ def test_retry_uses_the_predicate():
     src = _run_source()
     assert "skill_activation.should_retry_without_pin(" in src
     assert "not message_emitted and not call_names" not in src
+
+
+def test_fallback_retry_nudges_the_model():
+    src = _run_source()
+    i_release = src.index("tool_choice=None)")
+    i_nudge = src.index("Retry notice: your first attempt returned no tool call")
+    i_continue = src.index("continue", i_release)
+    assert i_release < i_nudge < i_continue

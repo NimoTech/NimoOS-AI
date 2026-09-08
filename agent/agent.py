@@ -1326,6 +1326,10 @@ class AgentRunner:
                         })
                         agent.model_settings = dataclasses.replace(
                             agent.model_settings, tool_choice=None)
+                        agent.instructions = (str(agent.instructions or "") +
+                            "\n\n[Retry notice: your first attempt returned no tool call and no text. "
+                            "Begin this attempt by calling nimoos_search for the question above, then answer "
+                            "from what it returns; do not answer from memory.]")
                         continue
                     break
 
