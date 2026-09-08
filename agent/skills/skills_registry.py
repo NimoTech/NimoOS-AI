@@ -76,6 +76,7 @@ def _scan_runtime_view() -> list[dict]:
             m = json.loads(manifest.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        act = m.get("activation")
         out.append({
             "id": m.get("id", entry.name),
             "name": m.get("name", entry.name),
@@ -83,6 +84,8 @@ def _scan_runtime_view() -> list[dict]:
             "trigger": m.get("trigger", "auto"),
             # Logical id only — actual reading goes through read_skill_file.
             "skill_id": entry.name,
+            # Server-side activation rules (spec 2026-09-08); None when absent.
+            "activation": act if isinstance(act, dict) else None,
         })
     return out
 
