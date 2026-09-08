@@ -51,6 +51,26 @@ RUN_SCRATCH_VAR: ContextVar[dict] = ContextVar("run_scratch")
 # model pages through); folding it into a placeholder would break that UI.
 OFFLOAD_EXEMPT_TOOLS = frozenset({"search_photos"})
 
+# Retrieval tools return the evidence the model is supposed to read NOW
+# (search hits with small documents inlined in full, chunk windows, whole
+# documents up to their own max_chars). Folding those at the generic 6k cap
+# left the model with the first hit truncated and a file to page through
+# (2026-09-08 acceptance run 3: a first-search hit on the right CSV was cut
+# off and the model concluded the corpus was empty). They keep their own,
+# larger cap; anything beyond it still folds.
+RETRIEVAL_OFFLOAD_THRESHOLD_CHARS = int(
+    os.environ.get("NIMOOS_RETRIEVAL_OFFLOAD_THRESHOLD_CHARS", "").strip() or 32000)
+OFFLOAD_THRESHOLD_BY_TOOL: dict[str, int] = {
+    "nimoos_search": RETRIEVAL_OFFLOAD_THRESHOLD_CHARS,
+    "read_file_chunk": RETRIEVAL_OFFLOAD_THRESHOLD_CHARS,
+    "read_document": RETRIEVAL_OFFLOAD_THRESHOLD_CHARS,
+}
+
+
+def offload_threshold_for(tool_name: str) -> int:
+    return OFFLOAD_THRESHOLD_BY_TOOL.get(tool_name or "", OFFLOAD_THRESHOLD_CHARS)
+
+
 _SAFE_CALL_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 # CONTRACT shared with the UI (streamMappers.ts OFFLOAD_TRAILER_RE). Byte-exact.
 TRAILER_RE = re.compile(r"\[tool output offloaded: chars=(\d+) path=(\S+)\]")
@@ -150,7 +170,7 @@ def postprocess(output, *, tool_name: str, call_id: str):
     if tool_name in OFFLOAD_EXEMPT_TOOLS or output.startswith("[MCP error]"):
         return output
     n = len(output)
-    if n <= OFFLOAD_THRESHOLD_CHARS:
+    if n <= offload_threshold_for(tool_name):
         return output
     if TRAILER_RE.search(output):
         return output
