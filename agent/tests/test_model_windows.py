@@ -79,10 +79,18 @@ import json
 import types
 
 
-def test_parse_ollama_show_prefers_num_ctx_then_context_length():
+def test_parse_ollama_show_trusts_only_num_ctx_never_model_info():
+    # Final review Major 1: model_info.*.context_length is the model's
+    # advertised CAPABILITY, not the window Ollama actually serves (num_ctx,
+    # default 8192) — trusting it silently disabled compaction for local
+    # chat (measured 262144 on a real box). Only a Modelfile num_ctx is a
+    # real served window; model_info alone must fall through to the
+    # LOCAL_CONTEXT_WINDOW tier default (None here, not 131072).
     assert mw._parse_ollama_show({"parameters": "num_ctx                        32768\nstop  <|im_end|>",
                                   "model_info": {"qwen3.context_length": 40960}}) == 32768
-    assert mw._parse_ollama_show({"model_info": {"llama.context_length": 131072}}) == 131072
+    assert mw._parse_ollama_show({"model_info": {"llama.context_length": 131072}}) is None
+    assert mw._parse_ollama_show({"model_info": {"qwen35.context_length": 262144}}) is None
+    assert mw._parse_ollama_show({"parameters": "stop x", "model_info": {"llama.context_length": 131072}}) is None
     assert mw._parse_ollama_show({"parameters": "stop x"}) is None
     assert mw._parse_ollama_show({}) is None
 
@@ -175,3 +183,31 @@ def test_ensure_fetched_also_respects_a_learned_row(conn, fake_httpx):
 
 def test_model_key_handles_colon_inside_bare_name():
     assert mw.model_key("cloud:4:qwen3:32b") == "cloud:qwen3:32b"
+
+
+def test_model_key_mangles_colon_bearing_name_given_without_provider_id():
+    # Nit 3 (final review): unreachable through either real caller (the UI
+    # always sends "cloud:<id>:<name>"; runs send a bare name + provider_type)
+    # but pin the current behaviour so a future caller can't introduce this
+    # silently — "cloud:gpt:4" strips the middle segment as if it were a
+    # provider id, losing "gpt".
+    assert mw.model_key("cloud:gpt:4") == "cloud:4"
+
+
+def test_to_int_accepts_float_valued_numbers():
+    # Minor 11 (final review): a provider reporting a JSON float
+    # ("context_length": 8192.0) or its string form must still parse.
+    assert mw._to_int(8192.0) == 8192
+    assert mw._to_int("8192.0") == 8192
+    assert mw._to_int("8192") == 8192
+    assert mw._to_int("not a number") is None
+    assert mw._to_int(0.0) is None
+
+
+def test_upsert_enforces_max_window_ceiling(conn):
+    # Minor 4 (final review): no upper bound previously let a typo (or a
+    # capability number mistaken for a served window) disable compaction.
+    with pytest.raises(ValueError):
+        mw.upsert(conn, "cloud:m", cc.MAX_CONTEXT_WINDOW + 1, "manual")
+    mw.upsert(conn, "cloud:m", cc.MAX_CONTEXT_WINDOW, "manual")
+    assert mw.get(conn, "cloud:m")["window"] == cc.MAX_CONTEXT_WINDOW

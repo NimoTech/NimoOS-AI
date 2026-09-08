@@ -26,6 +26,7 @@ CLOUD_CONTEXT_WINDOW = 131072   # cloud default; most user-selected models are
                                  # 128k — P3 makes this per-model
 LOCAL_CONTEXT_WINDOW = 8192     # 8k
 MIN_CONTEXT_WINDOW = 1024
+MAX_CONTEXT_WINDOW = 2_000_000   # sanity ceiling on a fetched/manual row (final review Minor 4)
 # Callers with no tier signal (e.g. context-usage with model omitted) are
 # treated as cloud.
 DEFAULT_CONTEXT_WINDOW = CLOUD_CONTEXT_WINDOW

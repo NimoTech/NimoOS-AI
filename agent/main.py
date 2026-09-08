@@ -2361,14 +2361,23 @@ async def put_model_window(request: Request, body: ModelWindowPayload):
     user_id = request.headers.get("X-User-Id", "")
     if not user_id:
         raise HTTPException(status_code=401, detail="X-User-Id required")
+    if not body.model.strip():
+        raise HTTPException(status_code=400, detail="model required")
     import model_windows as _mw  # noqa: PLC0415
     conn = _db()
     key = _mw.model_key(body.model, body.provider_type)
     if body.window == 0:
         _mw.delete_manual(conn, key)
-        return {"status": "ok", "model_key": key, "window": None, "source": None}
+        # Clearing the manual override does not mean "no window in force" —
+        # a fetched/learned row (or the tier default) may still apply, and a
+        # learned row only ever shrinks so it never expires on its own.
+        # Report the truth instead of a misleading null (final review Minor 5).
+        w, s = context_compaction.resolve_window_with_source(conn, user_id, body.model, body.provider_type)
+        return {"status": "ok", "model_key": key, "window": w, "source": s}
     if body.window < context_compaction.MIN_CONTEXT_WINDOW:
         raise HTTPException(status_code=400, detail="window_too_small")
+    if body.window > context_compaction.MAX_CONTEXT_WINDOW:
+        raise HTTPException(status_code=400, detail="window_too_large")
     _mw.upsert(conn, key, int(body.window), "manual")
     return {"status": "ok", "model_key": key, "window": int(body.window), "source": "manual"}
 

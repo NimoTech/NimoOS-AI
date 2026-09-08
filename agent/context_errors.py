@@ -9,6 +9,8 @@ PATTERNS: tuple[str, ...] = (
     r"too many tokens", r"input tokens exceed", r"max_tokens[^\n]{0,120}context",
     r"tokens[^\n]{0,120}exceed[^\n]{0,120}limit", r"context window",
     r"exceeds the available context", r"context size",
+    # Qwen/DashScope and the Gemini OpenAI-shim wordings (final review Minor 3).
+    r"range of input length", r"input length", r"maximum number of tokens",
 )
 _PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I)
 # Numbers anchored to an explicit limit/window phrase — "maximum context
@@ -23,17 +25,35 @@ _PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I)
 # phrase is a candidate; if several are found, the limit is never larger than
 # what was requested, so MIN is still correct among them.
 _ANCHOR_RES: tuple[re.Pattern, ...] = (
+    # Drop-in replacement (final review Minor 1): the two separately-optional
+    # `\s*` runs around an optional `(?:\(|of\s+)?` group let the backtracker
+    # retry every split of a whitespace run between the two `\s*`s against the
+    # failing lookahead, which is quadratic in the run length (293 ms measured
+    # at the 4 KB text cap). `[\s(]{0,4}` is a single bounded, non-backtracking
+    # character class covering the same real-world separators ("is 131072",
+    # "of 32768", "(8192)", "is  (4096)") with identical captures.
     re.compile(
         r"(?:maximum context length|context length|context window|context size|limit)"
-        r"(?:\s+(?:is|of))?\s*(?:\(|of\s+)?\s*(?<![\w.])(\d{4,7})(?![\w.])", re.I),
+        r"(?:\s+(?:is|of))?[\s(]{0,4}(?<![\w.])(\d{4,7})(?![\w.])", re.I),
     re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])\s*(?:tokens?)?\s*(?:maximum|max\b|limit)", re.I),
     re.compile(r"limit of (?<![\w.])(\d{4,7})(?![\w.])", re.I),
+    # Qwen/DashScope: "Range of input length should be [1, 30720]" and
+    # "Input length 35000 exceeds the maximum length 30720" (final review
+    # Minor 3) — both report the limit as the LAST number, unlike every other
+    # anchored pattern above (which anchors before the number), so these two
+    # are their own patterns rather than reusing the generic phrase.
+    re.compile(r"input length should be \[\s*\d+\s*,\s*(?<![\w.])(\d{4,7})(?![\w.])\s*\]", re.I),
+    re.compile(r"exceeds the maximum length (?<![\w.])(\d{4,7})(?![\w.])", re.I),
+    # Gemini OpenAI-shim: "input token count (1050000) exceeds the maximum
+    # number of tokens allowed (1000000)" — the limit is the second number.
+    re.compile(r"maximum number of tokens allowed[^\n\d]{0,20}\(?(?<![\w.])(\d{4,7})(?![\w.])", re.I),
 )
 # Fallback when no phrase anchors a number at all: the classic "N tokens"
 # wording (the pre-anchor-fix regex) — still requires the word "tokens" right
 # after the number, so it does not pick up parenthetical budget breakdowns or
-# bare IDs/years, only genuinely token-denominated counts.
-_TOKENS_RE = re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])\s*tokens")
+# bare IDs/years, only genuinely token-denominated counts. re.I restored
+# (final review Minor 2): a capitalised "8192 Tokens" was not matching.
+_TOKENS_RE = re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])\s*tokens", re.I)
 _MAX_TEXT_LEN = 4000
 
 

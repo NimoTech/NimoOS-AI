@@ -69,7 +69,7 @@ async def test_context_400_triggers_one_rescue_and_learns_window(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m", max_turns=13)
+                         provider_url="", model_name="m", max_turns=13)
     assert len(calls) == 2
     assert calls[1][1] == 10                                   # 13 - 3 llm calls used
     # classify() now takes the MIN of the two numbers in the message (the
@@ -115,7 +115,7 @@ async def test_rescue_window_forced_below_manual_row_and_prev_window(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
+                         provider_url="", model_name="m")
     assert len(calls) == 2
     assert calls[0][1] == 131_072                                  # user override, not the manual row
     assert calls[1][1] < 100_000 and calls[1][1] >= cc.MIN_CONTEXT_WINDOW
@@ -138,7 +138,7 @@ async def test_rescue_forces_compaction_on_for_the_retry(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
+                         provider_url="", model_name="m")
     assert enabled_at_call == [False, True]                        # user disabled it; the rescue forces it on
 
 
@@ -162,7 +162,7 @@ async def test_rescue_window_binds_to_prev_window_on_large_payload(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
+                         provider_url="", model_name="m")
     assert len(calls) == 2
     assert calls[0][1] == 131_072                                       # CLOUD_CONTEXT_WINDOW default
     assert calls[1][1] == int(131_072 * 0.9)                            # prev_w*0.9 binds, not the estimate
@@ -218,7 +218,7 @@ async def test_second_context_400_falls_through_to_error(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
+                         provider_url="", model_name="m")
     assert n["i"] == 2
     types = [e["type"] for e in sink.events]
     assert types.count("context_recovered") == 1 and "error" in types and types[-1] == "done"
@@ -233,22 +233,30 @@ async def test_unrelated_400_is_not_rescued(runner):
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
+                         provider_url="", model_name="m")
     assert n["i"] == 1 and not any(e["type"] == "context_recovered" for e in sink.events)
     assert any(e["type"] == "error" for e in sink.events)
 
 
 @pytest.mark.asyncio
-async def test_context_400_without_parsable_window_and_no_usage_is_not_rescued(runner):
+async def test_context_400_without_parsable_window_on_first_call_is_now_rescued(runner):
+    # Minor 9 (final review): RunCtx.last_input_tokens starts at 0 and is
+    # never seeded, so a numberless context 400 on the FIRST model call of a
+    # run used to make classify()'s tier-3 fallback (0.9 * last_input_tokens)
+    # yield None -> no rescue at all. classify() is now given an estimate of
+    # the payload that was actually just sent, so this same case rescues.
     n = {"i": 0}
     def fake_run_streamed(agent, input_messages, **kw):
         n["i"] += 1
-        return _failing_stream(input_messages, _bad_request("prompt is too long"), [])
+        if n["i"] == 1:
+            return _failing_stream(input_messages, _bad_request("prompt is too long"), [])
+        return _ok_stream(input_messages, [{"role": "assistant", "content": "done"}])
     sink = _Sink()
     with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
-                         provider_url="http://x", model_name="m")
-    assert n["i"] == 1 and not any(e["type"] == "context_recovered" for e in sink.events)
+                         provider_url="", model_name="m")
+    assert n["i"] == 2
+    assert any(e["type"] == "context_recovered" for e in sink.events)
 
 
 def test_rescue_estimates_shrink_when_over_window():

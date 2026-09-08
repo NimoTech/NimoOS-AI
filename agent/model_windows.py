@@ -4,7 +4,10 @@ learned. Manual is never overwritten by machines; learned only shrinks."""
 from __future__ import annotations
 
 import logging
+import re
 import time
+
+import httpx
 
 import context_compaction as cc
 
@@ -42,6 +45,8 @@ def upsert(conn, key: str, window: int, source: str) -> None:
     window = int(window)
     if window < cc.MIN_CONTEXT_WINDOW:
         raise ValueError(f"window {window} < MIN_CONTEXT_WINDOW {cc.MIN_CONTEXT_WINDOW}")
+    if window > cc.MAX_CONTEXT_WINDOW:
+        raise ValueError(f"window {window} > MAX_CONTEXT_WINDOW {cc.MAX_CONTEXT_WINDOW}")
     cur = get(conn, key)
     if cur is not None:
         if cur["source"] == "manual" and source != "manual":
@@ -66,10 +71,6 @@ def resolve_stored(conn, key: str) -> tuple[int, str] | None:
     return (int(row["window"]), row["source"]) if row else None
 
 
-import re
-
-import httpx
-
 FETCH_TIMEOUT = 3.0
 _TRIED: set[str] = set()          # model keys already probed in this process
 _NUM_CTX_RE = re.compile(r"^\s*num_ctx\s+(\d+)", re.M)
@@ -78,25 +79,34 @@ _LIST_FIELDS = ("context_length", "context_window", "max_context_length", "max_i
 
 def _to_int(v) -> int | None:
     try:
-        n = int(str(v).strip())
+        # int(float(...)) also accepts a float-valued JSON number
+        # ("context_length": 8192.0) or its string form, which plain
+        # int(str(v)) rejects (final review Minor 11).
+        n = int(float(str(v).strip()))
         return n if n > 0 else None
     except (TypeError, ValueError):
         return None
 
 
 def _parse_ollama_show(payload: dict) -> int | None:
+    """Only a Modelfile `num_ctx` (spec §6.1's stated source) is trusted as
+    the window Ollama actually SERVES. `model_info.*.context_length` is the
+    model's advertised CAPABILITY (its trained/supported maximum), not what
+    the running server allocated `num_ctx` for — Ollama only puts `num_ctx`
+    in `parameters` when it was baked into the Modelfile, so this branch
+    returns None far more often than it returns a real served window. Before
+    this guard, a bare capability number (measured 262144 on a real box) was
+    stored as a `fetched` row and silently disabled compaction for local
+    chat, since every threshold is a fraction of the stored window (final
+    review Major 1). When only `model_info` is available, fall through to
+    the LOCAL_CONTEXT_WINDOW tier default instead — an honest budget for the
+    hardware NimoOS targets; the user can still set a manual per-model row
+    for a box that really can serve more."""
     params = payload.get("parameters") if isinstance(payload, dict) else None
     if isinstance(params, str):
         m = _NUM_CTX_RE.search(params)
         if m:
             return _to_int(m.group(1))
-    info = payload.get("model_info") if isinstance(payload, dict) else None
-    if isinstance(info, dict):
-        for k, v in info.items():
-            if str(k).endswith(".context_length"):
-                n = _to_int(v)
-                if n:
-                    return n
     return None
 
 

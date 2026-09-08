@@ -66,3 +66,34 @@ def test_no_events_leaves_messages_untouched(client):
     r = client.get("/agent/sessions/cr-s1/messages", headers={"X-User-Id": "cr-u1"})
     assert r.status_code == 200
     assert not any(b.get("type") == "context_recovered" for m in r.json() for b in m.get("blocks", []))
+
+
+def test_card_lands_one_turn_late_when_an_earlier_run_left_no_assistant_block(client):
+    # Minor 8 (final review, deferred — documents the known limitation): the
+    # correlation is "the k-th run that recovered maps to the k-th assistant
+    # turn", but run_index counts ALL of the session's runs while
+    # assistant_turns omits a run that produced no visible block. Sequence:
+    # run0 errors with no output, run1 rescues and answers, run2 answers
+    # (matching the review's exact example). run_index puts run1 at 1, but
+    # assistant_turns (only 2 — run0 left none) has run1's own answer at
+    # index 0 — so the card lands on turns[1] (run2's turn) instead of
+    # turns[0] (run1's own turn). Pinning today's behaviour so fixing the
+    # correlation (walking messages by agent_runs.user_message, per the
+    # review) is a deliberate change, not an accidental one.
+    runner = main.AgentRunner(main._conn)
+    runner._save_history("cr-s1", _history(2))          # only 2 assistant turns are ever hydrated
+    now = int(time.time())
+    _run(main._conn, "cr-run0", now - 15, [{"type": "error"}])                      # run0: no assistant block
+    _run(main._conn, "cr-run1", now - 10, [{"type": "context_recovered",
+                                            "before": 100000, "after": 60000, "window": 90000},
+                                           {"type": "message_delta", "content": "a0"}, {"type": "done"}])
+    _run(main._conn, "cr-run2", now - 5, [{"type": "done"}])
+    r = client.get("/agent/sessions/cr-s1/messages", headers={"X-User-Id": "cr-u1"})
+    assert r.status_code == 200
+    turns = [m for m in r.json() if m.get("role") == "assistant"]
+    assert len(turns) == 2
+    # Known-wrong: the card lands on turns[1] (run2's turn), not turns[0]
+    # (run1's own turn) — see the comment above.
+    assert not any(b.get("type") == "context_recovered" for b in turns[0]["blocks"])
+    cards = [b for b in turns[1]["blocks"] if b.get("type") == "context_recovered"]
+    assert cards == [{"type": "context_recovered", "before": 100000, "after": 60000, "window": 90000}]

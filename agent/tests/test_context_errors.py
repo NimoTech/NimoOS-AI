@@ -61,6 +61,77 @@ def test_classify_matches_ollama_llamacpp_context_size_message():
     assert isinstance(err, ce.ContextLimitError) and err.matched
 
 
+def test_classify_is_fast_on_whitespace_heavy_body_at_the_4kb_cap():
+    # Final review Minor 1: the anchored-limit regex's two independently
+    # optional `\s*` runs backtracked quadratically on a whitespace run
+    # between the anchor phrase and the number — 293 ms measured on this
+    # exact shape at the 4 KB text cap (_MAX_TEXT_LEN). The bounded
+    # `[\s(]{0,4}` replacement must stay well under that.
+    msg = "maximum context length is" + (" " * 3900) + "131072"
+    exc = _bad_request(msg)
+    t0 = time.perf_counter()
+    result = ce.classify(exc)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.02, f"classify() took {elapsed:.4f}s on whitespace-heavy body"
+    assert result is None or isinstance(result, ce.ContextLimitError)
+
+
+@pytest.mark.parametrize("msg,expected_window", [
+    # Final review §3 probe table — real provider wordings, re-verified
+    # against the fixed patterns.
+    ("This model's maximum context length is 128000 tokens. However, you "
+     "requested 130000 tokens. Please reduce the length of the messages.", 128000),
+    ("This model's maximum context length is 8192 tokens. However, you requested "
+     "8500 tokens (300 in the messages, 8200 in the completion).", 8192),
+    ("This model's maximum context length is 4096 tokens, however you requested "
+     "5000 tokens (4500 in your prompt; 500 for the completion)", 4096),
+    ("This model's maximum context length is 65536 tokens. However, you requested "
+     "70000 tokens (69000 in the messages, 1000 in the completion)", 65536),
+    ("The maximum context length is 32768 tokens, but the messages resulted in "
+     "33000 tokens", 32768),
+    ("This model's maximum context length is 32768 tokens. However, you requested "
+     "33000 tokens", 32768),
+    ("prompt is too long: 210000 tokens > 200000 maximum", 200000),
+    ("litellm.BadRequestError: AnthropicException - {\"error\":{\"type\":\"invalid_request_error\","
+     "\"message\":\"prompt is too long: 210000 tokens > 200000 maximum\"}}", 200000),
+    ("Please reduce your prompt; or completion length. The model context length is "
+     "8192 tokens, however you requested 8300 tokens", 8192),
+    # Qwen/DashScope and the Gemini OpenAI-shim (Minor 3) — previously
+    # unrecognised, now learn the real limit.
+    ("Range of input length should be [1, 30720]", 30720),
+    ("Input length 35000 exceeds the maximum length 30720", 30720),
+    ("The input token count (1050000) exceeds the maximum number of tokens "
+     "allowed (1000000).", 1000000),
+])
+def test_classify_learns_real_provider_wordings(msg, expected_window):
+    err = ce.classify(_bad_request(msg), last_input_tokens=0)
+    assert isinstance(err, ce.ContextLimitError)
+    assert err.window == expected_window
+
+
+@pytest.mark.parametrize("msg", [
+    # Fallback shape (Volces/ark prose, llama.cpp, Ollama-style, Mistral):
+    # no anchored number at all → 0.9 * last_input_tokens, never poisoned by
+    # an unrelated digit in the body.
+    "input tokens exceeded the model's context length limit",
+    "the request exceeds the available context size, please increase context "
+    "or reduce prompt length",
+    "input length exceeds context length",
+    "Too many tokens in prompt: 40000 > 32768",
+])
+def test_classify_falls_back_to_90pct_for_numberless_or_unparsed_wordings(msg):
+    err = ce.classify(_bad_request(msg), last_input_tokens=50_000)
+    assert isinstance(err, ce.ContextLimitError)
+    assert err.window == 45_000
+
+
+def test_classify_tokens_pattern_is_case_insensitive():
+    # Minor 2 (final review): re.I was lost on the tier-2 "N tokens"
+    # fallback — a capitalised "Tokens" stopped parsing.
+    err = ce.classify(_bad_request("prompt is too long: 8192 Tokens"))
+    assert isinstance(err, ce.ContextLimitError) and err.window == 8192
+
+
 def test_classify_is_linear_time_on_adversarial_body():
     # A provider echoing a very long prompt back in the error body must not
     # be able to hang the (synchronous, event-loop-blocking) classify() call.

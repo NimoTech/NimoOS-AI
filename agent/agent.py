@@ -112,24 +112,30 @@ ORCHESTRATION_GUIDANCE = (
 CONTEXT_RESCUE_MAX = 1
 
 
-def _rescue_estimates(items: list, window: int) -> tuple[int, int]:
+def _rescue_estimates(items: list, window: int, ctx=None, *, fallback: int = 0) -> tuple[int, int]:
     """(tokens before, tokens after) for the context_recovered event: `after`
     is a rough preview of what the retry will send next — L1 (micro_compact)
     on old tool outputs, then a hard truncation to the last 2 turns if that
-    alone doesn't get under 0.85 * window. Both numbers are message-only
-    estimates (they exclude ctx.overhead_tokens / ctx.summary, unlike the
-    filter's own budget/_estimate), so treat them as relative, not absolute
-    token counts. Pure; never raises."""
+    alone doesn't get under 0.85 * window. When `ctx` is given both numbers
+    are computed through compaction_filter._estimate (overhead_tokens +
+    summary included) — the same units the filter itself budgets against and
+    the caller already reports as `before` in the context_recovered event
+    (Minor 7, final review: `before` used to include overhead/summary while
+    `after` was message-only, so the reported "recovery" overstated the real
+    saving). Without a ctx they fall back to a message-only estimate. On any
+    failure both numbers are `fallback` (the caller's own before-estimate),
+    never a hardcoded 0 against a non-zero before. Pure; never raises."""
     try:
         import compaction_filter as _cf  # noqa: PLC0415
-        before = context_compaction.estimate_messages_tokens(items)
+        est = (lambda its: _cf._estimate(ctx, its)) if ctx is not None else context_compaction.estimate_messages_tokens
+        before = est(items)
         compacted, _ = _cf.micro_compact(items)
         budget = int(window * 0.85)
-        if context_compaction.estimate_messages_tokens(compacted) > budget:
+        if est(compacted) > budget:
             compacted = _cf.truncate_turns(compacted, keep_turns=2)
-        return before, min(before, context_compaction.estimate_messages_tokens(compacted))
+        return before, min(before, est(compacted))
     except Exception:  # noqa: BLE001
-        return 0, 0
+        return fallback, fallback
 
 
 _SNAPSHOT_STORE = SnapshotStore()
@@ -1234,6 +1240,11 @@ class AgentRunner:
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None
+            # Assigned before the try (Nit 1, final review): read again in the
+            # MaxTurnsExceeded handler below, so a future refactor that moves
+            # something raise-worthy ahead of its in-try assignment can't turn
+            # that read into a NameError.
+            _attempt_turns = max_turns
             try:
                 # Set the ContextVar as the first thing inside the try whose
                 # finally resets it, so a failure between here and the
@@ -1264,7 +1275,6 @@ class AgentRunner:
                 # against the LAST `stream`.
                 _rescues = 0
                 _attempt_input = input_messages
-                _attempt_turns = max_turns
                 while True:
                     stream = Runner.run_streamed(
                         agent, _attempt_input, max_turns=_attempt_turns,
@@ -1298,7 +1308,21 @@ class AgentRunner:
                         raise
                     except Exception as _exc:  # noqa: BLE001
                         import context_errors as _ce  # noqa: PLC0415
-                        _cl = _ce.classify(_exc, last_input_tokens=_ctx.last_input_tokens)
+                        # Minor 9 (final review): last_input_tokens starts at 0
+                        # and is never seeded, so a numberless context 400 on
+                        # the FIRST model call of a run (last_input_tokens==0)
+                        # made classify()'s tier-3 fallback (0.9 * last_input)
+                        # yield None — no rescue, no learning. Do not seed it
+                        # from sessions.last_real_input_tokens (budget()'s
+                        # provider path would double-count against
+                        # items_seen_at_last_call == 0); instead estimate the
+                        # payload that was just sent, the same way the rescue
+                        # branch below estimates the retry's payload.
+                        _fold0 = int(getattr(_ctx, "fold_idx", 0) or 0)
+                        _sent0 = (_attempt_input[_fold0:] if 0 < _fold0 <= len(_attempt_input)
+                                  else _attempt_input)
+                        _cl = _ce.classify(
+                            _exc, last_input_tokens=_ctx.last_input_tokens or _cf._estimate(_ctx, _sent0))
                         if (_cl is None or _cl.window is None or _cl.window < context_compaction.MIN_CONTEXT_WINDOW
                                 or _rescues >= CONTEXT_RESCUE_MAX or _ctx.depth > 0):
                             # depth > 0 (a delegate child) never reaches this path in
@@ -1318,6 +1342,15 @@ class AgentRunner:
                         except Exception:  # noqa: BLE001
                             raise _exc
                         _attempt_input = _inject_synthetic_reasoning(_attempt_input)
+                        # Not needed for the ordinary case (a model call only
+                        # happens after all tool outputs for the previous turn
+                        # are appended), but provider_adapters.py documents one
+                        # path that does leave a dangling tool_call — a
+                        # parallel-tool cancel cascade on a non-DeepSeek
+                        # provider (Nit 4, final review). One repair call here
+                        # removes a whole class of "the rescue retried and got
+                        # a different 400".
+                        _attempt_input = _repair_dangling_tool_calls(_attempt_input)
                         # Force a real shrink for THIS retry, independent of what
                         # got persisted above: learn() can return a window >= the
                         # one that just failed (a manual/fetched row "wins" over a
@@ -1373,7 +1406,7 @@ class AgentRunner:
                         _used = int(_ctx.extra.get("llm_calls", 0) or 0)
                         if _attempt_turns is not None:
                             _attempt_turns = max(1, _attempt_turns - _used)
-                        _, _after = _rescue_estimates(_sent_items, _retry_w)
+                        _, _after = _rescue_estimates(_sent_items, _retry_w, _ctx, fallback=_est_before)
                         _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
                                      session_id, _retry_w, _est_before, _after, _attempt_turns)
                         await sink.put({"type": "context_recovered", "before": _est_before, "after": _after, "window": _retry_w})
