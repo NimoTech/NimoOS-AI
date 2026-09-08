@@ -26,7 +26,7 @@ def test_step_summary_mode_defaults_auto(monkeypatch):
 def test_prompt_carries_answer_contract():
     from ask import prompt
     p = prompt.ASK_SYSTEM_PROMPT
-    assert "[n]" in p and "Sources" in p and "<evidence>" in p
+    assert "[n]" in p and "Sources" in p and "[EVIDENCE START]" in p
     assert "at most 3" in p.lower() or "at most three" in p.lower()
     assert "needs_retrieval" in prompt.REWRITE_INSTRUCTION
     assert "queries" in prompt.REWRITE_INSTRUCTION

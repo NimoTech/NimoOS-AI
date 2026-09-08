@@ -25,6 +25,7 @@ def test_merge_adjacent_keeps_rank_of_best_member():
     assert [c.key for c in out] == ["doc:a:body:1", "doc:b:body:1"]
     m = out[0]
     assert m.text == "AAAABB" and m.merged_chunk_nos == [1, 2] and m.rrf == 0.9 and m.chunk_no == 1
+    assert m.raw_scores is not a2.raw_scores
 
 
 def test_merge_adjacent_does_not_merge_gaps_or_other_files():
@@ -93,6 +94,8 @@ def test_render_pack_numbering_and_fence():
     out = ev.render_pack(pack, budget_chars=24000)
     body = unfence(out, source="evidence")
     assert body.startswith(ev.EVIDENCE_INTRO)
+    assert "[EVIDENCE START]" in body and body.strip().endswith("[EVIDENCE END]")
+    assert "evidence>" not in body
     assert "[1] a.csv" in body and "/D/a.csv" in body and "chunk 1" in body and "hit by: q1, q3" in body
     assert "[2] b.csv" in body and "full text" in body
     assert "Step summaries:\n- s1" in body

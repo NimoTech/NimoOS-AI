@@ -68,6 +68,7 @@ def merge_adjacent(cands: list[Candidate]) -> list[Candidate]:
             m.merged_chunk_nos = [c.chunk_no for c in r]
             m.hit_queries = sorted({q for c in r for q in c.hit_queries})
             m.rrf = best.rrf
+            m.raw_scores = list(best.raw_scores)
             for c in r:
                 consumed.add(c.key)
             merged_for[best.key] = m
@@ -121,6 +122,7 @@ async def expand_parents(cands: list[Candidate], *, invoke_tool, user_id: str,
             p.text, p.parent = text, True
             p.merged_chunk_nos = sorted(int(ch.get("chunk_no") or 0) for ch in chunks)
             p.hit_queries = sorted({q for c in members for q in c.hit_queries})
+            p.raw_scores = list(best.raw_scores)
             replaced[best.key] = p
             consumed.update(c.key for c in members if c.key != best.key)
         except Exception as exc:  # noqa: BLE001 — expansion is best effort
@@ -189,14 +191,17 @@ def _header(n: int, c: Candidate) -> str:
 def render_pack(pack: EvidencePack, *, budget_chars: int) -> str:
     if not pack.items:
         return ""
-    parts = [EVIDENCE_INTRO, "<evidence>"]
+    # fence_untrusted strips every literal '<'/'>' from the body it wraps, so
+    # bracketed markers (not angle-bracket tags) are what actually survives
+    # sanitization and reaches the model.
+    parts = [EVIDENCE_INTRO, "[EVIDENCE START]"]
     if pack.step_summaries:
         parts.append("Step summaries:\n" + "\n".join(f"- {s}" for s in pack.step_summaries))
     for n, c in enumerate(pack.items, 1):
         parts.append(_header(n, c) + "\n" + c.text.strip())
     if pack.dropped:
         parts.append(f"({pack.dropped} further relevant passages were not included for space.)")
-    parts.append("</evidence>")
+    parts.append("[EVIDENCE END]")
     return fence_untrusted("evidence", "\n\n".join(parts), cap=budget_chars + 4000)
 
 
