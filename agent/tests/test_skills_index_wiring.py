@@ -15,7 +15,7 @@ def _run_source():
 
 def test_run_injects_skill_index_guarded_by_profile():
     src = _run_source()
-    assert "skills_registry.render_index_block()" in src
+    assert "skills_registry.render_index_block(_rt_view)" in src
     # The injection guard must appear before the call site.
     assert src.index("profile.tools is None") < src.index(
-        "skills_registry.render_index_block()")
+        "skills_registry.render_index_block(_rt_view)")

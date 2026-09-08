@@ -182,3 +182,16 @@ def test_render_index_skips_invalid_skill_id(tmp_path):
     block = render_index_block()
     assert "- good-one:" in block
     assert "bad" not in block and "<x" not in block
+
+
+def test_render_index_block_accepts_a_prescanned_list(tmp_path):
+    rt = tmp_path / ".runtime" / "42"
+    rt.mkdir(parents=True)
+    builtin = tmp_path / "builtin"
+    _make_skill(builtin, "alpha")
+    os.symlink(builtin / "alpha", rt / "alpha")
+    SKILLS_ROOT_VAR.set(str(tmp_path))
+    USER_ID_VAR.set("42")
+    scanned = _scan_runtime_view()
+    assert render_index_block(scanned) == render_index_block()
+    assert render_index_block([]) == ""
