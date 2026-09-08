@@ -14,10 +14,25 @@
     "List every Lunar Lake processor in my docs, sorted by model number",
     "What do my notes and reports say about the 2025 budget, across all documents?"
   ],
+  "activation": {
+    "keywords": [
+      "哪些", "全部列出", "列出所有", "列出全部", "一共有", "有几款", "有几个", "有多少", "多少",
+      "对比", "比较", "区别", "差异",
+      "最高", "最低", "最大", "最小", "最多", "最少", "最早", "最晚",
+      "首个", "第一个", "最后一个", "排序", "排名",
+      "资料库", "我的文档", "我的资料", "我的文件", "我的笔记", "文档里", "文档中", "资料里",
+      "list all", "list every", "which of", "which one", "which has", "which is the",
+      "compare", "comparison", "versus", "difference between",
+      "the most", "the least", "highest", "lowest", "largest", "smallest", "earliest", "latest",
+      "first to", "sorted", "ranked", "how much", "how many",
+      "in my documents", "my documents", "in my files", "in my notes", "my docs", "what do my", "according to my"
+    ],
+    "first_tool": "nimoos_search"
+  },
   "permissions": {
     "network": false,
     "writable_paths": []
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Nimo"
 }

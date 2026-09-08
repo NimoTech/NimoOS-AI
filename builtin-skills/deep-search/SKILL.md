@@ -11,6 +11,14 @@ shot. Every statement in the answer is tied to the document it came from.
   clearly not answered by any single document
 - Not for reading one known document end to end — use file-reader for that
 
+### When this arrives inside <activated-skill>
+The server matched the question's shape and loaded this skill for you; your
+first tool call has already been pinned to `nimoos_search`. Do not call
+`read_skill_file` again. Write the plan (step 1) in your first message and
+treat that first search as the plan's first step. If the question is really
+about NAS operations, code or general knowledge, say so briefly and answer
+normally instead.
+
 ### Tools
 - `nimoos_search(query, sources, top_k)` — `sources="semantic"` finds passages
   by meaning (each hit carries a `file_id`, a `kind` and a `chunk_no`);
