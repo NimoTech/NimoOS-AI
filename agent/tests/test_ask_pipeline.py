@@ -113,7 +113,9 @@ async def test_all_queries_failed_emits_error_and_empty_block():
     res = await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
                        sink=sink, conn=_conn(), search=Search({}, fail=True), parser=Parser())
     assert ("ask_stage", "retrieve", "error") in [(e["type"], e.get("stage"), e.get("status")) for e in sink.events]
-    assert res.evidence_block == "" and "retrieve_failed" in res.warnings
+    assert res.sources == [] and "retrieve_failed" in res.warnings
+    # no passages, but the model is told what was attempted (spec §5 row 7)
+    assert "Reason: retrieve_error." in res.evidence_block
 
 
 @pytest.mark.asyncio
@@ -145,7 +147,7 @@ async def test_run_guarded_never_raises():
     conn.close()   # store access will raise → must be swallowed
     res = await pl.run_guarded(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
                                sink=sink, conn=conn, search=Boom(), parser=Parser())
-    assert res.evidence_block == ""
+    assert res.sources == [] and "[EVIDENCE START]" not in res.evidence_block
     assert any(e["type"] == "ask_stage" and e["status"] == "error" for e in sink.events)
 
 
@@ -223,3 +225,121 @@ async def test_step_summaries_skipped_when_the_deadline_is_near(monkeypatch):
     assert "[EVIDENCE END]" in unfence(res.evidence_block, source="evidence")
     assert [e for e in sink.events if e["type"] == "ask_sources"][-1]["items"]
     assert len(store.list_turns(conn, "s")) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_hits_tells_the_model_what_was_tried():
+    """spec §5 row 7: an empty pack must still reach the model as a short
+    server-authored note, or the prompt's "say which queries were tried"
+    instruction has nothing to work from."""
+    async def complete(instruction, body, *, max_tokens, timeout):
+        return _plan_json("265K turbo", "265K 睿频")
+
+    res = await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
+                       sink=Sink(), conn=_conn(), search=Search({}), parser=Parser())
+    assert res.sources == []
+    assert "Server-side retrieval ran 2 queries" in res.evidence_block
+    assert "1) 265K turbo 2) 265K 睿频" in res.evidence_block
+    assert "Reason: no_hits." in res.evidence_block
+    assert "[EVIDENCE START]" not in res.evidence_block   # server-authored, not fenced data
+
+
+@pytest.mark.asyncio
+async def test_all_failed_note_reports_retrieve_error():
+    async def complete(instruction, body, *, max_tokens, timeout):
+        return _plan_json("a", "b")
+
+    sink = Sink()
+    res = await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
+                       sink=sink, conn=_conn(), search=Search({}, fail=True), parser=Parser())
+    assert "Server-side retrieval ran 2 queries" in res.evidence_block
+    assert "1) a 2) b" in res.evidence_block and "Reason: retrieve_error." in res.evidence_block
+    stages = [(e.get("stage"), e.get("status")) for e in sink.events if e["type"] == "ask_stage"]
+    assert ("rank", "skipped") in stages and ("pack", "skipped") in stages
+
+
+@pytest.mark.asyncio
+async def test_partial_retrieval_note_reports_partial_timeout(monkeypatch):
+    """One query answered (with nothing), one was still running at the
+    deadline: not "all failed", but the empty pack is a timeout artefact and
+    the model must be told so rather than that the documents lack the answer."""
+    class SlowSecond(Search):
+        async def search_text(self, q, *, user_id, top_k, rerank, timeout_s=None):
+            self.calls.append(q)
+            if q == "b":
+                await asyncio.sleep(30)
+            return {"hits": [], "warnings": []}
+
+    async def complete(instruction, body, *, max_tokens, timeout):
+        return _plan_json("a", "b")
+
+    monkeypatch.setattr(pl.config, "PER_QUERY_TIMEOUT_S", 0.2)
+    sink, conn = Sink(), _conn()
+    res = await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
+                       sink=sink, conn=conn, search=SlowSecond({}), parser=Parser())
+    assert "Reason: partial_timeout." in res.evidence_block
+    assert "1) a 2) b" in res.evidence_block
+    assert "retrieve_partial" in res.warnings
+    assert len(store.list_turns(conn, "s")) == 1
+
+
+@pytest.mark.asyncio
+async def test_pack_stages_only_process_the_top_slice():
+    """I6: merging, parent expansion and inlining used to run over the whole
+    fused pool — one read_file_chunk round trip per parent group, however deep
+    in the ranking it sat."""
+    async def complete(instruction, body, *, max_tokens, timeout):
+        return _plan_json("q1", "q2")
+
+    hits = []
+    for i in range(15):
+        for chunk in (1, 3):        # non-adjacent, same parent → a parent group
+            h = _hit(f"f{i:02d}", chunk, f"text {i}-{chunk}")
+            h["parent_id"] = f"p{i:02d}"
+            h["score"] = 1.0 - i / 100
+            hits.append(h)
+
+    calls = []
+
+    class ParentSearch(Search):
+        async def invoke_tool(self, name, args, user_id=None):
+            calls.append((name, args["file_id"]))
+            if name == "read_file_chunk":
+                return {"chunks": [{"chunk_no": 1, "text": "sec"}]}
+            return {"text": "FULL", "truncated": False}
+
+    res = await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
+                       sink=Sink(), conn=_conn(), search=ParentSearch({"q1": hits, "q2": []}),
+                       parser=Parser())
+    touched = sorted({fid for _, fid in calls})
+    assert len(touched) == pl.config.EVIDENCE_MAX_ITEMS      # 20 candidates -> 10 parent groups
+    assert touched == [f"f{i:02d}" for i in range(pl.config.EVIDENCE_MAX_ITEMS)]
+    # the 10 candidates sliced off before packing are still reported as dropped
+    assert res.dropped == 10
+
+
+@pytest.mark.asyncio
+async def test_persisted_stages_include_the_answer_stage():
+    async def complete(instruction, body, *, max_tokens, timeout):
+        return _plan_json("q1", "q2")
+
+    conn = _conn()
+    await pl.run(question="q", session_id="s", user_id="u", run_id="r", complete=complete,
+                 sink=Sink(), conn=conn, search=Search({"q1": [_hit("a", 1, "alpha")]}), parser=Parser())
+    stages = store.list_turns(conn, "s")[0]["stages"]
+    assert ("answer", "start") in [(st["stage"], st["status"]) for st in stages]
+    assert all("ms" in st and "detail" in st for st in stages)
+
+
+@pytest.mark.asyncio
+async def test_run_guarded_error_branch_resolves_every_stage(monkeypatch):
+    async def boom(**kwargs):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(pl, "run", boom)
+    sink = Sink()
+    res = await pl.run_guarded(question="q", session_id="s", user_id="u", run_id="r", complete=None,
+                               sink=sink, conn=_conn(), search=Search({}), parser=Parser())
+    stages = [(e.get("stage"), e.get("status")) for e in sink.events if e["type"] == "ask_stage"]
+    assert stages == [("retrieve", "error"), ("rank", "skipped"), ("pack", "skipped")]
+    assert res.warnings == ["pipeline_error"]

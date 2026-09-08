@@ -28,13 +28,29 @@ class _Stages:
 
     async def start(self, stage: str):
         self._t0[stage] = time.monotonic()
-        await self.sink.put({"type": "ask_stage", "stage": stage, "status": "start", "ms": 0, "detail": ""})
+        rec = {"stage": stage, "status": "start", "ms": 0, "detail": ""}
+        # Recorded, not just streamed: "answer" has no end() (the model call is
+        # not part of this pipeline), so without this the persisted stages of
+        # an ask_turn stopped at "pack" and a replay could not show that the
+        # pipeline actually handed off to the model.
+        self.records.append(rec)
+        await self.sink.put({"type": "ask_stage", **rec})
 
     async def end(self, stage: str, status: str, detail: str = ""):
         ms = int((time.monotonic() - self._t0.get(stage, time.monotonic())) * 1000)
         rec = {"stage": stage, "status": status, "ms": ms, "detail": detail}
         self.records.append(rec)
         await self.sink.put({"type": "ask_stage", **rec})
+
+
+def _no_evidence_note(plan: rewrite.Plan, reason: str) -> str:
+    """Server-authored, unfenced (i.e. trusted) replacement for an empty
+    evidence pack. The prompt tells the model to say which queries were
+    tried; with nothing in the user turn about the retrieval it had no way
+    to do that and would invent an explanation (spec §5 row 7)."""
+    tried = " ".join(f"{i + 1}) {q.q}" for i, q in enumerate(plan.queries))
+    return (f"Server-side retrieval ran {len(plan.queries)} queries and returned no usable "
+            f"passages. Queries tried: {tried}. Reason: {reason}.")
 
 
 def _plan_event(plan: rewrite.Plan, hits: list[int] | None) -> dict:
@@ -122,6 +138,7 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
     await sink.put(_plan_event(plan, rr.per_query_hits))
     if rr.all_failed:
         result.warnings.append("retrieve_failed")
+        result.evidence_block = _no_evidence_note(plan, "retrieve_error")
         await st.end("retrieve", "error", "all queries failed")
         for s in ("rank", "pack"):
             await st.end(s, "skipped")
@@ -147,13 +164,22 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
     # 4 pack
     await st.start("pack")
     budget = config.budget_for_window(window_tokens)
-    pack = await evidence.build_pack(ranked, invoke_tool=search.invoke_tool, user_id=user_id,
+    # Merging, parent expansion and inlining each cost a Search round trip per
+    # group, so they only run over what could plausibly be packed: at most
+    # twice the item cap. Everything below that is counted as dropped, not
+    # processed.
+    head, tail = ranked[:config.EVIDENCE_MAX_ITEMS * 2], ranked[config.EVIDENCE_MAX_ITEMS * 2:]
+    pack = await evidence.build_pack(head, invoke_tool=search.invoke_tool, user_id=user_id,
                                      max_items=config.EVIDENCE_MAX_ITEMS, budget_chars=budget)
+    pack.dropped += len(tail)          # ask_sources.dropped covers everything not sent
     pack.step_summaries = await _step_summaries(plan, pack, complete,
                                                 pool_chars=pool_chars, deadline=deadline)
     result.sources = evidence.sources_payload(pack, total_queries=len(plan.queries))
     result.dropped = pack.dropped
     result.evidence_block = evidence.render_pack(pack, budget_chars=budget)
+    if not pack.items:
+        result.evidence_block = _no_evidence_note(
+            plan, "partial_timeout" if rr.partial else "no_hits")
     await st.end("pack", "done", f"items={len(pack.items)} chars={pack.total_chars} dropped={pack.dropped}")
     await sink.put({"type": "ask_sources", "items": result.sources, "dropped": pack.dropped,
                     "warnings": result.warnings})
@@ -181,6 +207,11 @@ async def run_guarded(**kwargs) -> AskResult:
             try:
                 await sink.put({"type": "ask_stage", "stage": "retrieve", "status": "error", "ms": 0,
                                 "detail": f"pipeline error: {type(exc).__name__}"})
+                # The UI's stage timeline waits for every stage to resolve;
+                # without these two it would sit on "rank"/"pack" forever.
+                for stage in ("rank", "pack"):
+                    await sink.put({"type": "ask_stage", "stage": stage, "status": "skipped",
+                                    "ms": 0, "detail": ""})
                 await sink.put({"type": "ask_sources", "items": [], "dropped": 0,
                                 "warnings": ["pipeline_error"]})
             except Exception:  # noqa: BLE001

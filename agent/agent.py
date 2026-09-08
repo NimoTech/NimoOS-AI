@@ -1187,6 +1187,9 @@ class AgentRunner:
                     search=_search_skill._client, parser=_search_skill._parser_client,
                     window_tokens=context_compaction.resolve_window(
                         self._conn, str(user_id), model_name, provider_type),
+                    # Read-only for now: nothing writes ask.include_draft_notes
+                    # yet. Exposing it on the notes settings API is a follow-up;
+                    # until then the default (curated notes only) is what ships.
                     include_draft_notes=memory_store.get_bool_setting(
                         self._conn, str(user_id), "ask.include_draft_notes", False))
                 user_content = _append_text(user_content, _ask.evidence_block)
