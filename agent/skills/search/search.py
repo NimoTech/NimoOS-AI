@@ -37,6 +37,35 @@ _FS_GATE_ERRORS = (
 # Set per-run by AgentRunner.run; read at tool-call time.
 USER_ID_VAR: ContextVar[str] = ContextVar("search_user_id", default="")
 
+# Chunk kinds the Parser writes to the text collection. Anything else in a
+# kind_in filter matches nothing, so it is dropped and reported back to the
+# model instead of silently returning zero hits (2026-09-08 acceptance run:
+# the model invented kind_in=["document"] and concluded the corpus was empty).
+KNOWN_CHUNK_KINDS: frozenset[str] = frozenset({"body", "caption"})
+
+
+def _sanitise_kind_in(args: dict) -> str | None:
+    """Drop unknown kind_in values in args["filters"] in place. Returns a
+    warning string when something was dropped, else None."""
+    f = args.get("filters")
+    if not isinstance(f, dict) or "kind_in" not in f:
+        return None
+    raw = f.get("kind_in")
+    values = raw if isinstance(raw, list) else [raw]
+    known = [k for k in values if isinstance(k, str) and k in KNOWN_CHUNK_KINDS]
+    unknown = [k for k in values if not (isinstance(k, str) and k in KNOWN_CHUNK_KINDS)]
+    if not unknown:
+        return None
+    if known:
+        f["kind_in"] = known
+    else:
+        f.pop("kind_in")
+    if not f:
+        args.pop("filters")
+    return (f"ignored unknown kind_in values {unknown}; valid kinds are "
+            "\"body\" (document text) and \"caption\" (photo captions). "
+            "Omit filters to search everything.")
+
 
 async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
                               filters: Optional[str] = None, top_k: int = 5) -> str:
@@ -57,12 +86,16 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
         except json.JSONDecodeError as e:
             return json.dumps({"error": f"invalid filters JSON: {e}"},
                               ensure_ascii=False)
+    kind_warning = _sanitise_kind_in(args)
     uid = USER_ID_VAR.get() or None
     try:
         result = await _client.invoke_tool("nimoos_search", args, user_id=uid)
     except httpx.HTTPError as e:
         return json.dumps({"error": f"search request failed: {e}"},
                           ensure_ascii=False)
+    if kind_warning and isinstance(result, dict):
+        prior = result.get("warnings")
+        result["warnings"] = (list(prior) if isinstance(prior, list) else []) + [kind_warning]
     await _inline_small_documents(result, uid)
     result_text = json.dumps(result, ensure_ascii=False)
     # Search hits are external content the model reads — fence them so any
@@ -227,6 +260,9 @@ async def nimoos_search(query: str, sources: Optional[str] = None,
             all four.
         filters: Optional JSON-encoded filter object (applies to the semantic
             source only): root_ids, mime_prefix, kind_in, lang_in, mtime_after_ms.
+            Leave it unset unless you must narrow the search. kind_in accepts
+            only "body" (document text) and "caption" (photo captions); other
+            values are ignored with a warning.
         top_k: Max hits per source (default 5, max 20).
     """
     return await _nimoos_search_impl(query, sources, filters, top_k)
