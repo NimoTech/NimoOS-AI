@@ -1593,6 +1593,14 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
+@app.get("/agent/sessions/{session_id}/ask-turns")
+async def list_ask_turns(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
+    """Knowledge-ask pipeline records for the Ask page (plan / stages / sources per turn)."""
+    _assert_owns_session(session_id, x_user_id)
+    from ask import store as ask_store
+    return ask_store.list_turns(_conn, session_id)
+
+
 @app.get("/agent/sessions/{session_id}/plan")
 async def get_session_plan(session_id: str, x_user_id: str = Header(..., alias="X-User-Id")):
     row = _conn.execute("SELECT id FROM sessions WHERE id=? AND user_id=?",

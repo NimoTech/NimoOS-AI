@@ -50,6 +50,8 @@ from mcp_client import status as mcp_status
 from mcp_client.runtime import ConfigUnavailable, RuntimePayload
 import skills.mcp_gating as mcp_gating
 from profiles import get_profile
+from ask import config as ask_config
+from ask import pipeline as ask_pipeline
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
@@ -272,6 +274,16 @@ def build_user_content(message: str, attachment_ids, *,
     if degraded_notes:
         blocks.append({"type": "input_text", "text": "\n".join(degraded_notes)})
     return blocks
+
+
+def _append_text(content, text: str):
+    """Append a text block to the SDK user content (str or block list) without
+    mutating the input. Used to attach the ask evidence pack to the user turn."""
+    if not text:
+        return content
+    if isinstance(content, str):
+        return content + "\n\n" + text
+    return list(content) + [{"type": "input_text", "text": text}]
 
 
 def hydrate_image_blocks(history, *, session_id: str, data_root: str):
@@ -961,6 +973,12 @@ class AgentRunner:
             ).fetchone()
             profile = get_profile(row["agent_type"] if row else None)
 
+            # Created here (not after history load) so the ask pipeline can use
+            # the same background-model handle for query rewriting.
+            _summarize_fn = _make_summarize_fn(client, model_name)
+            if profile.max_turns is not None:
+                max_turns = profile.max_turns
+
             # kind=init is rejected for non-general sessions at the API layer
             # (main.py), so INIT_SYSTEM_PROMPT only ever pairs with the general
             # profile here.
@@ -1159,6 +1177,20 @@ class AgentRunner:
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,
                 model_name=model_name, provider_type=provider_type)
+
+            if (profile.pre_run == "ask" and kind == "chat" and not continue_run
+                    and ask_config.pipeline_enabled()):
+                from skills.search import search as _search_skill
+                _ask = await ask_pipeline.run_guarded(
+                    question=message, session_id=session_id, user_id=str(user_id), run_id=run_id,
+                    complete=getattr(_summarize_fn, "complete", None), sink=sink, conn=self._conn,
+                    search=_search_skill._client, parser=_search_skill._parser_client,
+                    window_tokens=context_compaction.resolve_window(
+                        self._conn, str(user_id), model_name, provider_type),
+                    include_draft_notes=memory_store.get_bool_setting(
+                        self._conn, str(user_id), "ask.include_draft_notes", False))
+                user_content = _append_text(user_content, _ask.evidence_block)
+
             stored_history = self._load_history(session_id)
             # Earlier turns' image blocks were stored in compact form
             # (attachment_id only) to keep the DB small. Re-inline the base64
@@ -1170,7 +1202,6 @@ class AgentRunner:
                 stored_history, session_id=session_id, data_root=data_root)
 
             # --- P4 context compaction (main path; bypass/fail → no-op/truncate) ---
-            _summarize_fn = _make_summarize_fn(client, model_name)
             # continue_run has no new user message (it's already in history), so
             # don't double-count it in the token estimate.
             if continue_run:
