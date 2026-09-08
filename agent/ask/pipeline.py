@@ -115,12 +115,9 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
 
     # 2 retrieve
     await st.start("retrieve")
-    def _note_title(nid: str) -> str:
-        row = conn.execute("SELECT title FROM notes WHERE id=?", (nid,)).fetchone()
-        return (row["title"] if row else "") or ""
     rr = await retrieve.retrieve(plan, question=question, user_id=user_id, search=search, parser=parser,
                                  deadline=deadline, include_draft_notes=include_draft_notes,
-                                 note_title=_note_title)
+                                 note_title=lambda nid: store.note_title(conn, user_id, nid))
     result.warnings.extend(rr.warnings)
     await sink.put(_plan_event(plan, rr.per_query_hits))
     if rr.all_failed:

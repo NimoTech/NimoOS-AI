@@ -55,3 +55,21 @@ def test_session_purge_removes_ask_turns(monkeypatch):
     asyncio.run(session_purge.purge_session(conn, "u", "s", snapshots_root="/tmp/nonexistent-snaps",
                                             vector_cleanup=no_vectors))
     assert conn.execute("SELECT COUNT(*) FROM ask_turns").fetchone()[0] == 0
+
+
+def _note(conn, nid, user_id, title, deleted_at=None):
+    conn.execute(
+        "INSERT INTO notes (id,user_id,path,title,content_hash,created_at,updated_at,deleted_at) "
+        "VALUES (?,?,?,?,?,1,1,?)", (nid, user_id, f"{nid}.md", title, "h", deleted_at))
+    conn.commit()
+
+
+def test_note_title_is_scoped_to_the_owner():
+    conn = _conn()
+    _note(conn, "n1", "u", "Mine")
+    _note(conn, "n2", "other", "Theirs")
+    _note(conn, "n3", "u", "Trashed", deleted_at=99)
+    assert store.note_title(conn, "u", "n1") == "Mine"
+    assert store.note_title(conn, "u", "n2") == ""      # another user's note
+    assert store.note_title(conn, "u", "n3") == ""      # soft-deleted
+    assert store.note_title(conn, "u", "missing") == ""

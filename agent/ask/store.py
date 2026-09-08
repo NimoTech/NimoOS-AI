@@ -48,6 +48,19 @@ def seen_keys(conn, session_id: str) -> set[str]:
     return keys
 
 
+def note_title(conn, user_id: str, note_id: str) -> str:
+    """Title of one of THIS user's live notes, "" for anything else.
+
+    The user_id filter is the point: note ids arrive from Parser's vector
+    index, and a lookup without it would let one user's note title be
+    rendered into another user's evidence pack.
+    """
+    row = conn.execute(
+        "SELECT title FROM notes WHERE id=? AND user_id=? AND deleted_at IS NULL",
+        (note_id, str(user_id))).fetchone()
+    return (row["title"] if row else "") or ""
+
+
 def recent_questions(conn, session_id: str, n: int = 2) -> str:
     rows = conn.execute(
         "SELECT question FROM ask_turns WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
