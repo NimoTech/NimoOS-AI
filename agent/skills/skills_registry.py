@@ -90,13 +90,16 @@ def _scan_runtime_view() -> list[dict]:
     return out
 
 
-def render_index_block() -> str:
+def render_index_block(skills=None) -> str:
     """Render the <available-skills> system-prompt block (L1 progressive
     disclosure). Empty string when the user has no visible (auto/slash)
     skills or the runtime view is unreadable. Never raises: prompt
-    composition must not fail because of bad skill data."""
+    composition must not fail because of bad skill data.
+
+    `skills` — a list already returned by `_scan_runtime_view()`; scanned
+    here when omitted."""
     try:
-        visible = [s for s in _scan_runtime_view()
+        visible = [s for s in (skills if skills is not None else _scan_runtime_view())
                    if s.get("trigger") != "manual"
                    and _SKILL_ID_RE.match(str(s.get("skill_id", "")))]
         if not visible:

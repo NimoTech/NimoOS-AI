@@ -133,3 +133,49 @@ def test_scan_runtime_view_exposes_activation(tmp_path):
     USER_ID_VAR.set("42")
     skills = _scan_runtime_view()
     assert skills[0]["activation"] == {"keywords": ["哪些"], "first_tool": "nimoos_search"}
+
+
+@pytest.mark.parametrize("q", PROBE_QUESTIONS)
+def test_probe_questions_pin_the_first_tool(q):
+    got = sa.select_auto_skill(q, [_deep_search_entry()])
+    assert got is not None and got.pin is True
+
+
+@pytest.mark.parametrize("q", [
+    "compare these two react hooks for me",          # 1 hit (compare), not a pin phrase
+    "which is the best way to write a quicksort",    # 1 hit (which is the)
+    "这个函数多少行",                                   # 1 hit (多少)
+    "帮我把这些照片按拍摄时间排序",                      # 1 hit (排序)
+])
+def test_single_broad_hit_injects_but_does_not_pin(q):
+    got = sa.select_auto_skill(q, [_deep_search_entry()])
+    assert got is not None and got.pin is False
+
+
+def test_two_hits_pin_without_pin_keywords():
+    skills = [_entry("alpha", ["哪些", "排序"])]
+    got = sa.select_auto_skill("哪些型号，按大小排序", skills)
+    assert got is not None and got.hits == 2 and got.pin is True
+
+
+def test_one_pin_keyword_hit_pins():
+    e = _entry("alpha", ["哪些", "最低"])
+    e["activation"]["pin_keywords"] = ["最低"]
+    got = sa.select_auto_skill("TDP 最低的是哪一款处理器", [e])
+    assert got is not None and got.hits == 1 and got.pin is True
+
+
+def test_malformed_skill_id_is_skipped():
+    e = _entry("Bad Id!", ["哪些"])
+    assert sa.select_auto_skill("哪些型号支持这个功能", [e]) is None
+
+
+@pytest.mark.parametrize("forced,retried,emitted,calls,expected", [
+    ("nimoos_search", False, False, {}, True),
+    ("nimoos_search", True, False, {}, False),
+    ("nimoos_search", False, True, {}, False),
+    ("nimoos_search", False, False, {"c1": "nimoos_search"}, False),
+    (None, False, False, {}, False),
+])
+def test_should_retry_without_pin(forced, retried, emitted, calls, expected):
+    assert sa.should_retry_without_pin(forced, retried, emitted, calls) is expected

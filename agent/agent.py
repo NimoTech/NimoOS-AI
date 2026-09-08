@@ -994,9 +994,17 @@ class AgentRunner:
             # Skill index (L1 progressive disclosure): list installed
             # auto/slash skills so the model can activate one by calling
             # read_skill_file. Only for runs whose tool set includes
-            # read_skill_file, i.e. the general profile.
+            # read_skill_file, i.e. the general profile. The runtime view is
+            # scanned once here and shared with select_auto_skill below; the
+            # scan itself sits inside a try so a corrupt manifest cannot
+            # break prompt composition (spec §5).
+            _rt_view: list = []
             if profile.tools is None:
-                skills_block = skills_registry.render_index_block()
+                try:
+                    _rt_view = skills_registry._scan_runtime_view()
+                except Exception:
+                    _LOG.warning("skill activation: runtime view scan failed", exc_info=True)
+                skills_block = skills_registry.render_index_block(_rt_view)
                 if skills_block:
                     full_prompt = full_prompt + "\n\n" + skills_block
 
@@ -1010,7 +1018,7 @@ class AgentRunner:
             activation_injected = False
             if profile.tools is None and kind == "chat" and not continue_run:
                 activated = skill_activation.select_auto_skill(
-                    message, skills_registry._scan_runtime_view())
+                    message, _rt_view)
             if activated is not None:
                 md = skills_registry._read_skill_file(activated.skill_id, "SKILL.md")
                 if md.startswith("Error:"):
@@ -1023,7 +1031,8 @@ class AgentRunner:
                         activated.skill_id, md)
                     activation_injected = True
             forced_tool = None
-            if (activated is not None and activated.first_tool
+            if (activated is not None and activated.first_tool and activated.pin
+                    and activation_injected
                     and skill_activation.forcing_enabled()
                     and provider_type in skill_activation.FORCE_PROVIDER_TYPES):
                 forced_tool = activated.first_tool
@@ -1257,6 +1266,7 @@ class AgentRunner:
                         "mode": "auto",
                         "forced_tool": forced_tool,
                         "injected": activation_injected,
+                        "pin": activated.pin,
                     })
                 forced_retry_done = False
                 while True:
@@ -1303,8 +1313,8 @@ class AgentRunner:
                     # tool_choice with finish_reason=tool_calls and no tool_calls
                     # delta. Retry the turn once with the pin released; the
                     # <activated-skill> block still steers the model to search.
-                    if (forced_tool and not forced_retry_done
-                            and not message_emitted and not call_names):
+                    if skill_activation.should_retry_without_pin(
+                            forced_tool, forced_retry_done, message_emitted, call_names):
                         forced_retry_done = True
                         _LOG.warning("skill activation: forced %s produced no tool call "
                                      "and no text; retrying without tool_choice", forced_tool)

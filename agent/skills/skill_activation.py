@@ -8,6 +8,12 @@ regex is compiled from manifest data (phrases go through re.escape, so the
 pattern is literal and linear), no I/O, no model call. Every entry point
 swallows its own exceptions — prompt composition must never fail because a
 manifest is odd.
+
+The forced tool_choice pin is a separate, stricter gate than injection: a
+single hit on any of the manifest's optional `pin_keywords` pins the first
+tool call, and otherwise two distinct keyword hits are required — a lone
+broad keyword (e.g. "compare", "排序") still injects SKILL.md but leaves the
+model free to choose its first tool.
 """
 from __future__ import annotations
 
@@ -16,6 +22,8 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+
+from skills.skills_registry import _SKILL_ID_RE
 
 _log = logging.getLogger(__name__)
 
@@ -44,11 +52,15 @@ _LATIN_RE = re.compile(r"^[\x00-\x7f]+$")
 _WS_RE = re.compile(r"\s+")
 
 
+PIN_MIN_HITS = 2
+
+
 @dataclass(frozen=True)
 class ActivatedSkill:
     skill_id: str
     hits: int
     first_tool: str | None
+    pin: bool
 
 
 def normalize(text: str) -> str:
@@ -100,6 +112,9 @@ def select_auto_skill(message: str, skills) -> ActivatedSkill | None:
             return None
         best: ActivatedSkill | None = None
         for s in sorted(skills or [], key=lambda x: str(x.get("skill_id", ""))):
+            sid = str(s.get("skill_id", ""))
+            if not _SKILL_ID_RE.match(sid):
+                continue
             if s.get("trigger") == "manual":
                 continue
             act = s.get("activation")
@@ -110,7 +125,9 @@ def select_auto_skill(message: str, skills) -> ActivatedSkill | None:
                 continue
             ft = act.get("first_tool")
             ft = ft if isinstance(ft, str) and ft in ALLOWED_FIRST_TOOLS else None
-            cand = ActivatedSkill(str(s.get("skill_id", "")), hits, ft)
+            pin_hits = match_keywords(message, act.get("pin_keywords"))
+            pin = hits >= PIN_MIN_HITS or pin_hits > 0
+            cand = ActivatedSkill(sid, hits, ft, pin)
             if best is None or cand.hits > best.hits:
                 best = cand
         return best
@@ -122,6 +139,12 @@ def select_auto_skill(message: str, skills) -> ActivatedSkill | None:
 def forcing_enabled() -> bool:
     """Process-wide kill switch for the forced first tool call."""
     return os.environ.get("NIMOOS_SKILL_FORCE_FIRST_TOOL", "1") != "0"
+
+
+def should_retry_without_pin(forced_tool, retried: bool, message_emitted: bool, call_names) -> bool:
+    """True exactly once: a forced first call was pinned, we have not retried
+    yet, and the run produced neither a tool call nor a message."""
+    return bool(forced_tool) and not retried and not message_emitted and not call_names
 
 
 def render_activation_block(skill_id: str, skill_md: str) -> str:
