@@ -24,6 +24,12 @@ def _bad_request(msg: str, body=None):
     ("too many tokens in the request", None),
     ("max_tokens is too large for the remaining context", None),
     ("Requested tokens (9000) exceed the context window limit (8192)", 8192),
+    # Anchored-first (Major 3 fix-round-2): the limit, never the completion
+    # budget quoted alongside the request.
+    ("This model's maximum context length is 128000 tokens. However, you requested "
+     "130000 tokens (129000 in the messages, 1000 in the completion)", 128000),
+    ("prompt is too long (request id 2026-09-08T10:00:00Z)", None),   # a bare year is not a limit
+    ("maximum context length is 32768 tokens. However, you requested 40000 tokens in the messages", 32768),
 ])
 def test_classify_matches_context_messages(msg, expected_window):
     err = ce.classify(_bad_request(msg), last_input_tokens=0)

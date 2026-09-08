@@ -11,12 +11,29 @@ PATTERNS: tuple[str, ...] = (
     r"exceeds the available context", r"context size",
 )
 _PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I)
-# Any standalone 4-7 digit integer in the text, not just ones followed by
-# "tokens" — providers also phrase the limit as "...limit (8192)" or similar.
-# We take the MINIMUM of all such numbers: two-number messages always give
-# (requested, limit) in either order, and the limit is never larger than what
-# was requested.
-_LIMIT_RE = re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])")
+# Numbers anchored to an explicit limit/window phrase — "maximum context
+# length is 131072", "context window of 8192", "limit of 32768", "200000
+# maximum" — NEVER a bare unanchored digit scan. A fully unanchored scan (what
+# a prior round of this fix used) also matches a completion-token budget
+# quoted alongside the request ("...requested N tokens (M in the messages, K
+# in the completion)" -> K, always < the real limit) or an unrelated number in
+# the body (a request id, a year in a timestamp) — both get persisted by
+# model_windows.learn() (which only ever shrinks), silently poisoning that
+# model's window forever. Only the number attached to a limit/maximum/window
+# phrase is a candidate; if several are found, the limit is never larger than
+# what was requested, so MIN is still correct among them.
+_ANCHOR_RES: tuple[re.Pattern, ...] = (
+    re.compile(
+        r"(?:maximum context length|context length|context window|context size|limit)"
+        r"(?:\s+(?:is|of))?\s*(?:\(|of\s+)?\s*(?<![\w.])(\d{4,7})(?![\w.])", re.I),
+    re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])\s*(?:tokens?)?\s*(?:maximum|max\b|limit)", re.I),
+    re.compile(r"limit of (?<![\w.])(\d{4,7})(?![\w.])", re.I),
+)
+# Fallback when no phrase anchors a number at all: the classic "N tokens"
+# wording (the pre-anchor-fix regex) — still requires the word "tokens" right
+# after the number, so it does not pick up parenthetical budget breakdowns or
+# bare IDs/years, only genuinely token-denominated counts.
+_TOKENS_RE = re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])\s*tokens")
 _MAX_TEXT_LEN = 4000
 
 
@@ -57,11 +74,12 @@ def classify(exc, *, last_input_tokens: int = 0) -> ContextLimitError | None:
         m = _PATTERN_RE.search(text)
         if not m:
             return None
-        nums = [int(n) for n in _LIMIT_RE.findall(text)]
-        # min(), not max(): a "requested N, limit M" message always has N >= M,
-        # and the LIMIT (never the oversized request) is the number we want to
-        # learn as this model's window.
-        window = min(nums) if nums else (int(last_input_tokens * 0.9) if last_input_tokens > 0 else None)
+        anchored = [int(n) for r in _ANCHOR_RES for n in r.findall(text)]
+        if anchored:
+            window = min(anchored)
+        else:
+            toks = [int(n) for n in _TOKENS_RE.findall(text)]
+            window = min(toks) if toks else (int(last_input_tokens * 0.9) if last_input_tokens > 0 else None)
         return ContextLimitError(exc, m.group(0), window)
     except Exception:  # noqa: BLE001
         return None

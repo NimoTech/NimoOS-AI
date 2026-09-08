@@ -1331,7 +1331,26 @@ class AgentRunner:
                         # The persisted model_windows row is untouched by this —
                         # it keeps whatever learn() returned above (spec §6.1: only
                         # a genuine measurement should shrink the stored value).
-                        _est_before = context_compaction.estimate_messages_tokens(_attempt_input)
+                        #
+                        # Estimate off the SENT slice, not the full attempt input:
+                        # once an L2 fold has already happened (ctx.fold_idx > 0)
+                        # the filter only ever sends full[fold_idx:] (the folded
+                        # prefix rides along as a summary in the instructions
+                        # instead) — estimating the un-folded list here would
+                        # overstate the retry's real payload by the whole folded
+                        # prefix, and a window sized off that overstatement can
+                        # come out too big to make the hard-truncation stage fire,
+                        # silently breaking the shrink guarantee on exactly the
+                        # long runs that get context 400s. compaction_filter's own
+                        # _estimate() (overhead + summary + message estimate) is
+                        # used instead of a bare estimate_messages_tokens() so the
+                        # number this is sized against, and the one reported in
+                        # context_recovered.before, matches what the filter itself
+                        # budgets against.
+                        _fold = int(getattr(_ctx, "fold_idx", 0) or 0)
+                        _sent_items = (_attempt_input[_fold:] if 0 < _fold <= len(_attempt_input)
+                                       else _attempt_input)
+                        _est_before = _cf._estimate(_ctx, _sent_items)  # noqa: SLF001
                         if _est_before > 0:
                             _retry_w = min(_learned, int(_prev_w * 0.9), int(_est_before * 0.9))
                         else:
@@ -1345,15 +1364,19 @@ class AgentRunner:
                         # it off) — a run that just proved it needs shrinking should
                         # get it applied, not silently resend the same-but-longer
                         # payload. Not persisted anywhere; deliberately left True for
-                        # the rest of THIS run too — it already proved it needs it.
+                        # the rest of THIS run too (confirmed intended, not an
+                        # oversight): the run already proved it needs it, and
+                        # restoring the user's setting mid-run would let the very
+                        # next over-threshold turn 400 again with compaction
+                        # silently off once more.
                         _ctx.compaction_enabled = True
                         _used = int(_ctx.extra.get("llm_calls", 0) or 0)
                         if _attempt_turns is not None:
                             _attempt_turns = max(1, _attempt_turns - _used)
-                        _before, _after = _rescue_estimates(_attempt_input, _retry_w)
+                        _, _after = _rescue_estimates(_sent_items, _retry_w)
                         _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
-                                     session_id, _retry_w, _before, _after, _attempt_turns)
-                        await sink.put({"type": "context_recovered", "before": _before, "after": _after, "window": _retry_w})
+                                     session_id, _retry_w, _est_before, _after, _attempt_turns)
+                        await sink.put({"type": "context_recovered", "before": _est_before, "after": _after, "window": _retry_w})
 
                 # Reasoning-only fallback. The fallback text also counts toward
                 # output_bytes so the token count is meaningful for these models.
@@ -1445,7 +1468,12 @@ class AgentRunner:
                     pass
                 await sink.put({
                     "type": "max_turns_exceeded",
-                    "max_turns": max_turns if max_turns is not None else 0,
+                    # The cap actually in force when this was raised: after a
+                    # rescue, _attempt_turns is max_turns reduced by the llm
+                    # calls already spent (agent.py rescue branch above) — the
+                    # PRE-rescue max_turns would misreport the limit the run
+                    # was really capped at (spec fix-round-1 review, Minor 3).
+                    "max_turns": _attempt_turns if _attempt_turns is not None else 0,
                 })
             except Exception as e:
                 # Evidence log: if a tool_call/tool pairing 400 ever slips past

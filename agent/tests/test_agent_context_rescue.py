@@ -5,10 +5,14 @@ import httpx
 import pytest
 from openai import BadRequestError
 
+from agents.run import CallModelData, ModelInputData
+
 import agent as agent_module
+import compaction_filter as cfmod
 import context_compaction as cc
 import model_windows as mw
 import run_context as rc
+import tool_output as to
 from db import init_db
 
 
@@ -74,7 +78,7 @@ async def test_context_400_triggers_one_rescue_and_learns_window(runner):
     # own payload is tiny, so the 0.9*estimate term dominates and drives the
     # window well below the classified limit — assert the shrink, not an
     # exact number that depends on the estimator's char-ratio constants.
-    assert calls[1][2] < 131_072 and calls[1][2] >= cc.MIN_CONTEXT_WINDOW  # RunCtx.window forced to shrink before the retry
+    assert calls[1][2] < calls[0][2] and calls[1][2] >= cc.MIN_CONTEXT_WINDOW  # RunCtx.window forced to shrink before the retry
     assert calls[1][0] == calls[0][0] + [{"type": "function_call", "call_id": "c1", "name": "web_fetch", "arguments": "{}"},
                                           {"type": "function_call_output", "call_id": "c1", "output": "x" * 9000}]
     rec = [e for e in sink.events if e["type"] == "context_recovered"]
@@ -136,6 +140,72 @@ async def test_rescue_forces_compaction_on_for_the_retry(runner):
         await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
                          provider_url="http://x", model_name="m")
     assert enabled_at_call == [False, True]                        # user disabled it; the rescue forces it on
+
+
+@pytest.mark.asyncio
+async def test_rescue_window_binds_to_prev_window_on_large_payload(runner):
+    # Unlike the two tests above (where a tiny fixture payload makes the
+    # 0.9*estimate term dominate the min()), a genuinely large payload should
+    # make the 0.9*prev_window term the binding constraint instead —
+    # exercising the OTHER branch of retry_w's min(). ~600 KB of tool output
+    # estimates to ~172_500+ tokens (well over the 131_072 window that just
+    # failed), so 0.9*est is far larger than 0.9*prev_w here.
+    calls = []
+    def fake_run_streamed(agent, input_messages, **kw):
+        calls.append((list(input_messages), rc.current().window))
+        if len(calls) == 1:
+            return _failing_stream(
+                input_messages, _bad_request("maximum context length is 131072 tokens"),
+                [{"type": "function_call", "call_id": "c1", "name": "web_fetch", "arguments": "{}"},
+                 {"type": "function_call_output", "call_id": "c1", "output": "x" * 600_000}])
+        return _ok_stream(input_messages, [{"role": "assistant", "content": "done"}])
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
+                         provider_url="http://x", model_name="m")
+    assert len(calls) == 2
+    assert calls[0][1] == 131_072                                       # CLOUD_CONTEXT_WINDOW default
+    assert calls[1][1] == int(131_072 * 0.9)                            # prev_w*0.9 binds, not the estimate
+    assert calls[1][1] < calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_real_compaction_filter_hard_truncates_the_retry_with_and_without_a_fold(tmp_path):
+    # Minor 6 / Major 4 (fix-round-2): a MagicMock-driven test can only assert
+    # RunCtx state (window, compaction_enabled) — it can never prove the
+    # retry's actual PAYLOAD shrinks. This runs the REAL compaction_filter
+    # with a window sized exactly the way agent.py's rescue branch now sizes
+    # it (0.9 * compaction_filter._estimate(ctx, sent_items)), once with no
+    # prior L2 fold (fold_idx=0) and once with one already applied
+    # (fold_idx>0 — the exact state Major 4 was about, where the filter only
+    # ever sends full[fold_idx:]). By construction
+    # est(sent) > 0.85 * (0.9*est(sent)), so the hard-truncation stage must
+    # fire on the slice actually sent, in both cases.
+    to.OFFLOAD_DIR_VAR.set(str(tmp_path))
+
+    # Plain user/assistant "message" turns, NOT function_call_output/reasoning
+    # — micro_compact (L1) only ever touches those two types, so these are
+    # untouched by L1 and est(after L1) == est(before L1) exactly, making the
+    # reviewer's inequality (est(sent) > 0.85 * 0.9*est(sent)) hold regardless
+    # of L1's effect. 20 alternating pairs also gives turn_starts() plenty of
+    # distinct turn boundaries for truncate_turns(keep_turns=2) to cut on.
+    def _make_items(n=20, size=4000):
+        items = []
+        for i in range(n):
+            items.append({"role": "user", "content": "go"})
+            items.append({"type": "message", "role": "assistant", "content": "y" * size})
+        return items
+
+    for fold_idx, summary in ((0, ""), (20, "earlier turns, summarized")):
+        full = _make_items()
+        ctx = rc.RunCtx(session_id="s", user_id="u", model_name="m", provider_type="other",
+                         window=1, compaction_enabled=True, fold_idx=fold_idx, summary=summary)
+        rc.RUN_CTX_VAR.set(ctx)
+        sent = full[fold_idx:] if 0 < fold_idx <= len(full) else full
+        ctx.window = max(int(cfmod._estimate(ctx, sent) * 0.9), cc.MIN_CONTEXT_WINDOW)
+        data = CallModelData(model_data=ModelInputData(input=full, instructions="SYS"), agent=None, context=None)
+        out = await cfmod.compaction_filter(data)
+        assert len(out.input) < len(sent), f"fold_idx={fold_idx}: hard truncation did not fire on the sent slice"
 
 
 @pytest.mark.asyncio
