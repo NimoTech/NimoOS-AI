@@ -104,6 +104,7 @@ async def purge_session(conn, user_id: str, session_id: str, *,
                  (session_id,))
     for table in _JOB_TABLES:
         conn.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
+    conn.execute("DELETE FROM ask_turns WHERE session_id=?", (session_id,))
     conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
     conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
     conn.commit()

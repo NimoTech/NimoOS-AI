@@ -456,6 +456,21 @@ CREATE TABLE IF NOT EXISTS task_prompt_revisions (
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_revisions_task
     ON task_prompt_revisions(task_id, id DESC);
+
+-- Knowledge-ask pipeline: one row per question answered through the search
+-- profile (spec 2026-09-08-knowledge-ask-agent-design §3.3.6). Drives MECE
+-- (chunks already shown) and lets the Ask page rebuild its sources panel.
+CREATE TABLE IF NOT EXISTS ask_turns (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    run_id       TEXT NOT NULL,
+    question     TEXT NOT NULL,
+    plan_json    TEXT NOT NULL,
+    sources_json TEXT NOT NULL,
+    stages_json  TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ask_turns_session ON ask_turns(session_id, created_at);
 """
 
 _DEFAULT_SNAPSHOTS_ROOT = "/var/lib/nimoos/ai/agent/snapshots"
