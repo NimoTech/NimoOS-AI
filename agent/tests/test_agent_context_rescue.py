@@ -6,6 +6,7 @@ import pytest
 from openai import BadRequestError
 
 import agent as agent_module
+import context_compaction as cc
 import model_windows as mw
 import run_context as rc
 from db import init_db
@@ -67,14 +68,74 @@ async def test_context_400_triggers_one_rescue_and_learns_window(runner):
                          provider_url="http://x", model_name="m", max_turns=13)
     assert len(calls) == 2
     assert calls[1][1] == 10                                   # 13 - 3 llm calls used
-    assert calls[1][2] == 140_000                              # RunCtx.window updated before retry
+    # classify() now takes the MIN of the two numbers in the message (the
+    # limit, 131072 — not the oversized 140000 request), and the retry window
+    # is then forced to a real shrink off that (Major 1): here the retry's
+    # own payload is tiny, so the 0.9*estimate term dominates and drives the
+    # window well below the classified limit — assert the shrink, not an
+    # exact number that depends on the estimator's char-ratio constants.
+    assert calls[1][2] < 131_072 and calls[1][2] >= cc.MIN_CONTEXT_WINDOW  # RunCtx.window forced to shrink before the retry
     assert calls[1][0] == calls[0][0] + [{"type": "function_call", "call_id": "c1", "name": "web_fetch", "arguments": "{}"},
                                           {"type": "function_call_output", "call_id": "c1", "output": "x" * 9000}]
     rec = [e for e in sink.events if e["type"] == "context_recovered"]
-    assert len(rec) == 1 and rec[0]["window"] == 140_000 and rec[0]["before"] > 0 and rec[0]["after"] <= rec[0]["before"]
+    assert (len(rec) == 1 and rec[0]["window"] == calls[1][2]
+            and rec[0]["before"] > 0 and rec[0]["after"] <= rec[0]["before"])
     assert not any(e["type"] == "error" for e in sink.events)
     assert sink.events[-1]["type"] == "done"
-    assert mw.get(runner._conn, "cloud:m") == {**mw.get(runner._conn, "cloud:m"), "window": 140_000, "source": "learned"}
+    # The PERSISTED model_windows row is the classified limit (131072, via
+    # learn()) — independent of the per-run retry window above, which is a
+    # working value only (never written to the store).
+    assert mw.get(runner._conn, "cloud:m") == {**mw.get(runner._conn, "cloud:m"), "window": 131_072, "source": "learned"}
+
+
+@pytest.mark.asyncio
+async def test_rescue_window_forced_below_manual_row_and_prev_window(runner):
+    # A manual model_windows row (200_000) always "wins" inside
+    # model_windows.learn() — it is returned untouched — and a user_settings
+    # override (131_072) makes resolve_window() ignore that row entirely for
+    # THIS run's starting window. So naively setting RunCtx.window to
+    # learn()'s return value would nearly DOUBLE the budget that just 400'd.
+    # Major 1's fix forces retry_w <= 0.9 * min(prev window, estimated
+    # payload size) regardless of what learn() returns.
+    mw.upsert(runner._conn, "cloud:m", 200_000, "manual")
+    runner._conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) VALUES('u1','context_window','131072',0)")
+    runner._conn.commit()
+    calls = []
+    def fake_run_streamed(agent, input_messages, **kw):
+        calls.append((list(input_messages), rc.current().window))
+        if len(calls) == 1:
+            return _failing_stream(input_messages,
+                                    _bad_request("maximum context length is 100000 tokens"), [])
+        return _ok_stream(input_messages, [{"role": "assistant", "content": "done"}])
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
+                         provider_url="http://x", model_name="m")
+    assert len(calls) == 2
+    assert calls[0][1] == 131_072                                  # user override, not the manual row
+    assert calls[1][1] < 100_000 and calls[1][1] >= cc.MIN_CONTEXT_WINDOW
+    # the persisted row is untouched: manual rows are never overwritten by learn()
+    assert mw.get(runner._conn, "cloud:m") == {**mw.get(runner._conn, "cloud:m"), "window": 200_000, "source": "manual"}
+
+
+@pytest.mark.asyncio
+async def test_rescue_forces_compaction_on_for_the_retry(runner):
+    runner._conn.execute(
+        "INSERT INTO user_settings(user_id, key, value, updated_at) VALUES('u1','compaction_enabled','0',0)")
+    runner._conn.commit()
+    enabled_at_call = []
+    def fake_run_streamed(agent, input_messages, **kw):
+        enabled_at_call.append(rc.current().compaction_enabled)
+        if len(enabled_at_call) == 1:
+            return _failing_stream(input_messages,
+                                    _bad_request("maximum context length is 100000 tokens"), [])
+        return _ok_stream(input_messages, [{"role": "assistant", "content": "done"}])
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="hi", sink=sink, provider_key="k",
+                         provider_url="http://x", model_name="m")
+    assert enabled_at_call == [False, True]                        # user disabled it; the rescue forces it on
 
 
 @pytest.mark.asyncio

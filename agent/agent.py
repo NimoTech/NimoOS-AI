@@ -114,10 +114,14 @@ CONTEXT_RESCUE_MAX = 1
 
 def _rescue_estimates(items: list, window: int) -> tuple[int, int]:
     """(tokens before, tokens after) for the context_recovered event: `after`
-    is what compaction_filter will roughly send next — L1 on old outputs,
-    then truncation to fit 0.85 * window. Pure; never raises."""
-    import compaction_filter as _cf  # noqa: PLC0415
+    is a rough preview of what the retry will send next — L1 (micro_compact)
+    on old tool outputs, then a hard truncation to the last 2 turns if that
+    alone doesn't get under 0.85 * window. Both numbers are message-only
+    estimates (they exclude ctx.overhead_tokens / ctx.summary, unlike the
+    filter's own budget/_estimate), so treat them as relative, not absolute
+    token counts. Pure; never raises."""
     try:
+        import compaction_filter as _cf  # noqa: PLC0415
         before = context_compaction.estimate_messages_tokens(items)
         compacted, _ = _cf.micro_compact(items)
         budget = int(window * 0.85)
@@ -1297,27 +1301,59 @@ class AgentRunner:
                         _cl = _ce.classify(_exc, last_input_tokens=_ctx.last_input_tokens)
                         if (_cl is None or _cl.window is None or _cl.window < context_compaction.MIN_CONTEXT_WINDOW
                                 or _rescues >= CONTEXT_RESCUE_MAX or _ctx.depth > 0):
+                            # depth > 0 (a delegate child) never reaches this path in
+                            # practice — children run their own Runner.run_streamed in
+                            # skills/orchestration.py, not AgentRunner.run — kept as a
+                            # defensive, spec-mandated gate rather than live coverage.
                             raise
                         _rescues += 1
+                        _prev_w = int(_ctx.window)
                         try:
                             import model_windows as _mw  # noqa: PLC0415
-                            _new_w = _mw.learn(self._conn, _mw.model_key(model_name, provider_type), _cl.window)
+                            _learned = _mw.learn(self._conn, _mw.model_key(model_name, provider_type), _cl.window)
                         except Exception:  # noqa: BLE001
-                            _new_w = _cl.window
-                        _ctx.window = _new_w
-                        _ctx.last_input_tokens = 0            # provider count is stale for the new input
-                        _ctx.items_seen_at_last_call = 0
+                            _learned = _cl.window
                         try:
                             _attempt_input = stream.to_input_list()
                         except Exception:  # noqa: BLE001
                             raise _exc
+                        _attempt_input = _inject_synthetic_reasoning(_attempt_input)
+                        # Force a real shrink for THIS retry, independent of what
+                        # got persisted above: learn() can return a window >= the
+                        # one that just failed (a manual/fetched row "wins" over a
+                        # smaller learned value — model_windows.upsert()'s humans-win
+                        # rule), and even an already-correct window means the 400
+                        # came from an under-estimate, not a wrong window — the
+                        # implementation's only lever is still a smaller window. So
+                        # _ctx.window is floored to <= 90% of BOTH the pre-failure
+                        # window and the actual size of the payload that just 400'd
+                        # (whichever is smaller), never to whatever learn() returned.
+                        # The persisted model_windows row is untouched by this —
+                        # it keeps whatever learn() returned above (spec §6.1: only
+                        # a genuine measurement should shrink the stored value).
+                        _est_before = context_compaction.estimate_messages_tokens(_attempt_input)
+                        if _est_before > 0:
+                            _retry_w = min(_learned, int(_prev_w * 0.9), int(_est_before * 0.9))
+                        else:
+                            _retry_w = min(_learned, int(_prev_w * 0.9))
+                        _retry_w = max(_retry_w, context_compaction.MIN_CONTEXT_WINDOW)
+                        _ctx.window = _retry_w
+                        _ctx.last_input_tokens = 0            # provider count is stale for the new input
+                        _ctx.items_seen_at_last_call = 0
+                        # Force compaction on for the retry even if the user turned
+                        # it off (or the P2-setup-failure fallback RunCtx hard-codes
+                        # it off) — a run that just proved it needs shrinking should
+                        # get it applied, not silently resend the same-but-longer
+                        # payload. Not persisted anywhere; deliberately left True for
+                        # the rest of THIS run too — it already proved it needs it.
+                        _ctx.compaction_enabled = True
                         _used = int(_ctx.extra.get("llm_calls", 0) or 0)
                         if _attempt_turns is not None:
                             _attempt_turns = max(1, _attempt_turns - _used)
-                        _before, _after = _rescue_estimates(_attempt_input, _new_w)
+                        _before, _after = _rescue_estimates(_attempt_input, _retry_w)
                         _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
-                                     session_id, _new_w, _before, _after, _attempt_turns)
-                        await sink.put({"type": "context_recovered", "before": _before, "after": _after, "window": _new_w})
+                                     session_id, _retry_w, _before, _after, _attempt_turns)
+                        await sink.put({"type": "context_recovered", "before": _before, "after": _after, "window": _retry_w})
 
                 # Reasoning-only fallback. The fallback text also counts toward
                 # output_bytes so the token count is meaningful for these models.

@@ -17,13 +17,13 @@ def _bad_request(msg: str, body=None):
 
 
 @pytest.mark.parametrize("msg,expected_window", [
-    ("This model's maximum context length is 131072 tokens. However, you requested 140000 tokens", 140000),
+    ("This model's maximum context length is 131072 tokens. However, you requested 140000 tokens", 131072),
     ("context_length_exceeded: prompt is too long", None),
     ("Input tokens exceed the configured limit of 32768 tokens", 32768),
-    ("prompt is too long: 210000 tokens > 200000 maximum", 210000),
+    ("prompt is too long: 210000 tokens > 200000 maximum", 200000),
     ("too many tokens in the request", None),
     ("max_tokens is too large for the remaining context", None),
-    ("Requested tokens (9000) exceed the context window limit (8192)", None),
+    ("Requested tokens (9000) exceed the context window limit (8192)", 8192),
 ])
 def test_classify_matches_context_messages(msg, expected_window):
     err = ce.classify(_bad_request(msg), last_input_tokens=0)

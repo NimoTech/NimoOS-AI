@@ -11,7 +11,12 @@ PATTERNS: tuple[str, ...] = (
     r"exceeds the available context", r"context size",
 )
 _PATTERN_RE = re.compile("|".join(f"(?:{p})" for p in PATTERNS), re.I)
-_LIMIT_RE = re.compile(r"(\d{4,7})\s*tokens", re.I)
+# Any standalone 4-7 digit integer in the text, not just ones followed by
+# "tokens" — providers also phrase the limit as "...limit (8192)" or similar.
+# We take the MINIMUM of all such numbers: two-number messages always give
+# (requested, limit) in either order, and the limit is never larger than what
+# was requested.
+_LIMIT_RE = re.compile(r"(?<![\w.])(\d{4,7})(?![\w.])")
 _MAX_TEXT_LEN = 4000
 
 
@@ -53,7 +58,10 @@ def classify(exc, *, last_input_tokens: int = 0) -> ContextLimitError | None:
         if not m:
             return None
         nums = [int(n) for n in _LIMIT_RE.findall(text)]
-        window = max(nums) if nums else (int(last_input_tokens * 0.9) if last_input_tokens > 0 else None)
+        # min(), not max(): a "requested N, limit M" message always has N >= M,
+        # and the LIMIT (never the oversized request) is the number we want to
+        # learn as this model's window.
+        window = min(nums) if nums else (int(last_input_tokens * 0.9) if last_input_tokens > 0 else None)
         return ContextLimitError(exc, m.group(0), window)
     except Exception:  # noqa: BLE001
         return None
