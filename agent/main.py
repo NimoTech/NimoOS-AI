@@ -1590,6 +1590,7 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
 
     messages = _hydrate_messages(history, session_id_for_urls=session_id)
     messages = _inject_access_request_cards(messages, session_id, _conn)
+    messages = _inject_context_recovered_cards(messages, session_id, _conn)
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
@@ -1929,6 +1930,66 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
         # leading text/thinking), not dangling at the very end of the turn.
         insert_at = next((i for i, b in enumerate(bs) if b.get("type") == "tool"), len(bs))
         bs[insert_at:insert_at] = cards
+    return messages
+
+
+def _inject_context_recovered_cards(messages: list, session_id: str, conn) -> list:
+    """Re-attach `context_recovered` hints (spec §6.3) to the loaded history.
+
+    The event is UI-only — never part of the SDK history — so a refreshed page
+    would lose it. It IS in event_log (RunSink persists every non-delta event),
+    so rebuild it from there. Correlation mirrors _inject_access_request_cards:
+    the k-th run that recovered maps to the k-th assistant turn; the card goes
+    at the end of that turn's blocks (the recovery happened mid-turn and the
+    turn's visible text continued afterwards). Best-effort: any failure leaves
+    the messages untouched."""
+    try:
+        rows = conn.execute(
+            "SELECT e.run_id AS run_id, e.payload AS payload "
+            "FROM event_log e JOIN agent_runs r ON r.id = e.run_id "
+            "WHERE r.session_id=? AND e.payload LIKE '%\"type\": \"context_recovered\"%' "
+            "ORDER BY r.created_at ASC, e.seq ASC",
+            (session_id,),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — hydration must never fail the endpoint
+        return messages
+    if not rows:
+        return messages
+    # Correlate by the run's position among ALL of the session's runs (one run
+    # ≈ one assistant turn), not among the runs that recovered — otherwise a
+    # recovery in the second run would land on the first turn.
+    try:
+        run_order = [r["id"] for r in conn.execute(
+            "SELECT id FROM agent_runs WHERE session_id=? ORDER BY created_at ASC, id ASC",
+            (session_id,)).fetchall()]
+    except Exception:  # noqa: BLE001
+        return messages
+    run_index = {rid: i for i, rid in enumerate(run_order)}
+    cards_by_run: dict[str, list] = {}
+    for r in rows:
+        try:
+            ev = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "context_recovered":
+            continue
+        cards_by_run.setdefault(r["run_id"], []).append({
+            "type": "context_recovered",
+            "before": int(ev.get("before") or 0),
+            "after": int(ev.get("after") or 0),
+            "window": int(ev.get("window") or 0),
+        })
+    if not cards_by_run:
+        return messages
+    assistant_turns = [m for m in messages if m.get("role") == "assistant"]
+    if not assistant_turns:
+        synthetic = {"id": "h-a-ctx", "role": "assistant", "blocks": [], "streaming": False}
+        messages.append(synthetic)
+        assistant_turns = [synthetic]
+    for rid, cards in cards_by_run.items():
+        gi = run_index.get(rid, len(assistant_turns) - 1)
+        turn = assistant_turns[gi] if gi < len(assistant_turns) else assistant_turns[-1]
+        turn.setdefault("blocks", []).extend(cards)
     return messages
 
 
