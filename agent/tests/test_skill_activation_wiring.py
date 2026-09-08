@@ -56,3 +56,16 @@ def test_model_settings_accepts_named_tool_choice():
     assert ms.tool_choice == "nimoos_search"
     from agents import Agent
     assert inspect.signature(Agent).parameters["reset_tool_choice"].default is True
+
+
+def test_forced_call_falls_back_once_when_nothing_was_produced():
+    src = _run_source()
+    i_runner = src.index("Runner.run_streamed(")
+    i_fallback = src.index('"type": "skill_activation_fallback"')
+    i_final = src.index('final = getattr(stream, "final_output", None)')
+    # The fallback decision sits after the streaming loop and before the
+    # reasoning-only fallback that reads stream.final_output.
+    assert i_runner < i_fallback < i_final
+    assert "tool_choice=None" in src
+    assert "forced_retry_done" in src
+    assert "not message_emitted and not call_names" in src

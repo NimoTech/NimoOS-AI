@@ -23,6 +23,8 @@ normally instead.
 - `nimoos_search(query, sources, top_k)` — `sources="semantic"` finds passages
   by meaning (each hit carries a `file_id`, a `kind` and a `chunk_no`);
   `sources="filenames"` finds files by name (hits carry a `file_id` only).
+  Do not pass `filters`: the only chunk kinds are `body` (document text) and
+  `caption` (photo captions), and an invented `kind_in` value returns nothing.
   Small text documents come back inlined in full (`full_text`) — treat that
   as already read; do not fetch them again.
 - `read_file_chunk(file_id, kind, chunk_no, window)` — the hit plus up to 5
