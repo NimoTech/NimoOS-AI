@@ -44,5 +44,24 @@ class SearchClient:
                 msg, request=e.request, response=e.response) from e
         return r.json()
 
+    async def search_text(self, query: str, *, user_id: str, top_k: int = 10,
+                          rerank: bool = True, timeout_s: float | None = None) -> dict[str, Any]:
+        """POST /v1/search/text — semantic hits with FULL chunk text (the agent
+        tool path trims previews to 200 chars; the ask pipeline needs the text).
+        Search's own per-user root scoping applies via X-NimoOS-User-ID."""
+        r = await self._client.post(
+            f"{self._base_url}/v1/search/text",
+            json={"query": query, "top_k": top_k, "rerank": rerank},
+            headers={"X-NimoOS-User-ID": str(user_id)},
+            timeout=timeout_s if timeout_s is not None else httpx.USE_CLIENT_DEFAULT,
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = (r.text or "").strip()
+            raise httpx.HTTPStatusError(
+                f"{e}: {body}" if body else str(e), request=e.request, response=e.response) from e
+        return r.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()
