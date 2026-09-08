@@ -136,16 +136,39 @@ async def expand_parents(cands: list[Candidate], *, invoke_tool, user_id: str,
     return out_list
 
 
-async def inline_small_docs(cands: list[Candidate], *, invoke_tool, user_id: str) -> None:
+async def inline_small_docs(cands: list[Candidate], *, invoke_tool,
+                            user_id: str) -> list[Candidate]:
+    """Replace a small document's chunk hits with its complete text.
+
+    Returns the filtered candidate list: the file's best-ranked candidate
+    carries the full text (at its own rank position) and the file's other
+    candidates are dropped. Writing the same full text onto every candidate
+    of that file, as this used to, shipped byte-identical [n] items and
+    charged the evidence budget once per copy.
+    """
     ids = [c.file_id for c in cands
            if c.source == "document" and not c.parent and inline_eligible(c.mime, c.kind)]
     if not ids:
-        return
+        return cands
     texts = await fetch_small_documents(ids, invoke_tool=invoke_tool, user_id=user_id)
+    if not texts:
+        return cands
+    carrier: dict[str, str] = {}
+    for fid in texts:
+        members = [c for c in cands if c.source == "document" and c.file_id == fid]
+        if members:
+            carrier[fid] = max(members, key=lambda c: c.rrf).key
+    out: list[Candidate] = []
     for c in cands:
         t = texts.get(c.file_id)
-        if t and c.source == "document":
-            c.text, c.full_text = t, True
+        if t is None or c.source != "document":
+            out.append(c)
+            continue
+        if carrier.get(c.file_id) != c.key:
+            continue                      # same file, same text — one copy is enough
+        c.text, c.full_text = t, True
+        out.append(c)
+    return out
 
 
 def apply_budget(cands: list[Candidate], *, max_items: int, budget_chars: int) -> tuple[list[Candidate], int]:
@@ -202,7 +225,10 @@ def render_pack(pack: EvidencePack, *, budget_chars: int) -> str:
     if pack.dropped:
         parts.append(f"({pack.dropped} further relevant passages were not included for space.)")
     parts.append("[EVIDENCE END]")
-    return fence_untrusted("evidence", "\n\n".join(parts), cap=budget_chars + 4000)
+    # +8000, not +4000: headers, step summaries and the intro all sit inside
+    # the same cap, and a cap that bites truncates the tail — i.e. the
+    # [EVIDENCE END] marker the prompt tells the model to look for.
+    return fence_untrusted("evidence", "\n\n".join(parts), cap=budget_chars + 8000)
 
 
 def sources_payload(pack: EvidencePack, *, total_queries: int) -> list[dict]:
@@ -223,6 +249,6 @@ async def build_pack(cands: list[Candidate], *, invoke_tool, user_id: str,
                      max_items: int, budget_chars: int) -> EvidencePack:
     step1 = merge_adjacent(cands)
     step2 = await expand_parents(step1, invoke_tool=invoke_tool, user_id=user_id)
-    await inline_small_docs(step2, invoke_tool=invoke_tool, user_id=user_id)
-    kept, dropped = apply_budget(step2, max_items=max_items, budget_chars=budget_chars)
+    step3 = await inline_small_docs(step2, invoke_tool=invoke_tool, user_id=user_id)
+    kept, dropped = apply_budget(step3, max_items=max_items, budget_chars=budget_chars)
     return EvidencePack(items=kept, dropped=dropped, total_chars=sum(len(c.text) for c in kept))

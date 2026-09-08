@@ -66,15 +66,31 @@ async def test_expand_parents_truncates_and_survives_failure():
 
 
 @pytest.mark.asyncio
-async def test_inline_small_docs_marks_full_text():
+async def test_inline_small_docs_keeps_one_item_per_inlined_file():
+    """The full text is the whole file, so it belongs on exactly one item.
+    Writing it onto every chunk hit of that file shipped identical [n] entries
+    and charged the evidence budget for each copy."""
     async def invoke_tool(name, args, user_id):
         return {"text": "FULL " + args["file_id"], "truncated": False}
 
-    cands = [_c("a", 1, "part"), _c("p", 1, "pdf", mime="application/pdf"), _c("a", 2, "part2")]
-    await ev.inline_small_docs(cands, invoke_tool=invoke_tool, user_id="u")
-    assert cands[0].full_text is True and cands[0].text == "FULL a"
-    assert cands[1].full_text is False
-    assert cands[2].full_text is True and cands[2].text == "FULL a"
+    cands = [_c("a", 1, "part", rrf=0.5), _c("p", 1, "pdf", mime="application/pdf", rrf=0.4),
+             _c("a", 2, "part2", rrf=0.9)]
+    out = await ev.inline_small_docs(cands, invoke_tool=invoke_tool, user_id="u")
+    # the file's best-ranked chunk carries the text, at its own position
+    assert [c.key for c in out] == ["doc:p:body:1", "doc:a:body:2"]
+    assert out[1].full_text is True and out[1].text == "FULL a"
+    assert out[0].full_text is False and out[0].text == "pdf"   # not text/* → not inlined
+
+
+@pytest.mark.asyncio
+async def test_inline_small_docs_leaves_the_list_alone_when_nothing_inlines():
+    async def invoke_tool(name, args, user_id):
+        return {"text": "x", "truncated": True}
+
+    cands = [_c("a", 1, "part"), _c("a", 2, "part2")]
+    out = await ev.inline_small_docs(cands, invoke_tool=invoke_tool, user_id="u")
+    assert [c.key for c in out] == ["doc:a:body:1", "doc:a:body:2"]
+    assert all(c.full_text is False for c in out)
 
 
 def test_apply_budget_by_items_and_chars():
@@ -101,6 +117,16 @@ def test_render_pack_numbering_and_fence():
     assert "Step summaries:\n- s1" in body
     assert body.index("[1] a.csv") < body.index("alpha") < body.index("[2] b.csv") < body.index("beta")
     assert ev.render_pack(ev.EvidencePack([], 0, 0, []), budget_chars=100) == ""
+
+
+def test_render_pack_omits_hit_line_for_notes():
+    note = Candidate(key="note:n1:0", source="note", file_id="note:n1", kind="note", chunk_no=0,
+                     text="note body", name="My note", path="notes://n1", mime="text/markdown",
+                     note_id="n1", hit_queries=[], merged_chunk_nos=[0])
+    pack = ev.EvidencePack(items=[note], dropped=0, total_chars=9, step_summaries=[])
+    body = unfence(ev.render_pack(pack, budget_chars=24000), source="evidence")
+    assert "[1] My note" in body and "knowledge note" in body
+    assert "hit by" not in body
 
 
 def test_sources_payload_shape():
