@@ -2,14 +2,16 @@
 
 Prefers the user's background_model (the small/cheap model already used for
 notes distillation) so a mid-run fold does not go through the possibly
-rate-limited session provider; falls back to the session client. Ollama/qwen
-backgrounds get thinking disabled exactly like notes_distill does — a thinking
-model burns thousands of reasoning tokens on a summary and times out.
+rate-limited session provider; falls back to the session client. Auxiliary
+one-shot calls on either path (background client or session fallback) get
+thinking disabled via aux_thinking_kwargs — a thinking model burns thousands
+of reasoning tokens on a short summary/rewrite prompt and times out.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
 
@@ -17,9 +19,43 @@ from context_compaction import COMPACT_LLM_TIMEOUT  # noqa: F401 — monkeypatch
 
 _LOG = logging.getLogger("nimoos-agent.compaction")
 
+# Hostnames (as base_url suffixes) of "other"-type endpoints verified live to
+# think by default and to honor an OpenAI-style extra_body override.
+_OTHER_THINKING_HOSTS = ("volces.com",)
+
 
 def _new_client(base_url: str, api_key: str):
     return AsyncOpenAI(base_url=base_url, api_key=api_key or "none", max_retries=0)
+
+
+def aux_thinking_kwargs(provider_type: str, base_url: str = "") -> dict:
+    """Extra chat-completion kwargs that disable thinking for auxiliary
+    one-shot calls (background summarizer / rewrite fallback). Shared by
+    resolve_background_client and make_summarizer's session-fallback branch
+    so both paths follow one rule. Never raises — worst case is thinking
+    stays on and the caller's own timeout still protects it."""
+    try:
+        if provider_type in ("deepseek", "qwen", "ollama"):
+            from provider_adapters import (  # noqa: PLC0415
+                ProviderType, ThinkingConfig, ThinkingLevel, build_model_settings,
+            )
+            settings = build_model_settings(
+                ProviderType(provider_type), ThinkingConfig(enabled=False, level=ThinkingLevel.LOW))
+            extra: dict = {}
+            if getattr(settings, "extra_body", None):
+                extra["extra_body"] = settings.extra_body
+            if getattr(settings, "extra_args", None):
+                extra["extra_args"] = settings.extra_args
+            return extra
+        if provider_type == "other":
+            host = urlparse(base_url or "").hostname or ""
+            if host.endswith(_OTHER_THINKING_HOSTS):
+                return {"extra_body": {"thinking": {"type": "disabled"}}}
+            return {}
+        return {}
+    except Exception as exc:  # noqa: BLE001 — never raise from a thinking-control helper
+        _LOG.info("aux_thinking_kwargs(%s) failed: %s", provider_type, exc)
+        return {}
 
 
 def session_complete_fn(client, model_name, extra_kwargs=None):
@@ -60,12 +96,7 @@ async def resolve_background_client(conn, user_id: str, *, creds_resolver=None):
     creds = await (creds_resolver or _default_creds)(user_id, model)
     if not creds or not creds.get("base_url") or not creds.get("model"):
         return None
-    extra: dict = {}
-    if creds.get("provider_type") in ("ollama", "qwen"):
-        from provider_adapters import ProviderType, ThinkingConfig, ThinkingLevel, build_model_settings  # noqa: PLC0415
-        settings = build_model_settings(ProviderType.OLLAMA, ThinkingConfig(enabled=False, level=ThinkingLevel.LOW))
-        if getattr(settings, "extra_body", None):
-            extra["extra_body"] = settings.extra_body
+    extra = aux_thinking_kwargs(creds.get("provider_type", ""), creds.get("base_url", ""))
     return _new_client(creds["base_url"], creds.get("api_key", "")), creds["model"], extra
 
 
@@ -77,7 +108,8 @@ def _summarize_via(complete):
     return _summarize
 
 
-def make_summarizer(conn, user_id: str, session_client, model_name: str, *, creds_resolver=None):
+def make_summarizer(conn, user_id: str, session_client, model_name: str, *,
+                     creds_resolver=None, provider_type: str = "other", base_url: str = ""):
     state: dict = {"resolved": False, "bg": None, "fn": None, "complete": None}
 
     async def _pick():
@@ -95,7 +127,8 @@ def make_summarizer(conn, user_id: str, session_client, model_name: str, *, cred
             state["bg"] = client
             state["complete"] = session_complete_fn(client, model, extra)
         else:
-            state["complete"] = session_complete_fn(session_client, model_name)
+            state["complete"] = session_complete_fn(
+                session_client, model_name, aux_thinking_kwargs(provider_type, base_url))
         state["fn"] = _summarize_via(state["complete"])
         return state["fn"]
 

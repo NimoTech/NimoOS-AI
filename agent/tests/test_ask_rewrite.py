@@ -133,4 +133,4 @@ async def test_rewrite_empty_answer_does_not_retry():
 
 
 def test_rewrite_timeout_default_fits_the_answer_budget():
-    assert rw.config.REWRITE_TIMEOUT_S == 8.0
+    assert rw.config.REWRITE_TIMEOUT_S == 10.0

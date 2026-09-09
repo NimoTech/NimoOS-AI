@@ -22,10 +22,13 @@ EVIDENCE_MAX_ITEMS = _int_env("NIMOOS_ASK_EVIDENCE_MAX_ITEMS", 10)
 EVIDENCE_BUDGET_CHARS = _int_env("NIMOOS_ASK_EVIDENCE_BUDGET_CHARS", 24000)
 PIPELINE_TIMEOUT_S = float(os.environ.get("NIMOOS_ASK_PIPELINE_TIMEOUT_S", "") or 45.0)
 PER_QUERY_TIMEOUT_S = 15.0
-# 8s, not 12: the rewrite is serial with retrieval inside the 15s p50
+# 10s, not 12: the rewrite is serial with retrieval inside the 15s p50
 # answer-start budget (G1), and a timeout falls straight through to the
-# deterministic plan rather than paying for a second round trip.
-REWRITE_TIMEOUT_S = 8.0
+# deterministic plan rather than paying for a second round trip. Raised from
+# 8s: a thinking-disabled one-shot call still measures ~5.2s live, leaving too
+# thin a margin at 8s once the session-fallback path (no background model
+# configured) is in play.
+REWRITE_TIMEOUT_S = 10.0
 REWRITE_MAX_TOKENS = 400
 STEP_SUMMARY_MAX_TOKENS = 120
 # Step summaries are a nicety, the finished evidence pack is not: they run in
