@@ -972,7 +972,8 @@ class AgentRunner:
             # shape, and the mid-run summarizer below reuses this very object
             # so a run never opens a second background client.
             _summarize_fn = summarizer.make_summarizer(
-                self._conn, str(user_id), client, model_name)
+                self._conn, str(user_id), client, model_name,
+                provider_type=provider_type, base_url=provider_url)
             if profile.max_turns is not None:
                 max_turns = profile.max_turns
 
