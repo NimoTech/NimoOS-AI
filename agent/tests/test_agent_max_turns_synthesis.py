@@ -134,6 +134,8 @@ async def test_search_profile_synthesizes_with_tools_off_after_max_turns(runner)
     def fake_run_streamed(agent, input_messages, **kwargs):
         calls.append({"input": input_messages, "kwargs": kwargs,
                       "tool_choice": agent.model_settings.tool_choice,
+                      "tools": [getattr(t, "name", "") for t in (agent.tools or [])],
+                      "mcp_servers": list(agent.mcp_servers or []),
                       "instructions": str(agent.instructions or "")})
         return _exhausted_stream() if len(calls) == 1 else _answer_stream()
 
@@ -146,10 +148,13 @@ async def test_search_profile_synthesizes_with_tools_off_after_max_turns(runner)
     first, second = calls
     assert first["kwargs"]["max_turns"] == 5                      # the profile cap
     assert first["tool_choice"] in (None, "auto")
-    # the synthesis call: whole transcript in, one turn, no tools, explicit notice
+    assert "nimoos_search" in first["tools"]                      # the search profile's tools
+    # the synthesis call: whole transcript in, one turn, NO tools declared (doubao
+    # ignored tool_choice="none" and searched again), tool_choice unset, explicit notice
     assert second["input"] == _TRANSCRIPT
     assert second["kwargs"]["max_turns"] == 1
-    assert second["tool_choice"] == "none"
+    assert second["tools"] == [] and second["mcp_servers"] == []
+    assert second["tool_choice"] is None
     assert agent_module.MAX_TURNS_SYNTHESIS_NOTICE in second["instructions"]
 
     types = [e["type"] for e in sink.events]

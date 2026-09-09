@@ -752,8 +752,8 @@ class AgentRunner:
 
         The transcript (`prior_stream.to_input_list()`: the original input plus
         every tool call/result the run produced) becomes the whole input of a
-        fresh 1-turn run with tool_choice="none", so the provider cannot spend
-        the call on yet another search. `max_turns_synthesized` is emitted
+        fresh 1-turn run with the tool list emptied, so the provider cannot
+        spend the call on yet another search. `max_turns_synthesized` is emitted
         right before the first forwarded event, so a call that fails before
         producing anything leaves no stray label. Returns True as soon as an
         answer reached the client (persistence failures are logged, never
@@ -775,7 +775,14 @@ class AgentRunner:
         stream = None
         try:
             items = _repair_dangling_tool_calls(list(prior_stream.to_input_list()))
-            agent.model_settings = dataclasses.replace(agent.model_settings, tool_choice="none")
+            # Strip the tools rather than pin tool_choice="none": 火山 doubao
+            # (2026-09-09, Intel2408 Q40) ignored "none" and called nimoos_search
+            # again, which the SDK executed before raising MaxTurnsExceeded(1).
+            # With no tools declared the model cannot spend the call on a tool,
+            # and tool_choice must be unset (providers reject it without tools).
+            agent.tools = []
+            agent.mcp_servers = []
+            agent.model_settings = dataclasses.replace(agent.model_settings, tool_choice=None)
             agent.instructions = (str(agent.instructions or "") + "\n\n" + MAX_TURNS_SYNTHESIS_NOTICE)
             # compaction_filter._with_summary rebuilds the instructions from
             # ctx.extra["base_instructions"] whenever a summary/plan exists —
