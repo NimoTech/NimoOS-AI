@@ -190,6 +190,9 @@ A separate systemd unit `nimoos-agent.service`, runs on `:8282`, reverse-proxied
 | `attachments/` | Session attachment layer (ingest / paths / extract / gc); inbound files from channels are registered via `ingest_external` |
 | `phoenix_tracing.py` | Optional Phoenix (OTLP) tracing, gated by a toggle (see "Phoenix Tracing" below) |
 | `observability/` | `phoenix_compose.yaml` — the NimoOS-app compose manifest for the Phoenix container |
+| `ask/` | Knowledge-ask pipeline for the `search` profile: rewrite (background model) → parallel `/v1/search/text` + notes → RRF/MECE → evidence pack appended to the user turn; emits `ask_stage/ask_plan/ask_sources`; persists `ask_turns`. Spec: nimo_os_docs `specs/2026-09-08-knowledge-ask-agent-design.md` |
+
+The `search` profile (`profiles.py`): 4 retrieval tools, `max_turns=5`, `pre_run="ask"`; master kill switch `NIMOOS_ASK_PIPELINE=0`.
 
 Dependencies, see `agent/requirements.txt`: `fastapi`, `uvicorn`, `openai-agents`, `openai`, `httpx`, `pathspec`, `mcp` (MCP SDK), `discord.py` (Discord channel), `openinference-instrumentation-openai-agents` + `opentelemetry-sdk/-exporter-otlp-proto-http` (Phoenix tracing), `pypdf`/`python-docx`/`openpyxl`/`python-pptx` (attachment extraction).
 

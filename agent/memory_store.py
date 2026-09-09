@@ -181,6 +181,16 @@ def get_context_window(conn, user_id) -> "int | None":
     return n if n > 0 else None
 
 
+def get_bool_setting(conn, user_id: str, key: str, default: bool) -> bool:
+    """Generic user_settings boolean getter (value stored as '1'/'0'/'true'/'false')."""
+    row = conn.execute(
+        "SELECT value FROM user_settings WHERE user_id=? AND key=?",
+        (str(user_id), key)).fetchone()
+    if not row:
+        return default
+    return str(row["value"]).strip().lower() in ("1", "true", "yes")
+
+
 def supersede_memory(conn, old_id, user_id, text, kind, *, priority=0,
                      trust="normal", origin_session_id=None, now=None):
     """Replace an active memory with a successor that inherits the family

@@ -8,6 +8,8 @@ forged request can at most select 'general' (today's behavior).
 from dataclasses import dataclass
 
 from skills.photos import ALL_TOOLS as PHOTOS_TOOLS
+from skills.search import SEARCH_TOOLS
+from ask.prompt import ASK_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,11 @@ class Profile:
     # False = skip the wiki context block and the visible-resources block when
     # composing the system prompt (profiles with no filesystem access).
     compose_resources: bool = True
+    # "ask" = run the knowledge-ask pipeline before the first model call and
+    # append its evidence pack to the user turn (spec 2026-09-08 §3.2).
+    pre_run: str | None = None
+    # None = the user's max-turns setting; an int overrides it for this profile.
+    max_turns: int | None = None
 
 
 PHOTOS_SYSTEM_PROMPT = """You are Nimo, the photo assistant inside the NimoOS Photos app.
@@ -81,12 +88,18 @@ PROFILES = {
     "photos": Profile(tools=tuple(PHOTOS_TOOLS),
                       prompt=PHOTOS_SYSTEM_PROMPT,
                       compose_resources=False),
+    "search": Profile(tools=tuple(SEARCH_TOOLS),
+                      prompt=ASK_SYSTEM_PROMPT,
+                      compose_resources=False,
+                      pre_run="ask",
+                      max_turns=5),
 }
 
 
 # Guard against a future refactor silently emptying the photos tool set —
 # that would degrade to "prompt but no tools" and be hard to notice.
 assert len(PROFILES["photos"].tools) == 7, "photos profile tool count drifted"
+assert len(PROFILES["search"].tools) == 4, "search profile tool count drifted"
 
 
 def get_profile(agent_type: str | None) -> Profile:
