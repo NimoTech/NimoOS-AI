@@ -753,23 +753,41 @@ class AgentRunner:
         The transcript (`prior_stream.to_input_list()`: the original input plus
         every tool call/result the run produced) becomes the whole input of a
         fresh 1-turn run with tool_choice="none", so the provider cannot spend
-        the call on yet another search. Emits `max_turns_synthesized` before
-        the answer so the client can label it. Returns True when an answer was
-        emitted and persisted; False (after logging) when nothing came back or
-        anything failed, in which case the caller falls through to the plain
-        pause event and persists the exhausted run's own history.
+        the call on yet another search. `max_turns_synthesized` is emitted
+        right before the first forwarded event, so a call that fails before
+        producing anything leaves no stray label. Returns True as soon as an
+        answer reached the client (persistence failures are logged, never
+        allowed to turn a delivered answer into a "paused" run); False when
+        nothing came back or the call itself failed, in which case the caller
+        falls through to the plain pause event and persists the exhausted
+        run's own history.
         """
         import compaction_filter as _cf  # noqa: PLC0415 — same deferred import as run()
+        announced = False
+
+        async def announce():
+            nonlocal announced
+            if not announced:
+                announced = True
+                await sink.put({"type": "max_turns_synthesized", "max_turns": max_turns})
+
+        message_emitted = False
         try:
             items = _repair_dangling_tool_calls(list(prior_stream.to_input_list()))
             agent.model_settings = dataclasses.replace(agent.model_settings, tool_choice="none")
             agent.instructions = (str(agent.instructions or "") + "\n\n" + MAX_TURNS_SYNTHESIS_NOTICE)
-            await sink.put({"type": "max_turns_synthesized", "max_turns": max_turns})
+            # compaction_filter._with_summary rebuilds the instructions from
+            # ctx.extra["base_instructions"] whenever a summary/plan exists —
+            # exactly the long runs that hit the cap — so the notice has to be
+            # appended to that seed too or it never reaches the model.
+            if ctx is not None:
+                base = ctx.extra.get("base_instructions")
+                if base is not None:
+                    ctx.extra["base_instructions"] = str(base) + "\n\n" + MAX_TURNS_SYNTHESIS_NOTICE
             stream = Runner.run_streamed(agent, items, max_turns=1,
                                          hooks=_cf.ContextHooks(), run_config=run_config)
             call_names: dict[str, str] = {}
             conv_state: dict = {"streamed_message": False}
-            message_emitted = False
             async for event in stream.stream_events():
                 sse_event = _convert_event(event, call_names, conv_state)
                 if sse_event is None:
@@ -781,23 +799,35 @@ class AgentRunner:
                     if conv_state["streamed_message"]:
                         continue
                     message_emitted = True
+                await announce()
                 await sink.put(sse_event)
             if not message_emitted:
                 final = getattr(stream, "final_output", None)
                 if final and isinstance(final, str) and final.strip():
+                    await announce()
                     await sink.put({"type": "message", "content": final})
                     message_emitted = True
             if not message_emitted:
                 _LOG.warning("max-turns synthesis produced no text; falling back to the pause event")
                 return False
+        except Exception:  # noqa: BLE001 — the pause event is the safe fallback
+            if message_emitted:
+                # The answer is already on the client: keep it as the outcome and
+                # only lose the persisted copy, never label a delivered answer as
+                # a pause. The caller's fallback would overwrite history with the
+                # exhausted transcript, so do our best to persist here instead.
+                _LOG.warning("max-turns synthesis failed after streaming an answer", exc_info=True)
+                return True
+            _LOG.warning("max-turns synthesis failed; falling back to the pause event", exc_info=True)
+            return False
+        try:
             final_history = persist_prefix + self._finalize_history(
                 stream, session_id=session_id, attachment_ids=attachment_ids, data_root=data_root)
             self._save_history(session_id, final_history)
             self._persist_midrun_state(ctx, session_id)
-            return True
-        except Exception:  # noqa: BLE001 — the pause event is the safe fallback
-            _LOG.warning("max-turns synthesis failed; falling back to the pause event", exc_info=True)
-            return False
+        except Exception:  # noqa: BLE001 — a delivered answer must not become a pause
+            _LOG.warning("persisting the max-turns synthesis failed", exc_info=True)
+        return True
 
     async def run(
         self,

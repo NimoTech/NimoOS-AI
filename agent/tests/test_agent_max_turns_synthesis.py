@@ -1,11 +1,15 @@
 """Search profile: exhausting max_turns ends in one tool-less synthesis call,
 not an empty transcript (2026-09-09 Intel2408 eval, Q29/Q39)."""
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from agents.exceptions import MaxTurnsExceeded
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 import agent as agent_module
+import compaction_filter as _cf
+import run_context as _rc
 import summarizer as summarizer_module
 from ask import pipeline as ask_pipeline
 from db import init_db
@@ -58,6 +62,45 @@ def _answer_stream(text="Meteor Lake H: 155H, 165H, 185H [1][3]"):
         {"role": "assistant", "content": text}]
     m.final_output = text
     m.raw_responses = []
+    return m
+
+
+def _delta(text):
+    """Chat-completions shaped raw event: choices[0].delta.content."""
+    return RawResponsesStreamEvent(data=SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content=text, reasoning_content=None))]))
+
+
+def _consolidated(text):
+    item = SimpleNamespace(type="message_output_item",
+                           content=[SimpleNamespace(type="output_text", text=text)])
+    return RunItemStreamEvent(name="message_output_created", item=item)
+
+
+def _streaming_answer_stream(text="Meteor Lake H: 155H, 165H, 185H [1][3]"):
+    """The realistic shape: text deltas, then the SDK's consolidated message item
+    (which the run loop must NOT forward a second time)."""
+    m = MagicMock()
+    half = len(text) // 2
+
+    async def events():
+        yield _delta(text[:half])
+        yield _delta(text[half:])
+        yield _consolidated(text)
+    m.stream_events = events
+    m.to_input_list.return_value = list(_TRANSCRIPT) + [{"role": "assistant", "content": text}]
+    m.final_output = text
+    m.raw_responses = []
+    return m
+
+
+_DANGLING = list(_TRANSCRIPT) + [
+    {"type": "function_call", "call_id": "c2", "name": "nimoos_search", "arguments": "{}"}]
+
+
+def _exhausted_dangling_stream():
+    m = _exhausted_stream()
+    m.to_input_list.return_value = list(_DANGLING)
     return m
 
 
@@ -155,6 +198,8 @@ async def test_failed_synthesis_falls_back_to_the_pause_event(runner):
     assert len(calls) == 2
     assert {"type": "max_turns_exceeded", "max_turns": 5} in sink.events
     assert not any(e["type"] == "message" for e in sink.events)
+    # nothing was produced, so no "synthesized" label was ever emitted
+    assert not any(e["type"] == "max_turns_synthesized" for e in sink.events)
     # the exhausted run's own transcript is what survives
     assert runner._load_history("s1") == _TRANSCRIPT
 
@@ -172,3 +217,77 @@ async def test_empty_synthesis_falls_back_to_the_pause_event(runner):
         await runner.run(session_id="s1", user_id="u1", message="q", sink=sink,
                          provider_key="k", provider_url="http://x", model_name="qwen")
     assert {"type": "max_turns_exceeded", "max_turns": 5} in sink.events
+
+
+@pytest.mark.asyncio
+async def test_streamed_synthesis_forwards_deltas_once_and_repairs_dangling_calls(runner):
+    calls = []
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        calls.append({"input": input_messages})
+        return _exhausted_dangling_stream() if len(calls) == 1 else _streaming_answer_stream()
+
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="q", sink=sink,
+                         provider_key="k", provider_url="http://x", model_name="qwen")
+
+    # the unpaired c2 call got a synthetic output before being re-sent
+    second_input = calls[1]["input"]
+    assert second_input[:len(_DANGLING)] == _DANGLING
+    assert second_input[len(_DANGLING)]["type"] == "function_call_output"
+    assert second_input[len(_DANGLING)]["call_id"] == "c2"
+
+    types = [e["type"] for e in sink.events]
+    assert types.count("max_turns_synthesized") == 1
+    assert types.index("max_turns_synthesized") < types.index("message_delta")
+    deltas = "".join(e["content"] for e in sink.events if e["type"] == "message_delta")
+    assert deltas == "Meteor Lake H: 155H, 165H, 185H [1][3]"
+    # the consolidated message item is suppressed after streamed deltas
+    assert "message" not in types
+    assert "max_turns_exceeded" not in types
+    assert runner._load_history("s1")[-1] == {"role": "assistant",
+                                              "content": "Meteor Lake H: 155H, 165H, 185H [1][3]"}
+
+
+@pytest.mark.asyncio
+async def test_notice_survives_the_compaction_filter_when_a_summary_exists(runner):
+    """compaction_filter rebuilds instructions from ctx.extra['base_instructions']
+    whenever a mid-run summary exists — the notice must be in that seed too."""
+    seen = {}
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        ctx = _rc.RUN_CTX_VAR.get()
+        if "first" not in seen:
+            seen["first"] = True
+            ctx.summary = "earlier turns: searched twice, found the H-series CSV"
+            return _exhausted_stream()
+        seen["filtered"] = _cf._with_summary(ctx, agent.instructions)
+        return _answer_stream()
+
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="q", sink=_Sink(),
+                         provider_key="k", provider_url="http://x", model_name="qwen")
+    assert agent_module.MAX_TURNS_SYNTHESIS_NOTICE in seen["filtered"]
+    assert seen["filtered"].count(agent_module.MAX_TURNS_SYNTHESIS_NOTICE) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_after_a_streamed_answer_is_not_a_pause(runner, monkeypatch):
+    calls = []
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        calls.append(kwargs)
+        return _exhausted_stream() if len(calls) == 1 else _streaming_answer_stream()
+
+    def boom(session_id, history):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(runner, "_save_history", boom)
+
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="q", sink=sink,
+                         provider_key="k", provider_url="http://x", model_name="qwen")
+    types = [e["type"] for e in sink.events]
+    assert "message_delta" in types and "max_turns_synthesized" in types
+    assert "max_turns_exceeded" not in types
