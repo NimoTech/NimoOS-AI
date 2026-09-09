@@ -772,6 +772,7 @@ class AgentRunner:
                 await sink.put({"type": "max_turns_synthesized", "max_turns": max_turns})
 
         message_emitted = False
+        stream = None
         try:
             items = _repair_dangling_tool_calls(list(prior_stream.to_input_list()))
             agent.model_settings = dataclasses.replace(agent.model_settings, tool_choice="none")
@@ -811,21 +812,25 @@ class AgentRunner:
                 _LOG.warning("max-turns synthesis produced no text; falling back to the pause event")
                 return False
         except Exception:  # noqa: BLE001 — the pause event is the safe fallback
-            if message_emitted:
-                # The answer is already on the client: keep it as the outcome and
-                # only lose the persisted copy, never label a delivered answer as
-                # a pause. The caller's fallback would overwrite history with the
-                # exhausted transcript, so do our best to persist here instead.
-                _LOG.warning("max-turns synthesis failed after streaming an answer", exc_info=True)
-                return True
-            _LOG.warning("max-turns synthesis failed; falling back to the pause event", exc_info=True)
-            return False
+            if not message_emitted:
+                _LOG.warning("max-turns synthesis failed; falling back to the pause event", exc_info=True)
+                return False
+            # Part of the answer is already on the client (e.g. the connection
+            # dropped mid-delta): keep it as the outcome, never label a delivered
+            # answer as a pause, and fall through to persist whatever the SDK
+            # accumulated. The caller's fallback would otherwise overwrite history
+            # with the exhausted transcript.
+            _LOG.warning("max-turns synthesis failed after streaming began; keeping the partial answer",
+                         exc_info=True)
+        # Best-effort persistence: a failure here is logged, not turned into a
+        # pause — the answer has been delivered.
         try:
             final_history = persist_prefix + self._finalize_history(
                 stream, session_id=session_id, attachment_ids=attachment_ids, data_root=data_root)
+            final_history = _repair_dangling_tool_calls(final_history)
             self._save_history(session_id, final_history)
             self._persist_midrun_state(ctx, session_id)
-        except Exception:  # noqa: BLE001 — a delivered answer must not become a pause
+        except Exception:  # noqa: BLE001
             _LOG.warning("persisting the max-turns synthesis failed", exc_info=True)
         return True
 

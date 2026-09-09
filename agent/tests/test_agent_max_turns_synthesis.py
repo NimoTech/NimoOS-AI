@@ -291,3 +291,35 @@ async def test_persistence_failure_after_a_streamed_answer_is_not_a_pause(runner
     types = [e["type"] for e in sink.events]
     assert "message_delta" in types and "max_turns_synthesized" in types
     assert "max_turns_exceeded" not in types
+
+
+@pytest.mark.asyncio
+async def test_mid_stream_failure_keeps_the_partial_answer_and_persists_it(runner):
+    calls = []
+
+    def half_then_boom():
+        m = MagicMock()
+
+        async def events():
+            yield _delta("Meteor Lake H: 155H, ")
+            raise RuntimeError("connection reset mid-stream")
+        m.stream_events = events
+        m.to_input_list.return_value = list(_TRANSCRIPT) + [
+            {"role": "assistant", "content": "Meteor Lake H: 155H, "}]
+        m.final_output = None
+        m.raw_responses = []
+        return m
+
+    def fake_run_streamed(agent, input_messages, **kwargs):
+        calls.append(kwargs)
+        return _exhausted_stream() if len(calls) == 1 else half_then_boom()
+
+    sink = _Sink()
+    with patch("agent.Runner.run_streamed", side_effect=fake_run_streamed):
+        await runner.run(session_id="s1", user_id="u1", message="q", sink=sink,
+                         provider_key="k", provider_url="http://x", model_name="qwen")
+    types = [e["type"] for e in sink.events]
+    assert "message_delta" in types and "max_turns_synthesized" in types
+    assert "max_turns_exceeded" not in types
+    # what the SDK accumulated is persisted, not the exhausted transcript
+    assert runner._load_history("s1")[-1] == {"role": "assistant", "content": "Meteor Lake H: 155H, "}
