@@ -88,7 +88,9 @@ def _streaming_answer_stream(text="Meteor Lake H: 155H, 165H, 185H [1][3]"):
         yield _delta(text[half:])
         yield _consolidated(text)
     m.stream_events = events
-    m.to_input_list.return_value = list(_TRANSCRIPT) + [{"role": "assistant", "content": text}]
+    # what the SDK reports back: the (flattened) input it was given + the answer
+    m.to_input_list.return_value = list(agent_module._flatten_tool_items(_TRANSCRIPT)) + [
+        {"role": "assistant", "content": text}]
     m.final_output = text
     m.raw_responses = []
     return m
@@ -149,9 +151,15 @@ async def test_search_profile_synthesizes_with_tools_off_after_max_turns(runner)
     assert first["kwargs"]["max_turns"] == 5                      # the profile cap
     assert first["tool_choice"] in (None, "auto")
     assert "nimoos_search" in first["tools"]                      # the search profile's tools
-    # the synthesis call: whole transcript in, one turn, NO tools declared (doubao
-    # ignored tool_choice="none" and searched again), tool_choice unset, explicit notice
-    assert second["input"] == _TRANSCRIPT
+    # the synthesis call: a tool-free VIEW of the transcript (role messages kept,
+    # tool call/result pairs rendered as one trailing user message), one turn,
+    # NO tools declared, tool_choice unset, explicit notice
+    assert second["input"][0] == _TRANSCRIPT[0]
+    assert all(m.get("role") for m in second["input"])
+    assert not any(m.get("type") in ("function_call", "function_call_output") for m in second["input"])
+    flat = second["input"][-1]
+    assert flat["role"] == "user" and agent_module.MAX_TURNS_FLATTEN_HEADER in flat["content"]
+    assert "nimoos_search" in flat["content"] and "hits..." in flat["content"]
     assert second["kwargs"]["max_turns"] == 1
     assert second["tools"] == [] and second["mcp_servers"] == []
     assert second["tool_choice"] is None
@@ -237,11 +245,9 @@ async def test_streamed_synthesis_forwards_deltas_once_and_repairs_dangling_call
         await runner.run(session_id="s1", user_id="u1", message="q", sink=sink,
                          provider_key="k", provider_url="http://x", model_name="qwen")
 
-    # the unpaired c2 call got a synthetic output before being re-sent
-    second_input = calls[1]["input"]
-    assert second_input[:len(_DANGLING)] == _DANGLING
-    assert second_input[len(_DANGLING)]["type"] == "function_call_output"
-    assert second_input[len(_DANGLING)]["call_id"] == "c2"
+    # the unpaired c2 call is rendered as a call without output in the flat view
+    flat = calls[1]["input"][-1]["content"]
+    assert "call 2: nimoos_search" in flat and "did not complete" in flat   # repaired dangling call
 
     types = [e["type"] for e in sink.events]
     assert types.count("max_turns_synthesized") == 1
@@ -251,8 +257,13 @@ async def test_streamed_synthesis_forwards_deltas_once_and_repairs_dangling_call
     # the consolidated message item is suppressed after streamed deltas
     assert "message" not in types
     assert "max_turns_exceeded" not in types
-    assert runner._load_history("s1")[-1] == {"role": "assistant",
-                                              "content": "Meteor Lake H: 155H, 165H, 185H [1][3]"}
+    # persisted: the REAL transcript (dangling c2 repaired) + the answer, not the flat view
+    saved = runner._load_history("s1")
+    assert saved[:len(_DANGLING)] == _DANGLING
+    assert saved[len(_DANGLING)] == {"type": "function_call_output", "call_id": "c2",
+                                     "output": saved[len(_DANGLING)]["output"]}
+    assert saved[-1] == {"role": "assistant", "content": "Meteor Lake H: 155H, 165H, 185H [1][3]"}
+    assert not any(agent_module.MAX_TURNS_FLATTEN_HEADER in str(m.get("content", "")) for m in saved)
 
 
 @pytest.mark.asyncio
@@ -309,7 +320,7 @@ async def test_mid_stream_failure_keeps_the_partial_answer_and_persists_it(runne
             yield _delta("Meteor Lake H: 155H, ")
             raise RuntimeError("connection reset mid-stream")
         m.stream_events = events
-        m.to_input_list.return_value = list(_TRANSCRIPT) + [
+        m.to_input_list.return_value = list(agent_module._flatten_tool_items(_TRANSCRIPT)) + [
             {"role": "assistant", "content": "Meteor Lake H: 155H, "}]
         m.final_output = None
         m.raw_responses = []
@@ -328,3 +339,26 @@ async def test_mid_stream_failure_keeps_the_partial_answer_and_persists_it(runne
     assert "max_turns_exceeded" not in types
     # what the SDK accumulated is persisted, not the exhausted transcript
     assert runner._load_history("s1")[-1] == {"role": "assistant", "content": "Meteor Lake H: 155H, "}
+
+
+def test_flatten_tool_items_renders_pairs_as_one_trailing_user_message():
+    items = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {"type": "reasoning", "summary": []},
+        {"type": "function_call", "call_id": "a", "name": "nimoos_search", "arguments": '{"query": "x"}'},
+        {"type": "function_call_output", "call_id": "a", "output": "OUT-A"},
+        {"role": "assistant", "content": "let me read more"},
+        {"type": "function_call", "call_id": "b", "name": "read_document", "arguments": {"file_id": "f"}},
+        {"type": "function_call_output", "call_id": "b", "output": "X" * 9000},
+        {"type": "function_call", "call_id": "c", "name": "nimoos_search", "arguments": "{}"},
+    ]
+    out = agent_module._flatten_tool_items(items)
+    assert [m.get("role") for m in out] == ["system", "user", "assistant", "user"]
+    flat = out[-1]["content"]
+    assert flat.startswith(agent_module.MAX_TURNS_FLATTEN_HEADER)
+    assert 'call 1: nimoos_search {"query": "x"}\nOUT-A' in flat
+    assert 'call 2: read_document {"file_id": "f"}' in flat and "…(truncated)" in flat
+    assert "call 3: nimoos_search {}\n(no output" in flat
+    # no tool activity -> untouched role messages, no trailer
+    assert agent_module._flatten_tool_items(items[:2]) == items[:2]
