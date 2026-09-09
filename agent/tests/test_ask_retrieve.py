@@ -162,3 +162,31 @@ async def test_retrieve_draft_notes_opt_in():
     await rt.retrieve(_plan("a", "b"), question="q", user_id="u", search=_Search({}), parser=parser,
                       deadline=time.monotonic() + 5, include_draft_notes=True)
     assert parser.calls[0][3] == ["curated", "draft"]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_drops_document_hits_under_excluded_prefixes():
+    # The notes layer's files are Parser-indexed like any folder; the same notes
+    # already arrive via the notes collection, so as documents they must go.
+    note_file = _hit("n", 1, "distilled answer")
+    note_file["paths"] = [{"root_id": "r", "path": "/DATA/Notes/1/xeon-tdp-3547e314.md", "mtime_ms": 1}]
+    log_file = _hit("l", 1, "log line")
+    log_file["paths"] = [{"root_id": "r", "path": "/DATA/Notes/1/log.md", "mtime_ms": 1}]
+    lookalike = _hit("k", 1, "keep me")
+    lookalike["paths"] = [{"root_id": "r", "path": "/DATA/Documents/Notes/keep.md", "mtime_ms": 1}]
+    search = _Search({"q1": [note_file, log_file, _hit("a", 1), lookalike]})
+    res = await rt.retrieve(_plan("q1"), question="orig", user_id="u", search=search, parser=_Parser(),
+                            deadline=time.monotonic() + 10, exclude_prefixes=("/DATA/Notes/",))
+    assert [c.key for c in res.candidates] == ["doc:a:body:1", "doc:k:body:1"]
+    assert res.per_query_hits == [2]
+    # default: nothing excluded
+    res2 = await rt.retrieve(_plan("q1"), question="orig", user_id="u", search=search, parser=_Parser(),
+                             deadline=time.monotonic() + 10)
+    assert len(res2.candidates) == 4
+
+
+def test_excluded_by_prefix_edge_cases():
+    assert rt.excluded_by_prefix("/DATA/Notes/1/log.md", ("/DATA/Notes/",))
+    assert not rt.excluded_by_prefix("/DATA/NotesArchive/a.md", ("/DATA/Notes/",))
+    assert not rt.excluded_by_prefix("", ("/DATA/Notes/",))
+    assert not rt.excluded_by_prefix("/DATA/Notes/1/log.md", ())

@@ -57,6 +57,14 @@ from wiki_context import WikiContextBuilder
 
 _LOG = logging.getLogger("nimoos-agent")
 
+# Appended to the system prompt for the one tool-less model call a
+# synthesize_on_max_turns profile gets after exhausting its turn budget.
+MAX_TURNS_SYNTHESIS_NOTICE = (
+    "[Tool budget exhausted. Do not call any more tools. Answer the user's question now "
+    "from the evidence pack and the tool results above: state what they support, cite "
+    "with [n] where the evidence pack applies, and say plainly which parts you could not "
+    "verify. Answer in the user's language.]")
+
 # Set at run start (see AgentRunner.run, right after Agent construction) to
 # this run's live Agent object. skills/tool_gating.py's L2 loading replaces
 # .tools on this object mid-run (see expand_categories / _load_l2_tools). The
@@ -737,6 +745,60 @@ class AgentRunner:
         return compact_image_blocks(
             final_history, image_id_resolver=lambda u: url_to_aid.get(u))
 
+    async def _synthesize_after_max_turns(self, agent, prior_stream, *, sink, run_config,
+                                          max_turns: int, session_id: str, attachment_ids,
+                                          data_root: str, persist_prefix: list, ctx) -> bool:
+        """One tool-less model call over the exhausted run's transcript.
+
+        The transcript (`prior_stream.to_input_list()`: the original input plus
+        every tool call/result the run produced) becomes the whole input of a
+        fresh 1-turn run with tool_choice="none", so the provider cannot spend
+        the call on yet another search. Emits `max_turns_synthesized` before
+        the answer so the client can label it. Returns True when an answer was
+        emitted and persisted; False (after logging) when nothing came back or
+        anything failed, in which case the caller falls through to the plain
+        pause event and persists the exhausted run's own history.
+        """
+        import compaction_filter as _cf  # noqa: PLC0415 — same deferred import as run()
+        try:
+            items = _repair_dangling_tool_calls(list(prior_stream.to_input_list()))
+            agent.model_settings = dataclasses.replace(agent.model_settings, tool_choice="none")
+            agent.instructions = (str(agent.instructions or "") + "\n\n" + MAX_TURNS_SYNTHESIS_NOTICE)
+            await sink.put({"type": "max_turns_synthesized", "max_turns": max_turns})
+            stream = Runner.run_streamed(agent, items, max_turns=1,
+                                         hooks=_cf.ContextHooks(), run_config=run_config)
+            call_names: dict[str, str] = {}
+            conv_state: dict = {"streamed_message": False}
+            message_emitted = False
+            async for event in stream.stream_events():
+                sse_event = _convert_event(event, call_names, conv_state)
+                if sse_event is None:
+                    continue
+                et = sse_event["type"]
+                if et == "message_delta":
+                    message_emitted = True
+                elif et == "message":
+                    if conv_state["streamed_message"]:
+                        continue
+                    message_emitted = True
+                await sink.put(sse_event)
+            if not message_emitted:
+                final = getattr(stream, "final_output", None)
+                if final and isinstance(final, str) and final.strip():
+                    await sink.put({"type": "message", "content": final})
+                    message_emitted = True
+            if not message_emitted:
+                _LOG.warning("max-turns synthesis produced no text; falling back to the pause event")
+                return False
+            final_history = persist_prefix + self._finalize_history(
+                stream, session_id=session_id, attachment_ids=attachment_ids, data_root=data_root)
+            self._save_history(session_id, final_history)
+            self._persist_midrun_state(ctx, session_id)
+            return True
+        except Exception:  # noqa: BLE001 — the pause event is the safe fallback
+            _LOG.warning("max-turns synthesis failed; falling back to the pause event", exc_info=True)
+            return False
+
     async def run(
         self,
         session_id: str,
@@ -1221,7 +1283,10 @@ class AgentRunner:
                     # yet. Exposing it on the notes settings API is a follow-up;
                     # until then the default (curated notes only) is what ships.
                     include_draft_notes=memory_store.get_bool_setting(
-                        self._conn, str(user_id), "ask.include_draft_notes", False))
+                        self._conn, str(user_id), "ask.include_draft_notes", False),
+                    # The notes layer's own files must not come back as
+                    # documents: they are already in the notes collection.
+                    exclude_prefixes=ask_pipeline.notes_exclude_prefixes(self._conn))
                 user_content = _append_text(user_content, _ask.evidence_block)
 
             stored_history = self._load_history(session_id)
@@ -1327,6 +1392,7 @@ class AgentRunner:
             # something raise-worthy ahead of its in-try assignment can't turn
             # that read into a NameError.
             _attempt_turns = max_turns
+            _trace_cfg = None
             try:
                 # Set the ContextVar as the first thing inside the try whose
                 # finally resets it, so a failure between here and the
@@ -1601,31 +1667,43 @@ class AgentRunner:
                     pass
             except MaxTurnsExceeded:
                 # Hitting the cap isn't an error, it's a "pause": persist + emit a
-                # resumable event, don't emit a red error.
-                try:
-                    if stream is not None:
-                        partial = self._finalize_history(
-                            stream, session_id=session_id,
-                            attachment_ids=attachment_ids, data_root=data_root)
-                        partial = _repair_dangling_tool_calls(partial)
-                        self._save_history(session_id, persist_prefix + partial)
-                        # _repair_dangling_tool_calls may insert synthetic
-                        # outputs below fold_idx, so persist_prefix_len +
-                        # fold_idx can under-count by the number inserted —
-                        # safe direction (a boundary turn is re-sent, never
-                        # dropped); do not "correct" it upward.
-                        self._persist_midrun_state(_ctx, session_id)
-                except Exception:
-                    pass
-                await sink.put({
-                    "type": "max_turns_exceeded",
-                    # The cap actually in force when this was raised: after a
-                    # rescue, _attempt_turns is max_turns reduced by the llm
-                    # calls already spent (agent.py rescue branch above) — the
-                    # PRE-rescue max_turns would misreport the limit the run
-                    # was really capped at (spec fix-round-1 review, Minor 3).
-                    "max_turns": _attempt_turns if _attempt_turns is not None else 0,
-                })
+                # resumable event, don't emit a red error. Profiles that opt in
+                # (search) first get one tool-less model call over the transcript,
+                # so a run that spent every turn on retrieval still ends in an
+                # answer rather than an empty one (2026-09-09 Intel2408 eval:
+                # Q29/Q39 hit max_turns=5 and produced no text at all).
+                _cap = _attempt_turns if _attempt_turns is not None else 0
+                synthesized = False
+                if profile.synthesize_on_max_turns and stream is not None:
+                    synthesized = await self._synthesize_after_max_turns(
+                        agent, stream, sink=sink, run_config=_trace_cfg, max_turns=_cap,
+                        session_id=session_id, attachment_ids=attachment_ids,
+                        data_root=data_root, persist_prefix=persist_prefix, ctx=_ctx)
+                if not synthesized:
+                    try:
+                        if stream is not None:
+                            partial = self._finalize_history(
+                                stream, session_id=session_id,
+                                attachment_ids=attachment_ids, data_root=data_root)
+                            partial = _repair_dangling_tool_calls(partial)
+                            self._save_history(session_id, persist_prefix + partial)
+                            # _repair_dangling_tool_calls may insert synthetic
+                            # outputs below fold_idx, so persist_prefix_len +
+                            # fold_idx can under-count by the number inserted —
+                            # safe direction (a boundary turn is re-sent, never
+                            # dropped); do not "correct" it upward.
+                            self._persist_midrun_state(_ctx, session_id)
+                    except Exception:
+                        pass
+                    await sink.put({
+                        "type": "max_turns_exceeded",
+                        # The cap actually in force when this was raised: after a
+                        # rescue, _attempt_turns is max_turns reduced by the llm
+                        # calls already spent (agent.py rescue branch above) — the
+                        # PRE-rescue max_turns would misreport the limit the run
+                        # was really capped at (spec fix-round-1 review, Minor 3).
+                        "max_turns": _cap,
+                    })
             except Exception as e:
                 # Evidence log: if a tool_call/tool pairing 400 ever slips past
                 # the converter repair, dump the exact item list so the root
