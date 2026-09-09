@@ -1590,6 +1590,7 @@ async def list_messages(session_id: str, x_user_id: str = Header(..., alias="X-U
 
     messages = _hydrate_messages(history, session_id_for_urls=session_id)
     messages = _inject_access_request_cards(messages, session_id, _conn)
+    messages = _inject_context_recovered_cards(messages, session_id, _conn)
     return _enrich_with_attachments(messages, session_id=session_id, conn=_conn)
 
 
@@ -1940,6 +1941,66 @@ def _inject_access_request_cards(messages: list, session_id: str, conn) -> list:
     return messages
 
 
+def _inject_context_recovered_cards(messages: list, session_id: str, conn) -> list:
+    """Re-attach `context_recovered` hints (spec §6.3) to the loaded history.
+
+    The event is UI-only — never part of the SDK history — so a refreshed page
+    would lose it. It IS in event_log (RunSink persists every non-delta event),
+    so rebuild it from there. Correlation mirrors _inject_access_request_cards:
+    the k-th run that recovered maps to the k-th assistant turn; the card goes
+    at the end of that turn's blocks (the recovery happened mid-turn and the
+    turn's visible text continued afterwards). Best-effort: any failure leaves
+    the messages untouched."""
+    try:
+        rows = conn.execute(
+            "SELECT e.run_id AS run_id, e.payload AS payload "
+            "FROM event_log e JOIN agent_runs r ON r.id = e.run_id "
+            "WHERE r.session_id=? AND e.payload LIKE '%\"type\": \"context_recovered\"%' "
+            "ORDER BY r.created_at ASC, e.seq ASC",
+            (session_id,),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — hydration must never fail the endpoint
+        return messages
+    if not rows:
+        return messages
+    # Correlate by the run's position among ALL of the session's runs (one run
+    # ≈ one assistant turn), not among the runs that recovered — otherwise a
+    # recovery in the second run would land on the first turn.
+    try:
+        run_order = [r["id"] for r in conn.execute(
+            "SELECT id FROM agent_runs WHERE session_id=? ORDER BY created_at ASC, id ASC",
+            (session_id,)).fetchall()]
+    except Exception:  # noqa: BLE001
+        return messages
+    run_index = {rid: i for i, rid in enumerate(run_order)}
+    cards_by_run: dict[str, list] = {}
+    for r in rows:
+        try:
+            ev = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "context_recovered":
+            continue
+        cards_by_run.setdefault(r["run_id"], []).append({
+            "type": "context_recovered",
+            "before": int(ev.get("before") or 0),
+            "after": int(ev.get("after") or 0),
+            "window": int(ev.get("window") or 0),
+        })
+    if not cards_by_run:
+        return messages
+    assistant_turns = [m for m in messages if m.get("role") == "assistant"]
+    if not assistant_turns:
+        synthetic = {"id": "h-a-ctx", "role": "assistant", "blocks": [], "streaming": False}
+        messages.append(synthetic)
+        assistant_turns = [synthetic]
+    for rid, cards in cards_by_run.items():
+        gi = run_index.get(rid, len(assistant_turns) - 1)
+        turn = assistant_turns[gi] if gi < len(assistant_turns) else assistant_turns[-1]
+        turn.setdefault("blocks", []).extend(cards)
+    return messages
+
+
 class TitleUpdate(BaseModel):
     title: str
 
@@ -2277,6 +2338,56 @@ async def get_context_usage(request: Request):
     model = request.query_params.get("model", "")
     return context_compaction.compute_usage(
         _db(), session_id=session_id, user_id=user_id, model=model)
+
+
+class ModelWindowPayload(BaseModel):
+    model: str
+    provider_type: str = ""
+    window: int
+
+
+@app.get("/agent/model-windows")
+async def get_model_window(request: Request):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    model = request.query_params.get("model", "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model required")
+    provider_type = request.query_params.get("provider_type", "")
+    import model_windows as _mw  # noqa: PLC0415
+    conn = _db()
+    key = _mw.model_key(model, provider_type)
+    window, source = context_compaction.resolve_window_with_source(conn, user_id, model, provider_type)
+    stored = _mw.get(conn, key)
+    return {"model_key": key, "window": window, "source": source,
+            "stored": {"window": stored["window"], "source": stored["source"]} if stored else None}
+
+
+@app.put("/agent/model-windows")
+async def put_model_window(request: Request, body: ModelWindowPayload):
+    user_id = request.headers.get("X-User-Id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id required")
+    if not body.model.strip():
+        raise HTTPException(status_code=400, detail="model required")
+    import model_windows as _mw  # noqa: PLC0415
+    conn = _db()
+    key = _mw.model_key(body.model, body.provider_type)
+    if body.window == 0:
+        _mw.delete_manual(conn, key)
+        # Clearing the manual override does not mean "no window in force" —
+        # a fetched/learned row (or the tier default) may still apply, and a
+        # learned row only ever shrinks so it never expires on its own.
+        # Report the truth instead of a misleading null (final review Minor 5).
+        w, s = context_compaction.resolve_window_with_source(conn, user_id, body.model, body.provider_type)
+        return {"status": "ok", "model_key": key, "window": w, "source": s}
+    if body.window < context_compaction.MIN_CONTEXT_WINDOW:
+        raise HTTPException(status_code=400, detail="window_too_small")
+    if body.window > context_compaction.MAX_CONTEXT_WINDOW:
+        raise HTTPException(status_code=400, detail="window_too_large")
+    _mw.upsert(conn, key, int(body.window), "manual")
+    return {"status": "ok", "model_key": key, "window": int(body.window), "source": "manual"}
 
 
 @app.put("/agent/user-memory/settings")

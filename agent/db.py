@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     source            TEXT NOT NULL DEFAULT 'web'
 );
 
+CREATE TABLE IF NOT EXISTS model_windows (
+    model_key  TEXT PRIMARY KEY,
+    window     INTEGER NOT NULL,
+    source     TEXT NOT NULL,          -- manual | fetched | learned
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id     TEXT NOT NULL,
     key         TEXT NOT NULL,

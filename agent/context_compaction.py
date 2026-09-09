@@ -26,6 +26,7 @@ CLOUD_CONTEXT_WINDOW = 131072   # cloud default; most user-selected models are
                                  # 128k — P3 makes this per-model
 LOCAL_CONTEXT_WINDOW = 8192     # 8k
 MIN_CONTEXT_WINDOW = 1024
+MAX_CONTEXT_WINDOW = 2_000_000   # sanity ceiling on a fetched/manual row (final review Minor 4)
 # Callers with no tier signal (e.g. context-usage with model omitted) are
 # treated as cloud.
 DEFAULT_CONTEXT_WINDOW = CLOUD_CONTEXT_WINDOW
@@ -172,9 +173,30 @@ def estimate_tools_tokens(tools) -> int:
     return total
 
 
+def resolve_window_with_source(conn, user_id, model_name, provider_type: str = "") -> tuple[int, str]:
+    """Spec §6.1 precedence: user global setting > per-model manual > fetched
+    > learned > tier default (local 8k / cloud 128k). Reads stay unfloored so
+    tests can force compaction with tiny windows."""
+    user_w = memory_store.get_context_window(conn, user_id)
+    if user_w:
+        return int(user_w), "user"
+    try:
+        import model_windows as _mw  # noqa: PLC0415 — model_windows imports this module
+        stored = _mw.resolve_stored(conn, _mw.model_key(model_name, provider_type))
+    except Exception:  # noqa: BLE001 — a store hiccup must not block a run
+        stored = None
+    if stored:
+        return stored
+    name = (model_name or "").lower()
+    if provider_type == "ollama" or name.startswith("local:"):
+        return LOCAL_CONTEXT_WINDOW, "default"
+    return CLOUD_CONTEXT_WINDOW, "default"
+
+
 def resolve_window(conn, user_id, model_name, provider_type: str = "") -> int:
-    """user_settings.context_window (int >= MIN_CONTEXT_WINDOW) > tier
-    default: local (Ollama) 8k, everything else (cloud) 256k.
+    """user_settings.context_window (int >= MIN_CONTEXT_WINDOW) > per-model
+    store (manual > fetched > learned) > tier default: local (Ollama) 8k,
+    everything else (cloud) 128k.
 
     Local is detected two ways because callers hold different names: chat
     runs send the bare model name plus provider_type ("ollama" for local);
@@ -183,13 +205,7 @@ def resolve_window(conn, user_id, model_name, provider_type: str = "") -> int:
     enforced at the settings write path (a stray saved "2" once put every
     session permanently over budget); reads stay unfloored so tests can
     force compaction with tiny windows."""
-    user_w = memory_store.get_context_window(conn, user_id)
-    if user_w:
-        return user_w
-    name = (model_name or "").lower()
-    if provider_type == "ollama" or name.startswith("local:"):
-        return LOCAL_CONTEXT_WINDOW
-    return CLOUD_CONTEXT_WINDOW
+    return resolve_window_with_source(conn, user_id, model_name, provider_type)[0]
 
 
 def _user_indices(history) -> list:
@@ -487,7 +503,7 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
     honours stream_options.include_usage) — the provider's own count of the
     current context. Falls back to the same char-ratio estimator compaction
     uses, so the fallback pct aligns with the THRESHOLD trigger."""
-    window = resolve_window(conn, user_id, model)
+    window, window_source = resolve_window_with_source(conn, user_id, model)
     source = "estimate"
     try:
         # Scope by user_id: a session is only readable by its owner. A
@@ -516,4 +532,5 @@ def compute_usage(conn, *, session_id, user_id, model) -> dict:
         _LOG.warning("context usage compute failed for %s: %s", session_id, e)
         tokens = 0
     pct = round(100 * tokens / window) if window else 0
-    return {"tokens": tokens, "window": window, "pct": pct, "source": source}
+    return {"tokens": tokens, "window": window, "pct": pct, "source": source,
+            "window_source": window_source}

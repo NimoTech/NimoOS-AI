@@ -113,6 +113,35 @@ ORCHESTRATION_GUIDANCE = (
     "yourself when a sub-agent can return the conclusion.]"
 )
 
+CONTEXT_RESCUE_MAX = 1
+
+
+def _rescue_estimates(items: list, window: int, ctx=None, *, fallback: int = 0) -> tuple[int, int]:
+    """(tokens before, tokens after) for the context_recovered event: `after`
+    is a rough preview of what the retry will send next — L1 (micro_compact)
+    on old tool outputs, then a hard truncation to the last 2 turns if that
+    alone doesn't get under 0.85 * window. When `ctx` is given both numbers
+    are computed through compaction_filter._estimate (overhead_tokens +
+    summary included) — the same units the filter itself budgets against and
+    the caller already reports as `before` in the context_recovered event
+    (Minor 7, final review: `before` used to include overhead/summary while
+    `after` was message-only, so the reported "recovery" overstated the real
+    saving). Without a ctx they fall back to a message-only estimate. On any
+    failure both numbers are `fallback` (the caller's own before-estimate),
+    never a hardcoded 0 against a non-zero before. Pure; never raises."""
+    try:
+        import compaction_filter as _cf  # noqa: PLC0415
+        est = (lambda its: _cf._estimate(ctx, its)) if ctx is not None else context_compaction.estimate_messages_tokens
+        before = est(items)
+        compacted, _ = _cf.micro_compact(items)
+        budget = int(window * 0.85)
+        if est(compacted) > budget:
+            compacted = _cf.truncate_turns(compacted, keep_turns=2)
+        return before, min(before, est(compacted))
+    except Exception:  # noqa: BLE001
+        return fallback, fallback
+
+
 _SNAPSHOT_STORE = SnapshotStore()
 
 _session_locks: dict[str, asyncio.Lock] = {}
@@ -1240,6 +1269,13 @@ class AgentRunner:
             import compaction_filter as _cf
             import run_context as _rc
             try:
+                try:
+                    import model_windows as _mw  # noqa: PLC0415
+                    await asyncio.wait_for(_mw.ensure_fetched(
+                        self._conn, provider_type=provider_type, provider_url=provider_url,
+                        model_name=model_name, api_key=provider_key), timeout=_mw.FETCH_TIMEOUT + 0.5)
+                except Exception:  # noqa: BLE001 — metadata is a nicety
+                    pass
                 _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
                 # Same object as the run's _summarize_fn (see its comment):
                 # one background client per run, closed once in the finally.
@@ -1285,6 +1321,11 @@ class AgentRunner:
             input_messages = _inject_synthetic_reasoning(input_messages)
 
             stream = None
+            # Assigned before the try (Nit 1, final review): read again in the
+            # MaxTurnsExceeded handler below, so a future refactor that moves
+            # something raise-worthy ahead of its in-try assignment can't turn
+            # that read into a NameError.
+            _attempt_turns = max_turns
             try:
                 # Set the ContextVar as the first thing inside the try whose
                 # finally resets it, so a failure between here and the
@@ -1294,6 +1335,17 @@ class AgentRunner:
                     phoenix_tracing.tracing_enabled_now(),
                     session_id, user_id, model_name, kind,
                     call_model_input_filter=_cf.compaction_filter)
+                # Per-run scratch shared with _convert_event:
+                #   streamed_message — True once any message_delta is emitted.
+                #     Used to suppress the SDK's final consolidated
+                #     message_output_item (it would duplicate the streamed text).
+                message_emitted = False  # any user-visible message text reached the client
+                t_start = time.monotonic()
+                t_first_token: float | None = None
+                output_bytes = 0
+                FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
+                BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
+
                 if activated is not None:
                     await sink.put({
                         "type": "skill_activated",
@@ -1304,44 +1356,152 @@ class AgentRunner:
                         "pin": activated.pin,
                     })
                 forced_retry_done = False
+
+                # Context-limit rescue (spec §6.2, ruling P3-R2): if the model
+                # call 400s on a context-length overflow, learn a shrunk
+                # window, retry ONCE on the partial input (stream.to_input_list()
+                # up to the failure) with max_turns reduced by the llm calls
+                # already spent, and emit context_recovered. Only stream
+                # creation + consumption live inside this loop — everything
+                # after it (reasoning fallback, stats, finalize) runs once,
+                # against the LAST `stream`.
+                _rescues = 0
+                _attempt_input = input_messages
                 while True:
                     stream = Runner.run_streamed(
-                        agent, input_messages, max_turns=max_turns,
+                        agent, _attempt_input, max_turns=_attempt_turns,
                         hooks=_cf.ContextHooks(), run_config=_trace_cfg)
                     # Maps tool call_id -> tool name so tool_result events can
-                    # report which tool produced the output (the SDK's output item
-                    # only carries call_id, not the name).
+                    # report which tool produced the output (the SDK's output
+                    # item only carries call_id, not the name).
                     call_names: dict[str, str] = {}
-                    # Per-run scratch shared with _convert_event:
-                    #   streamed_message — True once any message_delta is emitted.
-                    #     Used to suppress the SDK's final consolidated
-                    #     message_output_item (it would duplicate the streamed text).
                     conv_state: dict = {"streamed_message": False}
-                    message_emitted = False  # any user-visible message text reached the client
-                    t_start = time.monotonic()
-                    t_first_token: float | None = None
-                    output_bytes = 0
-                    FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
-                    BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
-
-                    async for event in stream.stream_events():
-                        sse_event = _convert_event(event, call_names, conv_state)
-                        if sse_event is None:
-                            continue
-                        et = sse_event["type"]
-                        if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
-                            t_first_token = time.monotonic()
-                        if et in BYTE_COUNT_TYPES:
-                            content = sse_event.get("content")
-                            if isinstance(content, str):
-                                output_bytes += len(content.encode("utf-8"))
-                        if et == "message_delta":
-                            message_emitted = True
-                        elif et == "message":
-                            if conv_state["streamed_message"]:
+                    try:
+                        async for event in stream.stream_events():
+                            sse_event = _convert_event(event, call_names, conv_state)
+                            if sse_event is None:
                                 continue
-                            message_emitted = True
-                        await sink.put(sse_event)
+                            et = sse_event["type"]
+                            if et in FIRST_ACTIVITY_TYPES and t_first_token is None:
+                                t_first_token = time.monotonic()
+                            if et in BYTE_COUNT_TYPES:
+                                content = sse_event.get("content")
+                                if isinstance(content, str):
+                                    output_bytes += len(content.encode("utf-8"))
+                            if et == "message_delta":
+                                message_emitted = True
+                            elif et == "message":
+                                if conv_state["streamed_message"]:
+                                    continue
+                                message_emitted = True
+                            await sink.put(sse_event)
+                    except MaxTurnsExceeded:
+                        raise
+                    except Exception as _exc:  # noqa: BLE001
+                        import context_errors as _ce  # noqa: PLC0415
+                        # Minor 9 (final review): last_input_tokens starts at 0
+                        # and is never seeded, so a numberless context 400 on
+                        # the FIRST model call of a run (last_input_tokens==0)
+                        # made classify()'s tier-3 fallback (0.9 * last_input)
+                        # yield None — no rescue, no learning. Do not seed it
+                        # from sessions.last_real_input_tokens (budget()'s
+                        # provider path would double-count against
+                        # items_seen_at_last_call == 0); instead estimate the
+                        # payload that was just sent, the same way the rescue
+                        # branch below estimates the retry's payload.
+                        _fold0 = int(getattr(_ctx, "fold_idx", 0) or 0)
+                        _sent0 = (_attempt_input[_fold0:] if 0 < _fold0 <= len(_attempt_input)
+                                  else _attempt_input)
+                        _cl = _ce.classify(
+                            _exc, last_input_tokens=_ctx.last_input_tokens or _cf._estimate(_ctx, _sent0))
+                        if (_cl is None or _cl.window is None or _cl.window < context_compaction.MIN_CONTEXT_WINDOW
+                                or _rescues >= CONTEXT_RESCUE_MAX or _ctx.depth > 0):
+                            # depth > 0 (a delegate child) never reaches this path in
+                            # practice — children run their own Runner.run_streamed in
+                            # skills/orchestration.py, not AgentRunner.run — kept as a
+                            # defensive, spec-mandated gate rather than live coverage.
+                            raise
+                        _rescues += 1
+                        _prev_w = int(_ctx.window)
+                        try:
+                            import model_windows as _mw  # noqa: PLC0415
+                            _learned = _mw.learn(self._conn, _mw.model_key(model_name, provider_type), _cl.window)
+                        except Exception:  # noqa: BLE001
+                            _learned = _cl.window
+                        try:
+                            _attempt_input = stream.to_input_list()
+                        except Exception:  # noqa: BLE001
+                            raise _exc
+                        _attempt_input = _inject_synthetic_reasoning(_attempt_input)
+                        # Not needed for the ordinary case (a model call only
+                        # happens after all tool outputs for the previous turn
+                        # are appended), but provider_adapters.py documents one
+                        # path that does leave a dangling tool_call — a
+                        # parallel-tool cancel cascade on a non-DeepSeek
+                        # provider (Nit 4, final review). One repair call here
+                        # removes a whole class of "the rescue retried and got
+                        # a different 400".
+                        _attempt_input = _repair_dangling_tool_calls(_attempt_input)
+                        # Force a real shrink for THIS retry, independent of what
+                        # got persisted above: learn() can return a window >= the
+                        # one that just failed (a manual/fetched row "wins" over a
+                        # smaller learned value — model_windows.upsert()'s humans-win
+                        # rule), and even an already-correct window means the 400
+                        # came from an under-estimate, not a wrong window — the
+                        # implementation's only lever is still a smaller window. So
+                        # _ctx.window is floored to <= 90% of BOTH the pre-failure
+                        # window and the actual size of the payload that just 400'd
+                        # (whichever is smaller), never to whatever learn() returned.
+                        # The persisted model_windows row is untouched by this —
+                        # it keeps whatever learn() returned above (spec §6.1: only
+                        # a genuine measurement should shrink the stored value).
+                        #
+                        # Estimate off the SENT slice, not the full attempt input:
+                        # once an L2 fold has already happened (ctx.fold_idx > 0)
+                        # the filter only ever sends full[fold_idx:] (the folded
+                        # prefix rides along as a summary in the instructions
+                        # instead) — estimating the un-folded list here would
+                        # overstate the retry's real payload by the whole folded
+                        # prefix, and a window sized off that overstatement can
+                        # come out too big to make the hard-truncation stage fire,
+                        # silently breaking the shrink guarantee on exactly the
+                        # long runs that get context 400s. compaction_filter's own
+                        # _estimate() (overhead + summary + message estimate) is
+                        # used instead of a bare estimate_messages_tokens() so the
+                        # number this is sized against, and the one reported in
+                        # context_recovered.before, matches what the filter itself
+                        # budgets against.
+                        _fold = int(getattr(_ctx, "fold_idx", 0) or 0)
+                        _sent_items = (_attempt_input[_fold:] if 0 < _fold <= len(_attempt_input)
+                                       else _attempt_input)
+                        _est_before = _cf._estimate(_ctx, _sent_items)  # noqa: SLF001
+                        if _est_before > 0:
+                            _retry_w = min(_learned, int(_prev_w * 0.9), int(_est_before * 0.9))
+                        else:
+                            _retry_w = min(_learned, int(_prev_w * 0.9))
+                        _retry_w = max(_retry_w, context_compaction.MIN_CONTEXT_WINDOW)
+                        _ctx.window = _retry_w
+                        _ctx.last_input_tokens = 0            # provider count is stale for the new input
+                        _ctx.items_seen_at_last_call = 0
+                        # Force compaction on for the retry even if the user turned
+                        # it off (or the P2-setup-failure fallback RunCtx hard-codes
+                        # it off) — a run that just proved it needs shrinking should
+                        # get it applied, not silently resend the same-but-longer
+                        # payload. Not persisted anywhere; deliberately left True for
+                        # the rest of THIS run too (confirmed intended, not an
+                        # oversight): the run already proved it needs it, and
+                        # restoring the user's setting mid-run would let the very
+                        # next over-threshold turn 400 again with compaction
+                        # silently off once more.
+                        _ctx.compaction_enabled = True
+                        _used = int(_ctx.extra.get("llm_calls", 0) or 0)
+                        if _attempt_turns is not None:
+                            _attempt_turns = max(1, _attempt_turns - _used)
+                        _, _after = _rescue_estimates(_sent_items, _retry_w, _ctx, fallback=_est_before)
+                        _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
+                                     session_id, _retry_w, _est_before, _after, _attempt_turns)
+                        await sink.put({"type": "context_recovered", "before": _est_before, "after": _after, "window": _retry_w})
+                        continue
 
                     # Forced first tool call that produced nothing at all: some
                     # providers (火山 doubao, 2026-09-08 probe) answer a pinned
@@ -1458,7 +1618,12 @@ class AgentRunner:
                     pass
                 await sink.put({
                     "type": "max_turns_exceeded",
-                    "max_turns": max_turns if max_turns is not None else 0,
+                    # The cap actually in force when this was raised: after a
+                    # rescue, _attempt_turns is max_turns reduced by the llm
+                    # calls already spent (agent.py rescue branch above) — the
+                    # PRE-rescue max_turns would misreport the limit the run
+                    # was really capped at (spec fix-round-1 review, Minor 3).
+                    "max_turns": _attempt_turns if _attempt_turns is not None else 0,
                 })
             except Exception as e:
                 # Evidence log: if a tool_call/tool pairing 400 ever slips past
