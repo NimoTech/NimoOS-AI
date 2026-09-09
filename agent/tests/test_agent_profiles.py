@@ -81,3 +81,14 @@ def test_select_tools_web_source_omits_send_attachment(monkeypatch):
         [], session_id="web1", profile=PROFILES["general"])
     names = {t.name for t in tools}
     assert "send_attachment" not in names
+
+
+def test_search_profile_pins_four_retrieval_tools_and_pre_run():
+    from profiles import PROFILES
+    p = PROFILES["search"]
+    tools = agent_module.select_tools_for_run([], session_id="s-ask", profile=p)
+    assert sorted(t.name for t in tools) == ["nimoos_search", "read_document", "read_file_chunk", "view_document_page"]
+    assert p.pre_run == "ask" and p.max_turns == 5 and p.compose_resources is False
+    assert "[n]" in p.prompt and "[EVIDENCE START]" in p.prompt
+    assert PROFILES["general"].pre_run is None and PROFILES["general"].max_turns is None
+    assert PROFILES["photos"].pre_run is None

@@ -7,7 +7,6 @@ boundary (it derives accessible roots from the X-NimoOS-User-ID header).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from contextvars import ContextVar
 from typing import Optional
@@ -22,6 +21,10 @@ from skills import filesystem as _fsskill
 from skills import photos as _photos
 from fs import ops as _fsops, paths as _fspaths, ignore as _fsignore
 from fences import fence_untrusted
+from skills.search.inline import (  # noqa: E402 — re-exported for existing importers/tests
+    INLINE_MAX_DOC_CHARS, INLINE_MAX_DOCS, INLINE_TOTAL_BUDGET, inline_eligible,
+    fetch_small_documents,
+)
 
 _client = SearchClient()
 _parser_client = ParserClient()
@@ -115,11 +118,8 @@ async def _nimoos_search_impl(query: str, sources: Optional[str] = None,
 # a second hop (read_document, or worse read_file(path) + an authorization
 # card). Inlining the complete text lets the model answer from the search
 # result directly. Bounded three ways so a broad query cannot blow up the
-# context: per-document size, number of documents, total budget.
-INLINE_MAX_DOC_CHARS = 8000
-INLINE_MAX_DOCS = 3
-INLINE_TOTAL_BUDGET = 16000
-_INLINE_MIME_PREFIXES = ("text/",)
+# context: per-document size, number of documents, total budget. Shared
+# implementation lives in skills.search.inline (reused by the ask pipeline).
 
 
 def _inline_candidates(result) -> list[dict]:
@@ -132,9 +132,9 @@ def _inline_candidates(result) -> list[dict]:
             continue
         fid = h.get("file_id")
         mime = str(h.get("mime") or "")
-        if not fid or fid in seen or h.get("kind", "body") != "body":
+        if not fid or fid in seen:
             continue
-        if not mime.startswith(_INLINE_MIME_PREFIXES):
+        if not inline_eligible(mime, h.get("kind", "body")):
             continue
         seen.add(fid)
         out.append(h)
@@ -154,29 +154,13 @@ async def _inline_small_documents(result, uid) -> None:
     cands = _inline_candidates(result)
     if not cands:
         return
-
-    async def fetch(h):
-        try:
-            return await _client.invoke_tool("read_document", {
-                "file_id": h["file_id"], "offset": 0,
-                "max_chars": INLINE_MAX_DOC_CHARS,
-            }, user_id=uid)
-        except Exception:  # noqa: BLE001 — inlining is an optimisation only
-            return None
-
-    docs = await asyncio.gather(*(fetch(h) for h in cands))
-    used = 0
-    for h, doc in zip(cands, docs):
-        if not isinstance(doc, dict) or doc.get("truncated"):
-            continue
-        text = doc.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        if len(text) > INLINE_MAX_DOC_CHARS or used + len(text) > INLINE_TOTAL_BUDGET:
-            continue
-        h["full_text"] = text
-        h["full_text_complete"] = True
-        used += len(text)
+    texts = await fetch_small_documents(
+        [h["file_id"] for h in cands], invoke_tool=_client.invoke_tool, user_id=uid)
+    for h in cands:
+        text = texts.get(h["file_id"])
+        if text:
+            h["full_text"] = text
+            h["full_text_complete"] = True
 
 
 async def _read_file_chunk_impl(file_id: str, kind: str, chunk_no: int,

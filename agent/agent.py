@@ -50,6 +50,8 @@ from mcp_client import status as mcp_status
 from mcp_client.runtime import ConfigUnavailable, RuntimePayload
 import skills.mcp_gating as mcp_gating
 from profiles import get_profile
+from ask import config as ask_config
+from ask import pipeline as ask_pipeline
 from wiki_client import WikiClient
 from wiki_context import WikiContextBuilder
 
@@ -120,17 +122,6 @@ def _get_lock(session_id: str) -> asyncio.Lock:
     if session_id not in _session_locks:
         _session_locks[session_id] = asyncio.Lock()
     return _session_locks[session_id]
-
-
-def _make_summarize_fn(client, model_name):
-    """Build the (injected) summarize callable for context compaction. Uses the
-    conversation's OWN provider client/model (no new model). Returns the
-    summary text; raises on failure (compact_for_run wraps with wait_for and
-    catches).
-
-    Thin wrapper — the actual implementation lives in summarizer.py so it can
-    be shared with make_summarizer's background-model preference path."""
-    return summarizer.session_summarize_fn(client, model_name)
 
 
 # Human-readable skip reasons, rendered into the system prompt so the model
@@ -272,6 +263,16 @@ def build_user_content(message: str, attachment_ids, *,
     if degraded_notes:
         blocks.append({"type": "input_text", "text": "\n".join(degraded_notes)})
     return blocks
+
+
+def _append_text(content, text: str):
+    """Append a text block to the SDK user content (str or block list) without
+    mutating the input. Used to attach the ask evidence pack to the user turn."""
+    if not text:
+        return content
+    if isinstance(content, str):
+        return content + "\n\n" + text
+    return list(content) + [{"type": "input_text", "text": text}]
 
 
 def hydrate_image_blocks(history, *, session_id: str, data_root: str):
@@ -961,6 +962,20 @@ class AgentRunner:
             ).fetchone()
             profile = get_profile(row["agent_type"] if row else None)
 
+            # ONE summarizer object per run, created here (not after history
+            # load) so the ask pipeline can reuse the same background-model
+            # handle for query rewriting. make_summarizer (not the bare
+            # session_summarize_fn) is required: only it carries .complete —
+            # the one-shot entry point the ask rewrite/step-summary stages
+            # call — and .aclose for the client it may open. It is compatible
+            # with compact_for_run's summarize_fn(instruction, prior, fold)
+            # shape, and the mid-run summarizer below reuses this very object
+            # so a run never opens a second background client.
+            _summarize_fn = summarizer.make_summarizer(
+                self._conn, str(user_id), client, model_name)
+            if profile.max_turns is not None:
+                max_turns = profile.max_turns
+
             # kind=init is rejected for non-general sessions at the API layer
             # (main.py), so INIT_SYSTEM_PROMPT only ever pairs with the general
             # profile here.
@@ -1159,6 +1174,26 @@ class AgentRunner:
                 message, attachment_ids,
                 session_id=session_id, data_root=data_root,
                 model_name=model_name, provider_type=provider_type)
+
+            if (profile.pre_run == "ask" and kind == "chat" and not continue_run
+                    and ask_config.pipeline_enabled()):
+                from skills.search import search as _search_skill
+                _ask = await ask_pipeline.run_guarded(
+                    question=message, session_id=session_id, user_id=str(user_id), run_id=run_id,
+                    # Direct attribute, deliberately not getattr(..., None): if the
+                    # summarizer ever loses .complete again the run must fail loudly
+                    # instead of silently rewriting every question with the fallback.
+                    complete=_summarize_fn.complete, sink=sink, conn=self._conn,
+                    search=_search_skill._client, parser=_search_skill._parser_client,
+                    window_tokens=context_compaction.resolve_window(
+                        self._conn, str(user_id), model_name, provider_type),
+                    # Read-only for now: nothing writes ask.include_draft_notes
+                    # yet. Exposing it on the notes settings API is a follow-up;
+                    # until then the default (curated notes only) is what ships.
+                    include_draft_notes=memory_store.get_bool_setting(
+                        self._conn, str(user_id), "ask.include_draft_notes", False))
+                user_content = _append_text(user_content, _ask.evidence_block)
+
             stored_history = self._load_history(session_id)
             # Earlier turns' image blocks were stored in compact form
             # (attachment_id only) to keep the DB small. Re-inline the base64
@@ -1170,7 +1205,6 @@ class AgentRunner:
                 stored_history, session_id=session_id, data_root=data_root)
 
             # --- P4 context compaction (main path; bypass/fail → no-op/truncate) ---
-            _summarize_fn = _make_summarize_fn(client, model_name)
             # continue_run has no new user message (it's already in history), so
             # don't double-count it in the token estimate.
             if continue_run:
@@ -1205,10 +1239,11 @@ class AgentRunner:
             _mid_summarize = None
             import compaction_filter as _cf
             import run_context as _rc
-            import summarizer as _summ
             try:
                 _win = context_compaction.resolve_window(self._conn, str(user_id), model_name, provider_type)
-                _mid_summarize = _summ.make_summarizer(self._conn, str(user_id), client, model_name)
+                # Same object as the run's _summarize_fn (see its comment):
+                # one background client per run, closed once in the finally.
+                _mid_summarize = _summarize_fn
                 _S0, _ = context_compaction._read_summary_state(self._conn, session_id)
                 _ctx = _rc.RunCtx(
                     session_id=session_id, user_id=str(user_id), model_name=model_name,
@@ -1501,16 +1536,19 @@ class AgentRunner:
                 except Exception:  # noqa: BLE001 — token from another context
                     shell_skills.RUN_SCRIPTS_VAR.set(())
                 await mcp_client.close_run_conns()
-                # Release the background-model client the mid-run summarizer
-                # may have opened. Placed alongside the other awaited
+                # Release the background-model client this run's summarizer
+                # may have opened. One object serves the ask rewrite, the
+                # pre-run compaction fold and the mid-run folds, so this is
+                # the single close. Placed alongside the other awaited
                 # cleanup (not right after the sync ContextVar resets above)
                 # so a CancelledError re-delivered at this await point can't
                 # skip those sync resets — they've already run by now.
-                if _mid_summarize is not None:
+                _summ_aclose = getattr(_summarize_fn, "aclose", None)
+                if _summ_aclose is not None:
                     try:
-                        await _mid_summarize.aclose()
+                        await _summ_aclose()
                     except Exception:  # noqa: BLE001
-                        _LOG.debug("mid-run summarizer aclose failed", exc_info=True)
+                        _LOG.debug("run summarizer aclose failed", exc_info=True)
                 if _mcp_write_token:
                     # Shrink the token's replay window back down to this run's
                     # actual duration instead of leaving it valid for Go's 24h

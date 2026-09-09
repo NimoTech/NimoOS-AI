@@ -7,6 +7,7 @@ import pytest
 
 import agent as agent_module
 import context_compaction as cc
+import summarizer
 from db import init_db
 
 
@@ -19,7 +20,7 @@ def runner(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_make_summarize_fn_calls_client():
+async def test_session_summarize_fn_calls_client():
     captured = {}
 
     class FakeMsg:
@@ -42,7 +43,7 @@ async def test_make_summarize_fn_calls_client():
     class FakeClient:
         chat = FakeChat()
 
-    fn = agent_module._make_summarize_fn(FakeClient(), "qwen")
+    fn = summarizer.session_summarize_fn(FakeClient(), "qwen")
     out = await fn("INSTR", "PRIOR", "FOLD")
     assert out == "ROLLED"
     assert captured["model"] == "qwen"
