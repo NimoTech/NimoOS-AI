@@ -473,3 +473,47 @@ async def test_inline_skips_results_without_semantic_group(monkeypatch):
     out = await search_skill._nimoos_search_impl("q")
     assert json.loads(unfence(out)) == {"hits": []}
     assert [c[0] for c in client.calls] == ["nimoos_search"]
+
+
+@pytest.mark.asyncio
+async def test_nimoos_search_drops_unknown_kind_in_and_warns(monkeypatch):
+    seen = {}
+
+    async def fake_invoke(name, args, user_id=None):
+        seen["args"] = args
+        return {"groups": {"semantic": []}, "stats": {}, "warnings": None}
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    out = await search_skill._nimoos_search_impl(
+        "Lunar Lake", sources="semantic", filters='{"kind_in": ["document"]}')
+    assert "filters" not in seen["args"]          # nothing valid left → filter removed
+    assert "document" in out and "body" in out and "caption" in out   # warning names the bad value and the valid kinds
+
+
+@pytest.mark.asyncio
+async def test_nimoos_search_keeps_known_kind_in(monkeypatch):
+    seen = {}
+
+    async def fake_invoke(name, args, user_id=None):
+        seen["args"] = args
+        return {"groups": {"semantic": []}, "stats": {}, "warnings": ["existing"]}
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    out = await search_skill._nimoos_search_impl(
+        "x", filters='{"kind_in": ["document", "caption"], "root_ids": ["r1"]}')
+    assert seen["args"]["filters"] == {"kind_in": ["caption"], "root_ids": ["r1"]}
+    assert "existing" in out and "document" in out   # prior warnings preserved, ours appended
+
+
+@pytest.mark.asyncio
+async def test_nimoos_search_valid_kind_in_untouched(monkeypatch):
+    seen = {}
+
+    async def fake_invoke(name, args, user_id=None):
+        seen["args"] = args
+        return {"groups": {"semantic": []}, "stats": {}, "warnings": None}
+
+    monkeypatch.setattr(search_skill._client, "invoke_tool", fake_invoke)
+    out = await search_skill._nimoos_search_impl("x", filters='{"kind_in": ["body"]}')
+    assert seen["args"]["filters"] == {"kind_in": ["body"]}
+    assert '"warnings": null' in out

@@ -76,6 +76,7 @@ def _scan_runtime_view() -> list[dict]:
             m = json.loads(manifest.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        act = m.get("activation")
         out.append({
             "id": m.get("id", entry.name),
             "name": m.get("name", entry.name),
@@ -83,17 +84,22 @@ def _scan_runtime_view() -> list[dict]:
             "trigger": m.get("trigger", "auto"),
             # Logical id only — actual reading goes through read_skill_file.
             "skill_id": entry.name,
+            # Server-side activation rules (spec 2026-09-08); None when absent.
+            "activation": act if isinstance(act, dict) else None,
         })
     return out
 
 
-def render_index_block() -> str:
+def render_index_block(skills=None) -> str:
     """Render the <available-skills> system-prompt block (L1 progressive
     disclosure). Empty string when the user has no visible (auto/slash)
     skills or the runtime view is unreadable. Never raises: prompt
-    composition must not fail because of bad skill data."""
+    composition must not fail because of bad skill data.
+
+    `skills` — a list already returned by `_scan_runtime_view()`; scanned
+    here when omitted."""
     try:
-        visible = [s for s in _scan_runtime_view()
+        visible = [s for s in (skills if skills is not None else _scan_runtime_view())
                    if s.get("trigger") != "manual"
                    and _SKILL_ID_RE.match(str(s.get("skill_id", "")))]
         if not visible:

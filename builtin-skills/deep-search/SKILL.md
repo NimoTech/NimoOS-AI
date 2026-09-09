@@ -11,10 +11,20 @@ shot. Every statement in the answer is tied to the document it came from.
   clearly not answered by any single document
 - Not for reading one known document end to end — use file-reader for that
 
+### When this arrives inside <activated-skill>
+The server matched the question's shape and loaded this skill for you; your
+first tool call has already been pinned to `nimoos_search`. Do not call
+`read_skill_file` again. Write the plan (step 1) in your first message and
+treat that first search as the plan's first step. If the question is really
+about NAS operations, code or general knowledge, say so briefly and answer
+normally instead.
+
 ### Tools
 - `nimoos_search(query, sources, top_k)` — `sources="semantic"` finds passages
   by meaning (each hit carries a `file_id`, a `kind` and a `chunk_no`);
   `sources="filenames"` finds files by name (hits carry a `file_id` only).
+  Do not pass `filters`: the only chunk kinds are `body` (document text) and
+  `caption` (photo captions), and an invented `kind_in` value returns nothing.
   Small text documents come back inlined in full (`full_text`) — treat that
   as already read; do not fetch them again.
 - `read_file_chunk(file_id, kind, chunk_no, window)` — the hit plus up to 5

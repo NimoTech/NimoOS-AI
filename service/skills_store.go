@@ -140,18 +140,82 @@ func ValidateSkillID(id string) error {
 	return nil
 }
 
+// SkillActivation lets a skill declare when the agent must load it without
+// waiting for the model to ask (spec 2026-09-08-skill-auto-activation): a
+// keyword hit on the user's message injects SKILL.md into that turn's system
+// prompt, and FirstTool (optional) pins the first model call to that tool.
+type SkillActivation struct {
+	Keywords []string `json:"keywords"`
+	// PinKeywords: phrases whose single hit is enough to pin the first tool
+	// call; without one, the pin needs two distinct keyword hits. Injection
+	// of SKILL.md happens on any keyword hit regardless.
+	PinKeywords []string `json:"pin_keywords,omitempty"`
+	FirstTool   string   `json:"first_tool,omitempty"`
+}
+
+// MaxActivationKeywords caps the keyword list; the Python matcher reads at
+// most this many entries.
+const MaxActivationKeywords = 64
+
+const (
+	minActivationKeywordRunes = 2
+	maxActivationKeywordRunes = 64
+)
+
+// ActivationFirstTools is the read-only core-tool allowlist for
+// activation.first_tool. Mirrored in agent/skills/skill_activation.py
+// (ALLOWED_FIRST_TOOLS); keep the two in sync.
+var ActivationFirstTools = map[string]bool{
+	"nimoos_search":   true,
+	"read_document":   true,
+	"read_file_chunk": true,
+}
+
+func validateActivation(a *SkillActivation) error {
+	if a == nil {
+		return nil
+	}
+	if len(a.Keywords) == 0 || len(a.Keywords) > MaxActivationKeywords {
+		return fmt.Errorf("manifest.activation.keywords must have 1..%d entries, got %d",
+			MaxActivationKeywords, len(a.Keywords))
+	}
+	for i, k := range a.Keywords {
+		n := utf8.RuneCountInString(strings.TrimSpace(k))
+		if n < minActivationKeywordRunes || n > maxActivationKeywordRunes {
+			return fmt.Errorf("manifest.activation.keywords[%d] must be %d..%d characters after trimming, got %d",
+				i, minActivationKeywordRunes, maxActivationKeywordRunes, n)
+		}
+	}
+	if len(a.PinKeywords) > MaxActivationKeywords {
+		return fmt.Errorf("manifest.activation.pin_keywords must have at most %d entries, got %d",
+			MaxActivationKeywords, len(a.PinKeywords))
+	}
+	for i, k := range a.PinKeywords {
+		n := utf8.RuneCountInString(strings.TrimSpace(k))
+		if n < minActivationKeywordRunes || n > maxActivationKeywordRunes {
+			return fmt.Errorf("manifest.activation.pin_keywords[%d] must be %d..%d characters after trimming, got %d",
+				i, minActivationKeywordRunes, maxActivationKeywordRunes, n)
+		}
+	}
+	if a.FirstTool != "" && !ActivationFirstTools[a.FirstTool] {
+		return fmt.Errorf("manifest.activation.first_tool %q is not an allowed read-only core tool", a.FirstTool)
+	}
+	return nil
+}
+
 // SkillManifest is the on-disk shape of <bundle>/manifest.json.
 type SkillManifest struct {
-	SchemaVersion int      `json:"schema_version"`
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Title         string   `json:"title"`
-	Description   string   `json:"description"`
-	Color         string   `json:"color"`
-	Icon          string   `json:"icon"`
-	Trigger       string   `json:"trigger"`
-	Examples      []string `json:"examples"`
-	Entrypoint    string   `json:"entrypoint,omitempty"`
+	SchemaVersion int              `json:"schema_version"`
+	ID            string           `json:"id"`
+	Name          string           `json:"name"`
+	Title         string           `json:"title"`
+	Description   string           `json:"description"`
+	Color         string           `json:"color"`
+	Icon          string           `json:"icon"`
+	Trigger       string           `json:"trigger"`
+	Examples      []string         `json:"examples"`
+	Activation    *SkillActivation `json:"activation,omitempty"`
+	Entrypoint    string           `json:"entrypoint,omitempty"`
 	Permissions   struct {
 		Network       bool     `json:"network"`
 		WritablePaths []string `json:"writable_paths"`
@@ -181,6 +245,9 @@ func (s *SkillsStore) LoadManifest(dir string) (*SkillManifest, error) {
 	}
 	if m.Trigger != "auto" && m.Trigger != "slash" && m.Trigger != "manual" {
 		return nil, fmt.Errorf("manifest.trigger must be auto|slash|manual, got %q", m.Trigger)
+	}
+	if err := validateActivation(m.Activation); err != nil {
+		return nil, err
 	}
 	switch m.Color {
 	case "blue", "purple", "pink", "orange", "green", "teal", "slate":

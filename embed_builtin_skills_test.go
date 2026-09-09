@@ -155,6 +155,28 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	}
 	require.GreaterOrEqual(t, bare, 2, "at least two examples must not name docs/files/notes")
 
+	// Server-side activation (spec 2026-09-08): the agent force-loads this
+	// skill on keyword hits and pins the first call to nimoos_search.
+	require.NotNil(t, m.Activation, "deep-search must declare activation")
+	require.Equal(t, "nimoos_search", m.Activation.FirstTool)
+	require.GreaterOrEqual(t, len(m.Activation.Keywords), 20)
+	for _, want := range []string{"哪些", "全部列出", "对比", "最低", "list all", "compare", "the most", "my documents"} {
+		require.Contains(t, m.Activation.Keywords, want)
+	}
+	require.LessOrEqual(t, len(m.Activation.Keywords), service.MaxActivationKeywords)
+
+	// The tool_choice pin needs either two keyword hits or one pin_keyword
+	// hit, so broad single words (compare, 排序) inject the skill but do
+	// not force a search. Every probe question must still pin: 最低 covers
+	// "TDP 最低的是哪一款".
+	require.NotEmpty(t, m.Activation.PinKeywords)
+	for _, want := range []string{"最低", "最高", "资料库", "list all", "my documents"} {
+		require.Contains(t, m.Activation.PinKeywords, want)
+	}
+	for _, k := range m.Activation.PinKeywords {
+		require.Contains(t, m.Activation.Keywords, k, "every pin_keyword must also be a keyword")
+	}
+
 	b, err := os.ReadFile(filepath.Join(store.BuiltinPath("deep-search"), "SKILL.md"))
 	require.NoError(t, err)
 	s := string(b)
@@ -162,7 +184,7 @@ func TestDeepSearchBundleContract(t *testing.T) {
 	for _, want := range []string{
 		"nimoos_search", "read_file_chunk", "read_document",
 		"plan", "already", "Sources", "not found", "untrusted",
-		"file-reader",
+		"file-reader", "activated-skill", "kind_in", "caption",
 	} {
 		require.Contains(t, s, want)
 	}

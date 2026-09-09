@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import dataclasses
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ import skills.shell as shell_skills
 import skills.init_doc as init_doc
 import skills.wiki as wiki_skills
 import skills.skills_registry as skills_registry
+import skills.skill_activation as skill_activation
 import skills.search as search_skills
 import skills.memory as memory_skills
 import memory_store
@@ -1021,11 +1023,48 @@ class AgentRunner:
             # Skill index (L1 progressive disclosure): list installed
             # auto/slash skills so the model can activate one by calling
             # read_skill_file. Only for runs whose tool set includes
-            # read_skill_file, i.e. the general profile.
+            # read_skill_file, i.e. the general profile. The runtime view is
+            # scanned once here and shared with select_auto_skill below; the
+            # scan itself sits inside a try so a corrupt manifest cannot
+            # break prompt composition (spec §5).
+            _rt_view: list = []
             if profile.tools is None:
-                skills_block = skills_registry.render_index_block()
+                try:
+                    _rt_view = skills_registry._scan_runtime_view()
+                except Exception:
+                    _LOG.warning("skill activation: runtime view scan failed", exc_info=True)
+                skills_block = skills_registry.render_index_block(_rt_view)
                 if skills_block:
                     full_prompt = full_prompt + "\n\n" + skills_block
+
+            # Server-side skill auto-activation (spec 2026-09-08). A keyword
+            # hit on THIS message force-loads one skill's SKILL.md into the
+            # turn's system prompt and, when the provider allows, pins the
+            # first model call to the skill's first_tool. Prompt-only
+            # activation was measured at 0/5 (doubao) and 1/5 (DeepSeek) on
+            # the Intel2408 probes. Turn-scoped: nothing is persisted.
+            activated = None
+            activation_injected = False
+            if profile.tools is None and kind == "chat" and not continue_run:
+                activated = skill_activation.select_auto_skill(
+                    message, _rt_view)
+            if activated is not None:
+                md = skills_registry._read_skill_file(activated.skill_id, "SKILL.md")
+                if md.startswith("Error:"):
+                    _LOG.warning("skill activation: cannot read %s: %s", activated.skill_id, md)
+                elif len(md.encode("utf-8")) > skill_activation.INJECT_CAP_BYTES:
+                    _LOG.warning("skill activation: %s SKILL.md exceeds %d bytes; index only",
+                                 activated.skill_id, skill_activation.INJECT_CAP_BYTES)
+                else:
+                    full_prompt = full_prompt + "\n\n" + skill_activation.render_activation_block(
+                        activated.skill_id, md)
+                    activation_injected = True
+            forced_tool = None
+            if (activated is not None and activated.first_tool and activated.pin
+                    and activation_injected
+                    and skill_activation.forcing_enabled()
+                    and provider_type in skill_activation.FORCE_PROVIDER_TYPES):
+                forced_tool = activated.first_tool
 
             if attachment_ids and profile.tools is None:
                 # Pinned-profile runs skip the attachment block: read_attachment
@@ -1133,6 +1172,13 @@ class AgentRunner:
             # estimate sees the session's real unlock state.
             run_tools = select_tools_for_run(
                 attachment_ids, session_id=session_id, profile=profile) + mcp_tools + _mcp_l2_tools
+            # Pin the first model call to the activated skill's first_tool.
+            # Agent.reset_tool_choice defaults to True, so the SDK returns
+            # tool_choice to "auto" after that one call.
+            if forced_tool and any(getattr(t, "name", "") == forced_tool for t in run_tools):
+                model_settings = dataclasses.replace(model_settings, tool_choice=forced_tool)
+            else:
+                forced_tool = None
             try:
                 _overhead = (context_compaction.estimate_tokens(full_prompt)
                              + context_compaction.estimate_tools_tokens(run_tools))
@@ -1265,6 +1311,17 @@ class AgentRunner:
                 FIRST_ACTIVITY_TYPES = frozenset({"message_delta", "thinking", "tool_call"})
                 BYTE_COUNT_TYPES = frozenset({"message_delta", "thinking"})
 
+                if activated is not None:
+                    await sink.put({
+                        "type": "skill_activated",
+                        "skill_id": activated.skill_id,
+                        "mode": "auto",
+                        "forced_tool": forced_tool,
+                        "injected": activation_injected,
+                        "pin": activated.pin,
+                    })
+                forced_retry_done = False
+
                 # Context-limit rescue (spec §6.2, ruling P3-R2): if the model
                 # call 400s on a context-length overflow, learn a shrunk
                 # window, retry ONCE on the partial input (stream.to_input_list()
@@ -1303,7 +1360,6 @@ class AgentRunner:
                                     continue
                                 message_emitted = True
                             await sink.put(sse_event)
-                        break                                   # normal completion
                     except MaxTurnsExceeded:
                         raise
                     except Exception as _exc:  # noqa: BLE001
@@ -1410,6 +1466,32 @@ class AgentRunner:
                         _LOG.warning("context-rescue: session=%s window=%d before=%d after=%d turns_left=%s",
                                      session_id, _retry_w, _est_before, _after, _attempt_turns)
                         await sink.put({"type": "context_recovered", "before": _est_before, "after": _after, "window": _retry_w})
+                        continue
+
+                    # Forced first tool call that produced nothing at all: some
+                    # providers (火山 doubao, 2026-09-08 probe) answer a pinned
+                    # tool_choice with finish_reason=tool_calls and no tool_calls
+                    # delta. Retry the turn once with the pin released; the
+                    # <activated-skill> block still steers the model to search.
+                    if skill_activation.should_retry_without_pin(
+                            forced_tool, forced_retry_done, message_emitted, call_names):
+                        forced_retry_done = True
+                        _LOG.warning("skill activation: forced %s produced no tool call "
+                                     "and no text; retrying without tool_choice", forced_tool)
+                        await sink.put({
+                            "type": "skill_activation_fallback",
+                            "skill_id": activated.skill_id if activated else None,
+                            "forced_tool": forced_tool,
+                            "reason": "empty_completion",
+                        })
+                        agent.model_settings = dataclasses.replace(
+                            agent.model_settings, tool_choice=None)
+                        agent.instructions = (str(agent.instructions or "") +
+                            "\n\n[Retry notice: your first attempt returned no tool call and no text. "
+                            "Begin this attempt by calling nimoos_search for the question above, then answer "
+                            "from what it returns; do not answer from memory.]")
+                        continue
+                    break
 
                 # Reasoning-only fallback. The fallback text also counts toward
                 # output_bytes so the token count is meaningful for these models.

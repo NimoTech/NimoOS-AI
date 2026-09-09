@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -369,5 +370,145 @@ func TestSkillsStore_CreateFromForm_RejectsBadDescription(t *testing.T) {
 	}
 	if _, statErr := os.Stat(s.UserPath("42", "bad-desc")); !os.IsNotExist(statErr) {
 		t.Fatalf("bundle dir must not be created on rejection")
+	}
+}
+
+func writeManifestBundle(t *testing.T, dir, manifest string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("## hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSkillsStore_LoadManifest_Activation(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := s.BuiltinPath("deep-search")
+	writeManifestBundle(t, dir, `{
+		"schema_version": 1, "id": "deep-search", "name": "deep-search",
+		"title": "Deep search", "description": "d", "color": "blue", "icon": "search",
+		"trigger": "auto", "examples": [], "version": "0.3.0", "author": "Nimo",
+		"activation": {"keywords": ["哪些", "list all"], "first_tool": "nimoos_search"}
+	}`)
+	m, err := s.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if m.Activation == nil {
+		t.Fatal("activation not parsed")
+	}
+	if len(m.Activation.Keywords) != 2 || m.Activation.Keywords[0] != "哪些" {
+		t.Fatalf("keywords: %+v", m.Activation.Keywords)
+	}
+	if m.Activation.FirstTool != "nimoos_search" {
+		t.Fatalf("first_tool: %q", m.Activation.FirstTool)
+	}
+}
+
+func TestSkillsStore_LoadManifest_NoActivationIsNil(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := s.BuiltinPath("plain")
+	writeManifestBundle(t, dir, `{
+		"schema_version": 1, "id": "plain", "name": "plain", "title": "Plain",
+		"description": "d", "color": "blue", "icon": "sparkle", "trigger": "auto",
+		"examples": [], "version": "0.1.0", "author": "Nimo"
+	}`)
+	m, err := s.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if m.Activation != nil {
+		t.Fatalf("expected nil activation, got %+v", m.Activation)
+	}
+}
+
+func TestSkillsStore_LoadManifest_RejectsBadActivation(t *testing.T) {
+	many := make([]string, 65)
+	for i := range many {
+		many[i] = fmt.Sprintf("kw%02d", i)
+	}
+	manyJSON, _ := json.Marshal(many)
+	cases := map[string]string{
+		"too many keywords": `{"keywords": ` + string(manyJSON) + `}`,
+		"empty keywords":    `{"keywords": []}`,
+		"short keyword":     `{"keywords": ["a"]}`,
+		"long keyword":      `{"keywords": ["` + strings.Repeat("x", 65) + `"]}`,
+		"blank keyword":     `{"keywords": ["   "]}`,
+		"write tool":        `{"keywords": ["哪些"], "first_tool": "run_command"}`,
+		"unknown tool":      `{"keywords": ["哪些"], "first_tool": "nope"}`,
+	}
+	for name, act := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			s := &SkillsStore{Root: root}
+			dir := s.BuiltinPath("bad")
+			writeManifestBundle(t, dir, `{
+				"schema_version": 1, "id": "bad", "name": "bad", "title": "Bad",
+				"description": "d", "color": "blue", "icon": "sparkle", "trigger": "auto",
+				"examples": [], "version": "0.1.0", "author": "Nimo",
+				"activation": `+act+`
+			}`)
+			if _, err := s.LoadManifest(dir); err == nil {
+				t.Fatalf("expected error for %s", name)
+			} else if !strings.Contains(err.Error(), "activation") {
+				t.Fatalf("error should name activation, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestSkillsStore_LoadManifest_PinKeywords(t *testing.T) {
+	root := t.TempDir()
+	s := &SkillsStore{Root: root}
+	dir := s.BuiltinPath("deep-search")
+	writeManifestBundle(t, dir, `{
+		"schema_version": 1, "id": "deep-search", "name": "deep-search",
+		"title": "Deep search", "description": "d", "color": "blue", "icon": "search",
+		"trigger": "auto", "examples": [], "version": "0.3.0", "author": "Nimo",
+		"activation": {"keywords": ["哪些", "最低"], "pin_keywords": ["最低"], "first_tool": "nimoos_search"}
+	}`)
+	m, err := s.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if len(m.Activation.PinKeywords) != 1 || m.Activation.PinKeywords[0] != "最低" {
+		t.Fatalf("pin_keywords: %+v", m.Activation.PinKeywords)
+	}
+}
+
+func TestSkillsStore_LoadManifest_RejectsBadPinKeywords(t *testing.T) {
+	many := make([]string, 65)
+	for i := range many {
+		many[i] = fmt.Sprintf("kw%02d", i)
+	}
+	manyJSON, _ := json.Marshal(many)
+	cases := map[string]string{
+		"too many pin keywords": `{"keywords": ["哪些"], "pin_keywords": ` + string(manyJSON) + `}`,
+		"short pin keyword":     `{"keywords": ["哪些"], "pin_keywords": ["a"]}`,
+	}
+	for name, act := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			s := &SkillsStore{Root: root}
+			dir := s.BuiltinPath("bad")
+			writeManifestBundle(t, dir, `{
+				"schema_version": 1, "id": "bad", "name": "bad", "title": "Bad",
+				"description": "d", "color": "blue", "icon": "sparkle", "trigger": "auto",
+				"examples": [], "version": "0.1.0", "author": "Nimo",
+				"activation": `+act+`
+			}`)
+			if _, err := s.LoadManifest(dir); err == nil {
+				t.Fatalf("expected error for %s", name)
+			} else if !strings.Contains(err.Error(), "pin_keywords") {
+				t.Fatalf("error should name pin_keywords, got: %v", err)
+			}
+		})
 	}
 }
