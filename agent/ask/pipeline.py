@@ -100,9 +100,21 @@ async def _step_summaries(plan, pack, complete, *, pool_chars: int, deadline: fl
     return [g for g in got if isinstance(g, str) and g]
 
 
+def notes_exclude_prefixes(conn) -> tuple[str, ...]:
+    """Directory prefixes retrieve() must drop from document hits: the notes
+    layer's root (agent/notes/store.py). Its .md files (plus log.md/index.md)
+    are Parser-indexed like any other folder, but the same notes already reach
+    the pack through the notes collection, so as documents they only crowd
+    out real sources and leak earlier answers back into later questions."""
+    from notes import store as notes_store  # noqa: PLC0415 — keep ask importable without notes deps
+    root = str(notes_store.get_notes_root(conn) or "").rstrip("/")
+    return (root + "/",) if root else ()
+
+
 async def run(*, question: str, session_id: str, user_id: str, run_id: str, complete, sink, conn,
               search, parser, window_tokens: int | None = None,
-              include_draft_notes: bool = False) -> AskResult:
+              include_draft_notes: bool = False,
+              exclude_prefixes: tuple[str, ...] = ()) -> AskResult:
     deadline = time.monotonic() + config.PIPELINE_TIMEOUT_S
     st = _Stages(sink)
     result = AskResult()
@@ -133,7 +145,8 @@ async def run(*, question: str, session_id: str, user_id: str, run_id: str, comp
     await st.start("retrieve")
     rr = await retrieve.retrieve(plan, question=question, user_id=user_id, search=search, parser=parser,
                                  deadline=deadline, include_draft_notes=include_draft_notes,
-                                 note_title=lambda nid: store.note_title(conn, user_id, nid))
+                                 note_title=lambda nid: store.note_title(conn, user_id, nid),
+                                 exclude_prefixes=exclude_prefixes)
     result.warnings.extend(rr.warnings)
     await sink.put(_plan_event(plan, rr.per_query_hits))
     if rr.all_failed:

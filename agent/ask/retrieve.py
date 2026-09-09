@@ -128,10 +128,19 @@ class RetrieveResult:
     partial: bool
 
 
+def excluded_by_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    """True when a document hit lives under one of `prefixes` (absolute dirs,
+    each ending in "/"). Used to keep the agent's own notes files — already
+    fused in via the notes collection — from re-entering as documents."""
+    return bool(prefixes) and bool(path) and path.startswith(prefixes)
+
+
 async def retrieve(plan, *, question: str, user_id: str, search, parser, deadline: float,
-                   include_draft_notes: bool = False, note_title=None) -> RetrieveResult:
+                   include_draft_notes: bool = False, note_title=None,
+                   exclude_prefixes: tuple[str, ...] = ()) -> RetrieveResult:
     queries = [q.q for q in plan.queries]
     statuses = ["curated", "draft"] if include_draft_notes else ["curated"]
+    exclude_prefixes = tuple(p for p in (exclude_prefixes or ()) if p)
 
     async def one_query(qi: int, q: str):
         # Rerank only the primary sub-query. Search's cross-encoder costs
@@ -144,6 +153,12 @@ async def retrieve(plan, *, question: str, user_id: str, search, parser, deadlin
                                        rerank=(qi == 0),
                                        timeout_s=config.PER_QUERY_TIMEOUT_S)
         cands = [c for c in (candidate_from_hit(h) for h in out.get("hits") or []) if c]
+        if exclude_prefixes:
+            kept = [c for c in cands if not excluded_by_prefix(c.path, exclude_prefixes)]
+            if len(kept) != len(cands):
+                _LOG.debug("ask retrieve q%d dropped %d hits under excluded prefixes",
+                           qi, len(cands) - len(kept))
+            cands = kept
         return qi, cands, list(out.get("warnings") or [])
 
     async def notes():

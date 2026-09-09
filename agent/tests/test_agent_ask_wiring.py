@@ -136,3 +136,6 @@ async def test_run_gives_the_ask_pipeline_a_working_complete(search_runner, monk
 
     # the evidence block reached the user turn
     assert "EVIDENCE-BLOCK" in json.dumps(seen["input"], ensure_ascii=False)
+
+    # the notes layer's root is excluded from document hits (default root)
+    assert captured["exclude_prefixes"] == ("/DATA/Notes/",)

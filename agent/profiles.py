@@ -27,6 +27,10 @@ class Profile:
     pre_run: str | None = None
     # None = the user's max-turns setting; an int overrides it for this profile.
     max_turns: int | None = None
+    # True = when the run exhausts max_turns, make one more model call with
+    # tools switched off so the run ends in an answer built from the tool
+    # results already gathered, instead of the resumable "pause" event.
+    synthesize_on_max_turns: bool = False
 
 
 PHOTOS_SYSTEM_PROMPT = """You are Nimo, the photo assistant inside the NimoOS Photos app.
@@ -92,7 +96,8 @@ PROFILES = {
                       prompt=ASK_SYSTEM_PROMPT,
                       compose_resources=False,
                       pre_run="ask",
-                      max_turns=5),
+                      max_turns=5,
+                      synthesize_on_max_turns=True),
 }
 
 
