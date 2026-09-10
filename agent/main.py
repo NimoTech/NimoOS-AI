@@ -1539,19 +1539,41 @@ def _session_agent_type(session_id: str) -> str:
 
 
 @app.get("/agent/sessions")
-async def list_sessions(x_user_id: str = Header(..., alias="X-User-Id")):
+async def list_sessions(agent_type: str | None = None,
+                        x_user_id: str = Header(..., alias="X-User-Id")):
     # source != 'task': every scheduled run opens its own session with a NULL
     # title, and they sort by updated_at like any other — so a task firing
     # every 5 minutes would push the user's real conversations off the top of
     # the chat list. Task sessions are reachable through the run history,
     # which is where they belong. `source` is NOT NULL DEFAULT 'web', so the
     # comparison never drops a legacy row to a NULL result.
-    rows = _db().execute(
-        "SELECT id, title, created_at, updated_at, agent_type "
-        "FROM sessions WHERE user_id=? AND source != 'task' "
-        "ORDER BY updated_at DESC",
-        (x_user_id,)
-    ).fetchall()
+    #
+    # ?agent_type= narrows the list to one profile: the agent chat page asks for
+    # 'general' so knowledge-ask ('search') and Photos sessions stop showing up
+    # in its sidebar, and the Ask page asks for 'search' to build its history.
+    # Omitted = every profile, exactly as before. Same fixed 422 as
+    # create_session so the parameter cannot be used to enumerate profiles.
+    #
+    # title: knowledge-ask sessions never get a title (the Ask page has no
+    # title UI and no auto-title run), so fall back to the session's first
+    # ask_turns question — that IS what the user would call the conversation.
+    # Correlated subquery instead of a JOIN so a session with N turns still
+    # yields one row. Sessions with a real title are untouched.
+    if agent_type is not None and agent_type not in PROFILES:
+        raise HTTPException(status_code=422, detail="invalid agent_type")
+    sql = (
+        "SELECT s.id, "
+        "COALESCE(s.title, (SELECT t.question FROM ask_turns t WHERE t.session_id=s.id "
+        "ORDER BY t.created_at ASC, t.rowid ASC LIMIT 1)) AS title, "
+        "s.created_at, s.updated_at, s.agent_type "
+        "FROM sessions s WHERE s.user_id=? AND s.source != 'task' "
+    )
+    params: list = [x_user_id]
+    if agent_type is not None:
+        sql += "AND s.agent_type=? "
+        params.append(agent_type)
+    sql += "ORDER BY s.updated_at DESC"
+    rows = _db().execute(sql, params).fetchall()
     return [dict(row) for row in rows]
 
 
